@@ -1,44 +1,45 @@
 # DS4 Smart Proxy
 
 ## Overview
-DS4 Smart Proxy is an OpenAI-compatible reverse proxy written in Rust. It is deployed locally alongside OpenAI API clients and transparently forwards requests to one of multiple DS4 backends. It is not an HTTP forward proxy in the conventional networking sense.
+
+DS4 Smart Proxy is a lightweight OpenAI-compatible reverse proxy written in Rust.
 
 Its purpose is to intelligently route OpenAI-compatible API requests between multiple standalone DwarfStar 4 (DS4) servers in a small homelab environment.
 
-The primary design target is a two-node deployment where each Apple Silicon machine hosts both:
+The primary deployment target is a small number of Apple Silicon Macs, where each machine acts as both:
 
-- a DS4 server
-- local AI clients (Codex, Hermes Agent, OpenAI SDKs, etc.)
+- an OpenAI API client (Codex, Hermes Agent, OpenAI SDKs, etc.)
+- a DS4 inference server
 
-The proxy should always prefer the local DS4 instance whenever possible and transparently fall back to a remote DS4 instance when the local instance is busy or unavailable.
+The proxy always prefers the local DS4 instance whenever possible and transparently falls back to a remote DS4 instance when the local instance is unavailable or already processing another request.
 
-Clients must never know which backend actually processed a request.
+Clients must never know which backend actually processed the request.
 
 ---
 
-## Goals
+# Goals
 
-- OpenAI API compatible
+- OpenAI-compatible reverse proxy
 - Rust implementation
-- Extremely low overhead
-- Streaming compatible
+- Very low overhead
+- Streaming-first design
 - Zero client configuration changes
 - Automatic backend selection
-- Health-aware routing
+- Local-first routing
 - Infrastructure agnostic
 - Single executable
 - Minimal dependencies
 
 ---
 
-## Non-goals
+# Non-goals
 
-The following are explicitly outside the scope of this project.
+The following features are intentionally out of scope.
 
 - Distributed inference
 - Multi-GPU inference
 - Request batching
-- Authentication provider
+- Authentication
 - User management
 - Billing
 - GPU scheduling
@@ -47,145 +48,219 @@ The following are explicitly outside the scope of this project.
 
 ---
 
-## Design Principles
+# Design Principles
 
 The proxy must remain infrastructure agnostic.
 
-- It must NOT depend on:
-    - DNS implementation
-    - mDNS / Bonjour
-    - Cloud providers
-    - Kubernetes
-    - Docker
-    - Prometheus
-    - Redis
+It must not depend on:
 
-Backend discovery is entirely configuration-driven. Any backend reachable over HTTP(S) may participate.
+- DNS implementation
+- mDNS / Bonjour
+- Reverse proxies
+- Cloud providers
+- Kubernetes
+- Docker
+- Redis
+- Prometheus
 
----
+Backend discovery is entirely configuration-driven.
 
-## Target Environment
-
-- Typical deployment: **Two Apple Silicon Macs.**
-- Each machine runs:
-    - DwarfStar 4
-    - DS4 Smart Proxy
-    - Codex / Hermes / OpenAI SDK clients
-- Each machine behaves as both
-    - client
-    - inference server
-
-There is no dedicated load balancer machine. Each client communicates only with its own local proxy.
+Any backend reachable over HTTP(S) may participate.
 
 ---
 
-## High-Level Architecture
+# Target Environment
+
+Typical deployment consists of two or more Apple Silicon Macs.
+
+Each machine runs:
+
+- DwarfStar 4
+- DS4 Smart Proxy
+- Codex / Hermes / OpenAI SDK clients
+
+Each machine behaves simultaneously as:
+
+- API client
+- inference server
+
+Every client communicates only with its own local proxy.
+
+---
+
+# High-Level Architecture
 
 ```
-          +--------------------------+
-          |      Local Client        |
-          |--------------------------|
-          | Codex                    |
-          | Hermes                   |
-          | curl                     |
-          | OpenAI SDK               |
-          +------------+-------------+
-                       |
-                       |
+        +---------------------------+
+        | Local AI Client           |
+        |---------------------------|
+        | Codex                     |
+        | Hermes                    |
+        | curl                      |
+        | OpenAI SDK                |
+        +-------------+-------------+
+                      |
                 localhost:18080
-                       |
-                DS4 Smart Proxy
-                       |
-          +------------+------------+
-          |                         |
-          |                         |
-      Local DS4               Remote DS4
+                      |
+             DS4 Smart Proxy
+                      |
+          +-----------+-----------+
+          |                       |
+          |                       |
+      Local DS4              Remote DS4
 ```
 
-The proxy always exposes a single OpenAI-compatible endpoint.
+Clients always communicate with the local proxy.
 
-Clients never communicate directly with backend servers.
+The proxy is responsible for backend selection.
 
 ---
 
-## Routing Policy
+# Routing Policy
 
-Priority order:
+Backend selection priority:
 
 1. Local backend
 2. Remote backend
-3. Return HTTP 503
+3. Return HTTP 503 (or optionally queue)
 
-The proxy MUST always prefer the local backend whenever it is available.
+The local backend should always be preferred whenever it is available.
 
 ---
 
-## Backend Selection
+# Backend Selection Policy
 
-Backend selection must NOT rely on:
+Backend selection MUST NOT rely on:
 
 - GPU utilization
 - CPU utilization
-- Unified memory usage
+- Unified memory utilization
 
 Reason:
 
-DS4 serializes inference internally. The best scheduling signal is actual request occupancy.
+DS4 already serializes inference internally.
+
+The most reliable scheduling signal is actual request occupancy.
 
 ---
 
-## Backend State
+# Backend State
 
-Each backend maintains:
+Each backend maintains runtime state.
 
 ```rust
 struct BackendState {
     healthy: bool,
     in_flight: usize,
     average_latency: Duration,
-    last_probe: Instant,
+    last_heartbeat: Instant,
+    last_failure: Option<Instant>,
 }
 ```
 
 ---
 
-## Busy Definition
+# Busy Definition
 
-Initially
+Initially:
 
 ```
 busy = in_flight >= max_in_flight
 ```
 
-Default
+Default:
 
 ```
 max_in_flight = 1
 ```
 
-Future versions may allow higher concurrency.
+The implementation should allow this to become configurable later.
 
 ---
 
-## Health Monitoring
+# Health Monitoring
 
-Every backend is periodically probed.
+## Heartbeat
 
-### Probe interval
+Backends are periodically monitored using a lightweight heartbeat.
+
+Heartbeat endpoint:
+
+```
+GET /v1/models
+```
+
+The heartbeat path should be configurable.
+The default is `/v1/models`.
+
+Purpose:
+
+- verify HTTP connectivity
+- verify that the backend process is reachable
+- avoid unnecessary inference
+
+Heartbeat interval:
 
 ```
 5 seconds
 ```
 
-### Probe timeout
+Heartbeat timeout:
 
 ```
-5 seconds
+3 seconds
 ```
 
-### Probe request
+Heartbeat MUST NOT execute inference.
 
-`POST /v1/chat/completions`
+A successful heartbeat does not by itself prove that inference can be served.
+It only means the backend may be considered as a routing candidate.
+
+---
+
+## Active Probe
+
+Inference probes are expensive.
+
+Therefore:
+
+**Inference probes MUST NOT execute periodically.**
+
+For each real client request, the proxy should execute an active inference probe
+against the selected routing candidate before forwarding the client request.
+
+The probe is part of request-time routing, not background monitoring.
+
+An active inference probe may execute only when:
+
+- a real client request has arrived
+- the backend is a routing candidate
+
+The proxy should evaluate candidates in routing order:
+
+1. probe local backend if it is not busy and heartbeat-reachable
+2. if local probe fails, mark local unhealthy and probe the next remote candidate
+3. forward the real request to the first candidate whose probe succeeds
+4. return HTTP 503 if no candidate succeeds
+
+Probe success updates:
+
+```
+healthy = true
+```
+
+Probe failure updates:
+
+```
+last_failure = now
+healthy = false
+```
+
+Probe request:
+
+```
+POST /v1/chat/completions
+```
 
 ```json
 {
@@ -203,52 +278,101 @@ Every backend is periodically probed.
 }
 ```
 
-### Healthy if
+Requirements:
 
-- HTTP 200
-- response received
-- timeout not exceeded
+- timeout ≤ 3 seconds
+- never executed on a timer
+- execute at most once per routing candidate per client request
 
 ---
 
-## Request Routing
+# Backend Selection Algorithm
+
+Preferred routing order:
 
 ```
-Incoming request
-  ↓
-Choose backend
-  ↓
-Increment: in_flight += 1
-  ↓
-Forward request
-  ↓
-Stream response directly
-  ↓
-Finally: in_flight -= 1
+Local backend
+
+if
+    heartbeat-reachable or healthy
+&&  in_flight < max_in_flight
+&&  active probe succeeds
+
+↓
+
+Remote backend
+
+if
+    heartbeat-reachable or healthy
+&&  in_flight < max_in_flight
+&&  active probe succeeds
+
+↓
+
+503 Service Unavailable
+(or optional request queue)
 ```
 
-- The decrement MUST happen even when:
-    - timeout
-    - cancellation
-    - panic
-    - broken connection
-
-**RAII / Drop guard is strongly recommended.**
+The active probe is intentionally performed before forwarding each real request.
+This avoids relying on historical success timestamps.
 
 ---
 
-## Retry Policy
+# Request Lifecycle
 
-- Connection failure: **Retry another healthy backend.**
-- HTTP 5xx: **Retry once on another backend.**
-- HTTP 4xx: **Never retry.**
-- Streaming already started: **Never retry.**
+Upon backend selection:
+
+```
+in_flight += 1
+```
+
+Forward request immediately.
+
+Responses must be streamed directly.
+
+After completion:
+
+```
+in_flight -= 1
+```
+
+Decrement MUST happen regardless of:
+
+- timeout
+- cancellation
+- panic
+- broken TCP connection
+- client disconnect
+
+RAII / Drop guard is strongly recommended.
 
 ---
 
-## OpenAI Compatibility
+# Retry Policy
 
-The proxy MUST transparently support every OpenAI endpoint. Known endpoints include:
+Connection failure:
+
+- retry another eligible backend after its active probe succeeds
+
+HTTP 5xx:
+
+- retry once on another eligible backend after its active probe succeeds
+
+HTTP 4xx:
+
+- never retry
+
+Streaming already started:
+
+- never retry
+
+---
+
+# OpenAI Compatibility
+
+The proxy must transparently forward every OpenAI-compatible endpoint.
+
+Known endpoints include:
 
 ```
 /v1/chat/completions
@@ -256,63 +380,74 @@ The proxy MUST transparently support every OpenAI endpoint. Known endpoints incl
 /v1/models
 ```
 
-Unknown paths should also be proxied. The proxy must never inspect request bodies except when required for routing.
+Unknown paths should also be proxied.
+
+The proxy should avoid inspecting request bodies unless routing requires it.
 
 ---
 
-## Streaming
+# Streaming
 
 Streaming is a first-class requirement.
 
-- Requirements
-    - no buffering
-    - no event aggregation
-    - preserve chunk ordering
-    - preserve chunk timing
-    - support Server Sent Events
-    - support HTTP chunked transfer
+Requirements:
+
+- do not buffer response bodies
+- preserve ordering
+- preserve timing
+- preserve streaming semantics
+- support SSE
+- support chunked transfer encoding
 
 The proxy should behave as transparently as possible.
+Exact HTTP chunk boundaries are not guaranteed by the proxy implementation.
 
 ---
 
-## Configuration
+# Configuration
 
-Configuration format
+Configuration format:
 
 ```
 TOML
 ```
 
-### Example
+Example:
 
 ```toml
 listen = "127.0.0.1:18080"
 
-self = "macbook"
-tls_accept_invalid_certs = false
+self_name = "macbook"
 
-probe_interval = "5s"
-probe_timeout = "5s"
+heartbeat_interval = "5s"
+heartbeat_timeout = "2s"
+heartbeat_path = "/v1/models"
 
-[[backend]]
+active_probe_timeout = "3s"
+
+[[backends]]
 name = "macbook"
 url = "http://127.0.0.1:8000"
 max_in_flight = 1
 
-[[backend]]
+[[backends]]
 name = "macstudio"
-url = "https://macstudio.example.internal"
+url = "https://macstudio.local"
 max_in_flight = 1
 ```
 
-The `self` field determines which backend should be preferred. The same binary must run on every machine. Only the configuration file changes.
+The same executable should run on every machine.
+
+Only the configuration file changes.
+
+The canonical backend array key is `[[backends]]`.
+Implementations may accept the legacy `[[backend]]` spelling for migration, but new configurations should use `[[backends]]`.
 
 ---
 
-## Health Endpoints
+# Health Endpoints
 
-The proxy exposes
+The proxy exposes:
 
 ```
 GET /healthz
@@ -320,7 +455,10 @@ GET /backends
 GET /metrics
 ```
 
-### Example
+`/metrics` may return a lightweight implementation-defined text format.
+Prometheus-compatible metrics are a future extension, not a requirement for the initial implementation.
+
+Example response:
 
 ```json
 [
@@ -329,41 +467,48 @@ GET /metrics
     "healthy":true,
     "busy":false,
     "in_flight":0,
-    "latency_ms":84
+    "latency_ms":83,
+    "last_heartbeat":"2026-07-05T12:34:56Z",
+    "last_failure":null
   },
   {
     "name":"macstudio",
     "healthy":true,
     "busy":true,
     "in_flight":1,
-    "latency_ms":76
+    "latency_ms":78,
+    "last_heartbeat":"2026-07-05T12:34:48Z",
+    "last_failure":null
   }
 ]
 ```
 
 ---
 
-## Logging
+# Logging
 
-Use structured logging. 
+Use structured logging.
 
-Recommended crate
+Recommended crate:
 
 ```
 tracing
 ```
 
-Every request should emit
+Each request should record:
 
-- request id
+- request ID
 - selected backend
+- routing reason
 - latency
 - response status
 - retry count
 
+Heartbeat failures should be logged only when backend state changes, to avoid excessive log noise.
+
 ---
 
-## Recommended Crates
+# Recommended Rust Crates
 
 - tokio
 - axum
@@ -374,31 +519,50 @@ Every request should emit
 - reqwest
 - serde
 - serde_json
+- toml
 - dashmap
 - arc-swap
 - tracing
 - tracing-subscriber
 - anyhow
 - thiserror
-- toml
+- clap
+- uuid
 
 ---
 
-## Future Extensions
+# Future Extensions
 
-Possible future improvements include
+Possible future improvements include:
 
+- Request queue
 - Weighted routing
 - Latency-aware routing
 - Sticky sessions
-- Request queue
 - Backend draining
-- Dynamic max_in_flight
-- Adaptive routing
+- Adaptive max_in_flight
 - Circuit breaker
 - Prometheus exporter
-- Unified memory monitoring
+- Unified memory awareness
 - Apple GPU utilization
 - More than two backends
 
 These features should not complicate the initial implementation.
+
+---
+
+# Implementation Guidelines
+
+The implementation should prioritize:
+
+1. Correctness
+2. Simplicity
+3. Predictable routing
+4. Low runtime overhead
+5. Streaming transparency
+
+Avoid premature optimization.
+
+A lightweight and maintainable implementation is preferred over a feature-rich design.
+
+The proxy should remain transparent, reliable, and easy to reason about.

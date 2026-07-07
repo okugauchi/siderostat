@@ -1,7 +1,7 @@
 use crate::config::{BackendConfig, Config};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct BackendState {
@@ -9,7 +9,8 @@ pub struct BackendState {
     pub healthy: bool,
     pub in_flight: usize,
     pub average_latency_ms: u64,
-    pub last_probe: Instant,
+    pub last_heartbeat: Option<SystemTime>,
+    pub last_failure: Option<SystemTime>,
 }
 
 impl BackendState {
@@ -18,7 +19,8 @@ impl BackendState {
             healthy: true,
             in_flight: 0,
             average_latency_ms: 0,
-            last_probe: Instant::now(),
+            last_heartbeat: None,
+            last_failure: None,
             config,
         }
     }
@@ -32,8 +34,10 @@ pub struct AppState {
     pub self_name: String,
     pub backends: Vec<BackendConfig>,
     pub states: Mutex<HashMap<String, BackendState>>,
-    pub probe_interval: Duration,
-    pub probe_timeout: Duration,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub heartbeat_path: String,
+    pub active_probe_timeout: Duration,
     pub client: reqwest::Client,
 }
 
@@ -55,8 +59,10 @@ impl AppState {
             self_name: config.self_name.clone(),
             backends: config.backends.clone(),
             states: Mutex::new(states),
-            probe_interval: config.probe_interval,
-            probe_timeout: config.probe_timeout,
+            heartbeat_interval: config.heartbeat_interval,
+            heartbeat_timeout: config.heartbeat_timeout,
+            heartbeat_path: config.heartbeat_path.clone(),
+            active_probe_timeout: config.active_probe_timeout,
             client,
         }
     }

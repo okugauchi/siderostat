@@ -30,7 +30,7 @@ DS4 Smart Proxy は、OpenAI互換のリバースプロキシを Rust で実装�
 
 - **OpenAI API 互換**: すべてのエンドポイント（`/v1/chat/completions`, `/v1/responses`, `/v1/models` 等）を透過的にプロキシ
 - **自動ルーティング**: ローカルバックエンドを最優先、使用中ならリモートへフォールバック
-- **ヘルスプローブ**: 5秒間隔で各バックエンドをプローブし、healthy状態を維持
+- **Heartbeat / Active Probe**: 軽量 heartbeat で到達性を確認し、実リクエスト時だけ active probe を実行
 - **ストリーミング対応**: SSE (`text/event-stream`) を検出し、バッファリングなしで透過ストリーム
 - **RAII Drop ガード**: panic・タイムアウト・切断時でも確実に `in_flight` をデクリメント
 - **リトライポリシー**: 接続失敗 / 5xx → 別バックエンドへ1回再試行、4xx / ストリーム開始後 → 再試行なし
@@ -66,18 +66,21 @@ cargo test
 ```toml
 listen = "127.0.0.1:18080"
 
-self = "macbook"
+self_name = "macbook"
 tls_accept_invalid_certs = false
 
-probe_interval = "5s"
-probe_timeout = "5s"
+heartbeat_interval = "5s"
+heartbeat_timeout = "2s"
+heartbeat_path = "/v1/models"
 
-[[backend]]
+active_probe_timeout = "3s"
+
+[[backends]]
 name = "macbook"
 url = "http://127.0.0.1:8000"
 max_in_flight = 1
 
-[[backend]]
+[[backends]]
 name = "macstudio"
 url = "https://macstudio.example.internal"
 max_in_flight = 1
@@ -86,11 +89,13 @@ max_in_flight = 1
 | 項目 | 説明 |
 |---|---|
 | `listen` | プロキシがリッスンするアドレス:ポート |
-| `self` | このインスタンスのバックエンド名（ローカル優先） |
+| `self_name` | このインスタンスのバックエンド名（ローカル優先） |
 | `tls_accept_invalid_certs` | HTTPS バックエンドの証明書検証を無効化します。自己署名証明書などローカル検証用途のみ `true` にしてください |
-| `probe_interval` | ヘルスプローブ間隔（例: `5s`） |
-| `probe_timeout` | プローブタイムアウト（例: `5s`） |
-| `[[backend]]` | バックエンド定義（複数可能） |
+| `heartbeat_interval` | heartbeat 間隔（例: `5s`） |
+| `heartbeat_timeout` | heartbeat タイムアウト（例: `2s`） |
+| `heartbeat_path` | heartbeat に使うパス（デフォルト `/v1/models`） |
+| `active_probe_timeout` | 実リクエスト時 active probe のタイムアウト（例: `3s`） |
+| `[[backends]]` | バックエンド定義（複数可能） |
 | `name` | バックエンド名 |
 | `url` | DS4 サーバーの URL |
 | `max_in_flight` | 同時実行数の上限（デフォルト 1） |
@@ -104,18 +109,21 @@ max_in_flight = 1
 ```bash
 cat > config.toml << EOF
 listen = "127.0.0.1:18080"
-self = "macbook"
+self_name = "macbook"
 tls_accept_invalid_certs = false
 
-probe_interval = "5s"
-probe_timeout = "5s"
+heartbeat_interval = "5s"
+heartbeat_timeout = "2s"
+heartbeat_path = "/v1/models"
 
-[[backend]]
+active_probe_timeout = "3s"
+
+[[backends]]
 name = "macbook"
 url = "http://127.0.0.1:8000"
 max_in_flight = 1
 
-[[backend]]
+[[backends]]
 name = "macstudio"
 url = "https://macstudio.example.internal"
 max_in_flight = 1
@@ -177,10 +185,9 @@ curl http://localhost:18080/v1/chat/completions \
 
 ## ルーティングポリシー
 
-1. **ローカルバックエンド**（healthy かつ busy でない）
-2. **リモートバックエンド**（healthy かつ busy でない）
-3. **いずれかの healthy なバックエンド**（busy でも可）
-4. 該当なし → **HTTP 503**
+1. **ローカルバックエンド**（healthy かつ busy でなく、active probe 成功）
+2. **リモートバックエンド**（healthy かつ busy でなく、active probe 成功）
+3. 該当なし → **HTTP 503**
 
 ## リトライポリシー
 
