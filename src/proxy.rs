@@ -1,3 +1,4 @@
+use crate::error::format_error_chain;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -44,7 +45,7 @@ impl Drop for InFlightGuard {
 /// Select backend according to routing policy:
 ///   1. Local backend (healthy & not busy)
 ///   2. Any remote backend (healthy & not busy)
-///   3. Any healthy backend (even if busy)
+///   3. Return 503 when every backend is busy or unhealthy
 fn select_backend(state: &AppState) -> Option<String> {
     let states = match state.states.lock() {
         Ok(s) => s,
@@ -73,19 +74,10 @@ fn select_backend(state: &AppState) -> Option<String> {
         }
     }
 
-    // Priority 3: any healthy backend (even if busy)
-    for b in &state.backends {
-        if let Some(s) = states.get(&b.name)
-            && s.healthy
-        {
-            return Some(b.name.clone());
-        }
-    }
-
     None
 }
 
-/// Find a healthy alternative backend excluding a given name.
+/// Find a healthy, non-busy alternative backend excluding a given name.
 fn find_alt_backend(state: &AppState, exclude: &str) -> Option<String> {
     let states = match state.states.lock() {
         Ok(s) => s,
@@ -95,6 +87,7 @@ fn find_alt_backend(state: &AppState, exclude: &str) -> Option<String> {
         if b.name != exclude
             && let Some(s) = states.get(&b.name)
             && s.healthy
+            && !s.is_busy()
         {
             return Some(b.name.clone());
         }
@@ -161,7 +154,7 @@ async fn retry_on_alt(
     path: &str,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<(reqwest::Response, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(reqwest::Response, String, InFlightGuard), Box<dyn std::error::Error + Send + Sync>> {
     let alt = match find_alt_backend(state, exclude) {
         Some(n) => n,
         None => return Err("no alternative backend available".into()),
@@ -171,9 +164,9 @@ async fn retry_on_alt(
         None => return Err("alternative backend not found".into()),
     };
 
-    let _guard = InFlightGuard::new(alt.clone(), state.clone());
+    let guard = InFlightGuard::new(alt.clone(), state.clone());
     let resp = forward_to_backend(&state.client, &alt_url, method, path, headers, body).await?;
-    Ok((resp, alt))
+    Ok((resp, alt, guard))
 }
 
 /// Build an axum Response from a reqwest Response.
@@ -183,6 +176,7 @@ async fn build_response(
     backend: &str,
     start: &Instant,
     retry_count: u32,
+    guard: InFlightGuard,
 ) -> Response<Body> {
     let status = upstream.status();
     let resp_headers = upstream.headers().clone();
@@ -202,9 +196,10 @@ async fn build_response(
     );
 
     let body = if is_streaming {
-        let stream = upstream
-            .bytes_stream()
-            .map(|result| result.map_err(|_| std::io::Error::other("stream error")));
+        let stream = upstream.bytes_stream().map(move |result| {
+            let _keep_guard_alive = &guard;
+            result.map_err(|_| std::io::Error::other("stream error"))
+        });
         Body::from_stream(stream)
     } else {
         let bytes = match upstream.bytes().await {
@@ -217,6 +212,7 @@ async fn build_response(
                     .unwrap();
             }
         };
+        drop(guard);
         Body::from(bytes)
     };
 
@@ -310,13 +306,14 @@ pub async fn proxy_handler(
         Ok(r) => r,
         Err(e) => {
             // Connection failure → retry on another healthy backend
+            let error = format_error_chain(&e);
             warn!(
                 request_id = %request_id,
                 backend = %backend_name,
-                error = %e,
+                error = %error,
                 "connection failed, retrying"
             );
-            let (resp, alt) = match retry_on_alt(
+            let (resp, alt, alt_guard) = match retry_on_alt(
                 &state,
                 &backend_name,
                 &method,
@@ -326,7 +323,7 @@ pub async fn proxy_handler(
             )
             .await
             {
-                Ok((r, alt_name)) => (r, alt_name),
+                Ok((r, alt_name, alt_guard)) => (r, alt_name, alt_guard),
                 Err(e2) => {
                     error!(request_id = %request_id, error = %e2, "retry failed");
                     return Response::builder()
@@ -336,7 +333,7 @@ pub async fn proxy_handler(
                 }
             };
             drop(guard);
-            return build_response(resp, &request_id, &alt, &start, 1).await;
+            return build_response(resp, &request_id, &alt, &start, 1, alt_guard).await;
         }
     };
 
@@ -344,8 +341,7 @@ pub async fn proxy_handler(
 
     // 4xx: never retry
     if status.as_u16() >= 400 && status.as_u16() < 500 {
-        drop(guard);
-        return build_response(upstream, &request_id, &backend_name, &start, 0).await;
+        return build_response(upstream, &request_id, &backend_name, &start, 0, guard).await;
     }
 
     // 5xx: retry once on another backend (response not yet sent to client)
@@ -356,7 +352,7 @@ pub async fn proxy_handler(
             status = status.as_u16(),
             "5xx, retrying on alt backend"
         );
-        let (resp, alt) = match retry_on_alt(
+        let (resp, alt, alt_guard) = match retry_on_alt(
             &state,
             &backend_name,
             &method,
@@ -366,7 +362,7 @@ pub async fn proxy_handler(
         )
         .await
         {
-            Ok((r, alt_name)) => (r, alt_name),
+            Ok((r, alt_name, alt_guard)) => (r, alt_name, alt_guard),
             Err(e) => {
                 error!(request_id = %request_id, error = %e, "retry failed");
                 return Response::builder()
@@ -376,9 +372,67 @@ pub async fn proxy_handler(
             }
         };
         drop(guard);
-        return build_response(resp, &request_id, &alt, &start, 1).await;
+        return build_response(resp, &request_id, &alt, &start, 1, alt_guard).await;
     }
 
-    drop(guard);
-    build_response(upstream, &request_id, &backend_name, &start, 0).await
+    build_response(upstream, &request_id, &backend_name, &start, 0, guard).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BackendConfig, Config};
+    use std::time::Duration;
+
+    fn test_state() -> AppState {
+        AppState::from_config(&Config {
+            listen: "127.0.0.1:18080".to_string(),
+            self_name: "local".to_string(),
+            tls_accept_invalid_certs: false,
+            probe_interval: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(5),
+            backends: vec![
+                BackendConfig {
+                    name: "local".to_string(),
+                    url: "http://127.0.0.1:8000".to_string(),
+                    max_in_flight: 1,
+                },
+                BackendConfig {
+                    name: "remote".to_string(),
+                    url: "http://127.0.0.1:8001".to_string(),
+                    max_in_flight: 1,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn select_backend_prefers_local_when_available() {
+        let state = test_state();
+
+        assert_eq!(select_backend(&state), Some("local".to_string()));
+    }
+
+    #[test]
+    fn select_backend_uses_remote_when_local_is_busy() {
+        let state = test_state();
+        {
+            let mut states = state.states.lock().unwrap();
+            states.get_mut("local").unwrap().in_flight = 1;
+        }
+
+        assert_eq!(select_backend(&state), Some("remote".to_string()));
+    }
+
+    #[test]
+    fn select_backend_returns_none_when_all_backends_are_busy() {
+        let state = test_state();
+        {
+            let mut states = state.states.lock().unwrap();
+            states.get_mut("local").unwrap().in_flight = 1;
+            states.get_mut("remote").unwrap().in_flight = 1;
+        }
+
+        assert_eq!(select_backend(&state), None);
+    }
 }

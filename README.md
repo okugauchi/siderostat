@@ -67,6 +67,7 @@ cargo test
 listen = "127.0.0.1:18080"
 
 self = "macbook"
+tls_accept_invalid_certs = false
 
 probe_interval = "5s"
 probe_timeout = "5s"
@@ -86,6 +87,7 @@ max_in_flight = 1
 |---|---|
 | `listen` | プロキシがリッスンするアドレス:ポート |
 | `self` | このインスタンスのバックエンド名（ローカル優先） |
+| `tls_accept_invalid_certs` | HTTPS バックエンドの証明書検証を無効化します。自己署名証明書などローカル検証用途のみ `true` にしてください |
 | `probe_interval` | ヘルスプローブ間隔（例: `5s`） |
 | `probe_timeout` | プローブタイムアウト（例: `5s`） |
 | `[[backend]]` | バックエンド定義（複数可能） |
@@ -103,6 +105,7 @@ max_in_flight = 1
 cat > config.toml << EOF
 listen = "127.0.0.1:18080"
 self = "macbook"
+tls_accept_invalid_certs = false
 
 probe_interval = "5s"
 probe_timeout = "5s"

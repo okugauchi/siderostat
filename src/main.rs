@@ -1,4 +1,5 @@
 mod config;
+mod error;
 mod probe;
 mod proxy;
 mod state;
