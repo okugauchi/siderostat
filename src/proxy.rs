@@ -1,4 +1,5 @@
 use crate::error::format_error_chain;
+use crate::probe::{active_probe_backend, mark_failure, mark_success};
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -42,54 +43,52 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Select backend according to routing policy:
-///   1. Local backend (healthy & not busy)
-///   2. Any remote backend (healthy & not busy)
-///   3. Return 503 when every backend is busy or unhealthy
-fn select_backend(state: &AppState) -> Option<String> {
+/// List backend candidates according to local-first routing policy.
+fn candidate_backends(state: &AppState, exclude: Option<&str>) -> Vec<String> {
     let states = match state.states.lock() {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(_) => return Vec::new(),
     };
+    let is_candidate = |name: &str| {
+        if exclude.is_some_and(|exclude| exclude == name) {
+            return false;
+        }
+        states
+            .get(name)
+            .is_some_and(|s| !s.is_busy() && (s.healthy || heartbeat_after_failure(s)))
+    };
+    let mut candidates = Vec::new();
 
-    // Priority 1: local backend that is healthy and not busy
     for b in &state.backends {
-        if b.name == state.self_name
-            && let Some(s) = states.get(&b.name)
-            && s.healthy
-            && !s.is_busy()
-        {
-            return Some(b.name.clone());
+        if b.name == state.self_name && is_candidate(&b.name) {
+            candidates.push(b.name.clone());
         }
     }
 
-    // Priority 2: any remote backend that is healthy and not busy
     for b in &state.backends {
-        if b.name != state.self_name
-            && let Some(s) = states.get(&b.name)
-            && s.healthy
-            && !s.is_busy()
-        {
-            return Some(b.name.clone());
+        if b.name != state.self_name && is_candidate(&b.name) {
+            candidates.push(b.name.clone());
         }
     }
 
-    None
+    candidates
 }
 
-/// Find a healthy, non-busy alternative backend excluding a given name.
-fn find_alt_backend(state: &AppState, exclude: &str) -> Option<String> {
-    let states = match state.states.lock() {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    for b in &state.backends {
-        if b.name != exclude
-            && let Some(s) = states.get(&b.name)
-            && s.healthy
-            && !s.is_busy()
+fn heartbeat_after_failure(backend: &crate::state::BackendState) -> bool {
+    match (backend.last_heartbeat, backend.last_failure) {
+        (Some(last_heartbeat), Some(last_failure)) => last_heartbeat > last_failure,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Select the first candidate whose request-time active probe succeeds.
+async fn select_backend(state: &Arc<AppState>, exclude: Option<&str>) -> Option<String> {
+    for name in candidate_backends(state, exclude) {
+        if let Some(url) = backend_url(state, &name)
+            && active_probe_backend(state, &name, &url).await
         {
-            return Some(b.name.clone());
+            return Some(name);
         }
     }
     None
@@ -155,7 +154,7 @@ async fn retry_on_alt(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<(reqwest::Response, String, InFlightGuard), Box<dyn std::error::Error + Send + Sync>> {
-    let alt = match find_alt_backend(state, exclude) {
+    let alt = match select_backend(state, Some(exclude)).await {
         Some(n) => n,
         None => return Err("no alternative backend available".into()),
     };
@@ -186,6 +185,11 @@ async fn build_response(
         .is_some_and(|s| s.contains("text/event-stream"));
 
     let latency = start.elapsed();
+    if status.is_success() {
+        mark_success(&guard.state, backend, latency.as_millis() as u64);
+    } else if status.is_server_error() {
+        mark_failure(&guard.state, backend);
+    }
     info!(
         request_id = %request_id,
         backend = %backend,
@@ -264,7 +268,7 @@ pub async fn proxy_handler(
     };
 
     // Select backend
-    let backend_name = match select_backend(&state) {
+    let backend_name = match select_backend(&state, None).await {
         Some(b) => b,
         None => {
             warn!(request_id = %request_id, "no available backends");
@@ -307,6 +311,7 @@ pub async fn proxy_handler(
         Err(e) => {
             // Connection failure → retry on another healthy backend
             let error = format_error_chain(&e);
+            mark_failure(&state, &backend_name);
             warn!(
                 request_id = %request_id,
                 backend = %backend_name,
@@ -346,6 +351,7 @@ pub async fn proxy_handler(
 
     // 5xx: retry once on another backend (response not yet sent to client)
     if status.as_u16() >= 500 {
+        mark_failure(&state, &backend_name);
         warn!(
             request_id = %request_id,
             backend = %backend_name,
@@ -389,8 +395,10 @@ mod tests {
             listen: "127.0.0.1:18080".to_string(),
             self_name: "local".to_string(),
             tls_accept_invalid_certs: false,
-            probe_interval: Duration::from_secs(5),
-            probe_timeout: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(5),
+            heartbeat_path: "/v1/models".to_string(),
+            active_probe_timeout: Duration::from_secs(3),
             backends: vec![
                 BackendConfig {
                     name: "local".to_string(),
@@ -407,25 +415,25 @@ mod tests {
     }
 
     #[test]
-    fn select_backend_prefers_local_when_available() {
+    fn candidate_backends_prefers_local_when_available() {
         let state = test_state();
 
-        assert_eq!(select_backend(&state), Some("local".to_string()));
+        assert_eq!(candidate_backends(&state, None), vec!["local", "remote"]);
     }
 
     #[test]
-    fn select_backend_uses_remote_when_local_is_busy() {
+    fn candidate_backends_uses_remote_when_local_is_busy() {
         let state = test_state();
         {
             let mut states = state.states.lock().unwrap();
             states.get_mut("local").unwrap().in_flight = 1;
         }
 
-        assert_eq!(select_backend(&state), Some("remote".to_string()));
+        assert_eq!(candidate_backends(&state, None), vec!["remote"]);
     }
 
     #[test]
-    fn select_backend_returns_none_when_all_backends_are_busy() {
+    fn candidate_backends_returns_empty_when_all_backends_are_busy() {
         let state = test_state();
         {
             let mut states = state.states.lock().unwrap();
@@ -433,6 +441,20 @@ mod tests {
             states.get_mut("remote").unwrap().in_flight = 1;
         }
 
-        assert_eq!(select_backend(&state), None);
+        assert!(candidate_backends(&state, None).is_empty());
+    }
+
+    #[test]
+    fn candidate_backends_allows_recent_heartbeat_after_failure() {
+        let state = test_state();
+        {
+            let mut states = state.states.lock().unwrap();
+            let local = states.get_mut("local").unwrap();
+            local.healthy = false;
+            local.last_failure = Some(std::time::SystemTime::UNIX_EPOCH);
+            local.last_heartbeat = Some(std::time::SystemTime::now());
+        }
+
+        assert_eq!(candidate_backends(&state, None), vec!["local", "remote"]);
     }
 }
