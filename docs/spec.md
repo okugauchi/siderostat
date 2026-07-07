@@ -290,6 +290,7 @@ TOML
 listen = "127.0.0.1:18080"
 
 self = "macbook"
+tls_accept_invalid_certs = false
 
 probe_interval = "5s"
 probe_timeout = "5s"

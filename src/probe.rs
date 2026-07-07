@@ -1,3 +1,4 @@
+use crate::error::format_error_chain;
 use crate::state::AppState;
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,8 +34,9 @@ async fn probe_backend(
             Err(format!("status {}", r.status()))
         }
         Err(e) => {
-            warn!(backend = %name, error = %e, "probe failed");
-            Err(e.to_string())
+            let error = format_error_chain(&e);
+            warn!(backend = %name, error = %error, "probe failed");
+            Err(error)
         }
     }
 }

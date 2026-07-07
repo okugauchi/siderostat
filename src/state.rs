@@ -47,6 +47,7 @@ impl AppState {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .danger_accept_invalid_certs(config.tls_accept_invalid_certs)
             .build()
             .expect("failed to build HTTP client");
 
