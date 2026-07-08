@@ -200,9 +200,21 @@ async fn build_response(
     );
 
     let body = if is_streaming {
+        let stream_state = guard.state.clone();
+        let stream_backend = backend.to_string();
+        let stream_request_id = request_id.to_string();
         let stream = upstream.bytes_stream().map(move |result| {
             let _keep_guard_alive = &guard;
-            result.map_err(|_| std::io::Error::other("stream error"))
+            result.map_err(|error| {
+                mark_failure(&stream_state, &stream_backend);
+                warn!(
+                    request_id = %stream_request_id,
+                    backend = %stream_backend,
+                    error = %error,
+                    "upstream stream error"
+                );
+                std::io::Error::other("stream error")
+            })
         });
         Body::from_stream(stream)
     } else {
