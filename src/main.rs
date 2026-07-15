@@ -34,8 +34,10 @@ struct Args {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_env_filter(EnvFilter::new("ds4_smart_proxy=info"))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("ds4_smart_proxy=info")),
+        )
         .init();
 
     let args = Args::parse();

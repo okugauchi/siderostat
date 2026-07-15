@@ -29,7 +29,7 @@ async fn heartbeat_backend(
     match resp {
         Ok(r) if r.status().is_success() => {
             let latency = start.elapsed().as_millis() as u64;
-            info!(backend = %name, latency_ms = latency, "heartbeat ok");
+            debug!(backend = %name, latency_ms = latency, "heartbeat ok");
             Ok(latency)
         }
         Ok(r) => Err(format!("status {}", r.status())),
