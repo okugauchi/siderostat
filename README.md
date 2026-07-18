@@ -30,7 +30,7 @@ DS4 Smart Proxy は、OpenAI互換のリバースプロキシを Rust で実装�
 
 - **OpenAI API 互換**: すべてのエンドポイント（`/v1/chat/completions`, `/v1/responses`, `/v1/models` 等）を透過的にプロキシ
 - **自動ルーティング**: ローカルバックエンドを最優先、使用中ならリモートへフォールバック
-- **Heartbeat / Active Probe**: 軽量 heartbeat で到達性を確認し、実リクエスト時だけ active probe を実行
+- **Heartbeat / Active Probe**: 軽量 heartbeat で到達性を確認し、active probe は障害後など推論状態が不明な場合に限定
 - **ストリーミング対応**: SSE (`text/event-stream`) を検出し、バッファリングなしで透過ストリーム
 - **RAII Drop ガード**: panic・タイムアウト・切断時でも確実に `in_flight` をデクリメント
 - **リトライポリシー**: 接続失敗 / 5xx → 別バックエンドへ1回再試行、4xx / ストリーム開始後 → 再試行なし
@@ -94,7 +94,7 @@ max_in_flight = 1
 | `heartbeat_interval` | heartbeat 間隔（例: `5s`） |
 | `heartbeat_timeout` | heartbeat タイムアウト（例: `2s`） |
 | `heartbeat_path` | heartbeat に使うパス（デフォルト `/v1/models`） |
-| `active_probe_timeout` | 実リクエスト時 active probe のタイムアウト（例: `3s`） |
+| `active_probe_timeout` | 回復確認時の active probe タイムアウト（例: `3s`） |
 | `[[backends]]` | バックエンド定義（複数可能） |
 | `name` | バックエンド名 |
 | `url` | DS4 サーバーの URL |
@@ -185,9 +185,12 @@ curl http://localhost:18080/v1/chat/completions \
 
 ## ルーティングポリシー
 
-1. **ローカルバックエンド**（healthy かつ busy でなく、active probe 成功）
-2. **リモートバックエンド**（healthy かつ busy でなく、active probe 成功）
+1. **ローカルバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
+2. **リモートバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
 3. 該当なし → **HTTP 503**
+
+Hermes で観測した約600秒待機後の遅延フェイルオーバーに関する調査・実装設計は
+[`docs/hermes-600s-failover.md`](docs/hermes-600s-failover.md) を参照してください。
 
 ## リトライポリシー
 

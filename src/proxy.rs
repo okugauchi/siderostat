@@ -4,11 +4,14 @@ use crate::state::AppState;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, Method, Response, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
 };
 use bytes::Bytes;
-use futures::StreamExt;
-use std::sync::Arc;
+use futures::{StreamExt, stream};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -123,6 +126,70 @@ fn build_upstream_headers(incoming: &HeaderMap) -> HeaderMap {
     out
 }
 
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn insert_request_id(headers: &mut HeaderMap, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert("x-request-id", value);
+    }
+}
+
+fn backend_in_flight(state: &AppState, name: &str) -> usize {
+    state
+        .states
+        .lock()
+        .ok()
+        .and_then(|states| states.get(name).map(|entry| entry.in_flight))
+        .unwrap_or(0)
+}
+
+struct StreamLifecycle {
+    request_id: String,
+    backend: String,
+    attempt: u32,
+    start: Instant,
+    first_chunk_seen: AtomicBool,
+    finished: AtomicBool,
+    bytes_forwarded: AtomicU64,
+}
+
+impl StreamLifecycle {
+    fn new(request_id: &str, backend: &str, attempt: u32, start: Instant) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            backend: backend.to_string(),
+            attempt,
+            start,
+            first_chunk_seen: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            bytes_forwarded: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for StreamLifecycle {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::Relaxed) {
+            warn!(
+                request_id = %self.request_id,
+                backend = %self.backend,
+                attempt = self.attempt,
+                elapsed_ms = self.start.elapsed().as_millis(),
+                stream_started = self.first_chunk_seen.load(Ordering::Relaxed),
+                bytes_forwarded = self.bytes_forwarded.load(Ordering::Relaxed),
+                "client_disconnected"
+            );
+        }
+    }
+}
+
 /// Forward a single request to a named backend.
 async fn forward_to_backend(
     client: &reqwest::Client,
@@ -148,11 +215,14 @@ async fn forward_to_backend(
 /// Retry on an alternative backend when the primary attempt fails.
 async fn retry_on_alt(
     state: &Arc<AppState>,
+    request_id: &str,
     exclude: &str,
+    retry_reason: &str,
     method: &Method,
     path: &str,
     headers: &HeaderMap,
     body: &Bytes,
+    start: &Instant,
 ) -> Result<(reqwest::Response, String, InFlightGuard), Box<dyn std::error::Error + Send + Sync>> {
     let alt = match select_backend(state, Some(exclude)).await {
         Some(n) => n,
@@ -163,8 +233,40 @@ async fn retry_on_alt(
         None => return Err("alternative backend not found".into()),
     };
 
+    let in_flight_before = backend_in_flight(state, &alt);
+    info!(
+        request_id = %request_id,
+        from_backend = %exclude,
+        to_backend = %alt,
+        attempt = 2,
+        retry_reason = %retry_reason,
+        "retry_started"
+    );
+    info!(
+        request_id = %request_id,
+        backend = %alt,
+        selected_backend = %alt,
+        attempt = 2,
+        routing_reason = "retry_alternative_active_probe_ok",
+        in_flight_before = in_flight_before,
+        "backend_selected"
+    );
+
     let guard = InFlightGuard::new(alt.clone(), state.clone());
+    info!(
+        request_id = %request_id,
+        backend = %alt,
+        attempt = 2,
+        "upstream_connect_started"
+    );
     let resp = forward_to_backend(&state.client, &alt_url, method, path, headers, body).await?;
+    info!(
+        request_id = %request_id,
+        backend = %alt,
+        attempt = 2,
+        connect_elapsed_ms = start.elapsed().as_millis(),
+        "upstream_connected"
+    );
     Ok((resp, alt, guard))
 }
 
@@ -193,29 +295,92 @@ async fn build_response(
     info!(
         request_id = %request_id,
         backend = %backend,
-        latency_ms = latency.as_millis(),
+        attempt = retry_count + 1,
+        headers_elapsed_ms = latency.as_millis(),
         status = status.as_u16(),
-        retry = retry_count,
-        "request completed"
+        is_streaming = is_streaming,
+        "response_headers_received"
     );
 
     let body = if is_streaming {
+        let lifecycle = Arc::new(StreamLifecycle::new(
+            request_id,
+            backend,
+            retry_count + 1,
+            *start,
+        ));
         let stream_state = guard.state.clone();
         let stream_backend = backend.to_string();
         let stream_request_id = request_id.to_string();
-        let stream = upstream.bytes_stream().map(move |result| {
-            let _keep_guard_alive = &guard;
-            result.map_err(|error| {
-                mark_failure(&stream_state, &stream_backend);
-                warn!(
-                    request_id = %stream_request_id,
-                    backend = %stream_backend,
-                    error = %error,
-                    "upstream stream error"
-                );
-                std::io::Error::other("stream error")
-            })
-        });
+        let attempt = retry_count + 1;
+        let stream = stream::unfold(
+            (upstream.bytes_stream(), guard, lifecycle),
+            move |(mut upstream_stream, guard, lifecycle)| {
+                let stream_state = stream_state.clone();
+                let stream_backend = stream_backend.clone();
+                let stream_request_id = stream_request_id.clone();
+                async move {
+                    let item = upstream_stream.next().await;
+                    match item {
+                        Some(Ok(chunk)) => {
+                            let bytes = chunk.len() as u64;
+                            lifecycle
+                                .bytes_forwarded
+                                .fetch_add(bytes, Ordering::Relaxed);
+                            if !lifecycle.first_chunk_seen.swap(true, Ordering::Relaxed) {
+                                info!(
+                                    request_id = %stream_request_id,
+                                    backend = %stream_backend,
+                                    attempt = attempt,
+                                    first_body_chunk_elapsed_ms = lifecycle.start.elapsed().as_millis(),
+                                    first_body_chunk_bytes = bytes,
+                                    "first_body_chunk"
+                                );
+                            }
+                            Some((Ok(chunk), (upstream_stream, guard, lifecycle)))
+                        }
+                        Some(Err(error)) => {
+                            mark_failure(&stream_state, &stream_backend);
+                            warn!(
+                                request_id = %stream_request_id,
+                                backend = %stream_backend,
+                                attempt = attempt,
+                                error = %error,
+                                "upstream_stream_error"
+                            );
+                            lifecycle.finished.store(true, Ordering::Relaxed);
+                            info!(
+                                request_id = %stream_request_id,
+                                backend = %stream_backend,
+                                attempt = attempt,
+                                total_elapsed_ms = lifecycle.start.elapsed().as_millis(),
+                                bytes_forwarded = lifecycle.bytes_forwarded.load(Ordering::Relaxed),
+                                outcome = "upstream_error",
+                                "request_finished"
+                            );
+                            Some((
+                                Err(std::io::Error::other("stream error")),
+                                (upstream_stream, guard, lifecycle),
+                            ))
+                        }
+                        None => {
+                            lifecycle.finished.store(true, Ordering::Relaxed);
+                            info!(
+                                request_id = %stream_request_id,
+                                backend = %stream_backend,
+                                attempt = attempt,
+                                total_elapsed_ms = lifecycle.start.elapsed().as_millis(),
+                                bytes_forwarded = lifecycle.bytes_forwarded.load(Ordering::Relaxed),
+                                outcome = "ok",
+                                "request_finished"
+                            );
+                            drop(guard);
+                            None
+                        }
+                    }
+                }
+            },
+        );
         Body::from_stream(stream)
     } else {
         let bytes = match upstream.bytes().await {
@@ -228,6 +393,15 @@ async fn build_response(
                     .unwrap();
             }
         };
+        info!(
+            request_id = %request_id,
+            backend = %backend,
+            attempt = retry_count + 1,
+            total_elapsed_ms = start.elapsed().as_millis(),
+            bytes_forwarded = bytes.len(),
+            outcome = "ok",
+            "request_finished"
+        );
         drop(guard);
         Body::from(bytes)
     };
@@ -237,6 +411,7 @@ async fn build_response(
     for (k, v) in resp_headers.iter() {
         resp.headers_mut().insert(k, v.clone());
     }
+    insert_request_id(resp.headers_mut(), request_id);
     resp
 }
 
@@ -261,11 +436,20 @@ pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Response<Body> {
-    let request_id = Uuid::new_v4().to_string();
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri.clone();
     let headers = parts.headers.clone();
+    let request_id = request_id_from_headers(&headers);
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let start = Instant::now();
+
+    info!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        "request_received"
+    );
 
     // Read incoming body as bytes (may be empty for GET/HEAD)
     let body_bytes = match body_to_bytes(body).await {
@@ -302,12 +486,28 @@ pub async fn proxy_handler(
         }
     };
 
+    let in_flight_before = backend_in_flight(&state, &backend_name);
+    info!(
+        request_id = %request_id,
+        backend = %backend_name,
+        selected_backend = %backend_name,
+        attempt = 1,
+        routing_reason = "local_first_active_probe_ok",
+        in_flight_before = in_flight_before,
+        "backend_selected"
+    );
+
     let guard = InFlightGuard::new(backend_name.clone(), state.clone());
 
-    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let upstream_headers = build_upstream_headers(&headers);
-    let start = Instant::now();
+    let mut upstream_headers = build_upstream_headers(&headers);
+    insert_request_id(&mut upstream_headers, &request_id);
 
+    info!(
+        request_id = %request_id,
+        backend = %backend_name,
+        attempt = 1,
+        "upstream_connect_started"
+    );
     let result = forward_to_backend(
         &state.client,
         &backend_url,
@@ -319,7 +519,16 @@ pub async fn proxy_handler(
     .await;
 
     let upstream = match result {
-        Ok(r) => r,
+        Ok(r) => {
+            info!(
+                request_id = %request_id,
+                backend = %backend_name,
+                attempt = 1,
+                connect_elapsed_ms = start.elapsed().as_millis(),
+                "upstream_connected"
+            );
+            r
+        }
         Err(e) => {
             // Connection failure → retry on another healthy backend
             let error = format_error_chain(&e);
@@ -332,11 +541,14 @@ pub async fn proxy_handler(
             );
             let (resp, alt, alt_guard) = match retry_on_alt(
                 &state,
+                &request_id,
                 &backend_name,
+                "connection_failed",
                 &method,
                 path,
                 &upstream_headers,
                 &body_bytes,
+                &start,
             )
             .await
             {
@@ -372,11 +584,14 @@ pub async fn proxy_handler(
         );
         let (resp, alt, alt_guard) = match retry_on_alt(
             &state,
+            &request_id,
             &backend_name,
+            "http_5xx",
             &method,
             path,
             &upstream_headers,
             &body_bytes,
+            &start,
         )
         .await
         {

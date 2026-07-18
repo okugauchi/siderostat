@@ -220,28 +220,23 @@ It only means the backend may be considered as a routing candidate.
 
 ## Active Probe
 
-Inference probes are expensive.
+Inference probes are expensive and use the same DS4 worker and GPU capacity as a
+real request.
 
 Therefore:
 
-**Inference probes MUST NOT execute periodically.**
-
-For each real client request, the proxy should execute an active inference probe
-against the selected routing candidate before forwarding the client request.
-
-The probe is part of request-time routing, not background monitoring.
+**Inference probes MUST NOT execute periodically or before every normal request.**
 
 An active inference probe may execute only when:
 
 - a real client request has arrived
 - the backend is a routing candidate
+- the backend state is uncertain or recovering from a recent failure
+- no recent successful real inference is available
+- the probe is rate-limited
 
-The proxy should evaluate candidates in routing order:
-
-1. probe local backend if it is not busy and heartbeat-reachable
-2. if local probe fails, mark local unhealthy and probe the next remote candidate
-3. forward the real request to the first candidate whose probe succeeds
-4. return HTTP 503 if no candidate succeeds
+Normal routing should use heartbeat reachability, request occupancy and recent
+real-request success without adding a separate inference request.
 
 Probe success updates:
 
@@ -282,7 +277,8 @@ Requirements:
 
 - timeout ≤ 3 seconds
 - never executed on a timer
-- execute at most once per routing candidate per client request
+- execute at most once per uncertain routing candidate per client request
+- never execute on the normal path for an already available backend
 
 ---
 
@@ -296,7 +292,7 @@ Local backend
 if
     heartbeat-reachable or healthy
 &&  in_flight < max_in_flight
-&&  active probe succeeds
+&&  no unresolved cooldown or suspect state
 
 ↓
 
@@ -305,7 +301,7 @@ Remote backend
 if
     heartbeat-reachable or healthy
 &&  in_flight < max_in_flight
-&&  active probe succeeds
+&&  no unresolved cooldown or suspect state
 
 ↓
 
@@ -313,8 +309,9 @@ if
 (or optional request queue)
 ```
 
-The active probe is intentionally performed before forwarding each real request.
-This avoids relying on historical success timestamps.
+An uncertain candidate may require an active probe before it becomes available.
+A recent successful real request is a stronger inference-health signal than a
+heartbeat or synthetic probe.
 
 ---
 
