@@ -49,6 +49,13 @@ async fn main() -> Result<()> {
         listen = %config.listen,
         self_name = %config.self_name,
         backends = ?config.backends.iter().map(|b| &b.name).collect::<Vec<_>>(),
+        heartbeat_interval_ms = config.heartbeat_interval.as_millis(),
+        heartbeat_timeout_ms = config.heartbeat_timeout.as_millis(),
+        active_probe_timeout_ms = config.active_probe_timeout.as_millis(),
+        backend_connect_timeout_ms = 10_000u64,
+        response_headers_timeout = "none",
+        first_body_byte_timeout = "none",
+        stream_idle_timeout = "none",
         "config loaded"
     );
 
