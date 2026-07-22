@@ -20,6 +20,8 @@ pub struct Config {
     pub heartbeat_path: String,
     #[serde(deserialize_with = "deserialize_duration")]
     pub active_probe_timeout: Duration,
+    #[serde(default, alias = "locale")]
+    pub log_timezone: Option<String>,
     #[serde(alias = "backend")]
     pub backends: Vec<BackendConfig>,
 }
@@ -66,6 +68,7 @@ heartbeat_interval = "5s"
 heartbeat_timeout = "1m"
 heartbeat_path = "/v1/models"
 active_probe_timeout = "3s"
+log_timezone = "Asia/Tokyo"
 
 [[backends]]
 name = "macbook"
@@ -86,6 +89,7 @@ max_in_flight = 2
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(60));
         assert_eq!(config.heartbeat_path, "/v1/models");
         assert_eq!(config.active_probe_timeout, Duration::from_secs(3));
+        assert_eq!(config.log_timezone.as_deref(), Some("Asia/Tokyo"));
         assert_eq!(config.backends.len(), 2);
         assert_eq!(config.backends[1].url, "https://macstudio.example.internal");
     }
@@ -134,6 +138,29 @@ max_in_flight = 1
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(5));
         assert_eq!(config.heartbeat_path, "/v1/models");
+        assert_eq!(config.log_timezone, None);
         assert_eq!(config.backends.len(), 1);
+    }
+
+    #[test]
+    fn parses_locale_alias_for_log_timezone() {
+        let config: Config = toml::from_str(
+            r#"
+listen = "127.0.0.1:18080"
+self_name = "macbook"
+heartbeat_interval = "5s"
+heartbeat_timeout = "5s"
+active_probe_timeout = "3s"
+locale = "JST"
+
+[[backends]]
+name = "macbook"
+url = "http://127.0.0.1:8000"
+max_in_flight = 1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.log_timezone.as_deref(), Some("JST"));
     }
 }
