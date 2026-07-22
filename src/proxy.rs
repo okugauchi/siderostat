@@ -626,6 +626,7 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(5),
             heartbeat_path: "/v1/models".to_string(),
             active_probe_timeout: Duration::from_secs(3),
+            log_timezone: None,
             backends: vec![
                 BackendConfig {
                     name: "local".to_string(),

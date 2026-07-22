@@ -14,9 +14,11 @@ use axum::{
 };
 use clap::Parser;
 use serde_json::Value as JsonValue;
+use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::format::Writer, fmt::time::FormatTime};
 
 use crate::config::Config;
 use crate::probe::heartbeat_loop;
@@ -30,26 +32,102 @@ struct Args {
     config: String,
 }
 
+#[derive(Clone)]
+struct FixedOffsetTimer {
+    offset_seconds: i32,
+}
+
+impl FixedOffsetTimer {
+    fn from_config(value: Option<&str>) -> Self {
+        Self {
+            offset_seconds: value.and_then(parse_log_timezone).unwrap_or(0),
+        }
+    }
+
+    fn offset_suffix(&self) -> String {
+        if self.offset_seconds == 0 {
+            return "+00:00".to_string();
+        }
+        let sign = if self.offset_seconds < 0 { '-' } else { '+' };
+        let abs = self.offset_seconds.unsigned_abs();
+        format!("{sign}{:02}:{:02}", abs / 3_600, (abs % 3_600) / 60)
+    }
+}
+
+impl FormatTime for FixedOffsetTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let seconds = now.as_secs() as i128 + i128::from(self.offset_seconds);
+        let millis = now.subsec_millis();
+        let days = seconds.div_euclid(86_400) as i64;
+        let seconds_of_day = seconds.rem_euclid(86_400) as u64;
+        let (year, month, day) = civil_from_days(days);
+        let hour = seconds_of_day / 3_600;
+        let minute = (seconds_of_day % 3_600) / 60;
+        let second = seconds_of_day % 60;
+        let offset = self.offset_suffix();
+
+        write!(
+            w,
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}{offset}"
+        )
+    }
+}
+
+fn parse_log_timezone(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("GMT") || value.eq_ignore_ascii_case("UTC") {
+        return Some(0);
+    }
+    if value.eq_ignore_ascii_case("JST") || value.eq_ignore_ascii_case("Asia/Tokyo") {
+        return Some(9 * 60 * 60);
+    }
+
+    parse_timezone_offset(value)
+}
+
+fn parse_timezone_offset(value: &str) -> Option<i32> {
+    let sign = match value.as_bytes().first().copied() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    let rest = &value[1..];
+    let (hours, minutes) = rest.split_once(':')?;
+    let hours = hours.parse::<i32>().ok()?;
+    let minutes = minutes.parse::<i32>().ok()?;
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Load configuration before tracing so log time formatting can use it.
+    let config_content = tokio::fs::read_to_string(&args.config).await?;
+    let config: Config = toml::from_str(&config_content)?;
+    let log_timer = FixedOffsetTimer::from_config(config.log_timezone.as_deref());
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
+        .with_timer(log_timer)
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("ds4_smart_proxy=info")),
         )
         .init();
 
-    let args = Args::parse();
-
-    // Load configuration
-    let config_content = tokio::fs::read_to_string(&args.config).await?;
-    let config: Config = toml::from_str(&config_content)?;
     info!(
         listen = %config.listen,
         self_name = %config.self_name,
+        log_timezone = config.log_timezone.as_deref().unwrap_or("GMT"),
         backends = ?config.backends.iter().map(|b| &b.name).collect::<Vec<_>>(),
         heartbeat_interval_ms = config.heartbeat_interval.as_millis(),
         heartbeat_timeout_ms = config.heartbeat_timeout.as_millis(),

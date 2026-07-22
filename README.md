@@ -74,6 +74,7 @@ heartbeat_timeout = "2s"
 heartbeat_path = "/v1/models"
 
 active_probe_timeout = "3s"
+log_timezone = "Asia/Tokyo"
 
 [[backends]]
 name = "macbook"
@@ -95,6 +96,7 @@ max_in_flight = 1
 | `heartbeat_timeout` | heartbeat タイムアウト（例: `2s`） |
 | `heartbeat_path` | heartbeat に使うパス（デフォルト `/v1/models`） |
 | `active_probe_timeout` | 回復確認時の active probe タイムアウト（例: `3s`） |
+| `log_timezone` | ログ時刻のタイムゾーン。未指定時は `GMT`。`Asia/Tokyo`, `JST`, `UTC`, `GMT`, `+09:00` 形式に対応 |
 | `[[backends]]` | バックエンド定義（複数可能） |
 | `name` | バックエンド名 |
 | `url` | DS4 サーバーの URL |
@@ -117,6 +119,7 @@ heartbeat_timeout = "2s"
 heartbeat_path = "/v1/models"
 
 active_probe_timeout = "3s"
+log_timezone = "Asia/Tokyo"
 
 [[backends]]
 name = "macbook"

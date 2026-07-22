@@ -421,6 +421,7 @@ heartbeat_timeout = "2s"
 heartbeat_path = "/v1/models"
 
 active_probe_timeout = "3s"
+log_timezone = "Asia/Tokyo"
 
 [[backends]]
 name = "macbook"
@@ -502,6 +503,10 @@ Each request should record:
 - retry count
 
 Heartbeat failures should be logged only when backend state changes, to avoid excessive log noise.
+
+Log timestamps default to GMT when no timezone is configured. Operators may set
+`log_timezone` in the TOML configuration to a fixed timezone name or offset such
+as `Asia/Tokyo`, `JST`, `UTC`, `GMT`, or `+09:00`.
 
 ---
 
