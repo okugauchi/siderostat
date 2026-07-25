@@ -1,306 +1,167 @@
-# Hermes 600-second stall and delayed failover
+# Hermes 600秒stall調査ランブック
 
 ## Status
 
-Investigation and implementation task.
+`docs/spec.md` に基づくtimeout分離、request lifecycle log、safe retry、
+backend状態機械は実装済み。
 
-## Context
+この文書は、Hermesで「約600秒出力がない」現象を再観測した場合に、
+どの層が待機・切断・再試行を行ったかを特定するための運用手順である。
 
-Hermes Agent sometimes reports a message similar to:
+## 現在のproxy動作
 
-```text
-⏳ waiting on deepseek-v4-flash — 542s with no output yet
-(provider may be slow or overloaded, or the model is thinking)
-```
+- 定期監視は `GET /v1/models` だけを使用する。
+- 通常requestの前にactive inference probeを実行しない。
+- connect、response header、first body byte、stream idleを個別にtimeout管理する。
+- first body byteを受信するまでdownstream responseをcommitしない。
+- response開始後に別backendへretryしない。
+- first-body-byte timeoutは既定でretryせず、504を返してbackendをCooldownへ移す。
+- retryは再生可能なrequestの接続失敗、またはresponse開始前の502/503/504だけを対象とする。
+- 2回目は必ず異なるbackendを選ぶ。
+- response bodyのEOFまたはdropまでbackend permitを保持する。
 
-In the observed two-node deployment, one DS4 node remains at 0% GPU usage while
-the other node handles the request. Around 600 seconds after the request starts,
-the previously idle node begins working and Hermes starts receiving output.
-
-The leading hypothesis is:
-
-1. Hermes sends one request to DS4 Smart Proxy.
-2. The proxy selects one backend.
-3. The selected backend accepts the HTTP request but does not produce a response
-   body chunk for about 600 seconds.
-4. A timeout or disconnect outside the currently visible proxy logic occurs.
-5. The request is retried and routed to the other backend.
-6. The second backend produces output successfully.
-
-The exact layer that owns the approximately 600-second timeout is not yet known.
-
-## Findings in the current implementation
-
-### No 600-second timeout exists in the proxy configuration
-
-The shared `reqwest::Client` currently has only a 10-second connection timeout.
-The real proxied request has no total request timeout, response-header timeout,
-first-body-byte timeout, or stream-idle timeout.
-
-Therefore, the proxy cannot currently attribute a 600-second transition to one
-of its own timers. Runtime configuration, Hermes, DS4, Caddy or another network
-layer must be inspected before changing Hermes timeout values.
-
-### Request completion is logged before a streaming response completes
-
-`build_response` logs `request completed` immediately after response headers are
-received. For SSE, this happens before the first body chunk and before the stream
-finishes. The logged latency is therefore time-to-headers rather than total
-request duration.
-
-This prevents the current logs from distinguishing:
-
-- upstream connection time;
-- time to response headers;
-- time to first body chunk;
-- stream idle time;
-- total request duration.
-
-### Successful headers mark a backend healthy too early
-
-An HTTP success status marks the backend healthy before the first streaming body
-chunk arrives. A DS4 process whose HTTP frontend responds but whose inference
-worker is stalled may therefore be treated as healthy.
-
-### Heartbeat cannot prove inference availability
-
-The periodic `GET /v1/models` heartbeat correctly avoids GPU inference, but it
-only proves HTTP reachability. It cannot detect an inference worker that is hung
-or occupied by an abandoned request.
-
-### A failed backend is re-admitted too quickly
-
-`heartbeat_after_failure` makes a backend eligible again after the next successful
-heartbeat. Because `/v1/models` does not exercise inference, an inference-stalled
-backend can re-enter routing after one heartbeat interval.
-
-### Active probes add inference work to every real request
-
-The current implementation executes a short completion probe before every real
-request. This consumes the single DS4 inference worker and GPU capacity. It should
-be reserved for recovery from an uncertain or suspect state, not used on the
-normal routing path.
-
-### Retry count is effectively two attempts, but is implicit
-
-The current code attempts one selected backend and then one different backend for
-connection errors or HTTP 5xx responses. This already excludes the first backend,
-but the policy is not represented by an explicit `max_attempts = 2` setting and
-does not cover first-body-byte or stream-idle timeouts.
-
-### Per-proxy `in_flight` state is not globally authoritative
-
-Each Mac runs its own proxy and maintains independent backend state. A request
-sent through one proxy is not reflected in the other proxy's `in_flight` counter.
-This can cause both proxies to select the same DS4 node concurrently. This is a
-separate scheduling limitation and must be documented when interpreting logs.
-
-## Investigation plan
-
-### 1. Capture runtime configuration
-
-Record the exact production configuration and service definitions on both Macs:
-
-- DS4 Smart Proxy configuration;
-- Hermes provider timeout and retry settings;
-- DS4 server arguments;
-- Caddy or other reverse-proxy timeouts;
-- LaunchAgent environment variables.
-
-Do not assume the repository defaults match the running binaries.
-
-### 2. Correlate one request across all layers
-
-Use a stable request ID. Accept `x-request-id` from the client when present;
-otherwise generate one. Forward it upstream as `x-request-id` and include it in
-every proxy log event.
-
-For one reproduced stall, correlate:
-
-- Hermes logs;
-- DS4 Smart Proxy logs on the client machine;
-- DS4 logs on both backend machines;
-- Caddy access logs, if present;
-- GPU activity timestamps.
-
-### 3. Identify the owner of the 600-second boundary
-
-Look for the first event around 600 seconds:
-
-- client cancellation;
-- `ReadTimeout` or stale-call detection in Hermes;
-- upstream body read error in the proxy;
-- HTTP 502/504 from another proxy;
-- TCP FIN/RST;
-- DS4 request cancellation or completion;
-- a new request ID or a second attempt using the same logical Hermes task.
-
-The current source code has no 600-second proxy timer. This must be treated as a
-key finding unless the deployed binary differs from the current commit.
-
-## Required structured log events
-
-Every event must include `request_id`, `attempt`, and `backend` where applicable.
-
-Required events and fields:
-
-| Event | Required fields |
-|---|---|
-| `request_received` | method, path |
-| `backend_selected` | selected_backend, routing_reason, in_flight_before |
-| `upstream_connect_started` | backend |
-| `upstream_connected` | connect_elapsed_ms |
-| `response_headers_received` | status, headers_elapsed_ms |
-| `first_body_chunk` | first_body_chunk_elapsed_ms |
-| `stream_idle_timeout` | idle_elapsed_ms |
-| `first_body_byte_timeout` | elapsed_ms |
-| `retry_started` | from_backend, to_backend, retry_reason |
-| `request_finished` | status, total_elapsed_ms, bytes_forwarded, outcome |
-| `client_disconnected` | elapsed_ms, stream_started |
-| `backend_state_changed` | old_state, new_state, reason, cooldown_until |
-
-Do not use `request completed` when only response headers have arrived.
-
-## Timeout model
-
-The following timeout phases must be separate:
+既定値：
 
 ```toml
-connect_timeout = "5s"
-response_headers_timeout = "60s"
-first_body_byte_timeout = "300s"
-stream_idle_timeout = "300s"
+[timeouts]
+connect = "5s"
+response_headers = "60s"
+first_body_byte = "300s"
+stream_idle = "300s"
+
+[routing]
 max_attempts = 2
-failure_cooldown = "300s"
+
+[cooldown]
+duration = "300s"
+consecutive_failure_threshold = 2
 ```
 
-These values are initial defaults for investigation, not final tuning. A large
-uncached context may legitimately require a long prefill, so first-body-byte
-timeout must be configurable and validated against measured DS4 prefill times.
+長いuncached prefillでは正常でもTTFTが長くなるため、first body byte timeoutは
+実測に合わせて調整する。
 
-Definitions:
+## 重要な制約
 
-- `connect_timeout`: TCP/TLS connection establishment.
-- `response_headers_timeout`: request sent until upstream response headers.
-- `first_body_byte_timeout`: response headers received until the first body chunk.
-- `stream_idle_timeout`: maximum gap between body chunks after streaming starts.
+DS4がclient disconnect後に必ず推論を停止するとは限らない。
 
-For non-streaming responses, body completion still needs a bounded or explicitly
-unbounded policy. It must not accidentally inherit the stream-idle policy.
+このためfirst-body-byte timeout後にproxyが自動で別backendへ同一requestを送ると、
+2台で同じ論理推論を続ける可能性がある。現在の既定実装がfirst-body-byte timeoutを
+retryしないのは、この重複実行を避けるためである。
 
-## Retry policy
+また、各Macでproxyを別processとして動かす場合、`in_flight`とaffinity SQLiteは
+process-localである。他proxyの進行中requestは直接観測できない。
 
-1. `max_attempts` defaults to 2.
-2. Attempt 2 must always use a backend different from attempt 1.
-3. Retry before any downstream response body has been sent only.
-4. Never retry HTTP 4xx.
-5. Retry connection failures and clearly pre-response HTTP 5xx failures.
-6. Treat first-body-byte timeout as an investigation-gated retry condition.
-7. Never retry a stream after the first downstream body chunk.
-8. Log `retry_started` before the second attempt.
+## 調査手順
 
-Important DS4 caveat: disconnecting a timed-out request may not cancel backend
-prefill immediately. Retrying on the other node can temporarily make both GPUs
-process the same logical request. The implementation must expose this risk in
-logs and must not perform more than one failover attempt.
+### 1. 実行時設定を保存する
 
-## Backend state model
+両Macについて次を記録する。
 
-Replace the overloaded `healthy: bool` interpretation with explicit state:
+- DS4 Smart Proxy設定
+- Hermes provider timeout/retry設定
+- DS4起動引数
+- Caddy等の中間proxy設定
+- LaunchAgentの環境変数
 
-```rust
-enum BackendStatus {
-    Unknown,
-    Available,
-    Busy,
-    Suspect,
-    Offline,
-    Cooldown,
-}
+repositoryのexampleと稼働中設定が同じとは仮定しない。
+
+### 2. request IDを全層で相関する
+
+Hermesまたは外側のgatewayから `X-Request-Id` を付ける。proxyは値をupstreamへ
+転送し、responseにも返す。
+
+同じIDについて次を並べる。
+
+- Hermes log
+- client側DS4 Smart Proxy log
+- DS4 backend log
+- Caddy access log
+- GPU activity
+
+### 3. 最初に発生した境界を特定する
+
+次のどれが最初かを確認する。
+
+- response header timeout
+- first body byte timeout
+- stream idle timeout
+- client cancellation
+- upstream stream error
+- HTTP 502/503/504
+- Hermes側のstale-call detection
+- TCP FIN/RST
+- 新しいrequest IDによるcaller retry
+
+proxy自身が返すエラーはOpenAI形式JSONの `error.code` で識別できる。
+
+```text
+response_header_timeout
+first_body_byte_timeout
+upstream_connect_failed
+upstream_protocol_error
+no_backend_available
 ```
 
-Suggested transitions:
+## 観測するlog field
 
-- heartbeat success: `Offline -> Unknown`, not directly `Available`;
-- heartbeat failure: any non-busy state -> `Offline`;
-- successful real inference first chunk: `Unknown/Suspect -> Available`;
-- connection failure: -> `Suspect` or `Offline` depending on error;
-- first-body-byte or stream-idle timeout: -> `Cooldown`;
-- cooldown expiry plus heartbeat success: -> `Unknown`;
-- successful recovery probe: `Unknown -> Available`.
+```text
+request_id
+method
+path
+backend_id
+backend_kind
+routing_reason
+affinity_source
+affinity_key_tag
+affinity_hit
+in_flight_before
+attempt
+response_header_ms
+first_body_byte_ms
+total_ms
+status
+bytes_in
+bytes_out
+error_kind
+```
 
-`/v1/models` must never clear `Suspect` or `Cooldown` by itself.
+session ID、prompt、Authorization、完全affinity hashはログへ出力しない。
 
-## Active probe policy
+## Metrics
 
-Remove the active inference probe from the normal request path.
+特に次を確認する。
 
-Use it only when all of the following are true:
+```text
+ds4_proxy_time_to_first_byte_seconds
+ds4_proxy_in_flight
+ds4_proxy_backend_health
+ds4_proxy_retries_total
+ds4_proxy_cooldown_total
+ds4_proxy_stream_errors_total
+ds4_proxy_affinity_lookup_total
+```
 
-- a real client request is waiting;
-- the candidate is `Unknown` or `Suspect` after cooldown;
-- no recent real inference success is available;
-- the probe is rate-limited;
-- the backend has no known in-flight request.
+`/backends` ではhealth、in-flight、EWMA latency、最終成功・失敗、
+cooldown期限を確認できる。
 
-Normal routing should use heartbeat reachability, backend status, occupancy and
-recent real-request success without adding a separate GPU-consuming request.
+## 判定例
 
-## Implementation candidates
+### response headerが遅い
 
-### Phase 1: observability only
+`response_header_ms`がtimeout付近まで増え、`response_header_timeout`になる。
+DS4 HTTP frontend、request queue、接続先誤りを確認する。
 
-- Add the required lifecycle log events.
-- Preserve or forward `x-request-id`.
-- Record response-header, first-chunk and total timings separately.
-- Record bytes forwarded and client disconnects.
-- Add the running configuration values to the startup log.
+### headerは返るが最初のtokenが遅い
 
-This phase should not change failover behavior. Use it to locate the current
-approximately 600-second timeout owner.
+`response_header_ms`は短いが`first_body_byte_ms`が長い。
+長いprefill、worker stall、cache missを疑う。
 
-### Phase 2: explicit timeout phases
+### token生成途中で止まる
 
-- Add configuration keys for the four timeout phases.
-- Apply connection and response-header timeouts before constructing the Axum
-  response.
-- Wrap the upstream body stream with first-body-byte and idle timers.
-- Return an explicit 504 if no downstream body has started and the applicable
-  timeout expires.
-- Do not attempt to synthesize a second response after downstream streaming starts.
+最初のchunkは届くが`stream_idle_timeout`になる。開始後なのでproxyはretryしない。
+DS4 logとnetwork resetを確認する。
 
-### Phase 3: cooldown and bounded failover
+### 別backendで突然処理が始まる
 
-- Add explicit backend status and `cooldown_until`.
-- Add `max_attempts`, default 2.
-- Ensure retry selection excludes every previously attempted backend.
-- Add cooldown after first-byte or stream-idle timeout.
-- Prevent heartbeat success from immediately clearing cooldown.
-
-### Phase 4: scheduling correctness across two proxies
-
-Evaluate one of these designs separately:
-
-1. Route remote traffic through the remote machine's proxy so that each proxy is
-   authoritative for its local DS4 occupancy.
-2. Add a small backend-local lease endpoint.
-3. Accept occasional distributed `in_flight` races and document the limitation.
-
-Do not introduce Redis or another central dependency without a demonstrated need.
-
-## Acceptance criteria
-
-- A single request produces a traceable lifecycle from receipt to final stream
-  completion or failure.
-- Logs identify whether a 600-second stall occurs before headers, before the first
-  body chunk, or between body chunks.
-- `request_finished` is emitted only after the body stream ends or is dropped.
-- First-body-byte and stream-idle timeouts are separately configurable.
-- At most two backends are attempted, and the second differs from the first.
-- A timeout places the failed backend into cooldown/suspect state.
-- `/v1/models` success does not immediately clear inference-related suspicion.
-- Periodic health checks never execute model inference.
-- Active inference probes do not run before every normal client request.
-- Hermes timeout settings are not changed until proxy logs locate the current
-  600-second boundary.
-
+同じ `request_id` の `attempt=2` ならproxy retryである。別request IDならHermes等の
+caller retryである。`ds4_proxy_retries_total`と`routing_reason`を併せて確認する。
