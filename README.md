@@ -1,231 +1,160 @@
 # DS4 Smart Proxy
 
-DS4 Smart Proxy は、OpenAI互換のリバースプロキシを Rust で実装したものです。
-ローカルに立ち上げ、複数の DwarfStar 4 (DS4) サーバーへリクエストをインテリジェントにルーティングします。
+DS4 Smart Proxy は、複数のOpenAI互換DS4 endpointを束ねるRust製の
+reverse proxy / application gatewayです。
 
-## アーキテクチャ
+単純なleast-busy方式ではなく、local-firstとsession/prefix affinityを組み合わせ、
+長いHermesセッションのKV cache localityを保ちます。定期監視では推論を実行せず、
+`GET /v1/models` だけをheartbeatとして使用します。
 
-```
-          +--------------------------+
-          |      ローカルクライアント   |
-          |---------------------------|
-          | Codex / Hermes / curl     |
-          | OpenAI SDK                |
-          +------------+-------------+
-                       |
-                localhost:18080
-                       |
-                DS4 Smart Proxy
-                       |
-          +------------+------------+
-          |                         |
-      Local DS4               Remote DS4
-```
+## 主な機能
 
-- 各マシンに DS4 サーバーと DS4 Smart Proxy の両方を配置
-- クライアントは常にローカルプロキシとのみ通信
-- プロキシが自動的に最適なバックエンドを選択
+- OpenAI互換pathと未知pathの透過転送
+- local-first routing
+- Hermes session、conversation、prefixによるsticky routing
+- HMAC-SHA-256によるaffinity key保護
+- SQLite WALによるaffinity永続化
+- backendごとの推論用Semaphore
+- 非推論request用の独立concurrency limit
+- Unknown / Alive / Suspect / Offline / Cooldown状態管理
+- bufferしないresponse streamingとSSE転送
+- connect、response header、first body byte、stream idle timeout
+- response開始前だけの限定的な別backend retry
+- standalone DS4とdistributed coordinatorの共存
+- public listenerとloopback admin listenerの分離
+- 構造化ログとPrometheus互換metrics
 
-## 機能
+## ビルド
 
-- **OpenAI API 互換**: すべてのエンドポイント（`/v1/chat/completions`, `/v1/responses`, `/v1/models` 等）を透過的にプロキシ
-- **自動ルーティング**: ローカルバックエンドを最優先、使用中ならリモートへフォールバック
-- **Heartbeat / Active Probe**: 軽量 heartbeat で到達性を確認し、active probe は障害後など推論状態が不明な場合に限定
-- **ストリーミング対応**: SSE (`text/event-stream`) を検出し、バッファリングなしで透過ストリーム
-- **RAII Drop ガード**: panic・タイムアウト・切断時でも確実に `in_flight` をデクリメント
-- **リトライポリシー**: 接続失敗 / 5xx → 別バックエンドへ1回再試行、4xx / ストリーム開始後 → 再試行なし
-- **管理エンドポイント**: `/healthz`, `/backends`, `/metrics`
-- **構造化ログ**: tracing でリクエストID・選択バックエンド・レイテンシ・ステータス・リトライ回数を出力
-
-## 要件
-
-- Rust 1.96 以上（edition 2024）
-- Apple Silicon Mac（推奨）、または任意の Linux 環境
-
-## ビルド方法
+Rust stable（edition 2024）が必要です。
 
 ```bash
-# クローン
-git clone <repository-url>
-cd ds4-smart-proxy
-
-# ビルド（リリース）
 cargo build --release
-
-# 確認
-cargo check
-cargo test
+cargo test --all
+cargo clippy --all-targets --all-features -- -D warnings
 ```
-
-依存クレートは `Cargo.toml` に記載されており、ビルド時に自動的にダウンロードされます。
 
 ## 設定
 
-`config.toml` を作成します。
+設定はTOMLです。探索順は次のとおりです。
 
-```toml
-listen = "127.0.0.1:18080"
+1. `--config`
+2. `DS4_SMART_PROXY_CONFIG`
+3. `./ds4-smart-proxy.toml`
+4. platform既定path
 
-self_name = "macbook"
-tls_accept_invalid_certs = false
+完全な例は [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml) を参照してください。
 
-heartbeat_interval = "5s"
-heartbeat_timeout = "2s"
-heartbeat_path = "/v1/models"
+affinityを有効にする場合は32 bytes以上のsecretが必要です。
 
-active_probe_timeout = "3s"
-log_timezone = "Asia/Tokyo"
-
-[[backends]]
-name = "macbook"
-url = "http://127.0.0.1:8000"
-max_in_flight = 1
-
-[[backends]]
-name = "macstudio"
-url = "https://macstudio.example.internal"
-max_in_flight = 1
+```bash
+export DS4_SMART_PROXY_AFFINITY_SECRET='32 bytes以上のランダム値'
+cargo run --release -- --config ./ds4-smart-proxy.toml
 ```
 
-| 項目 | 説明 |
+設定不整合は起動時に検出します。backend IDの重複、複数local backend、userinfoを
+含むURL、無効なtimeout、短いaffinity secretなどは起動エラーになります。
+
+旧版のflat設定（`self_name`、`heartbeat_interval`、backendの`name`など）は
+新仕様では受理しません。exampleに従ってセクション形式へ移行してください。
+
+## Routing
+
+新規requestの基本順序は次のとおりです。
+
+1. 有効な既存affinity
+2. local backend
+3. priorityの高いremote backend
+4. in-flight比率
+5. EWMA latency
+6. backend ID
+
+同じaffinityがbusyの場合、既定では短いgrace期間だけ待ち、別backendへ即座に
+spillせず503を返します。長いprefixを別backendで再prefillすることを避けるためです。
+
+backend slotはSemaphoreで取得し、response bodyのEOF、エラー、client切断まで保持します。
+`GET /v1/models`、`HEAD`、設定されたheartbeat pathは推論slotを消費しません。
+
+## Affinity header
+
+正式なheader：
+
+```text
+X-DS4-Affinity-Key
+X-DS4-Conversation-Id
+X-DS4-Prefix-Hash
+```
+
+互換header：
+
+```text
+X-Hermes-Session-Id
+X-Hermes-Session-Key
+X-Conversation-Id
+Conversation-Id
+Session-Id
+X-Session-Id
+```
+
+Responses APIの`conversation`、`previous_response_id`も認識します。
+raw IDは保存・ログ出力せず、source namespaceを含むHMAC-SHA-256で保存します。
+
+### Hermes連携
+
+Hermesがcustom LLM providerへsession headerを自動転送する保証はないため、
+LLM request middlewareでrequestごとにheaderを追加します。概念例：
+
+```python
+def add_ds4_affinity_header(**kwargs):
+    request = dict(kwargs["request"])
+    session_id = str(kwargs.get("session_id") or "").strip()
+    if not session_id:
+        return None
+
+    headers = dict(request.get("extra_headers") or {})
+    headers["X-DS4-Affinity-Key"] = f"hermes-session:{session_id}"
+    request["extra_headers"] = headers
+    return {"request": request, "name": "ds4-affinity"}
+```
+
+実際の登録方法は使用中のHermes middleware APIに合わせてください。静的な
+`extra_headers`へ固定session IDを書くと、全sessionが同じbackendへ固定されるため避けます。
+
+## Timeoutとretry
+
+- DNS、TCP、TLS接続失敗は、再生可能なrequestに限り別backendへ1回retry
+- HTTP 502 / 503 / 504は、別のavailable backendがある場合だけ1回retry
+- HTTP 4xxはretryしない
+- response header timeoutとfirst body byte timeoutは重複推論防止のためretryしない
+- downstreamへresponseを開始した後はretryしない
+- 2回目は必ず異なるbackendを選択
+
+response bodyはContent-Typeにかかわらずstreamingし、全体をbufferしません。
+first body byteを受信してからdownstream responseをcommitするため、それ以前と
+stream開始後のfailure境界が明確です。
+
+## 管理API
+
+管理APIは既定で `127.0.0.1:18081` にのみbindします。
+
+| Endpoint | 内容 |
 |---|---|
-| `listen` | プロキシがリッスンするアドレス:ポート |
-| `self_name` | このインスタンスのバックエンド名（ローカル優先） |
-| `tls_accept_invalid_certs` | HTTPS バックエンドの証明書検証を無効化します。自己署名証明書などローカル検証用途のみ `true` にしてください |
-| `heartbeat_interval` | heartbeat 間隔（例: `5s`） |
-| `heartbeat_timeout` | heartbeat タイムアウト（例: `2s`） |
-| `heartbeat_path` | heartbeat に使うパス（デフォルト `/v1/models`） |
-| `active_probe_timeout` | 回復確認時の active probe タイムアウト（例: `3s`） |
-| `log_timezone` | ログ時刻のタイムゾーン。未指定時は `GMT`。`Asia/Tokyo`, `JST`, `UTC`, `GMT`, `+09:00` 形式に対応 |
-| `[[backends]]` | バックエンド定義（複数可能） |
-| `name` | バックエンド名 |
-| `url` | DS4 サーバーの URL |
-| `max_in_flight` | 同時実行数の上限（デフォルト 1） |
+| `GET /healthz` | process liveness |
+| `GET /readyz` | backendとaffinity storeのreadiness |
+| `GET /backends` | backend状態、in-flight、EWMA |
+| `GET /affinity` | 件数とbackend別集計 |
+| `DELETE /affinity/{tag}` | 12桁hash tagまたは完全hashのentry削除 |
+| `GET /metrics` | Prometheus text format |
 
-同じバイナリを全マシンで使い、設定ファイルだけを変更します。
+admin listenerの非loopback bindは、認証なしで状態を公開しないため起動時に拒否します。
 
-## 使い方
+## セキュリティ
 
-### 1. 設定ファイルを作成
+- backend TLS証明書検証は既定で有効
+- `Authorization`は転送するがログには出さない
+- request/response body、session ID、conversation ID、完全affinity hashをログへ出さない
+- affinity keyはrouting hintであり、認証・認可には使用しない
+- backend URLにuserinfoを含めない
+- affinity SQLiteにはraw identifierを保存しない
 
-```bash
-cat > config.toml << EOF
-listen = "127.0.0.1:18080"
-self_name = "macbook"
-tls_accept_invalid_certs = false
-
-heartbeat_interval = "5s"
-heartbeat_timeout = "2s"
-heartbeat_path = "/v1/models"
-
-active_probe_timeout = "3s"
-log_timezone = "Asia/Tokyo"
-
-[[backends]]
-name = "macbook"
-url = "http://127.0.0.1:8000"
-max_in_flight = 1
-
-[[backends]]
-name = "macstudio"
-url = "https://macstudio.example.internal"
-max_in_flight = 1
-EOF
-```
-
-### 2. プロキシを起動
-
-```bash
-cargo run --release -- config.toml
-```
-
-またはビルド済みバイナリを直接実行:
-
-```bash
-./target/release/ds4-smart-proxy config.toml
-```
-
-### 3. クライアントからアクセス
-
-```bash
-# OpenAI SDK / Codex / Hermes から localhost:18080 を指定
-# curl での確認例
-curl http://localhost:18080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"stream":false}'
-```
-
-クライアント側の設定変更は不要です。通常 DS4 サーバーを指すエンドポイントを `localhost:18080` に変更するだけです。
-
-## 管理エンドポイント
-
-| エンドポイント | 説明 |
-|---|---|
-| `GET /healthz` | ヘルスチェック（`ok` を返します） |
-| `GET /backends` | 全バックエンドの状態を JSON で返します |
-| `GET /metrics` | メトリクス（プレースホルダ） |
-
-### `/backends` レスポンス例
-
-```json
-[
-  {
-    "name": "macbook",
-    "healthy": true,
-    "busy": false,
-    "in_flight": 0,
-    "latency_ms": 84
-  },
-  {
-    "name": "macstudio",
-    "healthy": true,
-    "busy": true,
-    "in_flight": 1,
-    "latency_ms": 76
-  }
-]
-```
-
-## ルーティングポリシー
-
-1. **ローカルバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
-2. **リモートバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
-3. 該当なし → **HTTP 503**
-
-Hermes で観測した約600秒待機後の遅延フェイルオーバーに関する調査・実装設計は
-[`docs/hermes-600s-failover.md`](docs/hermes-600s-failover.md) を参照してください。
-
-## リトライポリシー
-
-| 状況 | 動作 |
-|---|---|
-| 接続失敗 | 別の healthy なバックエンドへ再試行 |
-| HTTP 5xx | 別のバックエンドへ1回再試行 |
-| HTTP 4xx | 再試行なし |
-| ストリーム開始後 | 再試行なし |
-
-## ログ
-
-`tracing` による構造化ログを出力します。環境変数 `RUST_LOG` でフィルタリングできます。
-
-```bash
-RUST_LOG=ds4_smart_proxy=info cargo run --release -- config.toml
-```
-
-各リクエストに以下の情報が含まれます:
-- `request_id` (UUID)
-- `backend` (選択されたバックエンド名)
-- `latency_ms` (レイテンシミリ秒)
-- `status` (HTTP ステータスコード)
-- `retry` (リトライ回数)
-
-## 設計原則
-
-- インフラストラクチャ非依存（DNS / mDNS / クラウド / Kubernetes / Docker / Prometheus / Redis に依存しない）
-- バックエンド検出は設定駆動型
-- GPU 使用率・CPU 使用率・メモリ使用量で選択しない（DS4 の直列推論モデルに合わせる）
-- 最小依存、シングルバイナリ
-
-## ライセンス
-
-MIT
+詳細な要件と受け入れ条件は [`docs/spec.md`](docs/spec.md) を参照してください。

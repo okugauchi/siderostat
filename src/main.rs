@@ -1,213 +1,240 @@
+mod affinity;
+mod app;
+mod backend;
 mod config;
 mod error;
-mod probe;
+mod heartbeat;
+mod metrics;
+mod persistence;
 mod proxy;
-mod state;
+mod routing;
 
+use crate::{
+    app::AppState,
+    config::{Config, LogFormat},
+    heartbeat::spawn_heartbeat_tasks,
+    proxy::proxy_handler,
+};
 use anyhow::Result;
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{Response, StatusCode},
-    routing::{any, get},
+    routing::{any, delete, get},
 };
 use clap::Parser;
-use serde_json::Value as JsonValue;
-use std::fmt;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use serde_json::{Value, json};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tracing::info;
-use tracing_subscriber::{EnvFilter, fmt::format::Writer, fmt::time::FormatTime};
-
-use crate::config::Config;
-use crate::probe::heartbeat_loop;
-use crate::proxy::proxy_handler;
-use crate::state::AppState;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 struct Args {
     /// Path to the TOML configuration file.
-    #[arg(default_value = "config.toml")]
-    config: String,
-}
-
-#[derive(Clone)]
-struct FixedOffsetTimer {
-    offset_seconds: i32,
-}
-
-impl FixedOffsetTimer {
-    fn from_config(value: Option<&str>) -> Self {
-        Self {
-            offset_seconds: value.and_then(parse_log_timezone).unwrap_or(0),
-        }
-    }
-
-    fn offset_suffix(&self) -> String {
-        if self.offset_seconds == 0 {
-            return "+00:00".to_string();
-        }
-        let sign = if self.offset_seconds < 0 { '-' } else { '+' };
-        let abs = self.offset_seconds.unsigned_abs();
-        format!("{sign}{:02}:{:02}", abs / 3_600, (abs % 3_600) / 60)
-    }
-}
-
-impl FormatTime for FixedOffsetTimer {
-    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        let seconds = now.as_secs() as i128 + i128::from(self.offset_seconds);
-        let millis = now.subsec_millis();
-        let days = seconds.div_euclid(86_400) as i64;
-        let seconds_of_day = seconds.rem_euclid(86_400) as u64;
-        let (year, month, day) = civil_from_days(days);
-        let hour = seconds_of_day / 3_600;
-        let minute = (seconds_of_day % 3_600) / 60;
-        let second = seconds_of_day % 60;
-        let offset = self.offset_suffix();
-
-        write!(
-            w,
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}{offset}"
-        )
-    }
-}
-
-fn parse_log_timezone(value: &str) -> Option<i32> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("GMT") || value.eq_ignore_ascii_case("UTC") {
-        return Some(0);
-    }
-    if value.eq_ignore_ascii_case("JST") || value.eq_ignore_ascii_case("Asia/Tokyo") {
-        return Some(9 * 60 * 60);
-    }
-
-    parse_timezone_offset(value)
-}
-
-fn parse_timezone_offset(value: &str) -> Option<i32> {
-    let sign = match value.as_bytes().first().copied() {
-        Some(b'+') => 1,
-        Some(b'-') => -1,
-        _ => return None,
-    };
-    let rest = &value[1..];
-    let (hours, minutes) = rest.split_once(':')?;
-    let hours = hours.parse::<i32>().ok()?;
-    let minutes = minutes.parse::<i32>().ok()?;
-    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
-        return None;
-    }
-    Some(sign * (hours * 3_600 + minutes * 60))
+    #[arg(long, short)]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    // Load configuration before tracing so log time formatting can use it.
-    let config_content = tokio::fs::read_to_string(&args.config).await?;
-    let config: Config = toml::from_str(&config_content)?;
-    let log_timer = FixedOffsetTimer::from_config(config.log_timezone.as_deref());
-
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .with_timer(log_timer)
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("ds4_smart_proxy=info")),
-        )
-        .init();
-
+    let (config, config_path) = Config::load(args.config.as_deref()).await?;
+    initialize_logging(&config);
     info!(
+        config_path = %config_path.display(),
         listen = %config.listen,
-        self_name = %config.self_name,
-        log_timezone = config.log_timezone.as_deref().unwrap_or("GMT"),
-        backends = ?config.backends.iter().map(|b| &b.name).collect::<Vec<_>>(),
-        heartbeat_interval_ms = config.heartbeat_interval.as_millis(),
-        heartbeat_timeout_ms = config.heartbeat_timeout.as_millis(),
-        active_probe_timeout_ms = config.active_probe_timeout.as_millis(),
-        backend_connect_timeout_ms = 10_000u64,
-        response_headers_timeout = "none",
-        first_body_byte_timeout = "none",
-        stream_idle_timeout = "none",
-        "config loaded"
+        admin_listen = %config.admin_listen,
+        backends = ?config.backends.iter().map(|backend| &backend.id).collect::<Vec<_>>(),
+        "configuration loaded"
     );
 
-    // Build application state
-    let state = Arc::new(AppState::from_config(&config));
+    let public_addr = config.listen;
+    let admin_addr = config.admin_listen;
+    let state = AppState::from_config(config)?;
+    spawn_heartbeat_tasks(
+        state.registry.clone(),
+        state.config.heartbeat.clone(),
+        state.config.cooldown.clone(),
+        state.metrics.clone(),
+    );
+    spawn_affinity_cleanup(state.clone());
 
-    // Spawn lightweight heartbeat background task
-    let probe_state = state.clone();
-    tokio::spawn(async move {
-        heartbeat_loop(probe_state).await;
-    });
-
-    // Build axum router
-    let app = Router::new()
-        .route("/healthz", get(health_handler))
-        .route("/backends", get(backends_handler))
-        .route("/metrics", get(metrics_handler))
+    let public = Router::new()
         .route("/{*path}", any(proxy_handler))
+        .with_state(state.clone());
+    let admin = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(ready))
+        .route("/backends", get(backends))
+        .route("/metrics", get(metrics))
+        .route("/affinity", get(affinity_summary))
+        .route("/affinity/{key_hash}", delete(delete_affinity))
         .with_state(state);
 
-    // Start server
-    let addr: std::net::SocketAddr = config.listen.parse()?;
-    info!(addr = %addr, "starting server");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    info!(addr = %public_addr, "public listener started");
+    info!(addr = %admin_addr, "admin listener started");
 
+    tokio::try_join!(
+        axum::serve(
+            public_listener,
+            public.into_make_service_with_connect_info::<std::net::SocketAddr>()
+        ),
+        axum::serve(admin_listener, admin),
+    )?;
     Ok(())
 }
 
-// ── Health endpoints ─────────────────────────────────────────────
+fn initialize_logging(config: &Config) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("ds4_smart_proxy={}", config.logging.level)));
+    match config.logging.format {
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(filter)
+            .init(),
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(filter)
+            .init(),
+    }
+}
 
-async fn health_handler() -> Response<Body> {
+fn spawn_affinity_cleanup(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            state.affinity.cleanup();
+        }
+    });
+}
+
+async fn health() -> &'static str {
+    "OK"
+}
+
+async fn ready(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let available = state
+        .registry
+        .all()
+        .iter()
+        .any(|backend| backend.is_available());
+    let ready = available && state.affinity.persistence_healthy();
+    Response::builder()
+        .status(if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        })
+        .body(Body::from(if ready { "READY" } else { "NOT READY" }))
+        .expect("valid readiness response")
+}
+
+async fn backends(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
+    Json(
+        state
+            .registry
+            .all()
+            .iter()
+            .map(|backend| {
+                let snapshot = backend.snapshot();
+                json!({
+                    "id": backend.config.id,
+                    "kind": format!("{:?}", backend.config.kind).to_ascii_lowercase(),
+                    "local": backend.config.local,
+                    "health": snapshot.health.as_str(),
+                    "in_flight": backend.in_flight(),
+                    "max_in_flight": backend.config.max_in_flight,
+                    "tags": backend.config.tags,
+                    "ewma_latency_ms": snapshot.ewma_latency_ms,
+                    "last_heartbeat_at": iso_time(snapshot.last_heartbeat_at),
+                    "last_success_at": iso_time(snapshot.last_success_at),
+                    "last_failure_at": iso_time(snapshot.last_failure_at),
+                    "cooldown_until": iso_time(snapshot.cooldown_until.map(instant_to_system_time)),
+                    "last_failure_kind": snapshot.last_failure_kind.map(|kind| kind.as_str()),
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let body = state.metrics.render(&state.registry, &state.affinity);
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from("ok"))
-        .unwrap()
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .expect("valid metrics response")
 }
 
-async fn backends_handler(State(state): State<Arc<AppState>>) -> Json<Vec<JsonValue>> {
-    let states = state.states.lock().unwrap();
-    let mut list: Vec<JsonValue> = Vec::new();
-    for (name, bs) in states.iter() {
-        list.push(serde_json::json!({
-            "name": name,
-            "healthy": bs.healthy,
-            "busy": bs.is_busy(),
-            "in_flight": bs.in_flight,
-            "latency_ms": bs.average_latency_ms,
-            "last_heartbeat": format_system_time(bs.last_heartbeat),
-            "last_failure": format_system_time(bs.last_failure),
-        }));
+async fn affinity_summary(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "entries": state.affinity.len(),
+        "by_backend": state.affinity.counts_by_backend(),
+        "persistence_healthy": state.affinity.persistence_healthy(),
+    }))
+}
+
+async fn delete_affinity(
+    State(state): State<Arc<AppState>>,
+    Path(key_hash): Path<String>,
+) -> StatusCode {
+    let removed = if key_hash.len() == 12 {
+        state.affinity.remove_by_tag(&key_hash)
+    } else if let Some(hash) = parse_hash(&key_hash) {
+        state.affinity.remove(hash)
+    } else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if removed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
     }
-    Json(list)
 }
 
-fn format_system_time(value: Option<std::time::SystemTime>) -> Option<String> {
-    value.and_then(|time| {
-        time.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|duration| format_unix_timestamp(duration.as_secs()))
+fn parse_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(output)
+}
+
+fn instant_to_system_time(value: Instant) -> SystemTime {
+    SystemTime::now()
+        + value
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO)
+}
+
+fn iso_time(value: Option<SystemTime>) -> Option<String> {
+    value.and_then(|value| {
+        let duration = value.duration_since(UNIX_EPOCH).ok()?;
+        let seconds = duration.as_secs();
+        let days = (seconds / 86_400) as i64;
+        let seconds_of_day = seconds % 86_400;
+        let (year, month, day) = civil_from_days(days);
+        Some(format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            seconds_of_day / 3_600,
+            (seconds_of_day % 3_600) / 60,
+            seconds_of_day % 60
+        ))
     })
-}
-
-fn format_unix_timestamp(seconds: u64) -> String {
-    let days = (seconds / 86_400) as i64;
-    let seconds_of_day = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
@@ -221,15 +248,6 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
-
+    year += i64::from(month <= 2);
     (year as i32, month as u32, day as u32)
-}
-
-async fn metrics_handler() -> Response<Body> {
-    // Minimal placeholder – future extension
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from("# ds4-smart-proxy metrics\n"))
-        .unwrap()
 }

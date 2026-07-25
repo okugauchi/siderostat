@@ -1,138 +1,869 @@
-use crate::error::format_error_chain;
-use crate::probe::{active_probe_backend, mark_failure, mark_success};
-use crate::state::AppState;
+use crate::{
+    affinity::AffinityKey,
+    app::AppState,
+    backend::BackendRuntime,
+    error::{FailureKind, ProxyError, format_error_chain},
+    heartbeat::try_active_probe,
+    routing::Selection,
+};
 use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri},
 };
 use bytes::Bytes;
-use futures::{StreamExt, stream};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use futures::{Stream, StreamExt, stream};
+use std::{
+    collections::HashSet,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Instant,
 };
-use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// RAII guard: increments in_flight on construction, decrements on drop.
-pub struct InFlightGuard {
-    backend_name: String,
-    state: Arc<AppState>,
+type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+struct ForwardInput<'a> {
+    method: &'a Method,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+    body: &'a Bytes,
+    request_id: &'a str,
 }
 
-impl InFlightGuard {
-    pub fn new(backend_name: String, state: Arc<AppState>) -> Self {
-        if let Ok(mut states) = state.states.lock()
-            && let Some(entry) = states.get_mut(&backend_name)
-        {
-            entry.in_flight = entry.in_flight.saturating_add(1);
-        }
-        Self {
-            backend_name,
-            state,
-        }
-    }
+struct PreparedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: UpstreamStream,
+    first_chunk: Option<Bytes>,
 }
 
-impl Drop for InFlightGuard {
+struct StreamingRequest {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+    peer: SocketAddr,
+    request_id: String,
+    inference: bool,
+    started: Instant,
+}
+
+struct StreamLifecycle {
+    request_id: String,
+    backend_id: String,
+    started: Instant,
+    completed: AtomicBool,
+    bytes: AtomicU64,
+    metrics: Arc<crate::metrics::Metrics>,
+    backend: Arc<BackendRuntime>,
+    failure_threshold: u32,
+    cooldown: std::time::Duration,
+    status: u16,
+}
+
+impl Drop for StreamLifecycle {
     fn drop(&mut self) {
-        if let Ok(mut states) = self.state.states.lock()
-            && let Some(entry) = states.get_mut(&self.backend_name)
-        {
-            entry.in_flight = entry.in_flight.saturating_sub(1);
+        let elapsed = self.started.elapsed();
+        self.metrics.observe_duration(elapsed.as_secs_f64());
+        if !self.completed.load(Ordering::Relaxed) {
+            warn!(
+                request_id = %self.request_id,
+                backend_id = %self.backend_id,
+                total_ms = elapsed.as_millis(),
+                bytes_out = self.bytes.load(Ordering::Relaxed),
+                error_kind = FailureKind::ClientCancelled.as_str(),
+                "request stream dropped"
+            );
         }
     }
 }
 
-/// List backend candidates according to local-first routing policy.
-fn candidate_backends(state: &AppState, exclude: Option<&str>) -> Vec<String> {
-    let states = match state.states.lock() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+pub async fn proxy_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let request_id = request_id(&parts.headers);
+    let started = Instant::now();
+    let inference = is_inference_request(&parts.method, &parts.uri, &state);
+    let declared_length = parts
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared_length.is_some_and(|length| length > state.config.request_body_limit_bytes) {
+        return ProxyError::BodyTooLarge.response(&request_id);
+    }
+
+    if declared_length.is_some_and(|length| length > state.config.max_replayable_body_bytes) {
+        return handle_streaming_request(
+            state,
+            StreamingRequest {
+                method: parts.method,
+                uri: parts.uri,
+                headers: parts.headers,
+                body,
+                peer,
+                request_id,
+                inference,
+                started,
+            },
+        )
+        .await;
+    }
+
+    let body = match to_bytes(body, state.config.request_body_limit_bytes).await {
+        Ok(body) => body,
+        Err(error) => {
+            let proxy_error = if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("length limit")
+            {
+                ProxyError::BodyTooLarge
+            } else {
+                ProxyError::InvalidBody
+            };
+            return proxy_error.response(&request_id);
+        }
     };
-    let is_candidate = |name: &str| {
-        if exclude.is_some_and(|exclude| exclude == name) {
-            return false;
-        }
-        states
-            .get(name)
-            .is_some_and(|s| !s.is_busy() && (s.healthy || heartbeat_after_failure(s)))
+    let replayable = body.len() <= state.config.max_replayable_body_bytes;
+    let affinity = match state.affinity.extract(&parts.headers, &body) {
+        Ok(affinity) => affinity,
+        Err(error) => return error.response(&request_id),
     };
-    let mut candidates = Vec::new();
+    let upstream_headers =
+        match build_upstream_headers(&parts.headers, peer, &parts.uri, &request_id) {
+            Ok(headers) => headers,
+            Err(error) => return error.response(&request_id),
+        };
+    let input = ForwardInput {
+        method: &parts.method,
+        uri: &parts.uri,
+        headers: &upstream_headers,
+        body: &body,
+        request_id: &request_id,
+    };
 
-    for b in &state.backends {
-        if b.name == state.self_name && is_candidate(&b.name) {
-            candidates.push(b.name.clone());
+    info!(
+        request_id = %request_id,
+        method = %parts.method,
+        path = %parts.uri.path(),
+        affinity_source = affinity.as_ref().map(|key| key.source.as_str()),
+        affinity_key_tag = affinity.as_ref().map(|key| key.tag.as_str()),
+        "request received"
+    );
+
+    match execute(
+        &state,
+        &input,
+        affinity.as_ref(),
+        inference,
+        replayable,
+        started,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            state
+                .metrics
+                .observe_duration(started.elapsed().as_secs_f64());
+            warn!(
+                request_id = %request_id,
+                error_kind = error.code(),
+                error = %error,
+                "request failed"
+            );
+            error.response(&request_id)
         }
     }
+}
 
-    for b in &state.backends {
-        if b.name != state.self_name && is_candidate(&b.name) {
-            candidates.push(b.name.clone());
+async fn handle_streaming_request(
+    state: Arc<AppState>,
+    request: StreamingRequest,
+) -> Response<Body> {
+    let affinity = match state.affinity.extract(&request.headers, &[]) {
+        Ok(affinity) => affinity,
+        Err(error) => return error.response(&request.request_id),
+    };
+    let upstream_headers = match build_upstream_headers(
+        &request.headers,
+        request.peer,
+        &request.uri,
+        &request.request_id,
+    ) {
+        Ok(headers) => headers,
+        Err(error) => return error.response(&request.request_id),
+    };
+    let empty = Bytes::new();
+    let input = ForwardInput {
+        method: &request.method,
+        uri: &request.uri,
+        headers: &upstream_headers,
+        body: &empty,
+        request_id: &request.request_id,
+    };
+    let excluded = HashSet::new();
+    let selection = match state
+        .router
+        .select(affinity.as_ref(), &excluded, request.inference, false)
+        .await
+    {
+        Ok(selection) => selection,
+        Err(error) if request.inference => {
+            let restored = try_active_probe(
+                &state.registry,
+                &state.config.active_probe,
+                &state.config.cooldown,
+                &state.metrics,
+            )
+            .await;
+            if restored {
+                match state
+                    .router
+                    .select(affinity.as_ref(), &excluded, request.inference, false)
+                    .await
+                {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        return error.response(&request.request_id);
+                    }
+                }
+            } else {
+                return error.response(&request.request_id);
+            }
+        }
+        Err(error) => return error.response(&request.request_id),
+    };
+    info!(
+        request_id = %request.request_id,
+        backend_id = %selection.backend.config.id,
+        routing_reason = selection.reason.as_str(),
+        replayable = false,
+        "streaming request body selected backend"
+    );
+    match forward_streaming_body(
+        &state,
+        &input,
+        selection,
+        affinity.as_ref(),
+        request.started,
+        request.body,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            state
+                .metrics
+                .observe_duration(request.started.elapsed().as_secs_f64());
+            error.response(&request.request_id)
         }
     }
-
-    candidates
 }
 
-fn heartbeat_after_failure(backend: &crate::state::BackendState) -> bool {
-    match (backend.last_heartbeat, backend.last_failure) {
-        (Some(last_heartbeat), Some(last_failure)) => last_heartbeat > last_failure,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
+async fn execute(
+    state: &Arc<AppState>,
+    input: &ForwardInput<'_>,
+    affinity: Option<&AffinityKey>,
+    inference: bool,
+    replayable: bool,
+    started: Instant,
+) -> Result<Response<Body>, ProxyError> {
+    let mut excluded = HashSet::new();
+    let mut retry_from: Option<(String, &'static str)> = None;
+    let max_attempts = if replayable {
+        state.config.routing.max_attempts
+    } else {
+        1
+    };
 
-/// Select the first candidate whose request-time active probe succeeds.
-async fn select_backend(state: &Arc<AppState>, exclude: Option<&str>) -> Option<String> {
-    for name in candidate_backends(state, exclude) {
-        if let Some(url) = backend_url(state, &name)
-            && active_probe_backend(state, &name, &url).await
+    for attempt in 1..=max_attempts {
+        let selection = match state
+            .router
+            .select(affinity, &excluded, inference, attempt > 1)
+            .await
         {
-            return Some(name);
+            Ok(selection) => selection,
+            Err(error) if attempt == 1 && inference => {
+                let restored = try_active_probe(
+                    &state.registry,
+                    &state.config.active_probe,
+                    &state.config.cooldown,
+                    &state.metrics,
+                )
+                .await;
+                if restored {
+                    state
+                        .router
+                        .select(affinity, &excluded, inference, false)
+                        .await?
+                } else {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        let backend_id = selection.backend.config.id.clone();
+        if attempt == 1
+            && let Some(key) = affinity
+        {
+            state.metrics.increment(
+                "ds4_proxy_affinity_lookup_total",
+                &[
+                    ("source", key.source.as_str()),
+                    (
+                        "result",
+                        if selection.affinity_hit {
+                            "hit"
+                        } else {
+                            "miss"
+                        },
+                    ),
+                ],
+            );
         }
-    }
-    None
-}
+        if let Some((from_backend, reason)) = retry_from.take() {
+            state.metrics.increment(
+                "ds4_proxy_retries_total",
+                &[
+                    ("from_backend", &from_backend),
+                    ("to_backend", &backend_id),
+                    ("reason", reason),
+                ],
+            );
+        }
+        let in_flight_before = selection.backend.in_flight().saturating_sub(1);
+        info!(
+            request_id = %input.request_id,
+            backend_id = %backend_id,
+            backend_kind = ?selection.backend.config.kind,
+            routing_reason = selection.reason.as_str(),
+            affinity_hit = selection.affinity_hit,
+            in_flight_before,
+            bytes_in = input.body.len(),
+            attempt,
+            "backend selected"
+        );
 
-/// Get backend URL by name.
-fn backend_url(state: &AppState, name: &str) -> Option<String> {
-    state
-        .backends
-        .iter()
-        .find(|b| b.name == name)
-        .map(|b| b.url.clone())
-}
-
-/// Convert axum Method to reqwest Method.
-fn convert_method(m: &Method) -> reqwest::Method {
-    reqwest::Method::from_bytes(m.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
-}
-
-/// Build upstream headers, skipping hop-by-hop headers.
-fn build_upstream_headers(incoming: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (k, v) in incoming.iter() {
-        let key = k.as_str();
-        match key {
-            "host" | "connection" | "transfer-encoding" | "upgrade" | "keep-alive" => {}
-            _ => {
-                out.insert(k.clone(), v.clone());
+        match forward_once(state, input, selection, affinity, started).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retryable = can_retry(&error, attempt, max_attempts);
+                excluded.insert(backend_id.clone());
+                if let Some(key) = affinity {
+                    state.affinity.mark_failure(key);
+                }
+                if retryable {
+                    retry_from = Some((backend_id.clone(), error.code()));
+                    warn!(
+                        request_id = %input.request_id,
+                        backend_id = %backend_id,
+                        attempt,
+                        error_kind = error.code(),
+                        "retrying on a different backend"
+                    );
+                    continue;
+                }
+                return Err(error);
             }
         }
     }
-    out
+    Err(ProxyError::NoBackendAvailable)
 }
 
-fn request_id_from_headers(headers: &HeaderMap) -> String {
+async fn forward_once(
+    state: &Arc<AppState>,
+    input: &ForwardInput<'_>,
+    selection: Selection,
+    affinity: Option<&AffinityKey>,
+    started: Instant,
+) -> Result<Response<Body>, ProxyError> {
+    let backend = selection.backend.clone();
+    let url = upstream_url(&backend, input.uri)?;
+    let mut builder = backend
+        .client
+        .request(convert_method(input.method), url)
+        .headers(input.headers.clone());
+    for (name, value) in &backend.config.static_headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ProxyError::Internal)?;
+        let value = HeaderValue::from_str(value).map_err(|_| ProxyError::Internal)?;
+        builder = builder.header(name, value);
+    }
+    if *input.method != Method::GET && *input.method != Method::HEAD {
+        builder = builder.body(input.body.clone());
+    }
+
+    let response_header_timeout = phase_timeout(
+        state.config.timeouts.response_headers,
+        state.config.timeouts.total,
+        started,
+    );
+    let upstream = match tokio::time::timeout(response_header_timeout, builder.send()).await {
+        Err(_) => {
+            record_failure(state, &backend, FailureKind::ResponseHeaderTimeout);
+            return Err(ProxyError::ResponseHeaderTimeout);
+        }
+        Ok(Err(error)) => {
+            let kind = classify_reqwest_error(&error);
+            record_failure(state, &backend, kind);
+            warn!(
+                request_id = %input.request_id,
+                backend_id = %backend.config.id,
+                error = %format_error_chain(&error),
+                error_kind = kind.as_str(),
+                "upstream request failed"
+            );
+            return Err(if kind == FailureKind::Protocol {
+                ProxyError::Protocol
+            } else {
+                ProxyError::Connect
+            });
+        }
+        Ok(Ok(response)) => response,
+    };
+
+    let status = upstream.status();
+    info!(
+        request_id = %input.request_id,
+        backend_id = %backend.config.id,
+        response_header_ms = started.elapsed().as_millis(),
+        status = status.as_u16(),
+        "upstream response headers received"
+    );
+    let has_alternative = state
+        .registry
+        .all()
+        .iter()
+        .any(|candidate| candidate.config.id != backend.config.id && candidate.is_available());
+    if retryable_status(status) && has_alternative {
+        record_failure(state, &backend, FailureKind::Http5xx);
+        return Err(ProxyError::RetryableUpstreamStatus);
+    }
+
+    let prepared = prepare_first_chunk(state, input, &backend, upstream, started).await?;
+    let ttfb = started.elapsed();
+    state.metrics.observe_ttfb(ttfb.as_secs_f64());
+    info!(
+        request_id = %input.request_id,
+        backend_id = %backend.config.id,
+        first_body_byte_ms = ttfb.as_millis(),
+        status = status.as_u16(),
+        "upstream first body byte ready"
+    );
+
+    if status.is_server_error() {
+        record_failure(state, &backend, FailureKind::Http5xx);
+    } else {
+        if status.is_success() || status.is_redirection() {
+            backend.record_success(ttfb);
+        }
+        if let Some(key) = affinity {
+            state.affinity.assign(key, &backend.config.id);
+        }
+    }
+
+    state.metrics.increment(
+        "ds4_proxy_requests_total",
+        &[
+            ("backend", &backend.config.id),
+            ("status_class", status_class(status)),
+        ],
+    );
+    Ok(build_response(
+        state,
+        input.request_id,
+        backend,
+        prepared,
+        selection.permit,
+        started,
+    ))
+}
+
+async fn forward_streaming_body(
+    state: &Arc<AppState>,
+    input: &ForwardInput<'_>,
+    selection: Selection,
+    affinity: Option<&AffinityKey>,
+    started: Instant,
+    body: Body,
+) -> Result<Response<Body>, ProxyError> {
+    let backend = selection.backend.clone();
+    let url = upstream_url(&backend, input.uri)?;
+    let mut builder = backend
+        .client
+        .request(convert_method(input.method), url)
+        .headers(input.headers.clone());
+    for (name, value) in &backend.config.static_headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ProxyError::Internal)?;
+        let value = HeaderValue::from_str(value).map_err(|_| ProxyError::Internal)?;
+        builder = builder.header(name, value);
+    }
+    builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let response_header_timeout = phase_timeout(
+        state.config.timeouts.response_headers,
+        state.config.timeouts.total,
+        started,
+    );
+    let upstream = match tokio::time::timeout(response_header_timeout, builder.send()).await {
+        Err(_) => {
+            record_failure(state, &backend, FailureKind::ResponseHeaderTimeout);
+            return Err(ProxyError::ResponseHeaderTimeout);
+        }
+        Ok(Err(error)) => {
+            let kind = classify_reqwest_error(&error);
+            record_failure(state, &backend, kind);
+            return Err(if kind == FailureKind::Protocol {
+                ProxyError::Protocol
+            } else {
+                ProxyError::Connect
+            });
+        }
+        Ok(Ok(response)) => response,
+    };
+    let status = upstream.status();
+    let prepared = prepare_first_chunk(state, input, &backend, upstream, started).await?;
+    let ttfb = started.elapsed();
+    state.metrics.observe_ttfb(ttfb.as_secs_f64());
+    if status.is_server_error() {
+        record_failure(state, &backend, FailureKind::Http5xx);
+    } else {
+        if status.is_success() || status.is_redirection() {
+            backend.record_success(ttfb);
+        }
+        if let Some(key) = affinity {
+            state.affinity.assign(key, &backend.config.id);
+        }
+    }
+    state.metrics.increment(
+        "ds4_proxy_requests_total",
+        &[
+            ("backend", &backend.config.id),
+            ("status_class", status_class(status)),
+        ],
+    );
+    Ok(build_response(
+        state,
+        input.request_id,
+        backend,
+        prepared,
+        selection.permit,
+        started,
+    ))
+}
+
+async fn prepare_first_chunk(
+    state: &AppState,
+    input: &ForwardInput<'_>,
+    backend: &BackendRuntime,
+    upstream: reqwest::Response,
+    started: Instant,
+) -> Result<PreparedResponse, ProxyError> {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let no_body = *input.method == Method::HEAD
+        || status == StatusCode::NO_CONTENT
+        || upstream.content_length() == Some(0);
+    let mut stream: UpstreamStream = Box::pin(upstream.bytes_stream());
+    if no_body {
+        return Ok(PreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: None,
+        });
+    }
+
+    let first_byte_timeout = phase_timeout(
+        state.config.timeouts.first_body_byte,
+        state.config.timeouts.total,
+        started,
+    );
+    match tokio::time::timeout(first_byte_timeout, stream.next()).await {
+        Ok(Some(Ok(first_chunk))) => Ok(PreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: Some(first_chunk),
+        }),
+        Ok(None) => Ok(PreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: None,
+        }),
+        Ok(Some(Err(error))) => {
+            record_failure(state, backend, FailureKind::Protocol);
+            warn!(
+                request_id = %input.request_id,
+                backend_id = %backend.config.id,
+                error = %error,
+                "upstream failed before first body byte"
+            );
+            Err(ProxyError::Protocol)
+        }
+        Err(_) => {
+            record_failure(state, backend, FailureKind::FirstByteTimeout);
+            Err(ProxyError::FirstByteTimeout)
+        }
+    }
+}
+
+fn phase_timeout(
+    phase: std::time::Duration,
+    total: Option<std::time::Duration>,
+    started: Instant,
+) -> std::time::Duration {
+    total
+        .map(|total| total.saturating_sub(started.elapsed()).min(phase))
+        .unwrap_or(phase)
+}
+
+fn build_response(
+    state: &Arc<AppState>,
+    request_id: &str,
+    backend: Arc<BackendRuntime>,
+    prepared: PreparedResponse,
+    permit: OwnedSemaphorePermit,
+    started: Instant,
+) -> Response<Body> {
+    let status = prepared.status;
+    let headers = prepared.headers;
+    let upstream_stream = prepared.stream;
+    let lifecycle = Arc::new(StreamLifecycle {
+        request_id: request_id.to_string(),
+        backend_id: backend.config.id.clone(),
+        started,
+        completed: AtomicBool::new(false),
+        bytes: AtomicU64::new(0),
+        metrics: state.metrics.clone(),
+        backend: backend.clone(),
+        failure_threshold: state.config.cooldown.consecutive_failure_threshold,
+        cooldown: state.config.cooldown.duration,
+        status: status.as_u16(),
+    });
+    let idle_timeout = state.config.timeouts.stream_idle;
+    let total_timeout = state.config.timeouts.total;
+    let stream = stream::unfold(
+        (
+            prepared.first_chunk,
+            upstream_stream,
+            Some(permit),
+            lifecycle,
+        ),
+        move |(first, mut upstream, permit, lifecycle)| async move {
+            if let Some(chunk) = first {
+                lifecycle
+                    .bytes
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                return Some((Ok(chunk), (None, upstream, permit, lifecycle)));
+            }
+            let remaining_total =
+                total_timeout.map(|total| total.saturating_sub(lifecycle.started.elapsed()));
+            let total_limited = remaining_total.is_some_and(|remaining| remaining <= idle_timeout);
+            let wait_timeout =
+                remaining_total.map_or(idle_timeout, |remaining| remaining.min(idle_timeout));
+            match tokio::time::timeout(wait_timeout, upstream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    lifecycle
+                        .bytes
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    Some((Ok(chunk), (None, upstream, permit, lifecycle)))
+                }
+                Ok(Some(Err(error))) => {
+                    lifecycle.backend.record_failure(
+                        FailureKind::Protocol,
+                        lifecycle.failure_threshold,
+                        lifecycle.cooldown,
+                    );
+                    lifecycle.metrics.increment(
+                        "ds4_proxy_stream_errors_total",
+                        &[
+                            ("backend", &lifecycle.backend_id),
+                            ("reason", "upstream_error"),
+                        ],
+                    );
+                    error!(
+                        request_id = %lifecycle.request_id,
+                        backend_id = %lifecycle.backend_id,
+                        error = %error,
+                        "upstream stream error"
+                    );
+                    lifecycle.completed.store(true, Ordering::Relaxed);
+                    upstream = Box::pin(stream::empty());
+                    Some((
+                        Err(io::Error::other("upstream stream error")),
+                        (None, upstream, None, lifecycle),
+                    ))
+                }
+                Err(_) => {
+                    lifecycle.backend.record_failure(
+                        FailureKind::StreamIdleTimeout,
+                        lifecycle.failure_threshold,
+                        lifecycle.cooldown,
+                    );
+                    let timeout_reason = if total_limited {
+                        "total_timeout"
+                    } else {
+                        "stream_idle_timeout"
+                    };
+                    lifecycle.metrics.increment(
+                        "ds4_proxy_stream_errors_total",
+                        &[
+                            ("backend", &lifecycle.backend_id),
+                            ("reason", timeout_reason),
+                        ],
+                    );
+                    warn!(
+                        request_id = %lifecycle.request_id,
+                        backend_id = %lifecycle.backend_id,
+                        error_kind = FailureKind::StreamIdleTimeout.as_str(),
+                        "upstream stream idle timeout"
+                    );
+                    lifecycle.completed.store(true, Ordering::Relaxed);
+                    upstream = Box::pin(stream::empty());
+                    Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upstream stream idle timeout",
+                        )),
+                        (None, upstream, None, lifecycle),
+                    ))
+                }
+                Ok(None) => {
+                    lifecycle.completed.store(true, Ordering::Relaxed);
+                    info!(
+                        request_id = %lifecycle.request_id,
+                        backend_id = %lifecycle.backend_id,
+                        total_ms = lifecycle.started.elapsed().as_millis(),
+                        bytes_out = lifecycle.bytes.load(Ordering::Relaxed),
+                        status = lifecycle.status,
+                        "request finished"
+                    );
+                    None
+                }
+            }
+        },
+    );
+
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    copy_response_headers(&headers, response.headers_mut());
+    insert_request_id(response.headers_mut(), request_id);
+    response
+}
+
+fn build_upstream_headers(
+    incoming: &HeaderMap,
+    peer: SocketAddr,
+    uri: &Uri,
+    request_id: &str,
+) -> Result<HeaderMap, ProxyError> {
+    let mut output = HeaderMap::new();
+    let connection_tokens = connection_header_tokens(incoming);
+    for (name, value) in incoming {
+        if !is_hop_by_hop(name.as_str(), &connection_tokens) && name != "host" {
+            output.append(name.clone(), value.clone());
+        }
+    }
+
+    append_forwarded(&mut output, "x-forwarded-for", &peer.ip().to_string())?;
+    if let Some(host) = incoming.get("host") {
+        output.insert("x-forwarded-host", host.clone());
+    }
+    if !output.contains_key("x-forwarded-proto") {
+        let protocol = uri.scheme_str().unwrap_or("http");
+        output.insert(
+            "x-forwarded-proto",
+            HeaderValue::from_str(protocol).map_err(|_| ProxyError::Internal)?,
+        );
+    }
+    append_forwarded(&mut output, "via", "1.1 ds4-smart-proxy")?;
+    insert_request_id(&mut output, request_id);
+    Ok(output)
+}
+
+fn copy_response_headers(source: &HeaderMap, destination: &mut HeaderMap) {
+    let connection_tokens = connection_header_tokens(source);
+    for (name, value) in source {
+        if !is_hop_by_hop(name.as_str(), &connection_tokens) {
+            destination.append(name.clone(), value.clone());
+        }
+    }
+}
+
+fn connection_header_tokens(headers: &HeaderMap) -> HashSet<String> {
+    headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn is_hop_by_hop(name: &str, connection_tokens: &HashSet<String>) -> bool {
+    connection_tokens.contains(name)
+        || matches!(
+            name,
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
+}
+
+fn append_forwarded(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), ProxyError> {
+    let combined = headers
+        .get(name)
+        .and_then(|existing| existing.to_str().ok())
+        .map_or_else(
+            || value.to_string(),
+            |existing| format!("{existing}, {value}"),
+        );
+    headers.insert(
+        name,
+        HeaderValue::from_str(&combined).map_err(|_| ProxyError::Internal)?,
+    );
+    Ok(())
+}
+
+fn upstream_url(backend: &BackendRuntime, uri: &Uri) -> Result<url::Url, ProxyError> {
+    let path = uri.path().trim_start_matches('/');
+    let mut url = backend.endpoint(path).map_err(|_| ProxyError::Internal)?;
+    url.set_query(uri.query());
+    Ok(url)
+}
+
+fn request_id(headers: &HeaderMap) -> String {
     headers
         .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
+        .unwrap_or_else(|| format!("req_{}", Uuid::new_v4().simple()))
 }
 
 fn insert_request_id(headers: &mut HeaderMap, request_id: &str) {
@@ -141,548 +872,483 @@ fn insert_request_id(headers: &mut HeaderMap, request_id: &str) {
     }
 }
 
-fn backend_in_flight(state: &AppState, name: &str) -> usize {
-    state
-        .states
-        .lock()
-        .ok()
-        .and_then(|states| states.get(name).map(|entry| entry.in_flight))
-        .unwrap_or(0)
+fn is_inference_request(method: &Method, uri: &Uri, state: &AppState) -> bool {
+    if *method == Method::HEAD || (*method == Method::GET && uri.path() == "/v1/models") {
+        return false;
+    }
+    !state
+        .registry
+        .all()
+        .iter()
+        .any(|backend| uri.path() == backend.config.heartbeat_path)
 }
 
-struct StreamLifecycle {
-    request_id: String,
-    backend: String,
-    attempt: u32,
-    start: Instant,
-    first_chunk_seen: AtomicBool,
-    finished: AtomicBool,
-    bytes_forwarded: AtomicU64,
+fn convert_method(method: &Method) -> reqwest::Method {
+    reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
-impl StreamLifecycle {
-    fn new(request_id: &str, backend: &str, attempt: u32, start: Instant) -> Self {
-        Self {
-            request_id: request_id.to_string(),
-            backend: backend.to_string(),
-            attempt,
-            start,
-            first_chunk_seen: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            bytes_forwarded: AtomicU64::new(0),
+fn classify_reqwest_error(error: &reqwest::Error) -> FailureKind {
+    if error.is_connect() {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("tls") || message.contains("certificate") {
+            FailureKind::Tls
+        } else {
+            FailureKind::Connect
         }
-    }
-}
-
-impl Drop for StreamLifecycle {
-    fn drop(&mut self) {
-        if !self.finished.load(Ordering::Relaxed) {
-            warn!(
-                request_id = %self.request_id,
-                backend = %self.backend,
-                attempt = self.attempt,
-                elapsed_ms = self.start.elapsed().as_millis(),
-                stream_started = self.first_chunk_seen.load(Ordering::Relaxed),
-                bytes_forwarded = self.bytes_forwarded.load(Ordering::Relaxed),
-                "client_disconnected"
-            );
-        }
-    }
-}
-
-/// Forward a single request to a named backend.
-async fn forward_to_backend(
-    client: &reqwest::Client,
-    backend_url: &str,
-    method: &Method,
-    path: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let upstream_url = format!("{}{}", backend_url.trim_end_matches('/'), path);
-    let req_method = convert_method(method);
-    let mut builder = client
-        .request(req_method, &upstream_url)
-        .headers(headers.clone());
-
-    if *method != Method::GET && *method != Method::HEAD {
-        builder = builder.body(body.clone());
-    }
-
-    builder.send().await
-}
-
-/// Retry on an alternative backend when the primary attempt fails.
-async fn retry_on_alt(
-    state: &Arc<AppState>,
-    request_id: &str,
-    exclude: &str,
-    retry_reason: &str,
-    method: &Method,
-    path: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-    start: &Instant,
-) -> Result<(reqwest::Response, String, InFlightGuard), Box<dyn std::error::Error + Send + Sync>> {
-    let alt = match select_backend(state, Some(exclude)).await {
-        Some(n) => n,
-        None => return Err("no alternative backend available".into()),
-    };
-    let alt_url = match backend_url(state, &alt) {
-        Some(u) => u,
-        None => return Err("alternative backend not found".into()),
-    };
-
-    let in_flight_before = backend_in_flight(state, &alt);
-    info!(
-        request_id = %request_id,
-        from_backend = %exclude,
-        to_backend = %alt,
-        attempt = 2,
-        retry_reason = %retry_reason,
-        "retry_started"
-    );
-    info!(
-        request_id = %request_id,
-        backend = %alt,
-        selected_backend = %alt,
-        attempt = 2,
-        routing_reason = "retry_alternative_active_probe_ok",
-        in_flight_before = in_flight_before,
-        "backend_selected"
-    );
-
-    let guard = InFlightGuard::new(alt.clone(), state.clone());
-    info!(
-        request_id = %request_id,
-        backend = %alt,
-        attempt = 2,
-        "upstream_connect_started"
-    );
-    let resp = forward_to_backend(&state.client, &alt_url, method, path, headers, body).await?;
-    info!(
-        request_id = %request_id,
-        backend = %alt,
-        attempt = 2,
-        connect_elapsed_ms = start.elapsed().as_millis(),
-        "upstream_connected"
-    );
-    Ok((resp, alt, guard))
-}
-
-/// Build an axum Response from a reqwest Response.
-async fn build_response(
-    upstream: reqwest::Response,
-    request_id: &str,
-    backend: &str,
-    start: &Instant,
-    retry_count: u32,
-    guard: InFlightGuard,
-) -> Response<Body> {
-    let status = upstream.status();
-    let resp_headers = upstream.headers().clone();
-    let is_streaming = resp_headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("text/event-stream"));
-
-    let latency = start.elapsed();
-    if status.is_success() {
-        mark_success(&guard.state, backend, latency.as_millis() as u64);
-    } else if status.is_server_error() {
-        mark_failure(&guard.state, backend);
-    }
-    info!(
-        request_id = %request_id,
-        backend = %backend,
-        attempt = retry_count + 1,
-        headers_elapsed_ms = latency.as_millis(),
-        status = status.as_u16(),
-        is_streaming = is_streaming,
-        "response_headers_received"
-    );
-
-    let body = if is_streaming {
-        let lifecycle = Arc::new(StreamLifecycle::new(
-            request_id,
-            backend,
-            retry_count + 1,
-            *start,
-        ));
-        let stream_state = guard.state.clone();
-        let stream_backend = backend.to_string();
-        let stream_request_id = request_id.to_string();
-        let attempt = retry_count + 1;
-        let stream = stream::unfold(
-            (upstream.bytes_stream(), guard, lifecycle),
-            move |(mut upstream_stream, guard, lifecycle)| {
-                let stream_state = stream_state.clone();
-                let stream_backend = stream_backend.clone();
-                let stream_request_id = stream_request_id.clone();
-                async move {
-                    let item = upstream_stream.next().await;
-                    match item {
-                        Some(Ok(chunk)) => {
-                            let bytes = chunk.len() as u64;
-                            lifecycle
-                                .bytes_forwarded
-                                .fetch_add(bytes, Ordering::Relaxed);
-                            if !lifecycle.first_chunk_seen.swap(true, Ordering::Relaxed) {
-                                info!(
-                                    request_id = %stream_request_id,
-                                    backend = %stream_backend,
-                                    attempt = attempt,
-                                    first_body_chunk_elapsed_ms = lifecycle.start.elapsed().as_millis(),
-                                    first_body_chunk_bytes = bytes,
-                                    "first_body_chunk"
-                                );
-                            }
-                            Some((Ok(chunk), (upstream_stream, guard, lifecycle)))
-                        }
-                        Some(Err(error)) => {
-                            mark_failure(&stream_state, &stream_backend);
-                            warn!(
-                                request_id = %stream_request_id,
-                                backend = %stream_backend,
-                                attempt = attempt,
-                                error = %error,
-                                "upstream_stream_error"
-                            );
-                            lifecycle.finished.store(true, Ordering::Relaxed);
-                            info!(
-                                request_id = %stream_request_id,
-                                backend = %stream_backend,
-                                attempt = attempt,
-                                total_elapsed_ms = lifecycle.start.elapsed().as_millis(),
-                                bytes_forwarded = lifecycle.bytes_forwarded.load(Ordering::Relaxed),
-                                outcome = "upstream_error",
-                                "request_finished"
-                            );
-                            Some((
-                                Err(std::io::Error::other("stream error")),
-                                (upstream_stream, guard, lifecycle),
-                            ))
-                        }
-                        None => {
-                            lifecycle.finished.store(true, Ordering::Relaxed);
-                            info!(
-                                request_id = %stream_request_id,
-                                backend = %stream_backend,
-                                attempt = attempt,
-                                total_elapsed_ms = lifecycle.start.elapsed().as_millis(),
-                                bytes_forwarded = lifecycle.bytes_forwarded.load(Ordering::Relaxed),
-                                outcome = "ok",
-                                "request_finished"
-                            );
-                            drop(guard);
-                            None
-                        }
-                    }
-                }
-            },
-        );
-        Body::from_stream(stream)
+    } else if error.is_timeout() {
+        FailureKind::ResponseHeaderTimeout
     } else {
-        let bytes = match upstream.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "failed to read upstream body");
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("upstream read error"))
-                    .unwrap();
-            }
-        };
-        info!(
-            request_id = %request_id,
-            backend = %backend,
-            attempt = retry_count + 1,
-            total_elapsed_ms = start.elapsed().as_millis(),
-            bytes_forwarded = bytes.len(),
-            outcome = "ok",
-            "request_finished"
+        FailureKind::Protocol
+    }
+}
+
+fn record_failure(state: &AppState, backend: &BackendRuntime, kind: FailureKind) {
+    let changed = backend.record_failure(
+        kind,
+        state.config.cooldown.consecutive_failure_threshold,
+        state.config.cooldown.duration,
+    );
+    if changed && backend.snapshot().health.as_str() == "cooldown" {
+        state.metrics.increment(
+            "ds4_proxy_cooldown_total",
+            &[("backend", &backend.config.id), ("reason", kind.as_str())],
         );
-        drop(guard);
-        Body::from(bytes)
-    };
-
-    let mut resp = Response::new(body);
-    *resp.status_mut() = status;
-    for (k, v) in resp_headers.iter() {
-        resp.headers_mut().insert(k, v.clone());
     }
-    insert_request_id(resp.headers_mut(), request_id);
-    resp
 }
 
-/// Read an axum Body into Bytes by collecting data frames.
-async fn body_to_bytes(body: Body) -> Result<Bytes, hyper::Error> {
-    let data_stream = body.into_data_stream();
-    let mut buf = Vec::new();
-    let mut stream = data_stream;
-    loop {
-        let item = stream.next().await;
-        match item {
-            Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-            Some(Err(_)) => continue,
-            None => break,
-        }
-    }
-    Ok(Bytes::from(buf))
-}
-
-/// Main proxy handler – catch-all route for all incoming requests.
-pub async fn proxy_handler(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-) -> Response<Body> {
-    let (parts, body) = req.into_parts();
-    let method = parts.method.clone();
-    let uri = parts.uri.clone();
-    let headers = parts.headers.clone();
-    let request_id = request_id_from_headers(&headers);
-    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let start = Instant::now();
-
-    info!(
-        request_id = %request_id,
-        method = %method,
-        path = %path,
-        "request_received"
-    );
-
-    // Read incoming body as bytes (may be empty for GET/HEAD)
-    let body_bytes = match body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!(request_id = %request_id, error = %e, "failed to read request body");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("failed to read request body"))
-                .unwrap();
-        }
-    };
-
-    // Select backend
-    let backend_name = match select_backend(&state, None).await {
-        Some(b) => b,
-        None => {
-            warn!(request_id = %request_id, "no available backends");
-            return Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("no available backends"))
-                .unwrap();
-        }
-    };
-
-    let backend_url = match backend_url(&state, &backend_name) {
-        Some(u) => u,
-        None => {
-            error!(request_id = %request_id, backend = %backend_name, "backend url not found");
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("backend configuration error"))
-                .unwrap();
-        }
-    };
-
-    let in_flight_before = backend_in_flight(&state, &backend_name);
-    info!(
-        request_id = %request_id,
-        backend = %backend_name,
-        selected_backend = %backend_name,
-        attempt = 1,
-        routing_reason = "local_first_active_probe_ok",
-        in_flight_before = in_flight_before,
-        "backend_selected"
-    );
-
-    let guard = InFlightGuard::new(backend_name.clone(), state.clone());
-
-    let mut upstream_headers = build_upstream_headers(&headers);
-    insert_request_id(&mut upstream_headers, &request_id);
-
-    info!(
-        request_id = %request_id,
-        backend = %backend_name,
-        attempt = 1,
-        "upstream_connect_started"
-    );
-    let result = forward_to_backend(
-        &state.client,
-        &backend_url,
-        &method,
-        path,
-        &upstream_headers,
-        &body_bytes,
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
     )
-    .await;
+}
 
-    let upstream = match result {
-        Ok(r) => {
-            info!(
-                request_id = %request_id,
-                backend = %backend_name,
-                attempt = 1,
-                connect_elapsed_ms = start.elapsed().as_millis(),
-                "upstream_connected"
-            );
-            r
-        }
-        Err(e) => {
-            // Connection failure → retry on another healthy backend
-            let error = format_error_chain(&e);
-            mark_failure(&state, &backend_name);
-            warn!(
-                request_id = %request_id,
-                backend = %backend_name,
-                error = %error,
-                "connection failed, retrying"
-            );
-            let (resp, alt, alt_guard) = match retry_on_alt(
-                &state,
-                &request_id,
-                &backend_name,
-                "connection_failed",
-                &method,
-                path,
-                &upstream_headers,
-                &body_bytes,
-                &start,
-            )
-            .await
-            {
-                Ok((r, alt_name, alt_guard)) => (r, alt_name, alt_guard),
-                Err(e2) => {
-                    error!(request_id = %request_id, error = %e2, "retry failed");
-                    return Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(Body::from("upstream error"))
-                        .unwrap();
-                }
-            };
-            drop(guard);
-            return build_response(resp, &request_id, &alt, &start, 1, alt_guard).await;
-        }
-    };
-
-    let status = upstream.status();
-
-    // 4xx: never retry
-    if status.as_u16() >= 400 && status.as_u16() < 500 {
-        return build_response(upstream, &request_id, &backend_name, &start, 0, guard).await;
-    }
-
-    // 5xx: retry once on another backend (response not yet sent to client)
-    if status.as_u16() >= 500 {
-        mark_failure(&state, &backend_name);
-        warn!(
-            request_id = %request_id,
-            backend = %backend_name,
-            status = status.as_u16(),
-            "5xx, retrying on alt backend"
-        );
-        let (resp, alt, alt_guard) = match retry_on_alt(
-            &state,
-            &request_id,
-            &backend_name,
-            "http_5xx",
-            &method,
-            path,
-            &upstream_headers,
-            &body_bytes,
-            &start,
+fn can_retry(error: &ProxyError, attempt: usize, max_attempts: usize) -> bool {
+    attempt < max_attempts
+        && matches!(
+            error,
+            ProxyError::Connect | ProxyError::RetryableUpstreamStatus
         )
-        .await
-        {
-            Ok((r, alt_name, alt_guard)) => (r, alt_name, alt_guard),
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "retry failed");
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("upstream error"))
-                    .unwrap();
-            }
-        };
-        drop(guard);
-        return build_response(resp, &request_id, &alt, &start, 1, alt_guard).await;
-    }
+}
 
-    build_response(upstream, &request_id, &backend_name, &start, 0, guard).await
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BackendConfig, Config};
-    use std::time::Duration;
+    use crate::{app::AppState, config::Config};
+    use axum::{Json, Router, routing::any};
+    use futures::stream;
+    use serde_json::Value;
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
+    use tokio::task::JoinHandle;
 
-    fn test_state() -> AppState {
-        AppState::from_config(&Config {
-            listen: "127.0.0.1:18080".to_string(),
-            self_name: "local".to_string(),
-            tls_accept_invalid_certs: false,
-            heartbeat_interval: Duration::from_secs(5),
-            heartbeat_timeout: Duration::from_secs(5),
-            heartbeat_path: "/v1/models".to_string(),
-            active_probe_timeout: Duration::from_secs(3),
-            log_timezone: None,
-            backends: vec![
-                BackendConfig {
-                    name: "local".to_string(),
-                    url: "http://127.0.0.1:8000".to_string(),
-                    max_in_flight: 1,
-                },
-                BackendConfig {
-                    name: "remote".to_string(),
-                    url: "http://127.0.0.1:8001".to_string(),
-                    max_in_flight: 1,
-                },
-            ],
-        })
+    #[test]
+    fn removes_standard_and_connection_declared_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("x-remove"));
+        headers.insert("x-remove", HeaderValue::from_static("secret"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("x-keep", HeaderValue::from_static("yes"));
+        let tokens = connection_header_tokens(&headers);
+        let mut output = HeaderMap::new();
+        copy_response_headers(&headers, &mut output);
+        assert!(is_hop_by_hop("x-remove", &tokens));
+        assert!(output.get("x-remove").is_none());
+        assert_eq!(output.get("x-keep").unwrap(), "yes");
     }
 
     #[test]
-    fn candidate_backends_prefers_local_when_available() {
-        let state = test_state();
-
-        assert_eq!(candidate_backends(&state, None), vec!["local", "remote"]);
+    fn only_gateway_statuses_are_retryable() {
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
     }
 
-    #[test]
-    fn candidate_backends_uses_remote_when_local_is_busy() {
-        let state = test_state();
-        {
-            let mut states = state.states.lock().unwrap();
-            states.get_mut("local").unwrap().in_flight = 1;
+    struct TestServer {
+        address: SocketAddr,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
         }
-
-        assert_eq!(candidate_backends(&state, None), vec!["remote"]);
     }
 
-    #[test]
-    fn candidate_backends_returns_empty_when_all_backends_are_busy() {
-        let state = test_state();
-        {
-            let mut states = state.states.lock().unwrap();
-            states.get_mut("local").unwrap().in_flight = 1;
-            states.get_mut("remote").unwrap().in_flight = 1;
-        }
-
-        assert!(candidate_backends(&state, None).is_empty());
+    async fn start_server(app: Router) -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        TestServer { address, task }
     }
 
-    #[test]
-    fn candidate_backends_allows_recent_heartbeat_after_failure() {
-        let state = test_state();
-        {
-            let mut states = state.states.lock().unwrap();
-            let local = states.get_mut("local").unwrap();
-            local.healthy = false;
-            local.last_failure = Some(std::time::SystemTime::UNIX_EPOCH);
-            local.last_heartbeat = Some(std::time::SystemTime::now());
-        }
+    fn test_config(backends: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:18080"
+admin_listen = "127.0.0.1:18081"
 
-        assert_eq!(candidate_backends(&state, None), vec!["local", "remote"]);
+[routing]
+max_attempts = 2
+
+[affinity]
+enabled = false
+
+[timeouts]
+connect = "200ms"
+response_headers = "2s"
+first_body_byte = "2s"
+stream_idle = "2s"
+
+{backends}
+"#
+        ))
+        .unwrap()
+    }
+
+    async fn start_proxy(config: Config) -> (TestServer, Arc<AppState>) {
+        let state = AppState::from_config(config).unwrap();
+        for backend in state.registry.all() {
+            backend.record_heartbeat_success();
+        }
+        let app = Router::new()
+            .route("/", any(proxy_handler))
+            .route("/{*path}", any(proxy_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        (TestServer { address, task }, state)
+    }
+
+    #[tokio::test]
+    async fn forwards_unknown_path_query_and_forwarding_headers() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                let request_id = request
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let forwarded_for = request
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                Json(serde_json::json!({
+                    "uri": request.uri().to_string(),
+                    "request_id": request_id,
+                    "forwarded_for": forwarded_for,
+                }))
+            }),
+        ))
+        .await;
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+"#,
+            backend.address
+        ));
+        let (proxy, _state) = start_proxy(config).await;
+
+        let response: Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/custom?answer=42", proxy.address))
+            .header("x-request-id", "req_test")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["uri"], "/v1/custom?answer=42");
+        assert_eq!(response["request_id"], "req_test");
+        assert_eq!(response["forwarded_for"], "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn retries_connect_failure_on_different_backend() {
+        let remote =
+            start_server(Router::new().route("/{*path}", any(|| async { "remote-ok" }))).await;
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unused.local_addr().unwrap();
+        drop(unused);
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{unavailable_address}"
+local = true
+priority = 100
+
+[[backends]]
+id = "remote"
+url = "http://{}"
+priority = 50
+"#,
+            remote.address
+        ));
+        let (proxy, state) = start_proxy(config).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "remote-ok");
+        assert_eq!(
+            state.registry.by_id("local").unwrap().snapshot().health,
+            crate::backend::BackendHealth::Suspect
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_http_4xx() {
+        let local = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async { (StatusCode::BAD_REQUEST, "local-bad-request") }),
+        ))
+        .await;
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let hits = remote_hits.clone();
+        let remote = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "remote"
+                }
+            }),
+        ))
+        .await;
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+priority = 100
+
+[[backends]]
+id = "remote"
+url = "http://{}"
+priority = 50
+"#,
+            local.address, remote.address
+        ));
+        let (proxy, _state) = start_proxy(config).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.text().await.unwrap(), "local-bad-request");
+        assert_eq!(remote_hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn streams_chunks_without_buffering_whole_response() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    if index == 3 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let chunk = Bytes::from(format!("data: {index}\n\n"));
+                    Some((Ok::<_, Infallible>(chunk), index + 1))
+                });
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+"#,
+            backend.address
+        ));
+        let (proxy, state) = start_proxy(config).await;
+        let started = Instant::now();
+        let response = reqwest::get(format!("http://{}/v1/stream", proxy.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let first_elapsed = started.elapsed();
+        let mut output = first.to_vec();
+        while let Some(chunk) = body.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        assert!(
+            first_elapsed < Duration::from_millis(200),
+            "first chunk was delayed for {first_elapsed:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(220));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "data: 0\n\ndata: 1\n\ndata: 2\n\n"
+        );
+        assert_eq!(state.registry.by_id("local").unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_byte_timeout_is_not_retried() {
+        let local = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Ok::<_, Infallible>(Bytes::from_static(b"late"))
+                });
+                Response::new(Body::from_stream(chunks))
+            }),
+        ))
+        .await;
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let hits = remote_hits.clone();
+        let remote = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "remote"
+                }
+            }),
+        ))
+        .await;
+        let mut config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+priority = 100
+
+[[backends]]
+id = "remote"
+url = "http://{}"
+priority = 50
+"#,
+            local.address, remote.address
+        ));
+        config.timeouts.first_body_byte = Duration::from_millis(50);
+        let (proxy, state) = start_proxy(config).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(remote_hits.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(
+            state.registry.by_id("local").unwrap().snapshot().health,
+            crate::backend::BackendHealth::Cooldown
+        );
+    }
+
+    #[tokio::test]
+    async fn client_cancellation_releases_in_flight_permit() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((
+                        Ok::<_, Infallible>(Bytes::from(format!("{index}\n"))),
+                        index + 1,
+                    ))
+                });
+                Response::new(Body::from_stream(chunks))
+            }),
+        ))
+        .await;
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+"#,
+            backend.address
+        ));
+        let (proxy, state) = start_proxy(config).await;
+        let response = reqwest::get(format!("http://{}/v1/stream", proxy.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let _ = body.next().await.unwrap().unwrap();
+        drop(body);
+        for _ in 0..20 {
+            if state.registry.by_id("local").unwrap().in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.registry.by_id("local").unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn forwards_body_larger_than_replay_limit_without_retry_buffer() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                let body = to_bytes(request.into_body(), 4096).await.unwrap();
+                body.len().to_string()
+            }),
+        ))
+        .await;
+        let mut config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+"#,
+            backend.address
+        ));
+        config.max_replayable_body_bytes = 4;
+        config.request_body_limit_bytes = 4096;
+        let (proxy, _state) = start_proxy(config).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/upload", proxy.address))
+            .body(vec![7_u8; 1024])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "1024");
     }
 }
