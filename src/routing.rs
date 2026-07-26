@@ -1,6 +1,6 @@
 use crate::{
     affinity::{AffinityKey, AffinityStore},
-    backend::{BackendHealth, BackendRegistry, BackendRuntime},
+    backend::{BackendHealth, BackendRegistry, BackendRuntime, RecoveryGuard},
     config::{AffinityBusyPolicy, BackendKind, RoutingConfig},
     error::ProxyError,
 };
@@ -17,6 +17,7 @@ pub enum RoutingReason {
     LeastLoaded,
     OnlyAvailable,
     RetryDifferentBackend,
+    HalfOpenRecovery,
 }
 
 impl RoutingReason {
@@ -30,6 +31,7 @@ impl RoutingReason {
             Self::LeastLoaded => "least_loaded",
             Self::OnlyAvailable => "only_available",
             Self::RetryDifferentBackend => "retry_different_backend",
+            Self::HalfOpenRecovery => "half_open_recovery",
         }
     }
 }
@@ -39,6 +41,7 @@ pub struct Selection {
     pub permit: OwnedSemaphorePermit,
     pub reason: RoutingReason,
     pub affinity_hit: bool,
+    pub _recovery_guard: Option<RecoveryGuard>,
 }
 
 pub struct Router {
@@ -82,6 +85,7 @@ impl Router {
                         permit,
                         reason: RoutingReason::AffinityHit,
                         affinity_hit: true,
+                        _recovery_guard: None,
                     });
                 }
                 if self.config.affinity_busy_policy == AffinityBusyPolicy::Fail {
@@ -95,6 +99,7 @@ impl Router {
                                 permit,
                                 reason: RoutingReason::AffinityHit,
                                 affinity_hit: true,
+                                _recovery_guard: None,
                             });
                         }
                         drop(permit);
@@ -116,7 +121,7 @@ impl Router {
                 if inference {
                     backend.is_available()
                 } else {
-                    backend.is_alive()
+                    backend.is_non_inference_eligible()
                 }
             })
             .cloned()
@@ -148,6 +153,55 @@ impl Router {
                     permit,
                     reason,
                     affinity_hit: false,
+                    _recovery_guard: None,
+                });
+            }
+        }
+        Err(ProxyError::NoBackendAvailable)
+    }
+
+    pub fn select_recovery(
+        &self,
+        key: Option<&AffinityKey>,
+        excluded: &HashSet<String>,
+    ) -> Result<Selection, ProxyError> {
+        if let Some(key) = key
+            && let Some(entry) = self.affinity.lookup(key)
+            && !excluded.contains(&entry.backend_id)
+            && let Some(backend) = self.registry.by_id(&entry.backend_id)
+            && backend.is_probe_candidate()
+            && let Some(recovery_guard) = backend.start_half_open()
+            && let Some(permit) = backend.try_acquire(true)
+        {
+            return Ok(Selection {
+                backend,
+                permit,
+                reason: RoutingReason::HalfOpenRecovery,
+                affinity_hit: true,
+                _recovery_guard: Some(recovery_guard),
+            });
+        }
+
+        let mut candidates = self
+            .registry
+            .all()
+            .iter()
+            .filter(|backend| !excluded.contains(&backend.config.id))
+            .filter(|backend| backend.is_probe_candidate())
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| compare(left, right, key.is_some(), &self.config));
+        for backend in candidates {
+            let Some(recovery_guard) = backend.start_half_open() else {
+                continue;
+            };
+            if let Some(permit) = backend.try_acquire(true) {
+                return Ok(Selection {
+                    backend,
+                    permit,
+                    reason: RoutingReason::HalfOpenRecovery,
+                    affinity_hit: false,
+                    _recovery_guard: Some(recovery_guard),
                 });
             }
         }
@@ -189,7 +243,10 @@ fn compare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{affinity::AffinitySource, backend::BackendRegistry, config::Config};
+    use crate::{
+        affinity::AffinitySource, backend::BackendRegistry, config::Config, error::FailureKind,
+    };
+    use std::time::Duration;
 
     fn components() -> (Arc<BackendRegistry>, Arc<AffinityStore>, RoutingConfig) {
         let config: Config = toml::from_str(
@@ -249,5 +306,51 @@ priority = 50
             .unwrap();
         assert_eq!(selection.backend.config.id, "remote");
         assert!(selection.affinity_hit);
+    }
+
+    #[tokio::test]
+    async fn non_inference_request_can_use_suspect_backend() {
+        let (registry, affinity, config) = components();
+        let local = registry.by_id("local").unwrap();
+        local.record_failure(FailureKind::Heartbeat, 1, Duration::from_secs(300));
+        local.record_heartbeat_success();
+        registry.by_id("remote").unwrap().record_failure(
+            FailureKind::Heartbeat,
+            1,
+            Duration::from_secs(300),
+        );
+        assert_eq!(local.snapshot().health, BackendHealth::Suspect);
+
+        let router = Router::new(registry, affinity, config);
+        let selection = router
+            .select(None, &HashSet::new(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(selection.backend.config.id, "local");
+    }
+
+    #[tokio::test]
+    async fn half_open_recovery_is_single_flight() {
+        let (registry, affinity, config) = components();
+        for backend in registry.all() {
+            backend.record_failure(FailureKind::Heartbeat, 1, Duration::from_secs(300));
+        }
+        let local = registry.by_id("local").unwrap();
+        local.record_heartbeat_success();
+        assert_eq!(local.snapshot().health, BackendHealth::Suspect);
+
+        let router = Router::new(registry, affinity, config);
+        assert!(
+            router
+                .select(None, &HashSet::new(), true, false)
+                .await
+                .is_err()
+        );
+        let recovery = router.select_recovery(None, &HashSet::new()).unwrap();
+        assert_eq!(recovery.backend.config.id, "local");
+        assert!(matches!(recovery.reason, RoutingReason::HalfOpenRecovery));
+        assert!(router.select_recovery(None, &HashSet::new()).is_err());
+        drop(recovery);
+        assert!(router.select_recovery(None, &HashSet::new()).is_ok());
     }
 }

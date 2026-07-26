@@ -75,6 +75,11 @@ spillせず503を返します。長いprefixを別backendで再prefillするこ�
 backend slotはSemaphoreで取得し、response bodyのEOF、エラー、client切断まで保持します。
 `GET /v1/models`、`HEAD`、設定されたheartbeat pathは推論slotを消費しません。
 
+`Suspect` backendでは、`GET /v1/models`などの非推論requestを転送できますが、
+その成功だけでは`Alive`へ昇格しません。`Alive`が1台もない状態で実推論requestが
+到着すると、`Unknown`または`Suspect` backendへsingle-flightのhalf-open requestを
+1件だけ送り、最初の正常なresponse body到着で`Alive`へ復帰させます。
+
 ## Affinity header
 
 正式なheader：
