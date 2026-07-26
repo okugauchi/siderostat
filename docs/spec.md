@@ -1130,7 +1130,7 @@ consecutive_failure_threshold = 2
 [affinity]
 enabled = true
 secret_env = "DS4_SMART_PROXY_AFFINITY_SECRET"
-database_path = "/Users/USER/Library/Application Support/ds4-smart-proxy/affinity.sqlite3"
+database_path = "$HOME/Library/Application Support/ds4-smart-proxy/affinity.sqlite3"
 compute_prefix_affinity = false
 minimum_prefix_bytes = 4096
 maximum_prefix_hash_bytes = 1048576
@@ -1177,6 +1177,9 @@ export DS4_SMART_PROXY_AFFINITY_SECRET='32 bytes以上のランダム値'
 ```
 
 secretが未設定でaffinity persistenceが有効なら起動失敗する。raw IDをplain SHA-256だけで保存しない。
+
+`database_path`の先頭にある `$VARIABLE`、`${VARIABLE}`、`~/` は起動時に展開する。
+参照した環境変数が未定義の場合は、literal名のdirectoryを作成せず起動失敗する。
 
 secretを変更すると既存DBのkey hashを再計算できないため、旧entryは利用不能になる。
 secret rotation時は旧DBを退避して新規DBを開始するか、複数世代secretを扱う明示的な

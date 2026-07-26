@@ -7,7 +7,13 @@ use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, env, sync::RwLock, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    sync::RwLock,
+    time::Duration,
+};
 use tracing::error;
 use unicode_normalization::UnicodeNormalization;
 
@@ -104,16 +110,20 @@ impl AffinityStore {
 
     pub(crate) fn with_secret(config: &AffinityConfig, secret: Vec<u8>) -> anyhow::Result<Self> {
         let (persistence, persisted, persistence_start_failed) = match &config.database_path {
-            Some(path) if config.enabled => match Persistence::open(path) {
-                Ok((persistence, entries)) => (Some(persistence), entries, false),
-                Err(open_error) => {
-                    error!(
-                        error = %open_error,
-                        "affinity persistence is unavailable; routing will continue in memory"
-                    );
-                    (None, Vec::new(), true)
+            Some(path) if config.enabled => {
+                let path = expand_database_path(path)?;
+                match Persistence::open(&path) {
+                    Ok((persistence, entries)) => (Some(persistence), entries, false),
+                    Err(open_error) => {
+                        error!(
+                            path = %path.display(),
+                            error = %open_error,
+                            "affinity persistence is unavailable; routing will continue in memory"
+                        );
+                        (None, Vec::new(), true)
+                    }
                 }
-            },
+            }
             _ => (None, Vec::new(), false),
         };
         let entries = persisted
@@ -489,6 +499,67 @@ fn from_persisted(entry: PersistedAffinity) -> Option<AffinityEntry> {
     })
 }
 
+fn expand_database_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let Some(value) = path.to_str() else {
+        return Ok(path.to_path_buf());
+    };
+    if value == "~" {
+        return environment_path("HOME", "");
+    }
+    if let Some(suffix) = value.strip_prefix("~/") {
+        return environment_path("HOME", suffix);
+    }
+    if let Some(variable) = value.strip_prefix('$') {
+        let (name, suffix) = if let Some(variable) = variable.strip_prefix('{') {
+            let end = variable.find('}').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid environment variable expression in affinity database_path: {value}"
+                )
+            })?;
+            (&variable[..end], &variable[end + 1..])
+        } else {
+            let end = variable
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(variable.len());
+            (&variable[..end], &variable[end..])
+        };
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| { character.is_ascii_alphanumeric() || character == '_' }),
+            "invalid environment variable name in affinity database_path: {value}"
+        );
+        anyhow::ensure!(
+            suffix.is_empty() || suffix.starts_with('/'),
+            "environment variable in affinity database_path must be followed by '/': {value}"
+        );
+        return environment_path(name, suffix.trim_start_matches('/'));
+    }
+    anyhow::ensure!(
+        !value.starts_with('~'),
+        "only '~/' is supported for home expansion in affinity database_path: {value}"
+    );
+    Ok(path.to_path_buf())
+}
+
+fn environment_path(name: &str, suffix: &str) -> anyhow::Result<PathBuf> {
+    let base = env::var_os(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "environment variable {name} referenced by affinity database_path is not set"
+        )
+    })?;
+    anyhow::ensure!(
+        !base.is_empty(),
+        "environment variable {name} referenced by affinity database_path is empty"
+    );
+    let mut path = PathBuf::from(base);
+    if !suffix.is_empty() {
+        path.push(suffix);
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +636,40 @@ mod tests {
         assert_eq!(
             store.extract(&headers, b"{}").unwrap().unwrap().source,
             AffinitySource::Conversation
+        );
+    }
+
+    #[test]
+    fn expands_home_in_database_path() {
+        let home = PathBuf::from(env::var_os("HOME").expect("HOME must be set for tests"));
+        assert_eq!(
+            expand_database_path(Path::new("$HOME/Library/test.sqlite3")).unwrap(),
+            home.join("Library/test.sqlite3")
+        );
+        assert_eq!(
+            expand_database_path(Path::new("${HOME}/Library/test.sqlite3")).unwrap(),
+            home.join("Library/test.sqlite3")
+        );
+        assert_eq!(
+            expand_database_path(Path::new("~/Library/test.sqlite3")).unwrap(),
+            home.join("Library/test.sqlite3")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_environment_variable_in_database_path() {
+        let error = expand_database_path(Path::new(
+            "$DS4_SMART_PROXY_MISSING_TEST_VARIABLE/db.sqlite3",
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("is not set"));
+    }
+
+    #[test]
+    fn leaves_ordinary_relative_database_path_unchanged() {
+        assert_eq!(
+            expand_database_path(Path::new("data/affinity.sqlite3")).unwrap(),
+            PathBuf::from("data/affinity.sqlite3")
         );
     }
 }

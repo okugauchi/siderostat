@@ -35,7 +35,7 @@ consecutive_failure_threshold = 2
 [affinity]
 enabled = true
 secret_env = "DS4_SMART_PROXY_AFFINITY_SECRET"
-database_path = "/Users/USER/Library/Application Support/ds4-smart-proxy/affinity.sqlite3"
+database_path = "$HOME/Library/Application Support/ds4-smart-proxy/affinity.sqlite3"
 compute_prefix_affinity = false
 minimum_prefix_bytes = 4096
 maximum_prefix_hash_bytes = 1048576

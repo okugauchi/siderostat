@@ -45,6 +45,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 完全な例は [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml) を参照してください。
 
+`affinity.database_path`の先頭では、`$HOME`、`${HOME}`、`~/`および
+`$VARIABLE`形式の環境変数を展開します。参照した環境変数が未定義の場合は、
+literal名のdirectoryを作成せず起動エラーになります。
+
 affinityを有効にする場合は32 bytes以上のsecretが必要です。
 
 ```bash
