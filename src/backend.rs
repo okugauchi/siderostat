@@ -61,11 +61,11 @@ struct ProbeState {
     last_started: Option<Instant>,
 }
 
-pub struct ProbeGuard {
+pub struct RecoveryGuard {
     backend: Arc<BackendRuntime>,
 }
 
-impl Drop for ProbeGuard {
+impl Drop for RecoveryGuard {
     fn drop(&mut self) {
         if let Ok(mut state) = self.backend.probe_lock.lock() {
             state.running = false;
@@ -138,6 +138,16 @@ impl BackendRuntime {
         self.state
             .read()
             .is_ok_and(|state| state.health == BackendHealth::Alive)
+    }
+
+    pub fn is_non_inference_eligible(&self) -> bool {
+        self.refresh_cooldown();
+        self.state.read().is_ok_and(|state| {
+            matches!(
+                state.health,
+                BackendHealth::Unknown | BackendHealth::Alive | BackendHealth::Suspect
+            )
+        })
     }
 
     pub fn is_probe_candidate(&self) -> bool {
@@ -225,7 +235,7 @@ impl BackendRuntime {
         previous != state.health
     }
 
-    pub fn start_probe(self: &Arc<Self>, minimum_interval: Duration) -> Option<ProbeGuard> {
+    pub fn start_probe(self: &Arc<Self>, minimum_interval: Duration) -> Option<RecoveryGuard> {
         let mut state = self.probe_lock.lock().ok()?;
         if state.running
             || state
@@ -236,7 +246,18 @@ impl BackendRuntime {
         }
         state.running = true;
         state.last_started = Some(Instant::now());
-        Some(ProbeGuard {
+        Some(RecoveryGuard {
+            backend: self.clone(),
+        })
+    }
+
+    pub fn start_half_open(self: &Arc<Self>) -> Option<RecoveryGuard> {
+        let mut state = self.probe_lock.lock().ok()?;
+        if state.running {
+            return None;
+        }
+        state.running = true;
+        Some(RecoveryGuard {
             backend: self.clone(),
         })
     }

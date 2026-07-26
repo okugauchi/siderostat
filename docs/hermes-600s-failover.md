@@ -19,6 +19,9 @@ backend状態機械は実装済み。
 - retryは再生可能なrequestの接続失敗、またはresponse開始前の502/503/504だけを対象とする。
 - 2回目は必ず異なるbackendを選ぶ。
 - response bodyのEOFまたはdropまでbackend permitを保持する。
+- `Suspect`には非推論requestを転送できるが、それだけで`Alive`には戻さない。
+- `Alive`がない場合、実推論requestをsingle-flightのhalf-open requestとして
+  `Unknown`または`Suspect`へ送り、成功時に`Alive`へ戻す。
 
 既定値：
 

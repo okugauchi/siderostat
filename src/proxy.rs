@@ -241,7 +241,10 @@ async fn handle_streaming_request(
                     }
                 }
             } else {
-                return error.response(&request.request_id);
+                match state.router.select_recovery(affinity.as_ref(), &excluded) {
+                    Ok(selection) => selection,
+                    Err(_) => return error.response(&request.request_id),
+                }
             }
         }
         Err(error) => return error.response(&request.request_id),
@@ -258,6 +261,7 @@ async fn handle_streaming_request(
         &input,
         selection,
         affinity.as_ref(),
+        request.inference,
         request.started,
         request.body,
     )
@@ -310,7 +314,10 @@ async fn execute(
                         .select(affinity, &excluded, inference, false)
                         .await?
                 } else {
-                    return Err(error);
+                    state
+                        .router
+                        .select_recovery(affinity, &excluded)
+                        .map_err(|_| error)?
                 }
             }
             Err(error) => return Err(error),
@@ -358,7 +365,7 @@ async fn execute(
             "backend selected"
         );
 
-        match forward_once(state, input, selection, affinity, started).await {
+        match forward_once(state, input, selection, affinity, inference, started).await {
             Ok(response) => return Ok(response),
             Err(error) => {
                 let retryable = can_retry(&error, attempt, max_attempts);
@@ -389,6 +396,7 @@ async fn forward_once(
     input: &ForwardInput<'_>,
     selection: Selection,
     affinity: Option<&AffinityKey>,
+    inference: bool,
     started: Instant,
 ) -> Result<Response<Body>, ProxyError> {
     let backend = selection.backend.clone();
@@ -467,7 +475,7 @@ async fn forward_once(
     if status.is_server_error() {
         record_failure(state, &backend, FailureKind::Http5xx);
     } else {
-        if status.is_success() || status.is_redirection() {
+        if inference && (status.is_success() || status.is_redirection()) {
             backend.record_success(ttfb);
         }
         if let Some(key) = affinity {
@@ -497,6 +505,7 @@ async fn forward_streaming_body(
     input: &ForwardInput<'_>,
     selection: Selection,
     affinity: Option<&AffinityKey>,
+    inference: bool,
     started: Instant,
     body: Body,
 ) -> Result<Response<Body>, ProxyError> {
@@ -540,7 +549,7 @@ async fn forward_streaming_body(
     if status.is_server_error() {
         record_failure(state, &backend, FailureKind::Http5xx);
     } else {
-        if status.is_success() || status.is_redirection() {
+        if inference && (status.is_success() || status.is_redirection()) {
             backend.record_success(ttfb);
         }
         if let Some(key) = affinity {
@@ -1350,5 +1359,56 @@ local = true
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "1024");
+    }
+
+    #[tokio::test]
+    async fn suspect_backend_recovers_via_half_open_real_request() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async { Json(serde_json::json!({"ok": true})) }),
+        ))
+        .await;
+        let config = test_config(&format!(
+            r#"
+[[backends]]
+id = "local"
+url = "http://{}"
+local = true
+"#,
+            backend.address
+        ));
+        let (proxy, state) = start_proxy(config).await;
+        let runtime = state.registry.by_id("local").unwrap();
+        runtime.record_failure(FailureKind::Heartbeat, 1, Duration::from_secs(300));
+        runtime.record_heartbeat_success();
+        assert_eq!(
+            runtime.snapshot().health,
+            crate::backend::BackendHealth::Suspect
+        );
+
+        let models = reqwest::get(format!("http://{}/v1/models", proxy.address))
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+        assert_eq!(
+            runtime.snapshot().health,
+            crate::backend::BackendHealth::Suspect,
+            "non-inference success must not promote inference health"
+        );
+
+        let completion = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy.address))
+            .json(&serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(completion.status(), StatusCode::OK);
+        assert_eq!(
+            runtime.snapshot().health,
+            crate::backend::BackendHealth::Alive
+        );
     }
 }
