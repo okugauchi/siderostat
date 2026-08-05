@@ -173,7 +173,8 @@ impl PeerLease {
             && self
                 .descriptor
                 .as_ref()
-                .is_some_and(|current| current.node_id == descriptor.node_id);
+                .is_some_and(|current| current.node_id == descriptor.node_id)
+            && !self.expired(now_millis);
         if !same_membership {
             self.first_authenticated_at_millis = Some(now_millis);
         }
@@ -230,6 +231,13 @@ impl PeerLease {
 
     pub fn invalidate_route(&mut self) {
         self.route_scoped = false;
+    }
+
+    fn advance_generation(&mut self, generation: u64) {
+        self.generation = self.generation.map(|_| generation);
+        if let Some(descriptor) = &mut self.descriptor {
+            descriptor.generation = generation;
+        }
     }
 }
 
@@ -350,6 +358,12 @@ impl ControlProcessor {
 
     pub(crate) fn lease_mut(&mut self) -> &mut PeerLease {
         &mut self.lease
+    }
+
+    pub(crate) fn advance_generation(&mut self, generation: u64) {
+        self.local.generation = generation;
+        self.lease.advance_generation(generation);
+        self.processed.clear();
     }
 }
 

@@ -557,7 +557,7 @@ Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster
 
 Evidence: `src/proxy.rs`、`src/app.rs`; peer token raw bytesをlowercase hex bearerへ変換しconstant-time比較、expected worker source IP、hop=`1`を検証。Public入力のtoken/hop/cluster headerを除去し、Worker→Coordinator target時だけ内部token/hopを再生成。Peer ingressはCoordinator role + fixed coordinator address以外のbindを拒否し、認証後もLocalStandalone以外へ転送せず2-hop目を明示的に阻止。同じ`ModeAwareProxyState`のstreaming/body limit/admission/in-flightをpublic/peerで共有。invalid token/source/hop、untrusted header置換、wrong-role/wildcard bind、loop prevention、Worker public→Coordinator peer→local backendの2-hop SSEとpermit解放を含む6 tests、共通local gate（78 tests）、test-support gate（81 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P2-08 Solo/Paired transitionを統合する
+#### [x] P2-08 Solo/Paired transitionを統合する
 
 - Actor: agent
 - Depends on: P2-07
@@ -565,6 +565,8 @@ Evidence: `src/proxy.rs`、`src/app.rs`; peer token raw bytesをlowercase hex be
 - Actions: Required peer stability、worker drain、local placeholder stop hook、fallbackを実装
 - Verification: Cable fixture、Bonjour loss only、lease expiry、peer reconnect test
 - Done when: Fake upstreamでSolo → Paired → Soloが自動収束
+
+Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/control.rs`、`tests/phase2_pairing.rs`; single-writer cluster state、control generation、proxy target、shared admissionを`ModeRuntime`で統合。Worker pairingは既存in-flightをdrain後local placeholder stop、Coordinator targetへ切替。Route/lease喪失はfuture admissionを先にblockし、local start完了後Soloへ復帰。Required stability前はSolo維持、Bonjour result消失だけでは有効lease中のPairedを維持、lease expiry、route loss、reconnect時のstability再計測、Unknown role非pairingを実装。Runtime 2 testsに加え、実listener/fake upstreamで応答先`worker-solo` → `coordinator-local` → `worker-solo`を確認するintegration test成功。共通local gate（81 tests）、test-support gate（84 tests）、check/clippy成功。Integration gate初回は未使用importを`clippy -D warnings`が検出して停止し、除去後に同一gate成功; 2026-08-06
 
 ### Phase 3: DS4 standalone supervisor
 

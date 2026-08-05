@@ -71,6 +71,10 @@ impl WorkerControl {
     pub fn invalidate_route(&mut self) {
         self.processor.lease_mut().invalidate_route();
     }
+
+    pub fn advance_generation(&mut self, generation: u64) {
+        self.processor.advance_generation(generation);
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ mod network_events;
 mod network_snapshot;
 mod platform;
 mod role;
+mod runtime;
 mod state;
 mod worker;
 
@@ -38,6 +39,7 @@ pub use platform::{
     macos::MacOsDynamicStoreWatcher,
 };
 pub use role::{RoleAssessment, assess_role};
+pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};
 pub use state::{
     ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, TransitionError,
     spawn_state_machine,
