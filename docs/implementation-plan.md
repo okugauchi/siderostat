@@ -320,11 +320,11 @@ Evidence: `docs/compatibility/ds4-b7e9f00.md`、`tests/fixtures/ds4/`; 69-byte s
 
 Blocked: `spikes/macos-network/results-2026-08-06.md`; public API spike build、read-only snapshot、Dynamic Store購読開始、bridge0限定Bonjour register/browseは成功。物理Cable操作を行っていないためattach/detach時のevent順序・重複・delayが未実測。`network-probe watch 30`実行中に対象Cableをdetach/attachしsanitized結果を採取後に再開; 2026-08-06
 
-#### [ ] P0-05 Fake DS4 test serverを作る
+#### [x] P0-05 Fake DS4 test serverを作る
 
 - Actor: agent
 - Depends on: P0-02
-- Files: `Cargo.toml`、`src/bin/fake-ds4.rs`、`tests/support/`、`tests/fixtures/ds4/`
+- Files: `Cargo.toml`、`src/bin/fake-ds4.rs`、`tests/support/`、`tests/fake_ds4.rs`、`tests/fixtures/ds4/`
 - Actions:
   1. `test-support` featureでだけbuildされる`fake-ds4` binary targetを追加する。Release default buildへ含めない。
   2. `/v1/models` readinessを返す。
@@ -334,6 +334,8 @@ Blocked: `spikes/macos-network/results-2026-08-06.md`; public API spike build、
   6. Prompt/bodyをlogしない。
 - Verification: `cargo test --all-targets --features test-support`。Cancellation後にprocess/listenerが残らない
 - Done when: P1以降が実DS4なしで再現可能
+
+Evidence: `src/bin/fake-ds4.rs`、`tests/fake_ds4.rs`; `cargo check --all-targets --all-features`、共通local gate、`cargo test --all-targets --features test-support`（34 tests成功、SIGTERM後process/listener不在）; 2026-08-06
 
 #### [ ] P0-06 Phase 0 gateを閉じる
 

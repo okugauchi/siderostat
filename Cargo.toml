@@ -3,6 +3,15 @@ name = "ds4-smart-proxy"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test-support = []
+
+[[bin]]
+name = "fake-ds4"
+path = "src/bin/fake-ds4.rs"
+required-features = ["test-support"]
+
 [dependencies]
 anyhow = "1.0.103"
 axum = "0.8.9"
