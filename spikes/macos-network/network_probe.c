@@ -15,6 +15,7 @@
 
 static const char *const kBridgeName = "bridge0";
 static const char *const kServiceType = "_ds4cluster._tcp";
+static CFAbsoluteTime watch_started_at = 0;
 
 static unsigned prefix_bits(const struct sockaddr_in *mask) {
     uint32_t bits = ntohl(mask->sin_addr.s_addr);
@@ -113,9 +114,37 @@ static int snapshot(void) {
 }
 
 static void store_changed(SCDynamicStoreRef store, CFArrayRef changed_keys, void *context) {
-    (void)store;
     (void)context;
-    printf("dynamic_store_event key_count=%ld\n", (long)CFArrayGetCount(changed_keys));
+    CFIndex bridge_state_count = 0;
+    CFIndex service_setup_count = 0;
+    CFIndex other_count = 0;
+    const CFIndex count = CFArrayGetCount(changed_keys);
+    for (CFIndex index = 0; index < count; ++index) {
+        CFStringRef key = (CFStringRef)CFArrayGetValueAtIndex(changed_keys, index);
+        if (CFStringHasPrefix(key, CFSTR("State:/Network/Interface/bridge0/"))) {
+            ++bridge_state_count;
+        } else if (CFStringHasPrefix(key, CFSTR("Setup:/Network/Service/"))) {
+            ++service_setup_count;
+        } else {
+            ++other_count;
+        }
+    }
+    CFPropertyListRef link = SCDynamicStoreCopyValue(
+        store, CFSTR("State:/Network/Interface/bridge0/Link"));
+    CFPropertyListRef ipv4 = SCDynamicStoreCopyValue(
+        store, CFSTR("State:/Network/Interface/bridge0/IPv4"));
+    const double elapsed = CFAbsoluteTimeGetCurrent() - watch_started_at;
+    printf("dynamic_store_event elapsed_ms=%.0f key_count=%ld bridge_state=%ld "
+           "service_setup=%ld other=%ld link=%s ipv4=%s\n",
+           elapsed * 1000.0, (long)count, (long)bridge_state_count,
+           (long)service_setup_count, (long)other_count,
+           link == NULL ? "absent" : "present", ipv4 == NULL ? "absent" : "present");
+    if (link != NULL) {
+        CFRelease(link);
+    }
+    if (ipv4 != NULL) {
+        CFRelease(ipv4);
+    }
     fflush(stdout);
 }
 
@@ -152,6 +181,9 @@ static int watch(unsigned seconds) {
         return EXIT_FAILURE;
     }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+    watch_started_at = CFAbsoluteTimeGetCurrent();
+    printf("watch_ready duration_seconds=%u\n", seconds);
+    fflush(stdout);
     (void)CFRunLoopRunInMode(kCFRunLoopDefaultMode, (CFTimeInterval)seconds, false);
     CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
     CFRunLoopSourceInvalidate(source);
