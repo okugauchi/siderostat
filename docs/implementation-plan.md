@@ -534,7 +534,7 @@ Evidence: `src/cluster/bonjour.rs`、`src/cluster/discovery.rs`、`src/cluster/p
 
 Evidence: `src/cluster/auth.rs`、`src/cluster/control.rs`; METHOD/path+query/timestamp/nonce/lowercase SHA-256 body digestのcanonical HMAC-SHA256、constant-time `verify_slice`、32-byte以上secret、30秒clock skew、node ID/expected source IP検証、署名成功後のatomic nonce消費と5分TTL、64KiB逐次body accumulator、全control endpoint/header定義を実装。SecretはDrop時消去し、secret/signature/nonceを`Debug`でredact。既知signature vector、replay/TTL、clock skew、全signed field mutation、wrong source/node、body limit、redactionを含む8 tests、共通local gate（65 tests）、test-support gate（68 tests）、check/clippy成功。初回dependency取得はsandbox DNS制限で失敗し、承認済み`cargo fetch`で`hmac 0.12.1`/`sha2 0.10.9`取得成功; 2026-08-06
 
-#### [ ] P2-06 Peer leaseとcontrol endpointを実装する
+#### [x] P2-06 Peer leaseとcontrol endpointを実装する
 
 - Actor: agent
 - Depends on: P2-05
@@ -542,6 +542,8 @@ Evidence: `src/cluster/auth.rs`、`src/cluster/control.rs`; METHOD/path+query/ti
 - Actions: Pair、descriptor、lease renew/expiry、idempotency、generationを実装
 - Verification: Lease中断、old generation、duplicate message test
 - Done when: HMAC + route + stable leaseだけがpeer presentを作る
+
+Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`; serde deny-unknown descriptor/message/response、全control commandとrole別許可、HMAC verifierだけが生成できる`AuthenticatedPeer` capability、protocol/node/role/scoped route検証、Pair、5秒descriptor poll renew対応の15秒lease、required stability、route invalidation/expiry、generation 409、deployment 412、request ID idempotency/conflictを実装。Peer presentは認証済みdescriptor + scoped route + stability経過 + 未失効leaseの積だけ。lease interruption/route loss、old generation、duplicate renew、changed duplicate、deployment mismatch、role方向を含む7 tests、共通local gate（72 tests）、test-support gate（75 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P2-07 Peer ingressを実装する
 

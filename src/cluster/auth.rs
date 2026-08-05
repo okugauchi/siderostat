@@ -90,9 +90,36 @@ impl fmt::Debug for SignedControlHeaders {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPeer {
-    pub node_id: String,
-    pub source_ip: IpAddr,
-    pub timestamp_millis: u64,
+    node_id: String,
+    source_ip: IpAddr,
+    timestamp_millis: u64,
+}
+
+impl AuthenticatedPeer {
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn source_ip(&self) -> IpAddr {
+        self.source_ip
+    }
+
+    pub fn timestamp_millis(&self) -> u64 {
+        self.timestamp_millis
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        node_id: impl Into<String>,
+        source_ip: IpAddr,
+        timestamp_millis: u64,
+    ) -> Self {
+        Self {
+            node_id: node_id.into(),
+            source_ip,
+            timestamp_millis,
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]

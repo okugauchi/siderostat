@@ -1,21 +1,25 @@
 mod auth;
 mod bonjour;
 mod control;
+mod coordinator;
 mod discovery;
 mod network_events;
 mod network_snapshot;
 mod platform;
 mod role;
 mod state;
+mod worker;
 
 pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };
 pub use bonjour::{BonjourFailure, BonjourLifecycle, BonjourRegistration};
 pub use control::{
-    BoundedControlBody, ControlEndpoint, ControlRequest, HEADER_NODE, HEADER_NONCE,
-    HEADER_SIGNATURE, HEADER_TIMESTAMP,
+    BoundedControlBody, ControlCommand, ControlEndpoint, ControlError, ControlMessage, ControlMode,
+    ControlRequest, ControlResponse, ControlResponseStatus, ControlRole, HEADER_NODE, HEADER_NONCE,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, NodeDescriptor, PeerLease,
 };
+pub use coordinator::CoordinatorControl;
 pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,
@@ -38,3 +42,4 @@ pub use state::{
     ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, TransitionError,
     spawn_state_machine,
 };
+pub use worker::WorkerControl;
