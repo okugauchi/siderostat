@@ -393,7 +393,7 @@ Evidence: `src/config.rs`; schema/path/port/DNS-SD/duration/file/model/residency
 
 Evidence: `src/target.rs`; stable table全6 row、全transition state、mode/state不整合、unknown role readiness test、共通local gate（54 tests）、test-support gate（56 tests）成功; 2026-08-06
 
-#### [ ] P1-04 Admission gateを実装する
+#### [x] P1-04 Admission gateを実装する
 
 - Actor: agent
 - Depends on: P1-03
@@ -406,6 +406,8 @@ Evidence: `src/target.rs`; stable table全6 row、全transition state、mode/sta
   4. Generation違いのackを拒否するhookを用意する。
 - Verification: Race/cancellation/timeout unit test
 - Done when: Cancellation storm後にin-flight=0
+
+Evidence: `src/admission.rs`; serving/readiness/capacity、drain race、timeout、generation ack、128-task cancellation storm test、共通local gate（59 tests）、test-support gate（61 tests）成功; 2026-08-06
 
 #### [ ] P1-05 Proxyを単一target forwardingへ変更する
 

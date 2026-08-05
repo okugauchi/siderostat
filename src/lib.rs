@@ -1,3 +1,4 @@
+pub mod admission;
 mod affinity;
 pub mod app;
 mod backend;
