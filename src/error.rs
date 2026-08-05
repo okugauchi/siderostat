@@ -6,45 +6,12 @@ use serde::Serialize;
 use std::error::Error;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FailureKind {
-    Connect,
-    Tls,
-    Heartbeat,
-    ResponseHeaderTimeout,
-    FirstByteTimeout,
-    StreamIdleTimeout,
-    Http5xx,
-    Protocol,
-    ClientCancelled,
-}
-
-impl FailureKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Tls => "tls",
-            Self::Heartbeat => "heartbeat",
-            Self::ResponseHeaderTimeout => "response_header_timeout",
-            Self::FirstByteTimeout => "first_body_byte_timeout",
-            Self::StreamIdleTimeout => "stream_idle_timeout",
-            Self::Http5xx => "http_5xx",
-            Self::Protocol => "protocol",
-            Self::ClientCancelled => "client_cancelled",
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("No DS4 backend is currently available")]
     NoBackendAvailable,
-    #[error("invalid affinity header")]
-    InvalidAffinity,
     #[error("request body is too large")]
     BodyTooLarge,
-    #[error("failed to read request body")]
-    InvalidBody,
     #[error("upstream connection failed")]
     Connect,
     #[error("upstream DS4 backend timed out before returning response headers")]
@@ -53,8 +20,6 @@ pub enum ProxyError {
     FirstByteTimeout,
     #[error("upstream protocol error")]
     Protocol,
-    #[error("upstream returned a retryable gateway status")]
-    RetryableUpstreamStatus,
     #[error("internal state error")]
     Internal,
 }
@@ -76,12 +41,9 @@ struct ErrorBody<'a> {
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::InvalidAffinity | Self::InvalidBody => StatusCode::BAD_REQUEST,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NoBackendAvailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Connect | Self::Protocol | Self::RetryableUpstreamStatus => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::Connect | Self::Protocol => StatusCode::BAD_GATEWAY,
             Self::ResponseHeaderTimeout | Self::FirstByteTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -90,14 +52,11 @@ impl ProxyError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::NoBackendAvailable => "no_backend_available",
-            Self::InvalidAffinity => "invalid_affinity_header",
             Self::BodyTooLarge => "request_body_too_large",
-            Self::InvalidBody => "invalid_request_body",
             Self::Connect => "upstream_connect_failed",
             Self::ResponseHeaderTimeout => "response_header_timeout",
             Self::FirstByteTimeout => "first_body_byte_timeout",
             Self::Protocol => "upstream_protocol_error",
-            Self::RetryableUpstreamStatus => "upstream_gateway_status",
             Self::Internal => "internal_state_error",
         }
     }

@@ -441,7 +441,7 @@ Evidence: `src/proxy.rs`、`src/lib.rs`; `ProxyTarget`固定解決、request/res
 
 Evidence: `src/app.rs`、`src/main.rs`、`src/metrics.rs`、`src/proxy.rs`; schema v2 runtime configから単一target state/client/admissionを構築し、cluster無効時のSolo Standalone、仕様listener、mode-aware public path、`/healthz`・`/readyz`・`/cluster`・`/metrics`を接続。Legacy `/backends`・`/affinity`は新routerから除外。Admin status/body 2 tests、共通local gate（70 tests）、test-support gate（72 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P1-07 Legacy routing codeを除去する
+#### [x] P1-07 Legacy routing codeを除去する
 
 - Actor: agent
 - Depends on: P1-06
@@ -454,6 +454,8 @@ Evidence: `src/app.rs`、`src/main.rs`、`src/metrics.rs`、`src/proxy.rs`; sche
 - Verification: 共通local gate、`cargo tree`で不要dependency不在
 - Done when: Load balancing/affinity symbolがproduction sourceにない
 - Stop when: Streaming helperがlegacy moduleに残る。先に移動してtestする
+
+Evidence: `src/proxy.rs`へstreaming/header helperを保持したまま、`src/routing.rs`、`src/backend.rs`、`src/affinity.rs`、`src/heartbeat.rs`、`src/persistence.rs`と旧proxy path/schema/testsを削除。runtime型参照0件、旧SQLite実ファイルへの操作なし。`rusqlite`、`unicode-normalization`、`hmac`、`sha2`は`Cargo.toml`/lock/`cargo tree`から不在。共通local gate（40 tests）、test-support gate（42 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P1-08 Phase 1 integrationを固定する
 
