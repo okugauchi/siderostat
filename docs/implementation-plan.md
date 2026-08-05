@@ -482,7 +482,7 @@ Evidence: `ds4-smart-proxy.example.toml`、`tests/phase1_smoke.rs`; repository e
 
 Evidence: `src/cluster/mod.rs`、`src/cluster/state.rs`; bounded command channel、single-writer loop、watch snapshot、generation照合、型付きevent/transition errorを実装。Old generation、invalid transition、16 concurrent same-generation eventsの直列化3 tests、共通local gate（44 tests）、test-support gate（47 tests）、check/clippy成功。Child/network操作なし; 2026-08-06
 
-#### [ ] P2-02 Network snapshotとrole判定を実装する
+#### [x] P2-02 Network snapshotとrole判定を実装する
 
 - Actor: agent
 - Depends on: P2-01
@@ -491,6 +491,8 @@ Evidence: `src/cluster/mod.rs`、`src/cluster/state.rs`; bounded command channel
 - Actions: Service enabled、interface UP、IPv4/prefix、route scope、roleを型付きsnapshotへ変換
 - Verification: Fixtureで全`ThunderboltIpState`、address conflict、unknown role
 - Done when: Shell command parseなしでsnapshot生成
+
+Evidence: `src/cluster/network_snapshot.rs`、`src/cluster/role.rs`; System Configuration/getifaddrs bindingから渡せる型付きobservationを8種の`ThunderboltIpState`、固定address role、expected peer/route/auth状態へ変換。全state、unknown/prefix/multiple-address conflict、wrong route fixture 4 tests、共通local gate（48 tests）、test-support gate（51 tests）、check/clippy成功。Shell command parseなし; 2026-08-06
 
 #### [ ] P2-03 Dynamic Store event monitorを実装する
 
