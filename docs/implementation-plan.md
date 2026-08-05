@@ -678,7 +678,7 @@ Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest�
 
 Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`; Pair/PrepareWorker/BeginDrain/Drained/CancelGeneration/typed WorkerEvent/Demoteの全mutationを共通processorでendpoint、request ID、generation、deployment、lease、roleごとに検証。Coordinator/WorkerにUnpaired→Paired→WorkerPreparing→WorkerReady→Draining→Drained phaseを実装し、順序違反はidempotency履歴へ記録する前に409拒否。同一generation/request/payloadのみduplicate renew、内容変更・old generation/ackを409、deployment mismatchを412。Outbound prepare/drain/ready/drained messageもcurrent generation/deploymentから生成。Duplicate、reorder後の正規適用、cancelによるdrop収束、changed duplicate、old ackの2追加tests、共通local gate（105 tests）、test-support gate（109 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P4-03 DS4 HELLO parserを実装する
+#### [x] P4-03 DS4 HELLO parserを実装する
 
 - Actor: agent
 - Depends on: P4-02
@@ -687,6 +687,8 @@ Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster
 - Actions: Network byte order、40-byte fixed payload、name length、deadline、trailing dataを検証
 - Verification: Valid fixture、magic/type/size/truncate/fuzz test
 - Done when: Arbitrary bytesでpanicしない
+
+Evidence: `src/cluster/ds4_hello.rs`、`tests/fixtures/ds4/hello40-schema-v1.hex`; network byte orderの12-byte header、40-byte fixed payload、`bytes == 40 + model_name_len`、name 1..127、bool field、layer/context/count/port、UTF-8、exact frame/no trailingを検証するpure parserを実装。Async readerは設定deadline内にheader/payloadをexact readし、immediate trailing byteも拒否。`quant_bits`は診断値として保持するだけでMXFP4 identityに不使用。Known synthetic fixture、magic/kind/size/name/truncate/trailing、EOF/deadline、0..511 bytes deterministic fuzzの4 tests、共通local gate（109 tests）、test-support gate（113 tests）、check/clippy成功。初回clippyのmanual range指摘をinclusive rangeへ修正; 2026-08-06
 
 #### [ ] P4-04 Rendezvous listenerを実装する
 
