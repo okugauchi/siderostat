@@ -378,7 +378,7 @@ Evidence: `src/config.rs`; schema v2 complete example parse、unknown nested fie
 
 Evidence: `src/config.rs`; schema/path/port/DNS-SD/duration/file/model/residency/KV/layer/secret/extra-arg validation 22 tests、temporary regular files使用、共通local gate（50 tests）、test-support gate（52 tests）成功; 2026-08-06
 
-#### [ ] P1-03 Target resolverを実装する
+#### [x] P1-03 Target resolverを実装する
 
 - Actor: agent
 - Depends on: P1-02
@@ -390,6 +390,8 @@ Evidence: `src/config.rs`; schema/path/port/DNS-SD/duration/file/model/residency
   3. Request内容、latency、sessionをinputに含めない。
 - Verification: Table全rowとunknown roleのunit test
 - Done when: 1 stateから複数targetを返すpathがない
+
+Evidence: `src/target.rs`; stable table全6 row、全transition state、mode/state不整合、unknown role readiness test、共通local gate（54 tests）、test-support gate（56 tests）成功; 2026-08-06
 
 #### [ ] P1-04 Admission gateを実装する
 

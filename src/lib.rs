@@ -8,3 +8,4 @@ mod metrics;
 mod persistence;
 mod proxy;
 mod routing;
+pub mod target;
