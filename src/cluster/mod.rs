@@ -3,6 +3,7 @@ mod bonjour;
 mod control;
 mod coordinator;
 mod discovery;
+mod ds4_command;
 mod network_events;
 mod network_snapshot;
 mod platform;
@@ -25,6 +26,7 @@ pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,
 };
+pub use ds4_command::{Ds4Command, Ds4CommandError, Ds4Profile, build_standalone_command};
 pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,
     SpawnNetworkMonitorError, spawn_network_event_monitor,

@@ -570,7 +570,7 @@ Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/contr
 
 ### Phase 3: DS4 standalone supervisor
 
-#### [ ] P3-01 DS4 command builderを実装する
+#### [x] P3-01 DS4 command builderを実装する
 
 - Actor: agent
 - Depends on: P2-08
@@ -579,6 +579,8 @@ Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/contr
 - Actions: Q2/Q2-Q4/MXFP4、resident/ssd-streaming、KV、context、typed SSD optionをargvへ生成
 - Verification: Matrix snapshot test、forbidden duplicate arg test
 - Done when: Shellを介さず完全argvを生成
+
+Evidence: `src/cluster/ds4_command.rs`、`src/config.rs`; target upstream commit `b7e9f00`の`ds4_server.c`/`ds4_distributed.c` option parserを一次ソース確認し、executable/current directoryと各argumentを個別`OsString`としてTokio `Command`へ渡すshell-free builderを実装。`-m`、host/port、context、standalone KV namespace/space、Q2/Q2-Q4/MXFP4 × resident/ssd-streaming独立profile、cache experts/full layers/preload/coldを型付き生成。Preload 0はupstreamが拒否するためdisabledとして省略。Generated optionの`extra_args` overrideとresident SSD tuningをbuilderでもfail closed。Matrix/SSD/duplicate 3 tests、共通local gate（84 tests）、test-support gate（87 tests）、check/clippy成功。実binary `--help`/actual profile可否はP3-07 gateまで未確認のまま維持; 2026-08-06
 
 #### [ ] P3-02 Process ownershipとidentity検証を実装する
 

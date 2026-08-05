@@ -654,7 +654,7 @@ fn validate_secret_files(config: &ClusterSecurityConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_extra_args(name: &str, arguments: &[String]) -> anyhow::Result<()> {
+pub(crate) fn validate_extra_args(name: &str, arguments: &[String]) -> anyhow::Result<()> {
     const FORBIDDEN: &[&str] = &[
         "-m",
         "--model",
