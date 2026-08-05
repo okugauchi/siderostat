@@ -9,6 +9,7 @@ mod network_events;
 mod network_snapshot;
 mod platform;
 mod process;
+mod restart;
 mod role;
 mod runtime;
 mod state;
@@ -48,10 +49,15 @@ pub use platform::{
     macos::MacOsDynamicStoreWatcher,
     process::{MacOsProcessInspector, MacOsProcessSignaler},
 };
+pub use process::platform_process_controller;
 pub use process::{
     ChildIdentity, ManagedChild, ObservedProcess, ProcessControlError, ProcessController,
     ProcessInspector, ProcessSignal, ProcessSignaler, StandaloneSupervisor, VerifiedProcess,
     argv_sha256, wait_for_http_readiness,
+};
+pub use restart::{
+    RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
+    required_port_available,
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};

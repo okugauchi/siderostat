@@ -14,8 +14,12 @@ pub struct ClusterSnapshot {
 
 impl ClusterSnapshot {
     pub fn booting(role: LocalRole) -> Self {
+        Self::booting_at(role, 0)
+    }
+
+    pub fn booting_at(role: LocalRole, generation: u64) -> Self {
         Self::new(
-            0,
+            generation,
             role,
             StableMode::SoloStandalone,
             ClusterState::Booting,

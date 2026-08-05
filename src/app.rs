@@ -1,9 +1,10 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
-        ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,
-        PersistentMode, PersistentProxyTarget, StandaloneSupervisor, StateStore,
-        build_standalone_command,
+        ClusterHandle, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild,
+        PersistentClusterState, PersistentMode, PersistentProxyTarget, RestartDecision,
+        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
+        platform_process_controller, reconcile_restart, required_port_available,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::Metrics,
@@ -21,7 +22,10 @@ use axum::{
     routing::{any, get},
 };
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+};
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -40,6 +44,7 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
+    cluster: RwLock<Option<ClusterHandle>>,
 }
 
 impl AppState {
@@ -91,12 +96,45 @@ impl AppState {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
+            cluster: RwLock::new(None),
         }))
+    }
+
+    fn attach_cluster(&self, cluster: ClusterHandle) {
+        *self
+            .cluster
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cluster);
+    }
+
+    fn cluster_snapshot(&self) -> Option<crate::cluster::ClusterSnapshot> {
+        self.cluster
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(ClusterHandle::snapshot)
     }
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
+    let persisted = match state_store.load() {
+        Ok(state) => state,
+        Err(StateStoreError::CorruptPreserved { path, reason }) => {
+            tracing::warn!(preserved = %path.display(), reason, "corrupt cluster state preserved");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
+    let restart = reconcile_restart(
+        persisted.as_ref(),
+        &platform_process_controller(),
+        config.cluster.timeouts.stop,
+        config.ds4.allow_sigkill,
+        || required_port_available(local_address),
+    )
+    .await?;
     let state = AppState::from_config(config.clone())?;
     state.proxy.admission().block();
     state.proxy.set_target(
@@ -118,15 +156,35 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         config.cluster.timeouts.stop,
         config.ds4.allow_sigkill,
     ));
-    let runtime = Arc::new(
-        ModeRuntime::spawn_ready(
-            LocalRole::Unknown,
-            state.proxy.clone(),
-            supervisor.clone(),
-            config.cluster.timeouts.drain,
-        )
-        .await?,
-    );
+    let runtime = Arc::new(match restart {
+        RestartDecision::StartSolo {
+            baseline_generation,
+        } => {
+            ModeRuntime::spawn_ready_at(
+                LocalRole::Unknown,
+                state.proxy.clone(),
+                supervisor.clone(),
+                config.cluster.timeouts.drain,
+                baseline_generation,
+            )
+            .await?
+        }
+        RestartDecision::ManualIntervention {
+            baseline_generation,
+            reason,
+        } => {
+            tracing::error!(?reason, "restart reconcile requires manual intervention");
+            ModeRuntime::spawn_manual_at(
+                LocalRole::Unknown,
+                state.proxy.clone(),
+                supervisor.clone(),
+                config.cluster.timeouts.drain,
+                baseline_generation,
+            )
+            .await?
+        }
+    });
+    state.attach_cluster(runtime.cluster_handle());
     persist_runtime_state(
         &state_store,
         &runtime,
@@ -233,6 +291,22 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
     }
 }
 
+fn stable_mode_name(mode: StableMode) -> &'static str {
+    match mode {
+        StableMode::SoloStandalone => "solo-standalone",
+        StableMode::PairedStandalone => "paired-standalone",
+        StableMode::DistributedMxfp4 => "distributed-mxfp4",
+    }
+}
+
+fn role_name(role: LocalRole) -> &'static str {
+    match role {
+        LocalRole::Coordinator => "coordinator",
+        LocalRole::Worker => "worker",
+        LocalRole::Unknown => "unknown",
+    }
+}
+
 fn cluster_state_name(state: ClusterState) -> &'static str {
     match state {
         ClusterState::Booting => "booting",
@@ -333,12 +407,13 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let target = state.proxy.target_snapshot();
     let admission = state.proxy.admission().snapshot();
     let solo = !state.config.cluster_enabled;
+    let snapshot = state.cluster_snapshot();
     Json(json!({
         "node_id": state.config.node_id,
-        "role": "unknown",
-        "mode": if solo { "solo-standalone" } else { "unknown" },
-        "state": if solo { "solo-standalone-ready" } else { "booting" },
-        "generation": 0,
+        "role": snapshot.map_or("unknown", |snapshot| role_name(snapshot.role)),
+        "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| stable_mode_name(snapshot.stable_mode)),
+        "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| cluster_state_name(snapshot.state)),
+        "generation": snapshot.map_or(0, |snapshot| snapshot.generation),
         "target": target_name(target.target),
         "target_ready": target.ready,
         "admission": admission_json(admission),
@@ -463,6 +538,7 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
+            cluster: RwLock::new(None),
         })
     }
 
@@ -512,6 +588,28 @@ mod tests {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["status"], "not_ready");
         assert_eq!(body["admission"], "blocked");
+    }
+
+    #[tokio::test]
+    async fn cluster_endpoint_reports_manual_restart_state() {
+        let state = test_state(false);
+        let (handle, task) = crate::cluster::spawn_state_machine(
+            crate::cluster::ClusterSnapshot::booting_at(LocalRole::Unknown, 12),
+            2,
+        );
+        handle
+            .apply(crate::cluster::ClusterEvent {
+                expected_generation: 12,
+                kind: crate::cluster::ClusterEventKind::RequireManualIntervention,
+            })
+            .await
+            .unwrap();
+        state.attach_cluster(handle);
+        let (_, body) = get(state, "/cluster").await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["state"], "manual-intervention-required");
+        assert_eq!(body["generation"], 13);
+        task.abort();
     }
 
     #[test]

@@ -629,7 +629,7 @@ Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/proce
 
 Evidence: `src/cluster/state_store.rs`、`src/app.rs`; schema v1のcluster lifecycle、typed mode/target/failure code、owned child PID/canonical executable/argv SHA-256/spawn/start timeだけをJSON化し、secret/tokenを表現可能なfieldを排除。0600 temp fileへwrite、file `fsync`、same-directory atomic rename、directory `fsync`、non-blocking exclusive `flock`によるsingle-instance lock、loaded/saved generationより古いwrite拒否を実装。Invalid JSON/schema/fieldはUUID付きcorrupt siblingへatomic保全する。App Boot完了とlocal crash recovery後にruntime snapshotを保存。Partial temp、corrupt preservation、old generation、lock contention/reacquire、secret/token absenceの3 tests、共通local gate（97 tests）、test-support gate（101 tests）、check/clippy成功。初回clippyで検出したlock file truncate方針を`.truncate(false)`として明示; 2026-08-06
 
-#### [ ] P3-06 Restart reconcileを実装する
+#### [x] P3-06 Restart reconcileを実装する
 
 - Actor: agent
 - Depends on: P3-05
@@ -637,6 +637,8 @@ Evidence: `src/cluster/state_store.rs`、`src/app.rs`; schema v1のcluster lifec
 - Actions: Owned child reattach/stop、port conflict manual state、desired/observed convergenceを実装
 - Verification: Proxy restart with matching/mismatching child fixture
 - Done when: Unknown port ownerをkillせずmanual stateへ入る
+
+Evidence: `src/cluster/restart.rs`、`src/cluster/process.rs`、`src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/app.rs`; 起動前に保存stateを読込み、PID/canonical executable/length-framed argv SHA-256/process start timeが完全一致するrecovered childだけを毎signal前再検証してSIGTERM、消滅確認後に新managed Solo childへ収束。保存generationをwall clockに戻さずstate machine baselineとして継承する。Mismatch/stop failure/unknown port owner/address unavailableはsignalせず`ManualInterventionRequired`、public admission Blocked、`/cluster`へmanual state/generationを公開。Corrupt stateは保全後、port free時だけ安全なSolo startへ進む。Matching child stop、mismatching child no-signal、unknown port owner no-signal/manual、admin manual stateの3 tests、共通local gate（100 tests）、test-support gate（104 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P3-07 Standalone actual acceptanceを実行する
 

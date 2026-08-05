@@ -141,6 +141,82 @@ impl ProcessController {
             .signal_process_group(verified.identity.pid, signal)?;
         Ok(())
     }
+
+    pub async fn stop_recovered_owned(
+        &self,
+        identity: &ChildIdentity,
+        timeout: Duration,
+        poll_interval: Duration,
+        allow_sigkill: bool,
+    ) -> Result<(), ProcessControlError> {
+        if timeout.is_zero() || poll_interval.is_zero() {
+            return Err(ProcessControlError::InvalidReadinessTiming);
+        }
+        match self.signal_owned(identity, ProcessSignal::Terminate) {
+            Ok(()) => {}
+            Err(ProcessControlError::NotRunning) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < deadline => continue,
+                Ok(_) if !allow_sigkill => return Err(ProcessControlError::SigkillNotAllowed),
+                Ok(_) => break,
+            }
+        }
+        self.signal_owned(identity, ProcessSignal::Kill)?;
+        let kill_deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(kill_deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < kill_deadline => {}
+                Ok(_) => return Err(ProcessControlError::StopTimeout),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn platform_process_controller() -> ProcessController {
+    use crate::cluster::{MacOsProcessInspector, MacOsProcessSignaler};
+    ProcessController::new(
+        Arc::new(MacOsProcessInspector),
+        Arc::new(MacOsProcessSignaler),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn platform_process_controller() -> ProcessController {
+    struct Unsupported;
+    impl ProcessInspector for Unsupported {
+        fn observe(&self, _pid: u32) -> io::Result<Option<ObservedProcess>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process identity inspection requires macOS",
+            ))
+        }
+    }
+    impl ProcessSignaler for Unsupported {
+        fn signal_process_group(&self, _pid: u32, _signal: ProcessSignal) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process group signaling requires macOS",
+            ))
+        }
+    }
+    ProcessController::new(Arc::new(Unsupported), Arc::new(Unsupported))
 }
 
 pub struct ManagedChild {
@@ -299,7 +375,6 @@ impl LocalStandaloneLifecycle for StandaloneSupervisor {
 impl ManagedChild {
     #[cfg(target_os = "macos")]
     pub async fn spawn(command: &Ds4Command, generation: u64) -> Result<Self, ProcessControlError> {
-        use crate::cluster::{MacOsProcessInspector, MacOsProcessSignaler};
         use std::process::Stdio;
 
         let executable = tokio::fs::canonicalize(&command.executable).await?;
@@ -321,10 +396,7 @@ impl ManagedChild {
             reap_failed_spawn(&mut child).await;
             return Err(ProcessControlError::MissingPid);
         };
-        let controller = ProcessController::new(
-            Arc::new(MacOsProcessInspector),
-            Arc::new(MacOsProcessSignaler),
-        );
+        let controller = platform_process_controller();
         let observed = match controller.inspector.observe(pid) {
             Ok(Some(observed)) => observed,
             Ok(None) => {

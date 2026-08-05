@@ -68,11 +68,22 @@ impl ModeRuntime {
         local: Arc<dyn LocalStandaloneLifecycle>,
         drain_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
-        let (cluster, state_task) = spawn_state_machine(ClusterSnapshot::booting(role), 16);
+        Self::spawn_ready_at(role, proxy, local, drain_timeout, 0).await
+    }
+
+    pub async fn spawn_ready_at(
+        role: LocalRole,
+        proxy: Arc<ModeAwareProxyState>,
+        local: Arc<dyn LocalStandaloneLifecycle>,
+        drain_timeout: Duration,
+        baseline_generation: u64,
+    ) -> Result<Self, RuntimeError> {
+        let (cluster, state_task) =
+            spawn_state_machine(ClusterSnapshot::booting_at(role, baseline_generation), 16);
         let startup = async {
             let starting = cluster
                 .apply(ClusterEvent {
-                    expected_generation: 0,
+                    expected_generation: baseline_generation,
                     kind: ClusterEventKind::BeginSoloStandalone,
                 })
                 .await?;
@@ -99,6 +110,40 @@ impl ModeRuntime {
         };
         apply_proxy_snapshot(&proxy, ready);
         proxy.admission().start_serving();
+        Ok(Self {
+            role,
+            cluster,
+            state_task,
+            proxy,
+            local,
+            drain_timeout,
+        })
+    }
+
+    pub async fn spawn_manual_at(
+        role: LocalRole,
+        proxy: Arc<ModeAwareProxyState>,
+        local: Arc<dyn LocalStandaloneLifecycle>,
+        drain_timeout: Duration,
+        baseline_generation: u64,
+    ) -> Result<Self, RuntimeError> {
+        let (cluster, state_task) =
+            spawn_state_machine(ClusterSnapshot::booting_at(role, baseline_generation), 16);
+        let manual = match cluster
+            .apply(ClusterEvent {
+                expected_generation: baseline_generation,
+                kind: ClusterEventKind::RequireManualIntervention,
+            })
+            .await
+        {
+            Ok(manual) => manual,
+            Err(error) => {
+                state_task.abort();
+                return Err(error.into());
+            }
+        };
+        apply_proxy_snapshot(&proxy, manual);
+        proxy.admission().block();
         Ok(Self {
             role,
             cluster,
