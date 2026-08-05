@@ -42,15 +42,7 @@ pub fn build_distributed_worker_command(
     distributed_port: u16,
 ) -> Result<Ds4Command, Ds4CommandError> {
     let mxfp4 = &config.mxfp4;
-    validate_extra_args("ds4.mxfp4.extra_args", &mxfp4.extra_args)
-        .map_err(|error| Ds4CommandError::InvalidExtraArguments(error.to_string()))?;
-    if !mxfp4
-        .extra_args
-        .iter()
-        .any(|argument| argument == "--debug")
-    {
-        return Err(Ds4CommandError::DistributedDebugRequired);
-    }
+    validate_distributed_extra_args(mxfp4)?;
 
     let mut argv = vec![
         OsString::from("-m"),
@@ -71,16 +63,67 @@ pub fn build_distributed_worker_command(
     ];
     argv.extend(mxfp4.extra_args.iter().map(OsString::from));
 
-    Ok(Ds4Command {
+    Ok(distributed_command(config, "worker", argv))
+}
+
+pub fn build_distributed_coordinator_command(
+    config: &Ds4Config,
+    coordinator_address: IpAddr,
+    distributed_port: u16,
+) -> Result<Ds4Command, Ds4CommandError> {
+    let mxfp4 = &config.mxfp4;
+    validate_distributed_extra_args(mxfp4)?;
+    let mut argv = vec![
+        OsString::from("-m"),
+        mxfp4.model.as_os_str().to_owned(),
+        OsString::from("--role"),
+        OsString::from("coordinator"),
+        OsString::from("--layers"),
+        OsString::from(&mxfp4.coordinator_layers),
+        OsString::from("--listen"),
+        OsString::from(coordinator_address.to_string()),
+        OsString::from(distributed_port.to_string()),
+        OsString::from("--host"),
+        OsString::from(config.http_host.to_string()),
+        OsString::from("--port"),
+        OsString::from(config.http_port.to_string()),
+        OsString::from("--ctx"),
+        OsString::from(mxfp4.context_size.to_string()),
+        OsString::from("--kv-disk-dir"),
+        mxfp4.kv_disk_dir.as_os_str().to_owned(),
+        OsString::from("--kv-disk-space-mb"),
+        OsString::from(mxfp4.kv_disk_space_mb.to_string()),
+    ];
+    argv.extend(mxfp4.extra_args.iter().map(OsString::from));
+    Ok(distributed_command(config, "coordinator", argv))
+}
+
+fn validate_distributed_extra_args(
+    mxfp4: &crate::config::Ds4Mxfp4Config,
+) -> Result<(), Ds4CommandError> {
+    validate_extra_args("ds4.mxfp4.extra_args", &mxfp4.extra_args)
+        .map_err(|error| Ds4CommandError::InvalidExtraArguments(error.to_string()))?;
+    if !mxfp4
+        .extra_args
+        .iter()
+        .any(|argument| argument == "--debug")
+    {
+        return Err(Ds4CommandError::DistributedDebugRequired);
+    }
+    Ok(())
+}
+
+fn distributed_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> Ds4Command {
+    Ds4Command {
         executable: config.binary.clone(),
         working_directory: config.working_directory.clone(),
         argv,
         profile: Ds4Profile {
-            profile_id: "distributed-mxfp4-worker".into(),
+            profile_id: format!("distributed-mxfp4-{role}"),
             model_variant: ModelVariant::Mxfp4,
             residency: Residency::Resident,
         },
-    })
+    }
 }
 
 pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4CommandError> {
@@ -337,5 +380,41 @@ mod tests {
             build_distributed_worker_command(&override_role, IpAddr::from([10, 99, 0, 1]), 9911,),
             Err(Ds4CommandError::InvalidExtraArguments(_))
         ));
+    }
+
+    #[test]
+    fn distributed_coordinator_argv_owns_http_and_rendezvous_listeners() {
+        let command = build_distributed_coordinator_command(
+            &config(ModelVariant::Q2Q4, Residency::SsdStreaming),
+            IpAddr::from([10, 99, 0, 1]),
+            9911,
+        )
+        .unwrap();
+        assert_eq!(
+            argv(&command),
+            [
+                "-m",
+                "/models/mxfp4.gguf",
+                "--role",
+                "coordinator",
+                "--layers",
+                "0:19",
+                "--listen",
+                "10.99.0.1",
+                "9911",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+                "--ctx",
+                "262144",
+                "--kv-disk-dir",
+                "/cache/distributed",
+                "--kv-disk-space-mb",
+                "262144",
+                "--debug",
+            ]
+        );
+        assert_eq!(command.profile.profile_id, "distributed-mxfp4-coordinator");
     }
 }

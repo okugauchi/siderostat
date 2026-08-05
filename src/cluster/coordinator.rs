@@ -1,11 +1,316 @@
-use super::RendezvousControlSnapshot;
 use super::{
     AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
     ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase, NodeDescriptor,
     PeerLease, WorkerEventKind, control::ControlProcessor,
 };
-use crate::target::ClusterState;
-use std::time::Duration;
+use super::{
+    ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, Ds4Hello,
+    LocalStandaloneLifecycle, RendezvousControlSnapshot, TransitionError,
+};
+use crate::{
+    admission::DrainError,
+    proxy::ModeAwareProxyState,
+    target::{ClusterState, ProxyTarget, UnavailableReason},
+};
+use futures::future::BoxFuture;
+use std::{sync::Arc, time::Duration};
+use thiserror::Error;
+
+pub trait DistributedCoordinatorLifecycle: Send + Sync + 'static {
+    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn wait_ready(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn wait_route_loss(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+}
+
+pub trait CoordinatorPeerLifecycle: Send + Sync + 'static {
+    fn begin_drain(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn stop_worker(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
+}
+
+pub trait CoordinatorLeaseStatus: Send + Sync + 'static {
+    fn is_valid(&self) -> bool;
+}
+
+impl<F> CoordinatorLeaseStatus for F
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    fn is_valid(&self) -> bool {
+        self()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CoordinatorLifecycleError {
+    #[error(transparent)]
+    Transition(#[from] TransitionError),
+    #[error(transparent)]
+    Drain(#[from] DrainError),
+    #[error("standalone lifecycle failed: {0}")]
+    Standalone(#[source] anyhow::Error),
+    #[error("distributed coordinator lifecycle failed: {0}")]
+    Coordinator(#[source] anyhow::Error),
+    #[error("worker control lifecycle failed: {0}")]
+    Peer(#[source] anyhow::Error),
+    #[error("distributed coordinator startup timed out")]
+    StartupTimeout,
+    #[error("complete distributed route timed out")]
+    CompleteRouteTimeout,
+    #[error("promotion failed and Paired Standalone recovery also failed: {0}")]
+    Recovery(#[source] anyhow::Error),
+    #[error("coordinator lifecycle timeouts must be positive")]
+    InvalidTiming,
+    #[error("worker HELLO promotion requires ready worker control and a valid lease")]
+    PrerequisiteMissing,
+    #[error("worker lease was lost during distributed promotion")]
+    LeaseLost,
+}
+
+#[derive(Clone)]
+pub struct CoordinatorDistributedRuntime {
+    cluster: ClusterHandle,
+    proxy: Arc<ModeAwareProxyState>,
+    standalone: Arc<dyn LocalStandaloneLifecycle>,
+    coordinator: Arc<dyn DistributedCoordinatorLifecycle>,
+    peer: Arc<dyn CoordinatorPeerLifecycle>,
+    drain_timeout: Duration,
+    startup_timeout: Duration,
+    complete_route_timeout: Duration,
+    route_loss_grace: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinatorRuntimeTimeouts {
+    pub drain: Duration,
+    pub startup: Duration,
+    pub complete_route: Duration,
+    pub route_loss_grace: Duration,
+}
+
+impl CoordinatorDistributedRuntime {
+    pub fn new(
+        cluster: ClusterHandle,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        coordinator: Arc<dyn DistributedCoordinatorLifecycle>,
+        peer: Arc<dyn CoordinatorPeerLifecycle>,
+        timeouts: CoordinatorRuntimeTimeouts,
+    ) -> Result<Self, CoordinatorLifecycleError> {
+        if timeouts.drain.is_zero()
+            || timeouts.startup.is_zero()
+            || timeouts.complete_route.is_zero()
+            || timeouts.route_loss_grace.is_zero()
+        {
+            return Err(CoordinatorLifecycleError::InvalidTiming);
+        }
+        Ok(Self {
+            cluster,
+            proxy,
+            standalone,
+            coordinator,
+            peer,
+            drain_timeout: timeouts.drain,
+            startup_timeout: timeouts.startup,
+            complete_route_timeout: timeouts.complete_route,
+            route_loss_grace: timeouts.route_loss_grace,
+        })
+    }
+
+    pub async fn promote_after_hello(
+        &self,
+        _validated_hello: Ds4Hello,
+        control: &CoordinatorControl,
+        now_millis: u64,
+        lease: Arc<dyn CoordinatorLeaseStatus>,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        if control.phase() != DistributedControlPhase::WorkerReady
+            || !control.peer_present(now_millis)
+            || !lease.is_valid()
+        {
+            return Err(CoordinatorLifecycleError::PrerequisiteMissing);
+        }
+        let current = self.cluster.snapshot();
+        let promoting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::WorkerHelloAccepted,
+            })
+            .await?;
+        self.block_transition();
+
+        let result = self.promote_inner(promoting, lease).await;
+        match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.recover_paired().await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn promote_inner(
+        &self,
+        promoting: ClusterSnapshot,
+        lease: Arc<dyn CoordinatorLeaseStatus>,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        let local_drain = self
+            .proxy
+            .admission()
+            .drain(promoting.generation, self.drain_timeout);
+        let peer_drain = self.peer.begin_drain(promoting.generation);
+        let (local_result, peer_result) = tokio::join!(local_drain, peer_drain);
+        local_result?;
+        peer_result.map_err(CoordinatorLifecycleError::Peer)?;
+        if !lease.is_valid() {
+            return Err(CoordinatorLifecycleError::LeaseLost);
+        }
+
+        self.standalone
+            .stop()
+            .await
+            .map_err(CoordinatorLifecycleError::Standalone)?;
+        match tokio::time::timeout(
+            self.startup_timeout,
+            self.coordinator.start(promoting.generation),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(CoordinatorLifecycleError::Coordinator(error)),
+            Err(_) => return Err(CoordinatorLifecycleError::StartupTimeout),
+        }
+        if !lease.is_valid() {
+            return Err(CoordinatorLifecycleError::LeaseLost);
+        }
+        let starting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: promoting.generation,
+                kind: ClusterEventKind::DistributedChildStarted,
+            })
+            .await?;
+        match tokio::time::timeout(self.complete_route_timeout, self.coordinator.wait_ready()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(CoordinatorLifecycleError::Coordinator(error)),
+            Err(_) => return Err(CoordinatorLifecycleError::CompleteRouteTimeout),
+        }
+        if !lease.is_valid() {
+            return Err(CoordinatorLifecycleError::LeaseLost);
+        }
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: starting.generation,
+                kind: ClusterEventKind::DistributedRouteReady,
+            })
+            .await?;
+        self.proxy.set_target(ready.target, true);
+        self.proxy.admission().start_serving();
+        Ok(ready)
+    }
+
+    pub async fn wait_route_loss_and_demote(
+        &self,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        loop {
+            self.coordinator
+                .wait_route_loss()
+                .await
+                .map_err(CoordinatorLifecycleError::Coordinator)?;
+            match tokio::time::timeout(self.route_loss_grace, self.coordinator.wait_ready()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => return Err(CoordinatorLifecycleError::Coordinator(error)),
+                Err(_) => return self.demote().await,
+            }
+        }
+    }
+
+    pub async fn demote(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        let current = self.cluster.snapshot();
+        let demoting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::BeginDemotion,
+            })
+            .await?;
+        self.block_transition();
+        let local_drain = self
+            .proxy
+            .admission()
+            .drain(demoting.generation, self.drain_timeout);
+        let peer_drain = self.peer.begin_drain(demoting.generation);
+        let (local_result, peer_result) = tokio::join!(local_drain, peer_drain);
+        local_result?;
+        peer_result.map_err(CoordinatorLifecycleError::Peer)?;
+        self.coordinator
+            .stop()
+            .await
+            .map_err(CoordinatorLifecycleError::Coordinator)?;
+        self.peer
+            .stop_worker(demoting.generation)
+            .await
+            .map_err(CoordinatorLifecycleError::Peer)?;
+        self.standalone
+            .start(demoting.generation)
+            .await
+            .map_err(CoordinatorLifecycleError::Standalone)?;
+        let paired = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: demoting.generation,
+                kind: ClusterEventKind::PairingReady,
+            })
+            .await?;
+        self.proxy.set_target(paired.target, true);
+        self.proxy.admission().start_serving();
+        Ok(paired)
+    }
+
+    fn block_transition(&self) {
+        self.proxy.admission().block();
+        self.proxy.set_target(
+            ProxyTarget::Unavailable {
+                reason: UnavailableReason::Transition,
+            },
+            false,
+        );
+    }
+
+    async fn recover_paired(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.block_transition();
+        let generation = self.cluster.snapshot().generation;
+        let coordinator_stop = self.coordinator.stop();
+        let worker_stop = self.peer.stop_worker(generation);
+        let (coordinator_result, worker_result) = tokio::join!(coordinator_stop, worker_stop);
+        coordinator_result.map_err(|error| {
+            CoordinatorLifecycleError::Recovery(anyhow::anyhow!(
+                "coordinator cleanup failed: {error}"
+            ))
+        })?;
+        worker_result.map_err(|error| {
+            CoordinatorLifecycleError::Recovery(anyhow::anyhow!("worker cleanup failed: {error}"))
+        })?;
+        self.standalone.start(generation).await.map_err(|error| {
+            CoordinatorLifecycleError::Recovery(anyhow::anyhow!(
+                "standalone recovery failed: {error}"
+            ))
+        })?;
+        let paired = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: generation,
+                kind: ClusterEventKind::PromotionFailed,
+            })
+            .await?;
+        self.proxy.set_target(paired.target, true);
+        self.proxy.admission().start_serving();
+        Ok(paired)
+    }
+}
 
 #[derive(Debug)]
 pub struct CoordinatorControl {
@@ -212,8 +517,147 @@ fn validate_coordinator_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{ControlMode, ControlResponseStatus};
-    use std::net::IpAddr;
+    use crate::{
+        cluster::{
+            ControlMode, ControlResponseStatus, LocalStandaloneLifecycle, spawn_state_machine,
+        },
+        proxy::{ModeAwareProxyOptions, ModeAwareTargetSnapshot},
+        target::{LocalRole, StableMode},
+    };
+    use std::{
+        net::IpAddr,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct FakeStandalone {
+        running: Arc<AtomicBool>,
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl LocalStandaloneLifecycle for FakeStandalone {
+        fn start(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+            let running = self.running.clone();
+            let starts = self.starts.clone();
+            Box::pin(async move {
+                starts.fetch_add(1, Ordering::SeqCst);
+                running.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+            let running = self.running.clone();
+            let stops = self.stops.clone();
+            Box::pin(async move {
+                stops.fetch_add(1, Ordering::SeqCst);
+                running.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
+            let running = self.running.clone();
+            Box::pin(async move { Ok(running.load(Ordering::SeqCst)) })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDistributedCoordinator {
+        running: Arc<AtomicBool>,
+        start_hangs: Arc<AtomicBool>,
+        route_ready: Arc<AtomicBool>,
+        route_lost: Arc<AtomicBool>,
+        route_changed: Arc<tokio::sync::Notify>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl FakeDistributedCoordinator {
+        fn set_route_ready(&self, ready: bool) {
+            self.route_ready.store(ready, Ordering::SeqCst);
+            if ready {
+                self.route_lost.store(false, Ordering::SeqCst);
+            }
+            self.route_changed.notify_waiters();
+        }
+
+        fn lose_route(&self) {
+            self.route_ready.store(false, Ordering::SeqCst);
+            self.route_lost.store(true, Ordering::SeqCst);
+            self.route_changed.notify_waiters();
+        }
+    }
+
+    impl DistributedCoordinatorLifecycle for FakeDistributedCoordinator {
+        fn start(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+            let running = self.running.clone();
+            let hangs = self.start_hangs.clone();
+            Box::pin(async move {
+                running.store(true, Ordering::SeqCst);
+                if hangs.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn wait_ready(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+            let ready = self.route_ready.clone();
+            let changed = self.route_changed.clone();
+            Box::pin(async move {
+                while !ready.load(Ordering::SeqCst) {
+                    changed.notified().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+            let running = self.running.clone();
+            let stops = self.stops.clone();
+            Box::pin(async move {
+                stops.fetch_add(1, Ordering::SeqCst);
+                running.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn wait_route_loss(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+            let lost = self.route_lost.clone();
+            let changed = self.route_changed.clone();
+            Box::pin(async move {
+                while !lost.load(Ordering::SeqCst) {
+                    changed.notified().await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePeer {
+        drains: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl CoordinatorPeerLifecycle for FakePeer {
+        fn begin_drain(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+            let drains = self.drains.clone();
+            Box::pin(async move {
+                drains.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn stop_worker(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+            let stops = self.stops.clone();
+            Box::pin(async move {
+                stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
 
     const NOW: u64 = 10_000;
 
@@ -250,6 +694,127 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap()
+    }
+
+    fn ready_worker_control() -> CoordinatorControl {
+        let mut control = coordinator();
+        control
+            .handle(
+                ControlEndpoint::Pair,
+                pair("pair-promotion"),
+                &authenticated(),
+                true,
+                NOW,
+            )
+            .unwrap();
+        control.note_prepare_sent(7).unwrap();
+        control
+            .handle(
+                ControlEndpoint::WorkerEvent,
+                ControlMessage {
+                    request_id: "ready-promotion".into(),
+                    generation: 7,
+                    deployment_id: Some("deployment-a".into()),
+                    command: ControlCommand::WorkerEvent {
+                        event: WorkerEventKind::Ready,
+                    },
+                },
+                &authenticated(),
+                true,
+                NOW + 5_000,
+            )
+            .unwrap();
+        control
+    }
+
+    fn validated_hello() -> Ds4Hello {
+        Ds4Hello {
+            model_id: 1,
+            quant_bits: 2,
+            layer_start: 20,
+            layer_end: 60,
+            has_output: true,
+            has_hidden: true,
+            context_size: 262_144,
+            layer_count: 61,
+            listen_port: 9911,
+            model_name: "deepseek-v4-flash-mxfp4".into(),
+        }
+    }
+
+    fn proxy() -> Arc<ModeAwareProxyState> {
+        Arc::new(
+            ModeAwareProxyState::new(
+                url::Url::parse("http://127.0.0.1:8000").unwrap(),
+                url::Url::parse("http://10.99.0.1:18082").unwrap(),
+                ModeAwareProxyOptions {
+                    max_in_flight: 4,
+                    request_body_limit_bytes: 4096,
+                    response_header_timeout: Duration::from_secs(1),
+                    first_body_byte_timeout: Duration::from_secs(1),
+                    stream_idle_timeout: Duration::from_secs(1),
+                    connect_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn awaiting_hello_cluster() -> (ClusterHandle, tokio::task::JoinHandle<()>) {
+        let (cluster, task) =
+            spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 16);
+        let mut generation = 0;
+        for kind in [
+            ClusterEventKind::BeginSoloStandalone,
+            ClusterEventKind::LocalStandaloneReady,
+            ClusterEventKind::BeginPairing,
+            ClusterEventKind::PairingReady,
+            ClusterEventKind::BeginPromotion,
+        ] {
+            generation = cluster
+                .apply(ClusterEvent {
+                    expected_generation: generation,
+                    kind,
+                })
+                .await
+                .unwrap()
+                .generation;
+        }
+        assert_eq!(cluster.snapshot().state, ClusterState::AwaitingWorkerHello);
+        (cluster, task)
+    }
+
+    async fn promotion_runtime(
+        coordinator: Arc<FakeDistributedCoordinator>,
+    ) -> (
+        CoordinatorDistributedRuntime,
+        Arc<ModeAwareProxyState>,
+        Arc<FakeStandalone>,
+        Arc<FakePeer>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (cluster, task) = awaiting_hello_cluster().await;
+        let proxy = proxy();
+        proxy.set_target(ProxyTarget::LocalStandalone, true);
+        proxy.admission().start_serving();
+        let standalone = Arc::new(FakeStandalone::default());
+        standalone.running.store(true, Ordering::SeqCst);
+        let peer = Arc::new(FakePeer::default());
+        let runtime = CoordinatorDistributedRuntime::new(
+            cluster,
+            proxy.clone(),
+            standalone.clone(),
+            coordinator,
+            peer.clone(),
+            CoordinatorRuntimeTimeouts {
+                drain: Duration::from_millis(200),
+                startup: Duration::from_millis(30),
+                complete_route: Duration::from_millis(200),
+                route_loss_grace: Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        (runtime, proxy, standalone, peer, task)
     }
 
     #[test]
@@ -530,5 +1095,204 @@ mod tests {
                 received: 7
             })
         );
+    }
+
+    #[tokio::test]
+    async fn promotion_waits_for_in_flight_stream_and_complete_route_before_serving() {
+        let coordinator = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
+        let permit = proxy.admission().try_acquire(true).unwrap();
+        let control = ready_worker_control();
+        let promotion = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .promote_after_hello(
+                        validated_hello(),
+                        &control,
+                        NOW + 5_000,
+                        Arc::new(|| true),
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(standalone.stops.load(Ordering::SeqCst), 0);
+        assert!(!coordinator.running.load(Ordering::SeqCst));
+        drop(permit);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !coordinator.running.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.cluster.snapshot().state,
+            ClusterState::DistributedStarting
+        );
+        assert_eq!(
+            proxy.target_snapshot(),
+            ModeAwareTargetSnapshot {
+                target: ProxyTarget::Unavailable {
+                    reason: UnavailableReason::Transition,
+                },
+                ready: false,
+            }
+        );
+        assert!(!promotion.is_finished());
+
+        coordinator.set_route_ready(true);
+        let ready = promotion.await.unwrap().unwrap();
+        assert_eq!(ready.stable_mode, StableMode::DistributedMxfp4);
+        assert_eq!(ready.state, ClusterState::DistributedReady);
+        assert_eq!(peer.drains.load(Ordering::SeqCst), 1);
+        assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
+        assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn hello_without_ready_worker_control_never_starts_promotion() {
+        let child = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, _, _, task) = promotion_runtime(child.clone()).await;
+        let control = coordinator();
+
+        assert!(matches!(
+            runtime
+                .promote_after_hello(validated_hello(), &control, NOW, Arc::new(|| true))
+                .await,
+            Err(CoordinatorLifecycleError::PrerequisiteMissing)
+        ));
+        assert_eq!(
+            runtime.cluster.snapshot().state,
+            ClusterState::AwaitingWorkerHello
+        );
+        assert!(!child.running.load(Ordering::SeqCst));
+        assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_startup_timeout_reaps_children_and_recovers_paired() {
+        let coordinator = Arc::new(FakeDistributedCoordinator::default());
+        coordinator.start_hangs.store(true, Ordering::SeqCst);
+        let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
+        let control = ready_worker_control();
+
+        assert!(matches!(
+            runtime
+                .promote_after_hello(validated_hello(), &control, NOW + 5_000, Arc::new(|| true),)
+                .await,
+            Err(CoordinatorLifecycleError::StartupTimeout)
+        ));
+        assert!(!coordinator.running.load(Ordering::SeqCst));
+        assert!(standalone.running.load(Ordering::SeqCst));
+        assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.cluster.snapshot().state,
+            ClusterState::PairedStandaloneReady
+        );
+        assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
+        assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lease_loss_after_child_start_rejects_route_and_recovers_paired() {
+        let coordinator = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
+        let control = ready_worker_control();
+        let valid = Arc::new(AtomicBool::new(true));
+        let status = valid.clone();
+        let promotion = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .promote_after_hello(
+                        validated_hello(),
+                        &control,
+                        NOW + 5_000,
+                        Arc::new(move || status.load(Ordering::SeqCst)),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !coordinator.running.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        valid.store(false, Ordering::SeqCst);
+        coordinator.set_route_ready(true);
+
+        assert!(matches!(
+            promotion.await.unwrap(),
+            Err(CoordinatorLifecycleError::LeaseLost)
+        ));
+        assert_eq!(
+            runtime.cluster.snapshot().state,
+            ClusterState::PairedStandaloneReady
+        );
+        assert!(!coordinator.running.load(Ordering::SeqCst));
+        assert!(standalone.running.load(Ordering::SeqCst));
+        assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
+        assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn incomplete_route_never_serves_and_route_loss_demotes_after_drain() {
+        let coordinator = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
+        let control = ready_worker_control();
+        let promotion = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .promote_after_hello(
+                        validated_hello(),
+                        &control,
+                        NOW + 5_000,
+                        Arc::new(|| true),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(!promotion.is_finished());
+        assert!(!proxy.target_snapshot().ready);
+        coordinator.set_route_ready(true);
+        promotion.await.unwrap().unwrap();
+
+        let permit = proxy.admission().try_acquire(true).unwrap();
+        let demotion = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait_route_loss_and_demote().await }
+        });
+        coordinator.lose_route();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        coordinator.set_route_ready(true);
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        assert!(!demotion.is_finished());
+
+        coordinator.lose_route();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!demotion.is_finished());
+        assert_eq!(standalone.starts.load(Ordering::SeqCst), 0);
+        drop(permit);
+
+        let paired = demotion.await.unwrap().unwrap();
+        assert_eq!(paired.stable_mode, StableMode::PairedStandalone);
+        assert_eq!(paired.state, ClusterState::PairedStandaloneReady);
+        assert_eq!(peer.drains.load(Ordering::SeqCst), 2);
+        assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
+        assert!(!coordinator.running.load(Ordering::SeqCst));
+        assert!(standalone.running.load(Ordering::SeqCst));
+        assert!(proxy.target_snapshot().ready);
+        task.abort();
     }
 }

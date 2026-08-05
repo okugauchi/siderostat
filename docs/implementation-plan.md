@@ -712,14 +712,16 @@ Evidence: `src/cluster/ds4_hello.rs`、`src/cluster/coordinator.rs`; `Rendezvous
 
 Evidence: `src/cluster/worker.rs`、`src/cluster/ds4_command.rs`、`src/cluster/process.rs`; worker ingress drain→standalone verified stop→MXFP4 worker child起動を実装し、worker argvへrole/layer/coordinator/context/KVと必須`--debug`を一意に生成。Worker childの生存とleaseを監視し、startup timeout、early exit、lease loss、cancelの全経路でadmissionをBlockしてowned childをverified stopする。Valid lease中はchildを維持してDS4自身のHELLO再接続を妨げず、実HELLO acceptanceはcoordinator rendezvousに限定。起動済みhang、early exit、same-generation retry、lease loss、実owned child reapを含む5追加tests、共通local gate（118 tests）、test-support gate（122 tests）、clippy成功; 2026-08-06
 
-#### [ ] P4-06 Coordinator promotion/demotionを実装する
+#### [x] P4-06 Coordinator promotion/demotionを実装する
 
 - Actor: agent
 - Depends on: P4-05
-- Files: `coordinator.rs`、`state.rs`、`admission.rs`
+- Files: `coordinator.rs`、`state.rs`、`admission.rs`、`ds4_command.rs`、`ds4_log.rs`、`process.rs`、`mod.rs`
 - Actions: Cluster-wide drain、standalone stop、coordinator start、worker registered、complete route、target switch、demotionを実装
 - Verification: In-flight stream、route incomplete/loss、startup timeout test
 - Done when: Complete route前にadmissionを再開しない
+
+Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`; validated実HELLO値、authenticated worker Ready、live leaseの3条件を満たした場合だけcluster-wide drainを開始し、in-flight完了後にstandaloneをverified stopしてMXFP4 coordinatorを起動。HTTP readiness、lossless worker-registered/complete-route log eventの全条件が揃うまでadmissionをBlockし、route-loss grace後は両distributed childを停止してPaired Standaloneへ復帰。Startup/route timeout・lease lossではorphan cleanupとstandalone recoveryを実施。Coordinator argv、HELLO without Ready、in-flight、startup timeout、lease loss、route incomplete/transient/permanent loss、満杯log queueでもroute event非欠落を含む7追加tests、共通local gate（125 tests）、test-support gate（129 tests）、clippy成功。初回targeted testはcargoへfilterを2個渡したCLI指定誤りで失敗し、`cargo test cluster:: --all-features`（76件）へ修正後成功; 2026-08-06
 
 #### [ ] P4-07 Distributed integrationとactual acceptanceを実行する
 

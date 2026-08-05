@@ -56,6 +56,7 @@ pub enum ClusterEventKind {
     BeginPromotion,
     DistributedChildStarted,
     DistributedRouteReady,
+    PromotionFailed,
     BeginDemotion,
     PeerLost,
     EnterBackoff,
@@ -196,6 +197,16 @@ fn transition(
         (ClusterState::DistributedStarting, ClusterEventKind::DistributedRouteReady) => (
             StableMode::DistributedMxfp4,
             ClusterState::DistributedReady,
+            current.role != LocalRole::Worker,
+        ),
+        (
+            ClusterState::AwaitingWorkerHello
+            | ClusterState::Promoting
+            | ClusterState::DistributedStarting,
+            ClusterEventKind::PromotionFailed,
+        ) => (
+            StableMode::PairedStandalone,
+            ClusterState::PairedStandaloneReady,
             current.role != LocalRole::Worker,
         ),
         (ClusterState::DistributedReady, ClusterEventKind::BeginDemotion) => {

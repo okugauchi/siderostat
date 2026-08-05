@@ -28,14 +28,18 @@ pub use control::{
     HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, NodeDescriptor, PeerLease,
     WorkerEventKind,
 };
-pub use coordinator::CoordinatorControl;
+pub use coordinator::{
+    CoordinatorControl, CoordinatorDistributedRuntime, CoordinatorLeaseStatus,
+    CoordinatorLifecycleError, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
+    DistributedCoordinatorLifecycle,
+};
 pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,
 };
 pub use ds4_command::{
-    Ds4Command, Ds4CommandError, Ds4Profile, build_distributed_worker_command,
-    build_standalone_command,
+    Ds4Command, Ds4CommandError, Ds4Profile, build_distributed_coordinator_command,
+    build_distributed_worker_command, build_standalone_command,
 };
 pub use ds4_hello::{
     DS4D_HELLO_KIND, DS4D_MAGIC, Ds4Hello, Ds4HelloError, HELLO_FIXED_BYTES,
@@ -44,7 +48,7 @@ pub use ds4_hello::{
 };
 pub use ds4_log::{
     ChildLogForwarders, ChildLogRecord, ChildLogStream, Ds4LogEvent, MAX_CHILD_LOG_LINE_BYTES,
-    parse_ds4_log_event, spawn_child_log_forwarders,
+    parse_ds4_log_event, spawn_child_log_forwarders, spawn_child_log_forwarders_with_events,
 };
 pub use manifest::{
     DEPLOYMENT_MANIFEST_SCHEMA_VERSION, DistributedManifest, FileFingerprint, FingerprintCache,
@@ -67,9 +71,9 @@ pub use platform::{
 };
 pub use process::platform_process_controller;
 pub use process::{
-    ChildIdentity, DistributedWorkerSupervisor, ManagedChild, ObservedProcess, ProcessControlError,
-    ProcessController, ProcessInspector, ProcessSignal, ProcessSignaler, StandaloneSupervisor,
-    VerifiedProcess, argv_sha256, wait_for_http_readiness,
+    ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
+    ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
+    ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
 };
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,

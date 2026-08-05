@@ -65,12 +65,64 @@ where
     Out: AsyncRead + Unpin + Send + 'static,
     Err: AsyncRead + Unpin + Send + 'static,
 {
+    let (receiver, _, forwarders) = spawn_child_log_forwarders_inner(
+        stdout, stderr, profile_id, generation, pid, capacity, false,
+    );
+    (receiver, forwarders)
+}
+
+pub fn spawn_child_log_forwarders_with_events<Out, Err>(
+    stdout: Out,
+    stderr: Err,
+    profile_id: Arc<str>,
+    generation: u64,
+    pid: u32,
+    capacity: usize,
+) -> (
+    mpsc::Receiver<ChildLogRecord>,
+    mpsc::UnboundedReceiver<Ds4LogEvent>,
+    ChildLogForwarders,
+)
+where
+    Out: AsyncRead + Unpin + Send + 'static,
+    Err: AsyncRead + Unpin + Send + 'static,
+{
+    let (logs, events, forwarders) = spawn_child_log_forwarders_inner(
+        stdout, stderr, profile_id, generation, pid, capacity, true,
+    );
+    (logs, events.expect("event receiver requested"), forwarders)
+}
+
+fn spawn_child_log_forwarders_inner<Out, Err>(
+    stdout: Out,
+    stderr: Err,
+    profile_id: Arc<str>,
+    generation: u64,
+    pid: u32,
+    capacity: usize,
+    capture_events: bool,
+) -> (
+    mpsc::Receiver<ChildLogRecord>,
+    Option<mpsc::UnboundedReceiver<Ds4LogEvent>>,
+    ChildLogForwarders,
+)
+where
+    Out: AsyncRead + Unpin + Send + 'static,
+    Err: AsyncRead + Unpin + Send + 'static,
+{
     assert!(capacity > 0, "child log channel capacity must be positive");
     let (sender, receiver) = mpsc::channel(capacity);
+    let (event_sender, event_receiver) = if capture_events {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let tasks = vec![
         tokio::spawn(forward_stream(
             stdout,
             sender.clone(),
+            event_sender.clone(),
             profile_id.clone(),
             generation,
             pid,
@@ -79,13 +131,14 @@ where
         tokio::spawn(forward_stream(
             stderr,
             sender,
+            event_sender,
             profile_id,
             generation,
             pid,
             ChildLogStream::Stderr,
         )),
     ];
-    (receiver, ChildLogForwarders { tasks })
+    (receiver, event_receiver, ChildLogForwarders { tasks })
 }
 
 pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
@@ -124,6 +177,7 @@ pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
 async fn forward_stream<R>(
     stream: R,
     sender: mpsc::Sender<ChildLogRecord>,
+    event_sender: Option<mpsc::UnboundedSender<Ds4LogEvent>>,
     profile_id: Arc<str>,
     generation: u64,
     pid: u32,
@@ -144,6 +198,9 @@ where
             line,
             truncated,
         };
+        if let (Some(sender), Some(event)) = (&event_sender, record.event.clone()) {
+            let _ = sender.send(event);
+        }
         match sender.try_send(record) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
@@ -261,5 +318,27 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.stream == ChildLogStream::Stderr && record.line == "stderr line"
         }));
+    }
+
+    #[tokio::test]
+    async fn recognized_route_event_survives_a_full_lossy_log_queue() {
+        let output = format!(
+            "noise-1\nnoise-2\n{}\n",
+            "ds4: distributed coordinator: complete route ready: deployment-9"
+        );
+        let (_logs, mut events, _tasks) = spawn_child_log_forwarders_with_events(
+            std::io::Cursor::new(output),
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Arc::from("mxfp4-coordinator"),
+            9,
+            43,
+            1,
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .unwrap(),
+            Some(Ds4LogEvent::CompleteRouteReady { detail }) if detail == "deployment-9"
+        ));
     }
 }
