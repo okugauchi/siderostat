@@ -494,7 +494,7 @@ Evidence: `src/cluster/mod.rs`、`src/cluster/state.rs`; bounded command channel
 
 Evidence: `src/cluster/network_snapshot.rs`、`src/cluster/role.rs`; System Configuration/getifaddrs bindingから渡せる型付きobservationを8種の`ThunderboltIpState`、固定address role、expected peer/route/auth状態へ変換。全state、unknown/prefix/multiple-address conflict、wrong route fixture 4 tests、共通local gate（48 tests）、test-support gate（51 tests）、check/clippy成功。Shell command parseなし; 2026-08-06
 
-#### [ ] P2-03 Dynamic Store event monitorを実装する
+#### [x] P2-03 Dynamic Store event monitorを実装する
 
 - Actor: agent
 - Depends on: P2-02
@@ -503,6 +503,8 @@ Evidence: `src/cluster/network_snapshot.rs`、`src/cluster/role.rs`; System Conf
 - Actions: Link/IPv4/Setup notification、500ms debounce、30s reconcile、generation ownershipを実装
 - Verification: Duplicate/out-of-order fixture、cancel/drop test
 - Done when: Eventはrescanだけを起こしmodeを直接変更しない
+
+Evidence: `src/cluster/network_events.rs`、`src/cluster/platform/macos.rs`; bounded nonblocking callback channel、500ms設定可能debounce、30s設定可能reconcile、generation filter、last-handle cancellation、SCDynamicStore Link/IPv4/Interface/Setup subscriptionとRunLoop所有を実装。Event outputは型付きrescan requestのみ。duplicate/out-of-order/reconcile/drop/key分類4 tests、共通local gate（52 tests）、test-support gate（55 tests）、check/clippy成功。初回`cargo fetch`はsandbox DNS制限で失敗し、承認済みnetwork実行で`system-configuration 0.7.0`取得成功; 2026-08-06
 
 #### [ ] P2-04 Bonjour discoveryを実装する
 
