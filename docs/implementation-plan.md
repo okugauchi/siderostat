@@ -522,7 +522,7 @@ Evidence: `src/cluster/network_events.rs`、`src/cluster/platform/macos.rs`; bou
 
 Evidence: `src/cluster/bonjour.rs`、`src/cluster/discovery.rs`、`src/cluster/platform/bonjour.rs`; `if_nametoindex("bridge0")`と同一interface index限定のDNS-SD register/browse/resolve/getaddrinfo、network byte order port、最小TXT（`protocol=1`、`node_id`）、IPv4限定address解決、`AsyncFd`駆動とgeneration連動lifecycleを実装。解決結果はself/interface/protocol/subnet/期待address/scoped routeを検証してcandidateだけを生成し、重複を除去。permission/policy/daemon failure時のみ同じroute検証を通したstatic fallbackを許可。self/wrong interface/wrong subnet/unexpected address/wrong route/duplicate/permission fallbackを含む5 tests、共通local gate（57 tests）、test-support gate（60 tests）、check/clippy成功。明示的な`-ldns_sd`はmacOS linker failureとなったため、C spikeと同じsystem export利用へ修正; 2026-08-06
 
-#### [ ] P2-05 HMAC control authenticationを実装する
+#### [x] P2-05 HMAC control authenticationを実装する
 
 - Actor: agent
 - Depends on: P2-04
@@ -531,6 +531,8 @@ Evidence: `src/cluster/bonjour.rs`、`src/cluster/discovery.rs`、`src/cluster/p
 - Actions: Canonical signing、timestamp、nonce cache、body limit、constant-time verifyを実装
 - Verification: Replay、clock skew、field mutation、wrong source test
 - Done when: Secret/signatureがlogに出ない
+
+Evidence: `src/cluster/auth.rs`、`src/cluster/control.rs`; METHOD/path+query/timestamp/nonce/lowercase SHA-256 body digestのcanonical HMAC-SHA256、constant-time `verify_slice`、32-byte以上secret、30秒clock skew、node ID/expected source IP検証、署名成功後のatomic nonce消費と5分TTL、64KiB逐次body accumulator、全control endpoint/header定義を実装。SecretはDrop時消去し、secret/signature/nonceを`Debug`でredact。既知signature vector、replay/TTL、clock skew、全signed field mutation、wrong source/node、body limit、redactionを含む8 tests、共通local gate（65 tests）、test-support gate（68 tests）、check/clippy成功。初回dependency取得はsandbox DNS制限で失敗し、承認済み`cargo fetch`で`hmac 0.12.1`/`sha2 0.10.9`取得成功; 2026-08-06
 
 #### [ ] P2-06 Peer leaseとcontrol endpointを実装する
 

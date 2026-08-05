@@ -1,4 +1,6 @@
+mod auth;
 mod bonjour;
+mod control;
 mod discovery;
 mod network_events;
 mod network_snapshot;
@@ -6,7 +8,14 @@ mod platform;
 mod role;
 mod state;
 
+pub use auth::{
+    AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
+};
 pub use bonjour::{BonjourFailure, BonjourLifecycle, BonjourRegistration};
+pub use control::{
+    BoundedControlBody, ControlEndpoint, ControlRequest, HEADER_NODE, HEADER_NONCE,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP,
+};
 pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,
