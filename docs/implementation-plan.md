@@ -174,10 +174,10 @@ P3-01 -> P3-02 -> P3-03 -> P3-04 -> P3-05 -> P3-06
                                                     |              |
                                                     `-> P4-01 -> P4-02 -> P4-03
                                                         -> P4-04 -> P4-05 -> P4-06
-                                                                       |  |
-                                                                       +--+-> P4-07
-                                                                               |
-                                                                               v
+                                                                       `----> P4-07 -> P5-01
+                                                                              |
+P3-07 ------------------------------------------------------------------------+-> P4-08
+
 P5-01 -> P5-02 -> P5-03 -> P5-04 -> P5-05 -> P5-06
                                                         |
                                                         v
@@ -187,7 +187,7 @@ P6-01 -> P6-02 -> P6-03 -> P6-04 -> P6-05
 P7-01 -> P7-02 -> P7-03 -> P7-04
 ```
 
-図は概要であり、各taskの `Depends on` を正とする。Phase内taskは原則直列で行う。P0-03とP0-04だけはP0-02完了後に並行可能だが、同じworktreeでは並行編集しない。P4-01はP3-06完了後に開始できるが、P4-07にはP3-07とP4-06の両方が必要である。
+図は概要であり、各taskの `Depends on` を正とする。Phase内taskは原則直列で行う。P0-03とP0-04だけはP0-02完了後に並行可能だが、同じworktreeでは並行編集しない。P4-01はP3-06完了後に開始できる。P4-07のfake integration完了後は後続実装へ進めるが、release gateのP4-08 actual acceptanceにはP3-07とP4-07の両方が必要である。
 
 ## 7. 詳細task list
 
@@ -723,14 +723,23 @@ Evidence: `src/cluster/worker.rs`、`src/cluster/ds4_command.rs`、`src/cluster/
 
 Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`; validated実HELLO値、authenticated worker Ready、live leaseの3条件を満たした場合だけcluster-wide drainを開始し、in-flight完了後にstandaloneをverified stopしてMXFP4 coordinatorを起動。HTTP readiness、lossless worker-registered/complete-route log eventの全条件が揃うまでadmissionをBlockし、route-loss grace後は両distributed childを停止してPaired Standaloneへ復帰。Startup/route timeout・lease lossではorphan cleanupとstandalone recoveryを実施。Coordinator argv、HELLO without Ready、in-flight、startup timeout、lease loss、route incomplete/transient/permanent loss、満杯log queueでもroute event非欠落を含む7追加tests、共通local gate（125 tests）、test-support gate（129 tests）、clippy成功。初回targeted testはcargoへfilterを2個渡したCLI指定誤りで失敗し、`cargo test cluster:: --all-features`（76件）へ修正後成功; 2026-08-06
 
-#### [ ] P4-07 Distributed integrationとactual acceptanceを実行する
+#### [ ] P4-07 Fake distributed integrationを実行する
+
+- Actor: agent
+- Depends on: P4-06
+- Files: integration tests、本書Evidence
+- Actions: Fake child/controlを用い、socket HELLO、complete route、failure recovery、10回promotion/demotionを実行
+- Verification: 仕様書第32.3、33.3節のhardware/model非依存部分
+- Done when: Fake 2-node transitionが成功し、実DS4/GGUFなしで検証できる範囲が確定
+
+#### [ ] P4-08 Distributed actual acceptanceを実行する
 
 - Actor: agent + operator
-- Depends on: P3-07、P4-06
-- Files: integration tests、compatibility record、本書Evidence
-- Actions: Fake transition、実HELLO、short prompt、8K prefill、10回promotion/demotionを実行
+- Depends on: P3-07、P4-07
+- Files: compatibility record、本書Evidence
+- Actions: 実DS4 HELLO、short prompt、8K prefill、10回promotion/demotionを実行
 - Verification: 仕様書第32.3、32.5、33.3節
-- Done when: Fake test成功かつ実機結果をpass/blockedで記録
+- Done when: 実機結果をpass/blockedで記録し、blocked項目はrelease前に解消
 
 ### Phase 5: Recovery、operations、security
 
@@ -904,7 +913,7 @@ Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/p
 | Phase 1 | P1-01–P1-08 | Solo Standalone fixed targetでproxy test成功 |
 | Phase 2 | P2-01–P2-08 | Cable eventからPaired/Soloへ自動収束 |
 | Phase 3 | P3-01–P3-07 | Standalone profileとchild recoveryが実機成功 |
-| Phase 4 | P4-01–P4-07 | Distributed promotion/demotionがfake/実機成功 |
+| Phase 4 | P4-01–P4-08 | Distributed promotion/demotionがfake/実機成功 |
 | Phase 5 | P5-01–P5-06 | Recovery、admin、metrics、service、安全性が完成 |
 | Phase 6 | P6-01–P6-05 | Clean 2-node導入が文書だけで成功 |
 | Phase 7 | P7-01–P7-04 | Main release、legacy保存、rollback可能 |
