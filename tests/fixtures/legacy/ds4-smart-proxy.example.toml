@@ -1,0 +1,77 @@
+listen = "127.0.0.1:18080"
+admin_listen = "127.0.0.1:18081"
+request_body_limit_bytes = 33554432
+max_replayable_body_bytes = 33554432
+
+[routing]
+mode = "local-first"
+affinity_busy_policy = "fail"
+affinity_busy_grace = "2s"
+prefer_distributed_for_affinity = false
+max_attempts = 2
+
+[heartbeat]
+interval = "10s"
+timeout = "3s"
+failure_threshold = 2
+jitter_ratio = 0.20
+
+[active_probe]
+enabled = false
+timeout = "5s"
+minimum_interval = "300s"
+model = "deepseek-v4-flash"
+
+[timeouts]
+connect = "5s"
+response_headers = "60s"
+first_body_byte = "300s"
+stream_idle = "300s"
+
+[cooldown]
+duration = "300s"
+consecutive_failure_threshold = 2
+
+[affinity]
+enabled = true
+secret_env = "DS4_SMART_PROXY_AFFINITY_SECRET"
+database_path = "$HOME/Library/Application Support/ds4-smart-proxy/affinity.sqlite3"
+compute_prefix_affinity = false
+minimum_prefix_bytes = 4096
+maximum_prefix_hash_bytes = 1048576
+default_sliding_ttl = "7d"
+default_absolute_ttl = "30d"
+max_entries = 100000
+allow_body_ids = false
+
+[logging]
+format = "json"
+level = "info"
+redact_headers = [
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "x-ds4-affinity-key",
+  "x-hermes-session-id",
+  "x-hermes-session-key",
+]
+
+[[backends]]
+id = "macbook-local"
+kind = "standalone"
+url = "http://127.0.0.1:8000"
+local = true
+enabled = true
+priority = 100
+max_in_flight = 1
+heartbeat_path = "/v1/models"
+
+[[backends]]
+id = "macstudio-remote"
+kind = "standalone"
+url = "https://macstudio-ds4.home.arpa"
+local = false
+enabled = true
+priority = 50
+max_in_flight = 1
+heartbeat_path = "/v1/models"
