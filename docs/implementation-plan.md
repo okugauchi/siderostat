@@ -254,7 +254,7 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 
 ### Phase 0: Baselineとtest基盤
 
-#### [ ] P0-01 現行behavior fixtureを保存する
+#### [x] P0-01 現行behavior fixtureを保存する
 
 - Actor: agent
 - Depends on: T-03
@@ -267,7 +267,9 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 - Verification: `cargo test --all-targets`
 - Done when: 後続migrationで退行比較できるfixtureが存在
 
-#### [ ] P0-02 Library/test harnessへ挙動不変で分離する
+Evidence: `tests/fixtures/legacy/README.md`、`tests/fixtures/legacy/ds4-smart-proxy.example.toml`; legacy exampleとの`cmp`、共通local gate、32 tests成功; 2026-08-06
+
+#### [x] P0-02 Library/test harnessへ挙動不変で分離する
 
 - Actor: agent
 - Depends on: P0-01
@@ -280,6 +282,8 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 - Verification: 共通local gate。Migration前後の既存test数を比較
 - Done when: Behavior差分なしでintegration testからcrateを利用可能
 - Stop when: Public API化のためproduction型のsecurity invariantを弱める必要がある
+
+Evidence: `src/lib.rs`、`tests/support/mod.rs`; `cargo check --all-targets --all-features`、共通local gate、移行前後とも32 tests成功; 2026-08-06
 
 #### [ ] P0-03 DS4 compatibility recordを作成する
 
