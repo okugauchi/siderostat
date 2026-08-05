@@ -1,12 +1,14 @@
 use super::{
     AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
-    ControlResponse, ControlRole, NodeDescriptor, PeerLease, control::ControlProcessor,
+    ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase, NodeDescriptor,
+    PeerLease, WorkerEventKind, control::ControlProcessor,
 };
 use std::time::Duration;
 
 #[derive(Debug)]
 pub struct CoordinatorControl {
     processor: ControlProcessor,
+    phase: DistributedControlPhase,
 }
 
 impl CoordinatorControl {
@@ -25,6 +27,7 @@ impl CoordinatorControl {
                 lease,
                 required_stability,
             ),
+            phase: DistributedControlPhase::Unpaired,
         })
     }
 
@@ -56,8 +59,31 @@ impl CoordinatorControl {
         ) {
             return Err(ControlError::CommandNotAllowed);
         }
-        self.processor
-            .handle(endpoint, message, authenticated, route_scoped, now_millis)
+        let phase = self.phase;
+        let command = message.command.clone();
+        let response = self.processor.handle_validated(
+            endpoint,
+            message,
+            authenticated,
+            route_scoped,
+            now_millis,
+            |command| validate_coordinator_command(phase, command),
+        )?;
+        if response.status == ControlResponseStatus::Applied {
+            self.phase = match command {
+                ControlCommand::Pair { .. } => DistributedControlPhase::Paired,
+                ControlCommand::WorkerEvent {
+                    event: WorkerEventKind::Ready,
+                } => DistributedControlPhase::WorkerReady,
+                ControlCommand::WorkerEvent { .. } => phase,
+                ControlCommand::Drained => DistributedControlPhase::Drained,
+                ControlCommand::CancelGeneration | ControlCommand::Demote => {
+                    DistributedControlPhase::Paired
+                }
+                _ => phase,
+            };
+        }
+        Ok(response)
     }
 
     pub fn peer_present(&self, now_millis: u64) -> bool {
@@ -74,6 +100,96 @@ impl CoordinatorControl {
 
     pub fn advance_generation(&mut self, generation: u64) {
         self.processor.advance_generation(generation);
+        self.phase = if self.processor.lease().descriptor().is_some() {
+            DistributedControlPhase::Paired
+        } else {
+            DistributedControlPhase::Unpaired
+        };
+    }
+
+    pub fn note_prepare_sent(&mut self, generation: u64) -> Result<(), ControlError> {
+        self.require_generation(generation)?;
+        if self.phase != DistributedControlPhase::Paired {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::WorkerPreparing;
+        Ok(())
+    }
+
+    pub fn prepare_worker_message(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase != DistributedControlPhase::Paired {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::PrepareWorker))
+    }
+
+    pub fn note_begin_drain_sent(&mut self, generation: u64) -> Result<(), ControlError> {
+        self.require_generation(generation)?;
+        if self.phase != DistributedControlPhase::WorkerReady {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::Draining;
+        Ok(())
+    }
+
+    pub fn begin_drain_message(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase != DistributedControlPhase::WorkerReady {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::BeginDrain))
+    }
+
+    pub fn phase(&self) -> DistributedControlPhase {
+        self.phase
+    }
+
+    fn require_generation(&self, generation: u64) -> Result<(), ControlError> {
+        let expected = self.processor.generation();
+        if generation != expected {
+            return Err(ControlError::GenerationMismatch {
+                expected,
+                received: generation,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_coordinator_command(
+    phase: DistributedControlPhase,
+    command: &ControlCommand,
+) -> Result<(), ControlError> {
+    let valid = match command {
+        ControlCommand::Pair { .. } => true,
+        ControlCommand::WorkerEvent {
+            event: WorkerEventKind::Ready,
+        } => phase == DistributedControlPhase::WorkerPreparing,
+        ControlCommand::WorkerEvent { .. } => !matches!(phase, DistributedControlPhase::Unpaired),
+        ControlCommand::Drained => phase == DistributedControlPhase::Draining,
+        ControlCommand::CancelGeneration => matches!(
+            phase,
+            DistributedControlPhase::WorkerPreparing
+                | DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ),
+        ControlCommand::Demote => !matches!(phase, DistributedControlPhase::Unpaired),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ControlError::InvalidPhase { phase })
     }
 }
 
@@ -276,7 +392,7 @@ mod tests {
             generation: 7,
             deployment_id: Some("deployment-b".into()),
             command: ControlCommand::WorkerEvent {
-                event: "ready".into(),
+                event: WorkerEventKind::Ready,
             },
         };
         let error = control
@@ -290,5 +406,104 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ControlError::DeploymentMismatch);
         assert_eq!(error.http_status(), 412);
+    }
+
+    #[test]
+    fn distributed_ack_sequence_rejects_reorder_duplicate_change_and_old_generation() {
+        let mut control = coordinator();
+        control
+            .handle(
+                ControlEndpoint::Pair,
+                pair("pair-distributed"),
+                &authenticated(),
+                true,
+                NOW,
+            )
+            .unwrap();
+        let prepare = control.prepare_worker_message("prepare-1").unwrap();
+        assert_eq!(prepare.generation, 7);
+        assert_eq!(prepare.deployment_id.as_deref(), Some("deployment-a"));
+        control.note_prepare_sent(7).unwrap();
+
+        let ready = ControlMessage {
+            request_id: "ready-1".into(),
+            generation: 7,
+            deployment_id: Some("deployment-a".into()),
+            command: ControlCommand::WorkerEvent {
+                event: WorkerEventKind::Ready,
+            },
+        };
+        control
+            .handle(
+                ControlEndpoint::WorkerEvent,
+                ready.clone(),
+                &authenticated(),
+                true,
+                NOW + 1,
+            )
+            .unwrap();
+        assert_eq!(control.phase(), DistributedControlPhase::WorkerReady);
+        assert_eq!(
+            control
+                .handle(
+                    ControlEndpoint::WorkerEvent,
+                    ready,
+                    &authenticated(),
+                    true,
+                    NOW + 2,
+                )
+                .unwrap()
+                .status,
+            ControlResponseStatus::Duplicate
+        );
+
+        let drained = ControlMessage {
+            request_id: "drained-1".into(),
+            generation: 7,
+            deployment_id: Some("deployment-a".into()),
+            command: ControlCommand::Drained,
+        };
+        assert_eq!(
+            control.handle(
+                ControlEndpoint::Drained,
+                drained.clone(),
+                &authenticated(),
+                true,
+                NOW + 3,
+            ),
+            Err(ControlError::InvalidPhase {
+                phase: DistributedControlPhase::WorkerReady
+            })
+        );
+        assert_eq!(
+            control.begin_drain_message("drain-1").unwrap().generation,
+            7
+        );
+        control.note_begin_drain_sent(7).unwrap();
+        control
+            .handle(
+                ControlEndpoint::Drained,
+                drained.clone(),
+                &authenticated(),
+                true,
+                NOW + 4,
+            )
+            .unwrap();
+        assert_eq!(control.phase(), DistributedControlPhase::Drained);
+
+        control.advance_generation(8);
+        assert_eq!(
+            control.handle(
+                ControlEndpoint::Drained,
+                drained,
+                &authenticated(),
+                true,
+                NOW + 5,
+            ),
+            Err(ControlError::GenerationMismatch {
+                expected: 8,
+                received: 7
+            })
+        );
     }
 }

@@ -23,8 +23,9 @@ pub use auth::{
 pub use bonjour::{BonjourFailure, BonjourLifecycle, BonjourRegistration};
 pub use control::{
     BoundedControlBody, ControlCommand, ControlEndpoint, ControlError, ControlMessage, ControlMode,
-    ControlRequest, ControlResponse, ControlResponseStatus, ControlRole, HEADER_NODE, HEADER_NONCE,
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, NodeDescriptor, PeerLease,
+    ControlRequest, ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase,
+    HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, NodeDescriptor, PeerLease,
+    WorkerEventKind,
 };
 pub use coordinator::CoordinatorControl;
 pub use discovery::{

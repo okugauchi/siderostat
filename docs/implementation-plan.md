@@ -666,7 +666,7 @@ Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f
 
 Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest、lowercase SHA-256/非空/size検証、serde valueのkey昇順・UTF-8・余分な空白なしcanonical JSONとdeployment IDを実装。Distributed compatibilityはbinary/model/checkpoint/context/layer/wire/argvを比較しsource commitは診断専用。Tokio fileを1 MiB chunkでstreaming SHA-256し各chunkでyield、hash前後metadata一致を要求。Device/inode/size/mtime/digest/computed time cacheとFresh/Stale/Missing判定、UUID job ID、同一profile単一async job、status取得を実装。Key order、same/different deployment/compatibility、file change stale、duplicate job/completionの3 tests、共通local gate（103 tests）、test-support gate（107 tests）、check/clippy成功。初回compileで検出したerror変換とtest importを修正; 2026-08-06
 
-#### [ ] P4-02 Generation付きdistributed controlを実装する
+#### [x] P4-02 Generation付きdistributed controlを実装する
 
 - Actor: agent
 - Depends on: P4-01
@@ -675,6 +675,8 @@ Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest�
 - Actions: Prepare、ready、drain、demote、idempotency、old ack rejectionを実装
 - Verification: Duplicate/reorder/drop control message test
 - Done when: すべてのmutationがgenerationを検証
+
+Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`; Pair/PrepareWorker/BeginDrain/Drained/CancelGeneration/typed WorkerEvent/Demoteの全mutationを共通processorでendpoint、request ID、generation、deployment、lease、roleごとに検証。Coordinator/WorkerにUnpaired→Paired→WorkerPreparing→WorkerReady→Draining→Drained phaseを実装し、順序違反はidempotency履歴へ記録する前に409拒否。同一generation/request/payloadのみduplicate renew、内容変更・old generation/ackを409、deployment mismatchを412。Outbound prepare/drain/ready/drained messageもcurrent generation/deploymentから生成。Duplicate、reorder後の正規適用、cancelによるdrop収束、changed duplicate、old ackの2追加tests、共通local gate（105 tests）、test-support gate（109 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P4-03 DS4 HELLO parserを実装する
 

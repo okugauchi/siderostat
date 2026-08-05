@@ -27,6 +27,24 @@ pub enum ControlMode {
     Transitioning,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedControlPhase {
+    Unpaired,
+    Paired,
+    WorkerPreparing,
+    WorkerReady,
+    Draining,
+    Drained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkerEventKind {
+    Ready,
+    Exited,
+    Reconnecting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeDescriptor {
@@ -46,7 +64,7 @@ pub enum ControlCommand {
     BeginDrain,
     Drained,
     CancelGeneration,
-    WorkerEvent { event: String },
+    WorkerEvent { event: WorkerEventKind },
     Demote,
 }
 
@@ -113,15 +131,18 @@ pub enum ControlError {
     IdempotencyConflict,
     #[error("command is not accepted by this role")]
     CommandNotAllowed,
+    #[error("control command is not valid in phase {phase:?}")]
+    InvalidPhase { phase: DistributedControlPhase },
 }
 
 impl ControlError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::DeploymentMismatch => 412,
-            Self::GenerationMismatch { .. } | Self::IdempotencyConflict | Self::PeerNotPaired => {
-                409
-            }
+            Self::GenerationMismatch { .. }
+            | Self::IdempotencyConflict
+            | Self::PeerNotPaired
+            | Self::InvalidPhase { .. } => 409,
             Self::CommandNotAllowed => 403,
             Self::EndpointMismatch
             | Self::InvalidRequestId
@@ -285,14 +306,18 @@ impl ControlProcessor {
         })
     }
 
-    pub(crate) fn handle(
+    pub(crate) fn handle_validated<F>(
         &mut self,
         endpoint: ControlEndpoint,
         message: ControlMessage,
         authenticated: &AuthenticatedPeer,
         route_scoped: bool,
         now_millis: u64,
-    ) -> Result<ControlResponse, ControlError> {
+        validate: F,
+    ) -> Result<ControlResponse, ControlError>
+    where
+        F: FnOnce(&ControlCommand) -> Result<(), ControlError>,
+    {
         if endpoint != message.command.endpoint() {
             return Err(ControlError::EndpointMismatch);
         }
@@ -321,6 +346,8 @@ impl ControlProcessor {
                 .renew(authenticated, message.generation, route_scoped, now_millis)?;
             return Ok(self.response(ControlResponseStatus::Duplicate));
         }
+
+        validate(&message.command)?;
 
         match &message.command {
             ControlCommand::Pair { descriptor } => {
@@ -364,6 +391,19 @@ impl ControlProcessor {
         self.local.generation = generation;
         self.lease.advance_generation(generation);
         self.processed.clear();
+    }
+
+    pub(crate) fn message(&self, request_id: String, command: ControlCommand) -> ControlMessage {
+        ControlMessage {
+            request_id,
+            generation: self.local.generation,
+            deployment_id: self.local.deployment_id.clone(),
+            command,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.local.generation
     }
 }
 
