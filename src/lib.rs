@@ -7,6 +7,6 @@ mod error;
 mod heartbeat;
 mod metrics;
 mod persistence;
-mod proxy;
+pub mod proxy;
 mod routing;
 pub mod target;

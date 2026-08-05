@@ -1,10 +1,12 @@
 use crate::{
+    admission::{AdmissionGate, AdmissionPermit},
     affinity::AffinityKey,
     app::AppState,
     backend::BackendRuntime,
     error::{FailureKind, ProxyError, format_error_chain},
     heartbeat::try_active_probe,
     routing::Selection,
+    target::ProxyTarget,
 };
 use axum::{
     body::{Body, to_bytes},
@@ -19,7 +21,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
@@ -951,6 +953,322 @@ fn status_class(status: StatusCode) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyIngress {
+    Public,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyRequestContext {
+    pub ingress: ProxyIngress,
+    pub peer: SocketAddr,
+    pub hop: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedTargetState {
+    target: ProxyTarget,
+    ready: bool,
+}
+
+pub struct ModeAwareProxyState {
+    client: reqwest::Client,
+    local_upstream: url::Url,
+    coordinator_upstream: url::Url,
+    target: RwLock<FixedTargetState>,
+    admission: AdmissionGate,
+    request_body_limit_bytes: usize,
+    response_header_timeout: std::time::Duration,
+    first_body_byte_timeout: std::time::Duration,
+    stream_idle_timeout: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModeAwareProxyOptions {
+    pub max_in_flight: usize,
+    pub request_body_limit_bytes: usize,
+    pub response_header_timeout: std::time::Duration,
+    pub first_body_byte_timeout: std::time::Duration,
+    pub stream_idle_timeout: std::time::Duration,
+    pub connect_timeout: std::time::Duration,
+}
+
+impl ModeAwareProxyState {
+    pub fn new(
+        local_upstream: url::Url,
+        coordinator_upstream: url::Url,
+        options: ModeAwareProxyOptions,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .connect_timeout(options.connect_timeout)
+                .build()?,
+            local_upstream,
+            coordinator_upstream,
+            target: RwLock::new(FixedTargetState {
+                target: ProxyTarget::Unavailable {
+                    reason: crate::target::UnavailableReason::Transition,
+                },
+                ready: false,
+            }),
+            admission: AdmissionGate::new(options.max_in_flight),
+            request_body_limit_bytes: options.request_body_limit_bytes,
+            response_header_timeout: options.response_header_timeout,
+            first_body_byte_timeout: options.first_body_byte_timeout,
+            stream_idle_timeout: options.stream_idle_timeout,
+        })
+    }
+
+    pub fn set_target(&self, target: ProxyTarget, ready: bool) {
+        *self
+            .target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = FixedTargetState { target, ready };
+    }
+
+    pub fn admission(&self) -> &AdmissionGate {
+        &self.admission
+    }
+
+    fn fixed_target(&self) -> FixedTargetState {
+        *self
+            .target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+pub async fn mode_aware_proxy_handler(
+    State(state): State<Arc<ModeAwareProxyState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    forward_mode_aware(
+        state,
+        ProxyRequestContext {
+            ingress: ProxyIngress::Public,
+            peer,
+            hop: 0,
+        },
+        request,
+    )
+    .await
+}
+
+pub async fn forward_mode_aware(
+    state: Arc<ModeAwareProxyState>,
+    context: ProxyRequestContext,
+    request: Request<Body>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let request_id = request_id(&parts.headers);
+    let declared_length = parts
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared_length.is_some_and(|length| length > state.request_body_limit_bytes) {
+        return ProxyError::BodyTooLarge.response(&request_id);
+    }
+
+    let fixed = state.fixed_target();
+    let base = match fixed.target {
+        ProxyTarget::LocalStandalone => &state.local_upstream,
+        ProxyTarget::Coordinator => &state.coordinator_upstream,
+        ProxyTarget::Unavailable { .. } => {
+            return ProxyError::NoBackendAvailable.response(&request_id);
+        }
+    };
+    let permit = match state.admission.try_acquire(fixed.ready) {
+        Ok(permit) => permit,
+        Err(_) => return ProxyError::NoBackendAvailable.response(&request_id),
+    };
+    let url = match fixed_upstream_url(base, &parts.uri) {
+        Ok(url) => url,
+        Err(error) => return error.response(&request_id),
+    };
+    let headers = match build_mode_aware_headers(&parts.headers, &parts.uri, &request_id, context) {
+        Ok(headers) => headers,
+        Err(error) => return error.response(&request_id),
+    };
+    let method = convert_method(&parts.method);
+    let body_limit = state.request_body_limit_bytes;
+    let request_stream = stream::unfold(
+        (body.into_data_stream(), 0_usize, false),
+        move |(mut body, total, exceeded)| async move {
+            if exceeded {
+                return None;
+            }
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    let new_total = total.saturating_add(chunk.len());
+                    if new_total > body_limit {
+                        Some((
+                            Err(io::Error::other("request body limit exceeded")),
+                            (body, new_total, true),
+                        ))
+                    } else {
+                        Some((Ok(chunk), (body, new_total, false)))
+                    }
+                }
+                Some(Err(error)) => Some((
+                    Err(io::Error::other(error.to_string())),
+                    (body, total, true),
+                )),
+                None => None,
+            }
+        },
+    );
+    let builder = state
+        .client
+        .request(method, url)
+        .headers(headers)
+        .body(reqwest::Body::wrap_stream(request_stream));
+    let upstream = match tokio::time::timeout(state.response_header_timeout, builder.send()).await {
+        Err(_) => return ProxyError::ResponseHeaderTimeout.response(&request_id),
+        Ok(Err(error)) => {
+            let chain = format_error_chain(&error);
+            if chain.contains("request body limit exceeded") {
+                return ProxyError::BodyTooLarge.response(&request_id);
+            }
+            let proxy_error = if error.is_connect() {
+                ProxyError::Connect
+            } else {
+                ProxyError::Protocol
+            };
+            return proxy_error.response(&request_id);
+        }
+        Ok(Ok(response)) => response,
+    };
+
+    match prepare_mode_aware_response(&state, upstream).await {
+        Ok(prepared) => build_mode_aware_response(&state, &request_id, prepared, permit),
+        Err(error) => error.response(&request_id),
+    }
+}
+
+fn fixed_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
+    let mut url = base.clone();
+    let base_path = base.path().trim_end_matches('/');
+    let path = if base_path.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{base_path}{}", uri.path())
+    };
+    url.set_path(&path);
+    url.set_query(uri.query());
+    Ok(url)
+}
+
+fn build_mode_aware_headers(
+    incoming: &HeaderMap,
+    uri: &Uri,
+    request_id: &str,
+    context: ProxyRequestContext,
+) -> Result<HeaderMap, ProxyError> {
+    let mut headers = build_upstream_headers(incoming, context.peer, uri, request_id)?;
+    headers.remove("x-ds4-peer-proxy-token");
+    headers.remove("x-ds4-proxy-hop");
+    let cluster_headers = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-ds4-cluster-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in cluster_headers {
+        headers.remove(name);
+    }
+    // P3のpeer ingress認証でsource/tokenと合わせて検証するため、hopをcontextに保持する。
+    let _peer_hop_validation_hook = (context.ingress == ProxyIngress::Peer).then_some(context.hop);
+    Ok(headers)
+}
+
+struct ModeAwarePreparedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: UpstreamStream,
+    first_chunk: Option<Bytes>,
+}
+
+async fn prepare_mode_aware_response(
+    state: &ModeAwareProxyState,
+    upstream: reqwest::Response,
+) -> Result<ModeAwarePreparedResponse, ProxyError> {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let no_body = status == StatusCode::NO_CONTENT || upstream.content_length() == Some(0);
+    let mut stream: UpstreamStream = Box::pin(upstream.bytes_stream());
+    if no_body {
+        return Ok(ModeAwarePreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: None,
+        });
+    }
+    match tokio::time::timeout(state.first_body_byte_timeout, stream.next()).await {
+        Ok(Some(Ok(first_chunk))) => Ok(ModeAwarePreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: Some(first_chunk),
+        }),
+        Ok(None) => Ok(ModeAwarePreparedResponse {
+            status,
+            headers,
+            stream,
+            first_chunk: None,
+        }),
+        Ok(Some(Err(_))) => Err(ProxyError::Protocol),
+        Err(_) => Err(ProxyError::FirstByteTimeout),
+    }
+}
+
+fn build_mode_aware_response(
+    state: &ModeAwareProxyState,
+    request_id: &str,
+    prepared: ModeAwarePreparedResponse,
+    permit: AdmissionPermit,
+) -> Response<Body> {
+    let status = prepared.status;
+    let headers = prepared.headers;
+    let idle_timeout = state.stream_idle_timeout;
+    let stream = stream::unfold(
+        (prepared.first_chunk, prepared.stream, Some(permit)),
+        move |(first, mut upstream, permit)| async move {
+            if let Some(chunk) = first {
+                return Some((Ok(chunk), (None, upstream, permit)));
+            }
+            match tokio::time::timeout(idle_timeout, upstream.next()).await {
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (None, upstream, permit))),
+                Ok(Some(Err(_))) => {
+                    upstream = Box::pin(stream::empty());
+                    Some((
+                        Err(io::Error::other("upstream stream error")),
+                        (None, upstream, None),
+                    ))
+                }
+                Err(_) => {
+                    upstream = Box::pin(stream::empty());
+                    Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upstream stream idle timeout",
+                        )),
+                        (None, upstream, None),
+                    ))
+                }
+                Ok(None) => None,
+            }
+        },
+    );
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    copy_response_headers(&headers, response.headers_mut());
+    insert_request_id(response.headers_mut(), request_id);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,6 +1368,350 @@ stream_idle = "2s"
             .await;
         });
         (TestServer { address, task }, state)
+    }
+
+    fn mode_aware_state(address: SocketAddr, body_limit: usize) -> Arc<ModeAwareProxyState> {
+        let upstream = url::Url::parse(&format!("http://{address}")).unwrap();
+        let state = Arc::new(
+            ModeAwareProxyState::new(
+                upstream.clone(),
+                upstream,
+                ModeAwareProxyOptions {
+                    max_in_flight: 8,
+                    request_body_limit_bytes: body_limit,
+                    response_header_timeout: Duration::from_secs(2),
+                    first_body_byte_timeout: Duration::from_secs(2),
+                    stream_idle_timeout: Duration::from_secs(2),
+                    connect_timeout: Duration::from_millis(200),
+                },
+            )
+            .unwrap(),
+        );
+        state.set_target(ProxyTarget::LocalStandalone, true);
+        state.admission().start_serving();
+        state
+    }
+
+    async fn start_mode_aware_proxy(state: Arc<ModeAwareProxyState>) -> TestServer {
+        let app = Router::new()
+            .route("/", any(mode_aware_proxy_handler))
+            .route("/{*path}", any(mode_aware_proxy_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        TestServer { address, task }
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_forwards_unknown_path_query_and_headers() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                Json(serde_json::json!({
+                    "uri": request.uri().to_string(),
+                    "request_id": request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "forwarded_for": request
+                        .headers()
+                        .get("x-forwarded-for")
+                        .and_then(|value| value.to_str().ok()),
+                    "custom": request
+                        .headers()
+                        .get("x-custom")
+                        .and_then(|value| value.to_str().ok()),
+                    "internal_headers_removed": request
+                        .headers()
+                        .get("x-ds4-peer-proxy-token")
+                        .is_none()
+                        && request.headers().get("x-ds4-proxy-hop").is_none()
+                        && request
+                            .headers()
+                            .get("x-ds4-cluster-generation")
+                            .is_none(),
+                }))
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state).await;
+
+        let response: Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/custom?answer=42", proxy.address))
+            .header("x-request-id", "req_mode_aware")
+            .header("x-custom", "preserved")
+            .header("x-ds4-peer-proxy-token", "untrusted")
+            .header("x-ds4-proxy-hop", "99")
+            .header("x-ds4-cluster-generation", "99")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(response["uri"], "/v1/custom?answer=42");
+        assert_eq!(response["request_id"], "req_mode_aware");
+        assert_eq!(response["forwarded_for"], "127.0.0.1");
+        assert_eq!(response["custom"], "preserved");
+        assert_eq!(response["internal_headers_removed"], true);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_streams_sse_without_whole_response_buffering() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    match index {
+                        0 => Some((
+                            Ok::<_, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            Some((
+                                Ok::<_, Infallible>(Bytes::from_static(b"data: second\n\n")),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state.clone()).await;
+        let started = Instant::now();
+
+        let response = reqwest::get(format!("http://{}/v1/stream", proxy.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let first_elapsed = started.elapsed();
+        let second = body.next().await.unwrap().unwrap();
+
+        assert_eq!(first, Bytes::from_static(b"data: first\n\n"));
+        assert_eq!(second, Bytes::from_static(b"data: second\n\n"));
+        assert!(
+            first_elapsed < Duration::from_millis(100),
+            "first SSE chunk was delayed for {first_elapsed:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(body);
+        for _ in 0..20 {
+            if state.admission().snapshot().in_flight == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.admission().snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_returns_503_during_transition() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = hits.clone();
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = backend_hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "unexpected"
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        state.set_target(
+            ProxyTarget::Unavailable {
+                reason: crate::target::UnavailableReason::Transition,
+            },
+            false,
+        );
+        let proxy = start_mode_aware_proxy(state).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_maps_connect_failure_to_502_without_retry() {
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = unused.local_addr().unwrap();
+        drop(unused);
+        let state = mode_aware_state(unavailable, 4096);
+        let proxy = start_mode_aware_proxy(state).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_does_not_retry_gateway_status() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = hits.clone();
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = backend_hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    (StatusCode::SERVICE_UNAVAILABLE, "upstream unavailable")
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state).await;
+
+        let response = reqwest::get(format!("http://{}/v1/test", proxy.address))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.unwrap(), "upstream unavailable");
+        assert_eq!(hits.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_rejects_declared_body_over_limit() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = hits.clone();
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = backend_hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "unexpected"
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4);
+        let proxy = start_mode_aware_proxy(state).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/upload", proxy.address))
+            .body(vec![0_u8; 5])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_enforces_body_limit_while_streaming() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                match to_bytes(request.into_body(), 4096).await {
+                    Ok(_) => StatusCode::OK,
+                    Err(_) => StatusCode::BAD_REQUEST,
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4);
+        let proxy = start_mode_aware_proxy(state).await;
+        let chunks = stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            Ok::<_, io::Error>(Bytes::from_static(b"def")),
+        ]);
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/upload", proxy.address))
+            .body(reqwest::Body::wrap_stream(chunks))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn mode_aware_proxy_releases_permit_on_client_cancellation() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0_u64, |index| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((
+                        Ok::<_, Infallible>(Bytes::from(format!("{index}\n"))),
+                        index + 1,
+                    ))
+                });
+                Response::new(Body::from_stream(chunks))
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state.clone()).await;
+        let response = reqwest::get(format!("http://{}/v1/stream", proxy.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let _ = body.next().await.unwrap().unwrap();
+        drop(body);
+
+        for _ in 0..50 {
+            if state.admission().snapshot().in_flight == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.admission().snapshot().in_flight, 0);
+    }
+
+    #[test]
+    fn peer_context_removes_internal_hop_headers_before_forwarding() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert("x-ds4-peer-proxy-token", HeaderValue::from_static("secret"));
+        incoming.insert("x-ds4-proxy-hop", HeaderValue::from_static("1"));
+        incoming.insert("x-ds4-cluster-generation", HeaderValue::from_static("7"));
+        incoming.insert("x-keep", HeaderValue::from_static("yes"));
+        let headers = build_mode_aware_headers(
+            &incoming,
+            &Uri::from_static("/v1/test"),
+            "req_peer",
+            ProxyRequestContext {
+                ingress: ProxyIngress::Peer,
+                peer: "127.0.0.1:1234".parse().unwrap(),
+                hop: 1,
+            },
+        )
+        .unwrap();
+
+        assert!(headers.get("x-ds4-peer-proxy-token").is_none());
+        assert!(headers.get("x-ds4-proxy-hop").is_none());
+        assert!(headers.get("x-ds4-cluster-generation").is_none());
+        assert_eq!(headers.get("x-keep").unwrap(), "yes");
     }
 
     #[tokio::test]

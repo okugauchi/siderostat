@@ -409,7 +409,7 @@ Evidence: `src/target.rs`; stable table全6 row、全transition state、mode/sta
 
 Evidence: `src/admission.rs`; serving/readiness/capacity、drain race、timeout、generation ack、128-task cancellation storm test、共通local gate（59 tests）、test-support gate（61 tests）成功; 2026-08-06
 
-#### [ ] P1-05 Proxyを単一target forwardingへ変更する
+#### [x] P1-05 Proxyを単一target forwardingへ変更する
 
 - Actor: agent
 - Depends on: P1-04
@@ -423,6 +423,8 @@ Evidence: `src/admission.rs`; serving/readiness/capacity、drain race、timeout�
   5. Peer ingress hop headerを将来追加できる内部request contextを用意する。
 - Verification: SSE timing、unknown path、body limit、cancel、no-retry test
 - Done when: Request pathがaffinity/backend registryを参照しない
+
+Evidence: `src/proxy.rs`、`src/lib.rs`; `ProxyTarget`固定解決、request/response streaming、hop-by-hop・内部cluster header除去、body累積上限、permitのEOF/error/drop保持、transition 503 + `Retry-After`、connect 502、alternate retryなしを実装。mode-aware proxy 8 tests、共通local gate（68 tests）、test-support gate（70 tests）、`cargo check --all-targets --all-features`、`cargo clippy --all-targets --all-features -- -D warnings`成功; 2026-08-06
 
 #### [ ] P1-06 App stateとbasic admin APIを置換する
 
