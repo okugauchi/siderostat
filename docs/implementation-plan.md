@@ -582,7 +582,7 @@ Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/contr
 
 Evidence: `src/cluster/ds4_command.rs`、`src/config.rs`; target upstream commit `b7e9f00`の`ds4_server.c`/`ds4_distributed.c` option parserを一次ソース確認し、executable/current directoryと各argumentを個別`OsString`としてTokio `Command`へ渡すshell-free builderを実装。`-m`、host/port、context、standalone KV namespace/space、Q2/Q2-Q4/MXFP4 × resident/ssd-streaming独立profile、cache experts/full layers/preload/coldを型付き生成。Preload 0はupstreamが拒否するためdisabledとして省略。Generated optionの`extra_args` overrideとresident SSD tuningをbuilderでもfail closed。Matrix/SSD/duplicate 3 tests、共通local gate（84 tests）、test-support gate（87 tests）、check/clippy成功。実binary `--help`/actual profile可否はP3-07 gateまで未確認のまま維持; 2026-08-06
 
-#### [ ] P3-02 Process ownershipとidentity検証を実装する
+#### [x] P3-02 Process ownershipとidentity検証を実装する
 
 - Actor: agent
 - Depends on: P3-01
@@ -591,6 +591,8 @@ Evidence: `src/cluster/ds4_command.rs`、`src/config.rs`; target upstream commit
 - Actions: Process group、PID、executable、argv hash、start time、SIGTERM、optional verified SIGKILLを実装
 - Verification: PID reuse/mismatch/unknown process test
 - Done when: Unknown processへsignalするcode pathがない
+
+Evidence: `src/cluster/process.rs`、`src/cluster/platform/process.rs`; Tokio direct spawnと専用process group、canonical executable、length-framed argv SHA-256、profile/generation/spawn timestamp、libprocの`proc_pidpath`/`proc_pidinfo` start timeと`KERN_PROCARGS2` argvを用いたidentityを実装。全signal直前にidentityを再観測し、verified SIGTERM、optional `allow_sigkill`時のみ再検証後SIGKILL、wait/reap、spawn後検証失敗時のkill/wait cleanupを実施。PID reuse、executable/argv/start-time mismatch、unknown process no-signal、hash framing ambiguity、procargs parser、実macOS `/bin/sleep` process group smokeの5 tests、共通local gate（89 tests）、test-support gate（92 tests）、check/clippy成功。初回compileで検出した`PathBuf`から`OsStr`への型変換不足と不要importも修正; 2026-08-06
 
 #### [ ] P3-03 Child logとreadinessを実装する
 

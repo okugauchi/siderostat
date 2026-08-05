@@ -7,6 +7,7 @@ mod ds4_command;
 mod network_events;
 mod network_snapshot;
 mod platform;
+mod process;
 mod role;
 mod runtime;
 mod state;
@@ -39,6 +40,11 @@ pub use network_snapshot::{
 pub use platform::{
     bonjour::{BonjourPlatformEvent, MacOsBonjourOperation, bridge0_interface_index},
     macos::MacOsDynamicStoreWatcher,
+    process::{MacOsProcessInspector, MacOsProcessSignaler},
+};
+pub use process::{
+    ChildIdentity, ManagedChild, ObservedProcess, ProcessControlError, ProcessController,
+    ProcessInspector, ProcessSignal, ProcessSignaler, VerifiedProcess, argv_sha256,
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};
