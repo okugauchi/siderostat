@@ -302,7 +302,7 @@ Evidence: `src/lib.rs`、`tests/support/mod.rs`; `cargo check --all-targets --al
 
 Evidence: `docs/compatibility/ds4-b7e9f00.md`、`tests/fixtures/ds4/`; 69-byte synthetic frame確認、fixture SHA-256検証、共通local gate、32 tests成功; 2026-08-06
 
-#### [ ] P0-04 macOS network API spikeを完了する
+#### [!] P0-04 macOS network API spikeを完了する
 
 - Actor: agent + operator for cable operation
 - Depends on: P0-02
@@ -317,6 +317,8 @@ Evidence: `docs/compatibility/ds4-b7e9f00.md`、`tests/fixtures/ds4/`; 69-byte s
 - Verification: Spike build、sanitized fixture、cable event実測
 - Done when: Production moduleで使うAPI/bindingが1つに決定
 - Stop when: Private driver classをcorrectness条件にしないと実現できない
+
+Blocked: `spikes/macos-network/results-2026-08-06.md`; public API spike build、read-only snapshot、Dynamic Store購読開始、bridge0限定Bonjour register/browseは成功。物理Cable操作を行っていないためattach/detach時のevent順序・重複・delayが未実測。`network-probe watch 30`実行中に対象Cableをdetach/attachしsanitized結果を採取後に再開; 2026-08-06
 
 #### [ ] P0-05 Fake DS4 test serverを作る
 
