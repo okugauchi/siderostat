@@ -690,7 +690,7 @@ Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster
 
 Evidence: `src/cluster/ds4_hello.rs`、`tests/fixtures/ds4/hello40-schema-v1.hex`; network byte orderの12-byte header、40-byte fixed payload、`bytes == 40 + model_name_len`、name 1..127、bool field、layer/context/count/port、UTF-8、exact frame/no trailingを検証するpure parserを実装。Async readerは設定deadline内にheader/payloadをexact readし、immediate trailing byteも拒否。`quant_bits`は診断値として保持するだけでMXFP4 identityに不使用。Known synthetic fixture、magic/kind/size/name/truncate/trailing、EOF/deadline、0..511 bytes deterministic fuzzの4 tests、共通local gate（109 tests）、test-support gate（113 tests）、check/clippy成功。初回clippyのmanual range指摘をinclusive rangeへ修正; 2026-08-06
 
-#### [ ] P4-04 Rendezvous listenerを実装する
+#### [x] P4-04 Rendezvous listenerを実装する
 
 - Actor: agent
 - Depends on: P4-03
@@ -698,6 +698,8 @@ Evidence: `src/cluster/ds4_hello.rs`、`tests/fixtures/ds4/hello40-schema-v1.hex
 - Actions: Awaiting state限定bind、source/generation/deployment/layer確認、1 frame後closeを実装
 - Verification: Wrong source/state/deployment/layer、timeout test
 - Done when: AgentがHELLOを代理生成しない
+
+Evidence: `src/cluster/ds4_hello.rs`、`src/cluster/coordinator.rs`; `RendezvousListener`はAwaitingWorkerHello・valid stable lease・deployment有りの場合だけ固定coordinator addressへbindし、timeout付きone-shot acceptを実施。Accept元IPをworker固定addressと照合し、実socketから1 HELLO frameだけ読み、受信後にcurrent state/lease/generation/deploymentを再検証、expected layer/output/context/modelと照合してstream/listenerをclose。Coordinator control snapshotはlocal descriptor generation/deploymentとauthenticated leaseから生成し、HELLO生成APIは存在しない。Valid real socket frame、wrong state/source/deployment/layer、accept timeoutを含む2追加tests、共通local gate（111 tests）、test-support gate（115 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P4-05 Worker distributed lifecycleを実装する
 

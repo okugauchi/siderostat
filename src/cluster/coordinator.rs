@@ -1,8 +1,10 @@
+use super::RendezvousControlSnapshot;
 use super::{
     AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
     ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase, NodeDescriptor,
     PeerLease, WorkerEventKind, control::ControlProcessor,
 };
+use crate::target::ClusterState;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -151,6 +153,20 @@ impl CoordinatorControl {
 
     pub fn phase(&self) -> DistributedControlPhase {
         self.phase
+    }
+
+    pub fn rendezvous_snapshot(
+        &self,
+        state: ClusterState,
+        now_millis: u64,
+    ) -> RendezvousControlSnapshot {
+        let local = self.processor.local_descriptor();
+        RendezvousControlSnapshot {
+            state,
+            generation: local.generation,
+            deployment_id: local.deployment_id.clone(),
+            lease_valid: self.processor.lease().peer_present(now_millis),
+        }
     }
 
     fn require_generation(&self, generation: u64) -> Result<(), ControlError> {
@@ -424,6 +440,15 @@ mod tests {
         assert_eq!(prepare.generation, 7);
         assert_eq!(prepare.deployment_id.as_deref(), Some("deployment-a"));
         control.note_prepare_sent(7).unwrap();
+        assert_eq!(
+            control.rendezvous_snapshot(ClusterState::AwaitingWorkerHello, NOW + 5_000),
+            RendezvousControlSnapshot {
+                state: ClusterState::AwaitingWorkerHello,
+                generation: 7,
+                deployment_id: Some("deployment-a".into()),
+                lease_valid: true,
+            }
+        );
 
         let ready = ControlMessage {
             request_id: "ready-1".into(),

@@ -1,4 +1,9 @@
-use std::{io, time::Duration};
+use crate::target::ClusterState;
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -22,6 +27,31 @@ pub struct Ds4Hello {
     pub model_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendezvousControlSnapshot {
+    pub state: ClusterState,
+    pub generation: u64,
+    pub deployment_id: Option<String>,
+    pub lease_valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerHelloExpectation {
+    pub coordinator_address: IpAddr,
+    pub worker_address: IpAddr,
+    pub control: RendezvousControlSnapshot,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub has_output: bool,
+    pub context_size: u32,
+    pub model_name: String,
+}
+
+pub struct RendezvousListener {
+    listener: tokio::net::TcpListener,
+    expectation: WorkerHelloExpectation,
+}
+
 #[derive(Debug, Error)]
 pub enum Ds4HelloError {
     #[error("DS4 HELLO read timed out")]
@@ -42,8 +72,118 @@ pub enum Ds4HelloError {
     InvalidField,
     #[error("DS4 HELLO contains trailing data")]
     TrailingData,
+    #[error("rendezvous is only available while awaiting worker HELLO")]
+    WrongState,
+    #[error("rendezvous listener must bind the coordinator address")]
+    WrongBindAddress,
+    #[error("HELLO source is not the configured worker")]
+    WrongSource,
+    #[error("rendezvous control lease is not valid")]
+    InvalidLease,
+    #[error("rendezvous generation changed")]
+    GenerationChanged,
+    #[error("rendezvous deployment does not match")]
+    DeploymentMismatch,
+    #[error("HELLO layer assignment does not match")]
+    LayerMismatch,
+    #[error("HELLO context size does not match")]
+    ContextMismatch,
+    #[error("HELLO model name does not match")]
+    ModelMismatch,
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl RendezvousListener {
+    pub async fn bind(
+        address: SocketAddr,
+        expectation: WorkerHelloExpectation,
+    ) -> Result<Self, Ds4HelloError> {
+        validate_control_snapshot(&expectation.control)?;
+        if address.ip() != expectation.coordinator_address {
+            return Err(Ds4HelloError::WrongBindAddress);
+        }
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        Ok(Self {
+            listener,
+            expectation,
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub async fn accept_one<F>(
+        self,
+        timeout: Duration,
+        current_control: F,
+    ) -> Result<Ds4Hello, Ds4HelloError>
+    where
+        F: FnOnce() -> RendezvousControlSnapshot,
+    {
+        let (mut stream, source) = tokio::time::timeout(timeout, self.listener.accept())
+            .await
+            .map_err(|_| Ds4HelloError::Timeout)??;
+        if source.ip() != self.expectation.worker_address {
+            return Err(Ds4HelloError::WrongSource);
+        }
+        let read_deadline = timeout.min(Duration::from_secs(3));
+        let hello = read_hello_frame(&mut stream, read_deadline).await?;
+        let current = current_control();
+        validate_rendezvous_control(&self.expectation.control, &current)?;
+        validate_worker_hello(&hello, &self.expectation)?;
+        Ok(hello)
+    }
+}
+
+pub fn validate_worker_hello(
+    hello: &Ds4Hello,
+    expectation: &WorkerHelloExpectation,
+) -> Result<(), Ds4HelloError> {
+    if (hello.layer_start, hello.layer_end, hello.has_output)
+        != (
+            expectation.layer_start,
+            expectation.layer_end,
+            expectation.has_output,
+        )
+    {
+        return Err(Ds4HelloError::LayerMismatch);
+    }
+    if hello.context_size != expectation.context_size {
+        return Err(Ds4HelloError::ContextMismatch);
+    }
+    if hello.model_name != expectation.model_name {
+        return Err(Ds4HelloError::ModelMismatch);
+    }
+    Ok(())
+}
+
+fn validate_control_snapshot(snapshot: &RendezvousControlSnapshot) -> Result<(), Ds4HelloError> {
+    if snapshot.state != ClusterState::AwaitingWorkerHello {
+        return Err(Ds4HelloError::WrongState);
+    }
+    if !snapshot.lease_valid {
+        return Err(Ds4HelloError::InvalidLease);
+    }
+    if snapshot.deployment_id.is_none() {
+        return Err(Ds4HelloError::DeploymentMismatch);
+    }
+    Ok(())
+}
+
+fn validate_rendezvous_control(
+    expected: &RendezvousControlSnapshot,
+    current: &RendezvousControlSnapshot,
+) -> Result<(), Ds4HelloError> {
+    validate_control_snapshot(current)?;
+    if expected.generation != current.generation {
+        return Err(Ds4HelloError::GenerationChanged);
+    }
+    if expected.deployment_id != current.deployment_id {
+        return Err(Ds4HelloError::DeploymentMismatch);
+    }
+    Ok(())
 }
 
 pub fn parse_hello_frame(frame: &[u8]) -> Result<Ds4Hello, Ds4HelloError> {
@@ -187,6 +327,24 @@ mod tests {
             .collect()
     }
 
+    fn expectation() -> WorkerHelloExpectation {
+        WorkerHelloExpectation {
+            coordinator_address: IpAddr::from([127, 0, 0, 1]),
+            worker_address: IpAddr::from([127, 0, 0, 1]),
+            control: RendezvousControlSnapshot {
+                state: ClusterState::AwaitingWorkerHello,
+                generation: 12,
+                deployment_id: Some("deployment-a".into()),
+                lease_valid: true,
+            },
+            layer_start: 20,
+            layer_end: 42,
+            has_output: true,
+            context_size: 262_144,
+            model_name: "deepseek-v4-flash".into(),
+        }
+    }
+
     #[test]
     fn parses_known_network_order_fixture() {
         let hello = parse_hello_frame(&fixture()).unwrap();
@@ -273,5 +431,74 @@ mod tests {
             }
             let _ = parse_hello_frame(&bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn rendezvous_accepts_one_real_frame_from_expected_source() {
+        let listener = RendezvousListener::bind("127.0.0.1:0".parse().unwrap(), expectation())
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&fixture()).await.unwrap();
+        });
+        let expected_control = expectation().control;
+        let hello = listener
+            .accept_one(Duration::from_secs(1), || expected_control)
+            .await
+            .unwrap();
+        assert_eq!(hello.model_name, "deepseek-v4-flash");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rendezvous_rejects_state_source_deployment_layer_and_timeout() {
+        let mut wrong_state = expectation();
+        wrong_state.control.state = ClusterState::PairedStandaloneReady;
+        assert!(matches!(
+            RendezvousListener::bind("127.0.0.1:0".parse().unwrap(), wrong_state).await,
+            Err(Ds4HelloError::WrongState)
+        ));
+
+        let mut wrong_source = expectation();
+        wrong_source.worker_address = IpAddr::from([127, 0, 0, 2]);
+        let listener = RendezvousListener::bind("127.0.0.1:0".parse().unwrap(), wrong_source)
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let _stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        });
+        assert!(matches!(
+            listener
+                .accept_one(Duration::from_secs(1), || expectation().control)
+                .await,
+            Err(Ds4HelloError::WrongSource)
+        ));
+        writer.await.unwrap();
+
+        let mut wrong_layer = expectation();
+        wrong_layer.layer_start = 19;
+        assert!(matches!(
+            validate_worker_hello(&parse_hello_frame(&fixture()).unwrap(), &wrong_layer),
+            Err(Ds4HelloError::LayerMismatch)
+        ));
+        let mut current = expectation().control;
+        current.deployment_id = Some("deployment-b".into());
+        assert!(matches!(
+            validate_rendezvous_control(&expectation().control, &current),
+            Err(Ds4HelloError::DeploymentMismatch)
+        ));
+
+        let listener = RendezvousListener::bind("127.0.0.1:0".parse().unwrap(), expectation())
+            .await
+            .unwrap();
+        assert!(matches!(
+            listener
+                .accept_one(Duration::from_millis(10), || expectation().control)
+                .await,
+            Err(Ds4HelloError::Timeout)
+        ));
     }
 }

@@ -405,6 +405,10 @@ impl ControlProcessor {
     pub(crate) fn generation(&self) -> u64 {
         self.local.generation
     }
+
+    pub(crate) fn local_descriptor(&self) -> &NodeDescriptor {
+        &self.local
+    }
 }
 
 fn duration_millis(value: Duration) -> u64 {
