@@ -617,7 +617,7 @@ Evidence: `src/cluster/ds4_log.rs`、`src/cluster/process.rs`; stdout/stderrを�
 
 Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`、`src/app.rs`、`tests/phase3_supervisor.rs`; `StandaloneSupervisor`がshell-free commandをowned process groupとしてspawnし、log drainとHTTP readiness完了後だけ`LocalStandaloneReady`/Servingへ遷移するBoot pathを実装。Worker pairはgeneration付きlocal drain後にverified SIGTERM/wait、peer lossはUnavailableから再spawn/readiness後にSolo復帰。`LocalStandaloneLost` eventと1秒app reconcile loopによりchild早期終了時は新規admissionをblockして再起動する。起動失敗時はchild cleanupとstate task abortを実施。Fake lifecycle crash unit testと実`fake-ds4` childのstart→pair stop→peer-loss restart→timed crash→restart integration、共通local gate（94 tests）、test-support gate（98 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P3-05 Persistent cluster stateを実装する
+#### [x] P3-05 Persistent cluster stateを実装する
 
 - Actor: agent
 - Depends on: P3-04
@@ -626,6 +626,8 @@ Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/proce
 - Actions: Temp write、fsync、atomic rename、single-instance lock、corrupt preservationを実装
 - Verification: Partial write、corrupt JSON、old generation、lock contention test
 - Done when: Secretをstateへ保存しない
+
+Evidence: `src/cluster/state_store.rs`、`src/app.rs`; schema v1のcluster lifecycle、typed mode/target/failure code、owned child PID/canonical executable/argv SHA-256/spawn/start timeだけをJSON化し、secret/tokenを表現可能なfieldを排除。0600 temp fileへwrite、file `fsync`、same-directory atomic rename、directory `fsync`、non-blocking exclusive `flock`によるsingle-instance lock、loaded/saved generationより古いwrite拒否を実装。Invalid JSON/schema/fieldはUUID付きcorrupt siblingへatomic保全する。App Boot完了とlocal crash recovery後にruntime snapshotを保存。Partial temp、corrupt preservation、old generation、lock contention/reacquire、secret/token absenceの3 tests、共通local gate（97 tests）、test-support gate（101 tests）、check/clippy成功。初回clippyで検出したlock file truncate方針を`.truncate(false)`として明示; 2026-08-06
 
 #### [ ] P3-06 Restart reconcileを実装する
 

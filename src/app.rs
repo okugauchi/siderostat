@@ -1,13 +1,17 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
-    cluster::{ModeRuntime, StandaloneSupervisor, build_standalone_command},
+    cluster::{
+        ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,
+        PersistentMode, PersistentProxyTarget, StandaloneSupervisor, StateStore,
+        build_standalone_command,
+    },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::Metrics,
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
     },
-    target::{LocalRole, ProxyTarget, UnavailableReason},
+    target::{ClusterState, LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
 use axum::{
     Json, Router,
@@ -92,6 +96,7 @@ impl AppState {
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
+    let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
     let state = AppState::from_config(config.clone())?;
     state.proxy.admission().block();
     state.proxy.set_target(
@@ -117,19 +122,45 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         ModeRuntime::spawn_ready(
             LocalRole::Unknown,
             state.proxy.clone(),
-            supervisor,
+            supervisor.clone(),
             config.cluster.timeouts.drain,
         )
         .await?,
     );
+    persist_runtime_state(
+        &state_store,
+        &runtime,
+        &supervisor,
+        &config.ds4.standalone.profile_id,
+    )
+    .await?;
     let local_monitor_runtime = runtime.clone();
+    let local_monitor_supervisor = supervisor.clone();
+    let local_monitor_store = state_store.clone();
+    let local_monitor_profile = config.ds4.standalone.profile_id.clone();
     let local_monitor = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = local_monitor_runtime.reconcile_local().await {
-                tracing::error!(error = %error, "local standalone reconcile failed");
+            let before = local_monitor_runtime.snapshot().generation;
+            match local_monitor_runtime.reconcile_local().await {
+                Ok(snapshot) if snapshot.generation != before => {
+                    if let Err(error) = persist_runtime_state(
+                        &local_monitor_store,
+                        &local_monitor_runtime,
+                        &local_monitor_supervisor,
+                        &local_monitor_profile,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %error, "persistent cluster state write failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "local standalone reconcile failed");
+                }
             }
         }
     });
@@ -153,6 +184,70 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     drop(runtime);
     serve_result?;
     Ok(())
+}
+
+async fn persist_runtime_state(
+    store: &StateStore,
+    runtime: &ModeRuntime,
+    supervisor: &StandaloneSupervisor,
+    active_profile: &str,
+) -> anyhow::Result<()> {
+    let snapshot = runtime.snapshot();
+    let child = supervisor
+        .child_identity()
+        .await
+        .map(|identity| PersistentChild {
+            pid: identity.pid,
+            executable: identity.executable,
+            argv_sha256: identity
+                .argv_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            spawned_at_millis: identity.spawned_at_millis,
+            process_start_micros: identity.process_start_micros,
+        });
+    store.save(&PersistentClusterState {
+        schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
+        generation: snapshot.generation,
+        desired_mode: persistent_mode(snapshot.stable_mode),
+        last_stable_mode: persistent_mode(snapshot.stable_mode),
+        cluster_state: cluster_state_name(snapshot.state).into(),
+        proxy_target: match snapshot.target {
+            ProxyTarget::LocalStandalone => PersistentProxyTarget::LocalStandalone,
+            ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
+            ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
+        },
+        active_profile: Some(active_profile.into()),
+        child,
+        last_failure: None,
+    })?;
+    Ok(())
+}
+
+fn persistent_mode(mode: StableMode) -> PersistentMode {
+    match mode {
+        StableMode::SoloStandalone => PersistentMode::SoloStandalone,
+        StableMode::PairedStandalone => PersistentMode::PairedStandalone,
+        StableMode::DistributedMxfp4 => PersistentMode::DistributedMxfp4,
+    }
+}
+
+fn cluster_state_name(state: ClusterState) -> &'static str {
+    match state {
+        ClusterState::Booting => "booting",
+        ClusterState::SoloStandaloneStarting => "solo-standalone-starting",
+        ClusterState::SoloStandaloneReady => "solo-standalone-ready",
+        ClusterState::Pairing => "pairing",
+        ClusterState::PairedStandaloneReady => "paired-standalone-ready",
+        ClusterState::AwaitingWorkerHello => "awaiting-worker-hello",
+        ClusterState::Promoting => "promoting",
+        ClusterState::DistributedStarting => "distributed-starting",
+        ClusterState::DistributedReady => "distributed-ready",
+        ClusterState::Demoting => "demoting",
+        ClusterState::Backoff => "backoff",
+        ClusterState::ManualInterventionRequired => "manual-intervention-required",
+    }
 }
 
 pub fn public_router(state: Arc<AppState>) -> Router {

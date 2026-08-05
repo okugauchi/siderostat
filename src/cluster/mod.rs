@@ -12,6 +12,7 @@ mod process;
 mod role;
 mod runtime;
 mod state;
+mod state_store;
 mod worker;
 
 pub use auth::{
@@ -57,5 +58,9 @@ pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePe
 pub use state::{
     ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, TransitionError,
     spawn_state_machine,
+};
+pub use state_store::{
+    PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,
+    PersistentFailureCode, PersistentMode, PersistentProxyTarget, StateStore, StateStoreError,
 };
 pub use worker::WorkerControl;
