@@ -640,7 +640,7 @@ Evidence: `src/cluster/state_store.rs`、`src/app.rs`; schema v1のcluster lifec
 
 Evidence: `src/cluster/restart.rs`、`src/cluster/process.rs`、`src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/app.rs`; 起動前に保存stateを読込み、PID/canonical executable/length-framed argv SHA-256/process start timeが完全一致するrecovered childだけを毎signal前再検証してSIGTERM、消滅確認後に新managed Solo childへ収束。保存generationをwall clockに戻さずstate machine baselineとして継承する。Mismatch/stop failure/unknown port owner/address unavailableはsignalせず`ManualInterventionRequired`、public admission Blocked、`/cluster`へmanual state/generationを公開。Corrupt stateは保全後、port free時だけ安全なSolo startへ進む。Matching child stop、mismatching child no-signal、unknown port owner no-signal/manual、admin manual stateの3 tests、共通local gate（100 tests）、test-support gate（104 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P3-07 Standalone actual acceptanceを実行する
+#### [!] P3-07 Standalone actual acceptanceを実行する
 
 - Actor: operator
 - Depends on: P3-06
@@ -649,6 +649,8 @@ Evidence: `src/cluster/restart.rs`、`src/cluster/process.rs`、`src/cluster/run
 - Verification: `/v1/models`、short prompt、streaming、memory/startup記録、24h supervisor run
 - Done when: 各profileがpassまたは明示的blocked
 - Stop when: 未確認profileをproduction readyと記録しない
+
+Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f029aba58106a05f9b98ffd4bf279d3148cb04e39fa6f38`）の`--help`/`--help distributed`で使用option存在は確認したが、full source commitとの対応をbinaryから確定不能。Example指定のQ2-Q4/MXFP4 GGUF、両manifest、およびQ2 resident用model/configが対象hostに存在しないため、3 profileのreadiness/prompt/streaming/resource/24h gateを実行不能。Production statusは全profile未確認のまま維持。再開条件: target commitに対応するbinary provenance、3 profileのGGUF/manifest/config、24時間占有可能な対象Macをoperatorが配置すること。Evidence: `docs/compatibility/ds4-b7e9f00.md`; 2026-08-06
 
 ### Phase 4: Distributed MXFP4 lifecycle
 
