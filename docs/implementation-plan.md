@@ -654,7 +654,7 @@ Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f
 
 ### Phase 4: Distributed MXFP4 lifecycle
 
-#### [ ] P4-01 Deployment manifestとfingerprintを実装する
+#### [x] P4-01 Deployment manifestとfingerprintを実装する
 
 - Actor: agent
 - Depends on: P3-06
@@ -663,6 +663,8 @@ Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f
 - Actions: Canonical JSON、async SHA-256、metadata cache/stale判定、deployment IDを実装
 - Verification: Key order、file change、same/different digest test
 - Done when: Handler threadで巨大modelを同期hashしない
+
+Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest、lowercase SHA-256/非空/size検証、serde valueのkey昇順・UTF-8・余分な空白なしcanonical JSONとdeployment IDを実装。Distributed compatibilityはbinary/model/checkpoint/context/layer/wire/argvを比較しsource commitは診断専用。Tokio fileを1 MiB chunkでstreaming SHA-256し各chunkでyield、hash前後metadata一致を要求。Device/inode/size/mtime/digest/computed time cacheとFresh/Stale/Missing判定、UUID job ID、同一profile単一async job、status取得を実装。Key order、same/different deployment/compatibility、file change stale、duplicate job/completionの3 tests、共通local gate（103 tests）、test-support gate（107 tests）、check/clippy成功。初回compileで検出したerror変換とtest importを修正; 2026-08-06
 
 #### [ ] P4-02 Generation付きdistributed controlを実装する
 

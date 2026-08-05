@@ -5,6 +5,7 @@ mod coordinator;
 mod discovery;
 mod ds4_command;
 mod ds4_log;
+mod manifest;
 mod network_events;
 mod network_snapshot;
 mod platform;
@@ -34,6 +35,11 @@ pub use ds4_command::{Ds4Command, Ds4CommandError, Ds4Profile, build_standalone_
 pub use ds4_log::{
     ChildLogForwarders, ChildLogRecord, ChildLogStream, Ds4LogEvent, MAX_CHILD_LOG_LINE_BYTES,
     parse_ds4_log_event, spawn_child_log_forwarders,
+};
+pub use manifest::{
+    DEPLOYMENT_MANIFEST_SCHEMA_VERSION, DistributedManifest, FileFingerprint, FingerprintCache,
+    FingerprintCacheState, FingerprintJob, FingerprintJobError, FingerprintJobStatus,
+    FingerprintJobs, ManifestError, StandaloneManifest, fingerprint_file,
 };
 pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,
