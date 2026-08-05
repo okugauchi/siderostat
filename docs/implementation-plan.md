@@ -457,7 +457,7 @@ Evidence: `src/app.rs`、`src/main.rs`、`src/metrics.rs`、`src/proxy.rs`; sche
 
 Evidence: `src/proxy.rs`へstreaming/header helperを保持したまま、`src/routing.rs`、`src/backend.rs`、`src/affinity.rs`、`src/heartbeat.rs`、`src/persistence.rs`と旧proxy path/schema/testsを削除。runtime型参照0件、旧SQLite実ファイルへの操作なし。`rusqlite`、`unicode-normalization`、`hmac`、`sha2`は`Cargo.toml`/lock/`cargo tree`から不在。共通local gate（40 tests）、test-support gate（42 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P1-08 Phase 1 integrationを固定する
+#### [x] P1-08 Phase 1 integrationを固定する
 
 - Actor: agent
 - Depends on: P1-07
@@ -465,6 +465,8 @@ Evidence: `src/proxy.rs`へstreaming/header helperを保持したまま、`src/r
 - Actions: Exampleをparse可能なschema v2へ更新し、fake local upstreamでsmoke test
 - Verification: 共通local gate、example parse、Solo streaming
 - Done when: Phase 1 exit conditionとEvidenceを記録
+
+Evidence: `ds4-smart-proxy.example.toml`、`tests/phase1_smoke.rs`; repository exampleをschema v2 parserで固定し、Fake DS4 → Solo Standalone fixed target → clientのunknown path/body/SSE逐次転送smoke成功。Phase 1 exit condition「Solo Standalone fixed targetでproxy test成功」を充足。共通local gate（41 tests）、test-support gate（44 tests）、check/clippy成功; 2026-08-06
 
 ### Phase 2: Thunderbolt discoveryとPaired Standalone
 

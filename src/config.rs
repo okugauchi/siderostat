@@ -997,6 +997,15 @@ level = "info"
     }
 
     #[test]
+    fn parses_repository_schema_v2_example() {
+        let config = ModeAwareConfig::parse(include_str!("../ds4-smart-proxy.example.toml"))
+            .expect("repository example must remain parseable");
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
+        assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
+    }
+
+    #[test]
     fn rejects_unknown_mode_aware_field() {
         let input = mode_aware_config().replace(
             "max_in_flight = 1",
