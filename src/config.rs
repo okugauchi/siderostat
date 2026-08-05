@@ -1,10 +1,12 @@
 use axum::http::{HeaderName, HeaderValue};
 use serde::Deserialize;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
-    env,
+    env, fs,
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 use url::Url;
@@ -454,6 +456,515 @@ pub struct Ds4Mxfp4Config {
     pub extra_args: Vec<String>,
 }
 
+impl ModeAwareConfig {
+    pub async fn load(explicit: Option<&Path>) -> anyhow::Result<(Self, PathBuf)> {
+        let path = resolve_config_path(explicit)?;
+        let contents = tokio::fs::read_to_string(&path).await?;
+        let mut config = Self::parse(&contents)?;
+        config.expand_paths()?;
+        config.validate()?;
+        Ok((config, path))
+    }
+
+    pub fn parse(contents: &str) -> anyhow::Result<Self> {
+        let value: toml::Value = toml::from_str(contents)?;
+        if let Some(table) = value.as_table() {
+            let legacy = [
+                "backends",
+                "routing",
+                "affinity",
+                "heartbeat",
+                "active_probe",
+                "cooldown",
+            ]
+            .into_iter()
+            .filter(|field| table.contains_key(*field))
+            .collect::<Vec<_>>();
+            anyhow::ensure!(
+                legacy.is_empty(),
+                "legacy configuration fields are not supported by schema v2: {}; migrate to proxy/cluster/ds4 sections (the legacy affinity SQLite database is not deleted)",
+                legacy.join(", ")
+            );
+        }
+        toml::from_str(contents).map_err(Into::into)
+    }
+
+    pub fn expand_paths(&mut self) -> anyhow::Result<()> {
+        self.cluster.state_path = expand_config_path(&self.cluster.state_path)?;
+        self.cluster.manifest_cache_dir = expand_config_path(&self.cluster.manifest_cache_dir)?;
+        self.cluster.security.control_secret_file =
+            expand_config_path(&self.cluster.security.control_secret_file)?;
+        self.cluster.security.peer_proxy_token_file =
+            expand_config_path(&self.cluster.security.peer_proxy_token_file)?;
+        self.cluster.security.admin_token_file =
+            expand_config_path(&self.cluster.security.admin_token_file)?;
+        self.ds4.binary = expand_config_path(&self.ds4.binary)?;
+        self.ds4.working_directory = expand_config_path(&self.ds4.working_directory)?;
+        self.ds4.standalone.model = expand_config_path(&self.ds4.standalone.model)?;
+        self.ds4.standalone.model_manifest =
+            expand_config_path(&self.ds4.standalone.model_manifest)?;
+        self.ds4.standalone.kv_disk_dir = expand_config_path(&self.ds4.standalone.kv_disk_dir)?;
+        self.ds4.mxfp4.model = expand_config_path(&self.ds4.mxfp4.model)?;
+        self.ds4.mxfp4.model_manifest = expand_config_path(&self.ds4.mxfp4.model_manifest)?;
+        self.ds4.mxfp4.kv_disk_dir = expand_config_path(&self.ds4.mxfp4.kv_disk_dir)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 2,
+            "schema_version must be 2, got {}",
+            self.schema_version
+        );
+        anyhow::ensure!(
+            self.proxy.request_body_limit_bytes > 0,
+            "proxy.request_body_limit_bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.proxy.max_in_flight > 0,
+            "proxy.max_in_flight must be greater than zero"
+        );
+        ensure_loopback_or_explicit(self.proxy.admin_listen.ip())?;
+        validate_ports(self)?;
+        validate_dns_sd_name(
+            &self.cluster.discovery.bonjour_service_type,
+            &self.cluster.discovery.bonjour_domain,
+        )?;
+        validate_durations(self)?;
+        validate_paths(self)?;
+        validate_ssd_streaming(&self.ds4.standalone)?;
+        anyhow::ensure!(
+            self.ds4.standalone.kv_disk_dir != self.ds4.mxfp4.kv_disk_dir,
+            "standalone and distributed kv_disk_dir must be different"
+        );
+        validate_layer_split(
+            &self.ds4.mxfp4.coordinator_layers,
+            &self.ds4.mxfp4.worker_layers,
+        )?;
+        validate_secret_files(&self.cluster.security)?;
+        validate_extra_args("ds4.standalone.extra_args", &self.ds4.standalone.extra_args)?;
+        validate_extra_args("ds4.mxfp4.extra_args", &self.ds4.mxfp4.extra_args)?;
+        Ok(())
+    }
+}
+
+fn validate_ports(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    let ports = [
+        ("proxy.public_listen", config.proxy.public_listen.port()),
+        ("proxy.admin_listen", config.proxy.admin_listen.port()),
+        ("cluster.control_port", config.cluster.control_port),
+        (
+            "cluster.ds4_distributed_port",
+            config.cluster.ds4_distributed_port,
+        ),
+        (
+            "cluster.peer_ingress_port",
+            config.cluster.peer_ingress_port,
+        ),
+        ("ds4.http_port", config.ds4.http_port),
+    ];
+    let mut seen = std::collections::HashMap::new();
+    for (name, port) in ports {
+        anyhow::ensure!(port != 0, "{name} must not use port 0");
+        if let Some(previous) = seen.insert(port, name) {
+            anyhow::bail!("port collision: {previous} and {name} both use {port}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_dns_sd_name(service_type: &str, domain: &str) -> anyhow::Result<()> {
+    let service_labels = service_type.split('.').collect::<Vec<_>>();
+    anyhow::ensure!(
+        service_labels.len() == 2
+            && service_labels[0].starts_with('_')
+            && matches!(service_labels[1], "_tcp" | "_udp")
+            && service_labels.iter().all(|label| {
+                (2..=63).contains(&label.len())
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            }),
+        "cluster.discovery.bonjour_service_type is invalid: {service_type}"
+    );
+    anyhow::ensure!(
+        domain.ends_with('.') && domain.len() <= 255,
+        "cluster.discovery.bonjour_domain must be an absolute DNS name"
+    );
+    for label in domain.trim_end_matches('.').split('.') {
+        anyhow::ensure!(
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "cluster.discovery.bonjour_domain contains an invalid label"
+        );
+    }
+    Ok(())
+}
+
+fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    let durations = [
+        ("proxy.timeouts.connect", config.proxy.timeouts.connect),
+        (
+            "proxy.timeouts.response_headers",
+            config.proxy.timeouts.response_headers,
+        ),
+        (
+            "proxy.timeouts.first_body_byte",
+            config.proxy.timeouts.first_body_byte,
+        ),
+        (
+            "proxy.timeouts.stream_idle",
+            config.proxy.timeouts.stream_idle,
+        ),
+        (
+            "cluster.discovery.event_debounce",
+            config.cluster.discovery.event_debounce,
+        ),
+        (
+            "cluster.discovery.reconcile_interval",
+            config.cluster.discovery.reconcile_interval,
+        ),
+        (
+            "cluster.security.max_clock_skew",
+            config.cluster.security.max_clock_skew,
+        ),
+        (
+            "cluster.security.nonce_ttl",
+            config.cluster.security.nonce_ttl,
+        ),
+        (
+            "cluster.policy.required_peer_stability",
+            config.cluster.policy.required_peer_stability,
+        ),
+        (
+            "cluster.policy.route_loss_grace",
+            config.cluster.policy.route_loss_grace,
+        ),
+        (
+            "cluster.policy.promotion_backoff",
+            config.cluster.policy.promotion_backoff,
+        ),
+        (
+            "cluster.timeouts.peer_connect",
+            config.cluster.timeouts.peer_connect,
+        ),
+        (
+            "cluster.timeouts.peer_request",
+            config.cluster.timeouts.peer_request,
+        ),
+        (
+            "cluster.timeouts.control_lease",
+            config.cluster.timeouts.control_lease,
+        ),
+        ("cluster.timeouts.drain", config.cluster.timeouts.drain),
+        ("cluster.timeouts.stop", config.cluster.timeouts.stop),
+        (
+            "cluster.timeouts.rendezvous_hello",
+            config.cluster.timeouts.rendezvous_hello,
+        ),
+        (
+            "cluster.timeouts.worker_startup",
+            config.cluster.timeouts.worker_startup,
+        ),
+        (
+            "cluster.timeouts.coordinator_startup",
+            config.cluster.timeouts.coordinator_startup,
+        ),
+        (
+            "cluster.timeouts.complete_route",
+            config.cluster.timeouts.complete_route,
+        ),
+        (
+            "cluster.timeouts.standalone_startup",
+            config.cluster.timeouts.standalone_startup,
+        ),
+    ];
+    for (name, duration) in durations {
+        anyhow::ensure!(!duration.is_zero(), "{name} must be greater than zero");
+    }
+    anyhow::ensure!(
+        config.cluster.timeouts.rendezvous_hello >= config.cluster.timeouts.worker_startup,
+        "cluster.timeouts.rendezvous_hello must not be shorter than worker_startup"
+    );
+    anyhow::ensure!(
+        config.cluster.policy.max_consecutive_promotion_failures > 0,
+        "cluster.policy.max_consecutive_promotion_failures must be greater than zero"
+    );
+    Ok(())
+}
+
+fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    validate_regular_file("ds4.binary", &config.ds4.binary, true)?;
+    validate_directory("ds4.working_directory", &config.ds4.working_directory)?;
+    validate_regular_file("ds4.standalone.model", &config.ds4.standalone.model, false)?;
+    validate_regular_file(
+        "ds4.standalone.model_manifest",
+        &config.ds4.standalone.model_manifest,
+        false,
+    )?;
+    validate_regular_file("ds4.mxfp4.model", &config.ds4.mxfp4.model, false)?;
+    validate_regular_file(
+        "ds4.mxfp4.model_manifest",
+        &config.ds4.mxfp4.model_manifest,
+        false,
+    )?;
+    for (name, path) in [
+        ("cluster.state_path", &config.cluster.state_path),
+        (
+            "cluster.manifest_cache_dir",
+            &config.cluster.manifest_cache_dir,
+        ),
+        (
+            "ds4.standalone.kv_disk_dir",
+            &config.ds4.standalone.kv_disk_dir,
+        ),
+        ("ds4.mxfp4.kv_disk_dir", &config.ds4.mxfp4.kv_disk_dir),
+    ] {
+        validate_absolute_normalized(name, path)?;
+    }
+    Ok(())
+}
+
+fn validate_regular_file(name: &str, path: &Path, executable: bool) -> anyhow::Result<()> {
+    validate_absolute_normalized(name, path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("{name} {} is unavailable: {error}", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "{name} must not be a symlink"
+    );
+    anyhow::ensure!(metadata.is_file(), "{name} must be a regular file");
+    let canonical = fs::canonicalize(path)?;
+    anyhow::ensure!(
+        canonical == path,
+        "{name} must use its canonical absolute path"
+    );
+    #[cfg(unix)]
+    if executable {
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o111 != 0,
+            "{name} must be executable"
+        );
+    }
+    Ok(())
+}
+
+fn validate_directory(name: &str, path: &Path) -> anyhow::Result<()> {
+    validate_absolute_normalized(name, path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("{name} {} is unavailable: {error}", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "{name} must not be a symlink"
+    );
+    anyhow::ensure!(metadata.is_dir(), "{name} must be a directory");
+    anyhow::ensure!(fs::canonicalize(path)? == path, "{name} must be canonical");
+    Ok(())
+}
+
+fn validate_absolute_normalized(name: &str, path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_absolute(), "{name} must be an absolute path");
+    anyhow::ensure!(
+        !path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir)),
+        "{name} must not contain '.' or '..' components"
+    );
+    Ok(())
+}
+
+fn validate_ssd_streaming(config: &Ds4StandaloneConfig) -> anyhow::Result<()> {
+    let has_ssd_options = config.ssd_cache_experts.is_some()
+        || config.ssd_full_layers.is_some()
+        || config.ssd_preload_experts.is_some()
+        || config.ssd_cold;
+    anyhow::ensure!(
+        config.residency != Residency::Resident || !has_ssd_options,
+        "SSD streaming options require residency = 'ssd-streaming'"
+    );
+    if let Some(value) = &config.ssd_cache_experts {
+        let number = value.strip_suffix("GB").unwrap_or(value);
+        anyhow::ensure!(
+            number.parse::<u64>().is_ok_and(|number| number > 0),
+            "ds4.standalone.ssd_cache_experts must be a positive integer or <number>GB"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerEnd {
+    Number(u32),
+    Output,
+}
+
+fn parse_layer_range(value: &str) -> anyhow::Result<(u32, LayerEnd)> {
+    let (start, end) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid layer range: {value}"))?;
+    let start = start.parse::<u32>()?;
+    let end = if end == "output" {
+        LayerEnd::Output
+    } else {
+        LayerEnd::Number(end.parse::<u32>()?)
+    };
+    Ok((start, end))
+}
+
+fn validate_layer_split(coordinator: &str, worker: &str) -> anyhow::Result<()> {
+    let (coordinator_start, coordinator_end) = parse_layer_range(coordinator)?;
+    let (worker_start, worker_end) = parse_layer_range(worker)?;
+    anyhow::ensure!(
+        coordinator_start == 0,
+        "coordinator layers must start at layer 0"
+    );
+    let LayerEnd::Number(coordinator_end) = coordinator_end else {
+        anyhow::bail!("coordinator layers must not own output");
+    };
+    anyhow::ensure!(
+        worker_start == coordinator_end.saturating_add(1),
+        "layer split must not contain a gap or overlap"
+    );
+    anyhow::ensure!(
+        worker_end == LayerEnd::Output,
+        "worker layers must own output"
+    );
+    Ok(())
+}
+
+fn validate_secret_files(config: &ClusterSecurityConfig) -> anyhow::Result<()> {
+    let files = [
+        (
+            "cluster.security.control_secret_file",
+            &config.control_secret_file,
+        ),
+        (
+            "cluster.security.peer_proxy_token_file",
+            &config.peer_proxy_token_file,
+        ),
+        (
+            "cluster.security.admin_token_file",
+            &config.admin_token_file,
+        ),
+    ];
+    let mut paths = HashSet::new();
+    let mut values = HashSet::new();
+    for (name, path) in files {
+        validate_regular_file(name, path, false)?;
+        anyhow::ensure!(
+            paths.insert(path),
+            "cluster secret/token paths must be different"
+        );
+        let metadata = fs::metadata(path)?;
+        #[cfg(unix)]
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o777 == 0o600,
+            "{name} must have mode 0600"
+        );
+        let value = fs::read(path)?;
+        anyhow::ensure!(value.len() >= 32, "{name} must contain at least 32 bytes");
+        anyhow::ensure!(
+            values.insert(value),
+            "cluster secret/token values must be different"
+        );
+    }
+    Ok(())
+}
+
+fn validate_extra_args(name: &str, arguments: &[String]) -> anyhow::Result<()> {
+    const FORBIDDEN: &[&str] = &[
+        "-m",
+        "--model",
+        "--role",
+        "--layers",
+        "--coordinator",
+        "--listen",
+        "--host",
+        "--port",
+        "--ctx",
+        "--kv-disk-dir",
+        "--kv-disk-space-mb",
+        "--ssd-streaming",
+        "--ssd-streaming-cache-experts",
+        "--ssd-streaming-full-layers",
+        "--ssd-streaming-preload-experts",
+        "--ssd-streaming-cold",
+    ];
+    for argument in arguments {
+        if let Some(forbidden) = FORBIDDEN.iter().find(|forbidden| {
+            argument == **forbidden
+                || argument
+                    .strip_prefix(**forbidden)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        }) {
+            anyhow::bail!("{name} must not override generated option {forbidden}");
+        }
+    }
+    Ok(())
+}
+
+fn expand_config_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let Some(value) = path.to_str() else {
+        return Ok(path.to_path_buf());
+    };
+    if value == "~" {
+        return environment_config_path("HOME", "");
+    }
+    if let Some(suffix) = value.strip_prefix("~/") {
+        return environment_config_path("HOME", suffix);
+    }
+    if let Some(variable) = value.strip_prefix('$') {
+        let (name, suffix) = if let Some(variable) = variable.strip_prefix('{') {
+            let end = variable.find('}').ok_or_else(|| {
+                anyhow::anyhow!("invalid environment variable expression in config path: {value}")
+            })?;
+            (&variable[..end], &variable[end + 1..])
+        } else {
+            let end = variable
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(variable.len());
+            (&variable[..end], &variable[end..])
+        };
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+            "invalid environment variable name in config path: {value}"
+        );
+        anyhow::ensure!(
+            suffix.is_empty() || suffix.starts_with('/'),
+            "environment variable in config path must be followed by '/': {value}"
+        );
+        return environment_config_path(name, suffix.trim_start_matches('/'));
+    }
+    anyhow::ensure!(
+        !value.starts_with('~'),
+        "only '~/' is supported for home expansion in config path: {value}"
+    );
+    Ok(path.to_path_buf())
+}
+
+fn environment_config_path(name: &str, suffix: &str) -> anyhow::Result<PathBuf> {
+    let base = env::var_os(name).ok_or_else(|| {
+        anyhow::anyhow!("environment variable {name} referenced by config path is not set")
+    })?;
+    anyhow::ensure!(
+        !base.is_empty(),
+        "environment variable {name} referenced by config path is empty"
+    );
+    let mut path = PathBuf::from(base);
+    if !suffix.is_empty() {
+        path.push(suffix);
+    }
+    Ok(path)
+}
+
 impl Config {
     pub async fn load(explicit: Option<&Path>) -> anyhow::Result<(Self, PathBuf)> {
         let path = resolve_config_path(explicit)?;
@@ -676,6 +1187,7 @@ fn parse_duration(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn valid_config() -> &'static str {
         r#"
@@ -792,6 +1304,55 @@ level = "info"
 "#
     }
 
+    struct ConfigTestFiles {
+        root: PathBuf,
+    }
+
+    impl ConfigTestFiles {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ds4-smart-proxy-config-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self {
+                root: fs::canonicalize(root).unwrap(),
+            }
+        }
+
+        fn file(&self, name: &str, contents: &[u8], mode: u32) -> PathBuf {
+            let path = self.root.join(name);
+            fs::write(&path, contents).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            fs::canonicalize(path).unwrap()
+        }
+
+        fn config(&self) -> ModeAwareConfig {
+            let mut config = ModeAwareConfig::parse(mode_aware_config()).unwrap();
+            config.ds4.binary = self.file("ds4-server", b"fake binary", 0o700);
+            config.ds4.working_directory = self.root.clone();
+            config.ds4.standalone.model = self.file("standalone.gguf", b"model", 0o600);
+            config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
+            config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
+            config.ds4.mxfp4.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
+            config.cluster.security.control_secret_file = self.file("control.key", &[1; 32], 0o600);
+            config.cluster.security.peer_proxy_token_file = self.file("peer.key", &[2; 32], 0o600);
+            config.cluster.security.admin_token_file = self.file("admin.key", &[3; 32], 0o600);
+            config.cluster.state_path = self.root.join("cluster-state.json");
+            config.cluster.manifest_cache_dir = self.root.join("manifests");
+            config.ds4.standalone.kv_disk_dir = self.root.join("standalone-kv");
+            config.ds4.mxfp4.kv_disk_dir = self.root.join("distributed-kv");
+            config
+        }
+    }
+
+    impl Drop for ConfigTestFiles {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn parses_defaults_and_new_schema() {
         let config: Config = toml::from_str(valid_config()).unwrap();
@@ -871,5 +1432,229 @@ level = "info"
             mode_aware_config().replace("schema_version = 2", "schema_version = 2\nbackends = []");
         let error = toml::from_str::<ModeAwareConfig>(&input).unwrap_err();
         assert!(error.to_string().contains("backends"));
+    }
+
+    #[test]
+    fn validates_complete_mode_aware_config() {
+        let files = ConfigTestFiles::new();
+        files.config().validate().unwrap();
+    }
+
+    #[test]
+    fn expands_only_leading_config_path_expressions() {
+        let home = PathBuf::from(env::var_os("HOME").expect("HOME must be set for tests"));
+        assert_eq!(
+            expand_config_path(Path::new("$HOME/Library/test.bin")).unwrap(),
+            home.join("Library/test.bin")
+        );
+        assert_eq!(
+            expand_config_path(Path::new("${HOME}/Library/test.bin")).unwrap(),
+            home.join("Library/test.bin")
+        );
+        assert_eq!(
+            expand_config_path(Path::new("~/Library/test.bin")).unwrap(),
+            home.join("Library/test.bin")
+        );
+        assert_eq!(
+            expand_config_path(Path::new("literal/$HOME/test.bin")).unwrap(),
+            PathBuf::from("literal/$HOME/test.bin")
+        );
+    }
+
+    #[test]
+    fn returns_actionable_legacy_migration_error() {
+        let error = ModeAwareConfig::parse("backends = []").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("legacy configuration fields"));
+        assert!(message.contains("SQLite database is not deleted"));
+    }
+
+    #[test]
+    fn rejects_wrong_schema_version() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.schema_version = 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("schema_version")
+        );
+    }
+
+    #[test]
+    fn rejects_mode_aware_port_collisions() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.cluster.peer_ingress_port = config.proxy.public_listen.port();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("port collision")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bonjour_syntax() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.cluster.discovery.bonjour_service_type = "ds4cluster.tcp".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("bonjour_service_type")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_discovery_intervals() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.cluster.discovery.event_debounce = Duration::ZERO;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("event_debounce")
+        );
+    }
+
+    #[test]
+    fn rejects_non_executable_ds4_binary() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.ds4.binary = files.file("not-executable", b"binary", 0o600);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("executable")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_model_variant_and_residency() {
+        let bad_variant =
+            mode_aware_config().replace("model_variant = \"q2-q4\"", "model_variant = \"q8\"");
+        assert!(toml::from_str::<ModeAwareConfig>(&bad_variant).is_err());
+        let bad_residency = mode_aware_config()
+            .replace("residency = \"ssd-streaming\"", "residency = \"automatic\"");
+        assert!(toml::from_str::<ModeAwareConfig>(&bad_residency).is_err());
+    }
+
+    #[test]
+    fn rejects_ssd_options_for_resident_profile() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.ds4.standalone.residency = Residency::Resident;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("SSD streaming")
+        );
+    }
+
+    #[test]
+    fn rejects_shared_standalone_and_distributed_kv_path() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.ds4.mxfp4.kv_disk_dir = config.ds4.standalone.kv_disk_dir.clone();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("kv_disk_dir")
+        );
+    }
+
+    #[test]
+    fn rejects_layer_gap_overlap_or_missing_output() {
+        let files = ConfigTestFiles::new();
+        let mut gap = files.config();
+        gap.ds4.mxfp4.worker_layers = "21:output".into();
+        assert!(
+            gap.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("gap or overlap")
+        );
+
+        let mut missing_output = files.config();
+        missing_output.ds4.mxfp4.worker_layers = "20:42".into();
+        assert!(
+            missing_output
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("own output")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_insecure_or_duplicate_secret_files() {
+        let files = ConfigTestFiles::new();
+        let mut insecure = files.config();
+        insecure.cluster.security.control_secret_file = files.file("insecure.key", &[4; 32], 0o644);
+        assert!(
+            insecure
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("0600")
+        );
+
+        let mut duplicate = files.config();
+        duplicate.cluster.security.admin_token_file =
+            duplicate.cluster.security.control_secret_file.clone();
+        assert!(
+            duplicate
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("different")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_or_inconsistent_timeouts() {
+        let files = ConfigTestFiles::new();
+        let mut zero = files.config();
+        zero.proxy.timeouts.connect = Duration::ZERO;
+        assert!(zero.validate().unwrap_err().to_string().contains("connect"));
+
+        let mut inconsistent = files.config();
+        inconsistent.cluster.timeouts.rendezvous_hello = Duration::from_secs(1);
+        assert!(
+            inconsistent
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("rendezvous_hello")
+        );
+    }
+
+    #[test]
+    fn rejects_generated_ds4_option_overrides() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.ds4.standalone.extra_args = vec!["--port=9000".into()];
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("generated option --port")
+        );
     }
 }

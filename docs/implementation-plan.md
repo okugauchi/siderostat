@@ -366,7 +366,7 @@ Evidence: `tests/fixtures/legacy/`、`tests/fixtures/ds4/`、`spikes/macos-netwo
 
 Evidence: `src/config.rs`; schema v2 complete example parse、unknown nested field/legacy root field rejection、typed duration/address/path確認、共通local gate（35 tests）、test-support gate（37 tests）成功; 2026-08-06
 
-#### [ ] P1-02 Config validationとpath expansionを実装する
+#### [x] P1-02 Config validationとpath expansionを実装する
 
 - Actor: agent
 - Depends on: P1-01
@@ -375,6 +375,8 @@ Evidence: `src/config.rs`; schema v2 complete example parse、unknown nested fie
 - Verification: Port衝突、secret permission、model/KV分離、SSD option重複test
 - Done when: Validation checklistがtest名と1対1対応
 - Stop when: Testのため実model fileが必要。Temporary regular fileで代用する
+
+Evidence: `src/config.rs`; schema/path/port/DNS-SD/duration/file/model/residency/KV/layer/secret/extra-arg validation 22 tests、temporary regular files使用、共通local gate（50 tests）、test-support gate（52 tests）成功; 2026-08-06
 
 #### [ ] P1-03 Target resolverを実装する
 
