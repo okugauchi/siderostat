@@ -70,12 +70,16 @@ fn proxy_state(local: &Server, coordinator: &Server) -> Arc<ModeAwareProxyState>
 struct FakeLifecycle;
 
 impl LocalStandaloneLifecycle for FakeLifecycle {
-    fn start(&self) -> BoxFuture<'static, Result<()>> {
+    fn start(&self, _generation: u64) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
     fn stop(&self) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn is_running(&self) -> BoxFuture<'static, Result<bool>> {
+        Box::pin(async { Ok(true) })
     }
 }
 

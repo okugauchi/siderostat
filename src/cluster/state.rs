@@ -45,6 +45,7 @@ impl ClusterSnapshot {
 pub enum ClusterEventKind {
     BeginSoloStandalone,
     LocalStandaloneReady,
+    LocalStandaloneLost,
     BeginPairing,
     PairingReady,
     WorkerHelloAccepted,
@@ -157,6 +158,11 @@ fn transition(
             StableMode::SoloStandalone,
             ClusterState::SoloStandaloneReady,
             true,
+        ),
+        (ClusterState::SoloStandaloneReady, ClusterEventKind::LocalStandaloneLost) => (
+            StableMode::SoloStandalone,
+            ClusterState::SoloStandaloneStarting,
+            false,
         ),
         (ClusterState::SoloStandaloneReady, ClusterEventKind::BeginPairing) => (
             StableMode::SoloStandalone,

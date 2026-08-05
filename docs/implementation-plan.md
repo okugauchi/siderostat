@@ -606,7 +606,7 @@ Evidence: `src/cluster/process.rs`、`src/cluster/platform/process.rs`; Tokio di
 
 Evidence: `src/cluster/ds4_log.rs`、`src/cluster/process.rs`; stdout/stderrを独立Tokio taskで継続drainし、16 KiB上限、lossy UTF-8、bounded channelへのnon-blocking転送、profile/generation/PID/stream metadataを実装。専用parserはHTTP(S) listening URLと非空detailを検証した既知5 prefixだけをtyped eventへ変換し、unknown/invalid/truncated logはeventを生成しない。Managed childの生存を各試行前後に確認しつつ`GET /v1/models`成功を期限付きpollするreadiness、slow startup、timeout、early exitを実装。Known/unknown/truncated/metadata/slow startup/timeout/early exitの4 tests、共通local gate（93 tests）、test-support gate（96 tests）、check/clippy成功。初回compileで検出したasync buffer borrow範囲を修正し、loopback bind testはmacOS sandbox外でも成功; 2026-08-06
 
-#### [ ] P3-04 Standalone lifecycleをstate machineへ接続する
+#### [x] P3-04 Standalone lifecycleをstate machineへ接続する
 
 - Actor: agent
 - Depends on: P3-03
@@ -614,6 +614,8 @@ Evidence: `src/cluster/ds4_log.rs`、`src/cluster/process.rs`; stdout/stderrを�
 - Actions: Boot start、ready target switch、Paired worker stop、peer loss restart、local drainを実装
 - Verification: Fake child start/stop/crash/recovery integration
 - Done when: Solo/Paired transitionが実child lifecycleを伴う
+
+Evidence: `src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`、`src/app.rs`、`tests/phase3_supervisor.rs`; `StandaloneSupervisor`がshell-free commandをowned process groupとしてspawnし、log drainとHTTP readiness完了後だけ`LocalStandaloneReady`/Servingへ遷移するBoot pathを実装。Worker pairはgeneration付きlocal drain後にverified SIGTERM/wait、peer lossはUnavailableから再spawn/readiness後にSolo復帰。`LocalStandaloneLost` eventと1秒app reconcile loopによりchild早期終了時は新規admissionをblockして再起動する。起動失敗時はchild cleanupとstate task abortを実施。Fake lifecycle crash unit testと実`fake-ds4` childのstart→pair stop→peer-loss restart→timed crash→restart integration、共通local gate（94 tests）、test-support gate（98 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P3-05 Persistent cluster stateを実装する
 

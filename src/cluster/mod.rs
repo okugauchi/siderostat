@@ -49,8 +49,8 @@ pub use platform::{
 };
 pub use process::{
     ChildIdentity, ManagedChild, ObservedProcess, ProcessControlError, ProcessController,
-    ProcessInspector, ProcessSignal, ProcessSignaler, VerifiedProcess, argv_sha256,
-    wait_for_http_readiness,
+    ProcessInspector, ProcessSignal, ProcessSignaler, StandaloneSupervisor, VerifiedProcess,
+    argv_sha256, wait_for_http_readiness,
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};

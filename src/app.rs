@@ -1,5 +1,6 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
+    cluster::{ModeRuntime, StandaloneSupervisor, build_standalone_command},
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::Metrics,
     proxy::{
@@ -91,7 +92,47 @@ impl AppState {
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
-    let state = AppState::from_config(config)?;
+    let state = AppState::from_config(config.clone())?;
+    state.proxy.admission().block();
+    state.proxy.set_target(
+        ProxyTarget::Unavailable {
+            reason: UnavailableReason::Transition,
+        },
+        false,
+    );
+    let command = build_standalone_command(&config.ds4)?;
+    let models_url = url::Url::parse(&format!(
+        "http://{}:{}/v1/models",
+        config.ds4.http_host, config.ds4.http_port
+    ))?;
+    let supervisor = Arc::new(StandaloneSupervisor::new(
+        command,
+        models_url,
+        config.cluster.timeouts.standalone_startup,
+        std::time::Duration::from_millis(250),
+        config.cluster.timeouts.stop,
+        config.ds4.allow_sigkill,
+    ));
+    let runtime = Arc::new(
+        ModeRuntime::spawn_ready(
+            LocalRole::Unknown,
+            state.proxy.clone(),
+            supervisor,
+            config.cluster.timeouts.drain,
+        )
+        .await?,
+    );
+    let local_monitor_runtime = runtime.clone();
+    let local_monitor = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = local_monitor_runtime.reconcile_local().await {
+                tracing::error!(error = %error, "local standalone reconcile failed");
+            }
+        }
+    });
     let public_addr = state.config.public_listen;
     let admin_addr = state.config.admin_listen;
     let public = public_router(state.clone());
@@ -101,13 +142,16 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     info!(addr = %public_addr, "public listener started");
     info!(addr = %admin_addr, "admin listener started");
 
-    tokio::try_join!(
+    let serve_result = tokio::try_join!(
         axum::serve(
             public_listener,
             public.into_make_service_with_connect_info::<SocketAddr>()
         ),
         axum::serve(admin_listener, admin),
-    )?;
+    );
+    local_monitor.abort();
+    drop(runtime);
+    serve_result?;
     Ok(())
 }
 

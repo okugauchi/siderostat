@@ -12,8 +12,9 @@ use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 
 pub trait LocalStandaloneLifecycle: Send + Sync + 'static {
-    fn start(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>>;
 }
 
 pub trait RuntimePeerControl {
@@ -68,18 +69,34 @@ impl ModeRuntime {
         drain_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
         let (cluster, state_task) = spawn_state_machine(ClusterSnapshot::booting(role), 16);
-        let starting = cluster
-            .apply(ClusterEvent {
-                expected_generation: 0,
-                kind: ClusterEventKind::BeginSoloStandalone,
-            })
-            .await?;
-        let ready = cluster
-            .apply(ClusterEvent {
-                expected_generation: starting.generation,
-                kind: ClusterEventKind::LocalStandaloneReady,
-            })
-            .await?;
+        let startup = async {
+            let starting = cluster
+                .apply(ClusterEvent {
+                    expected_generation: 0,
+                    kind: ClusterEventKind::BeginSoloStandalone,
+                })
+                .await?;
+            local
+                .start(starting.generation)
+                .await
+                .map_err(RuntimeError::LocalLifecycle)?;
+            cluster
+                .apply(ClusterEvent {
+                    expected_generation: starting.generation,
+                    kind: ClusterEventKind::LocalStandaloneReady,
+                })
+                .await
+                .map_err(RuntimeError::Transition)
+        }
+        .await;
+        let ready = match startup {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = local.stop().await;
+                state_task.abort();
+                return Err(error);
+            }
+        };
         apply_proxy_snapshot(&proxy, ready);
         proxy.admission().start_serving();
         Ok(Self {
@@ -94,6 +111,10 @@ impl ModeRuntime {
 
     pub fn snapshot(&self) -> ClusterSnapshot {
         self.cluster.snapshot()
+    }
+
+    pub fn cluster_handle(&self) -> ClusterHandle {
+        self.cluster.clone()
     }
 
     pub async fn reconcile_peer<C: RuntimePeerControl>(
@@ -124,6 +145,47 @@ impl ModeRuntime {
             control.advance_generation(next.generation);
         }
         Ok(next)
+    }
+
+    pub async fn reconcile_local(&self) -> Result<ClusterSnapshot, RuntimeError> {
+        let current = self.cluster.snapshot();
+        if current.state != ClusterState::SoloStandaloneReady
+            || self
+                .local
+                .is_running()
+                .await
+                .map_err(RuntimeError::LocalLifecycle)?
+        {
+            return Ok(current);
+        }
+        self.proxy.admission().block();
+        self.proxy.set_target(
+            ProxyTarget::Unavailable {
+                reason: crate::target::UnavailableReason::Transition,
+            },
+            false,
+        );
+        let starting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::LocalStandaloneLost,
+            })
+            .await?;
+        self.local
+            .start(starting.generation)
+            .await
+            .map_err(RuntimeError::LocalLifecycle)?;
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: starting.generation,
+                kind: ClusterEventKind::LocalStandaloneReady,
+            })
+            .await?;
+        apply_proxy_snapshot(&self.proxy, ready);
+        self.proxy.admission().start_serving();
+        Ok(ready)
     }
 
     async fn form_pair(&self, current: ClusterSnapshot) -> Result<ClusterSnapshot, RuntimeError> {
@@ -178,7 +240,7 @@ impl ModeRuntime {
             .await?;
         if self.role == LocalRole::Worker {
             self.local
-                .start()
+                .start(starting.generation)
                 .await
                 .map_err(RuntimeError::LocalLifecycle)?;
         }
@@ -219,30 +281,40 @@ mod tests {
     };
     use std::{
         net::IpAddr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[derive(Default)]
     struct Lifecycle {
         starts: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
+        running: Arc<AtomicBool>,
     }
 
     impl LocalStandaloneLifecycle for Lifecycle {
-        fn start(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        fn start(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
             let starts = self.starts.clone();
+            let running = self.running.clone();
             Box::pin(async move {
                 starts.fetch_add(1, Ordering::Relaxed);
+                running.store(true, Ordering::Relaxed);
                 Ok(())
             })
         }
 
         fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
             let stops = self.stops.clone();
+            let running = self.running.clone();
             Box::pin(async move {
                 stops.fetch_add(1, Ordering::Relaxed);
+                running.store(false, Ordering::Relaxed);
                 Ok(())
             })
+        }
+
+        fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
+            let running = self.running.clone();
+            Box::pin(async move { Ok(running.load(Ordering::Relaxed)) })
         }
     }
 
@@ -355,7 +427,7 @@ mod tests {
         let solo = runtime.reconcile_peer(&mut control, 1_150).await.unwrap();
         assert_eq!(solo.stable_mode, StableMode::SoloStandalone);
         assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
-        assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 2);
 
         control
             .handle(
@@ -430,5 +502,30 @@ mod tests {
                 reason: UnavailableReason::Transition
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn local_crash_blocks_admission_until_restart_is_ready() {
+        let proxy = proxy();
+        let lifecycle = Arc::new(Lifecycle::default());
+        let runtime = ModeRuntime::spawn_ready(
+            LocalRole::Coordinator,
+            proxy.clone(),
+            lifecycle.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 1);
+        lifecycle.running.store(false, Ordering::Relaxed);
+
+        let recovered = runtime.reconcile_local().await.unwrap();
+        assert_eq!(recovered.state, ClusterState::SoloStandaloneReady);
+        assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 2);
+        assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
+        assert_eq!(
+            proxy.admission().snapshot().state,
+            crate::admission::AdmissionState::Serving
+        );
     }
 }
