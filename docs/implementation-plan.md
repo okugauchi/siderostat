@@ -337,13 +337,15 @@ Evidence: `spikes/macos-network/results-2026-08-06.md`; warning-free spike build
 
 Evidence: `src/bin/fake-ds4.rs`、`tests/fake_ds4.rs`; `cargo check --all-targets --all-features`、共通local gate、`cargo test --all-targets --features test-support`（34 tests成功、SIGTERM後process/listener不在）; 2026-08-06
 
-#### [ ] P0-06 Phase 0 gateを閉じる
+#### [x] P0-06 Phase 0 gateを閉じる
 
 - Actor: agent
 - Depends on: P0-03、P0-04、P0-05
 - Files: 本書のEvidenceのみ
 - Verification: 共通local gate、fixture checksum
 - Done when: Phase 1がDS4/Networkの未確定APIに依存しない
+
+Evidence: `tests/fixtures/legacy/`、`tests/fixtures/ds4/`、`spikes/macos-network/results-2026-08-06.md`; fixture SHA-256、legacy example `cmp`、共通local gate（32 tests）、test-support gate（34 tests）成功; 2026-08-06
 
 ### Phase 1: Mode-aware proxy core
 
