@@ -349,7 +349,7 @@ Evidence: `tests/fixtures/legacy/`、`tests/fixtures/ds4/`、`spikes/macos-netwo
 
 ### Phase 1: Mode-aware proxy core
 
-#### [ ] P1-01 Config schema v2の型を実装する
+#### [x] P1-01 Config schema v2の型を実装する
 
 - Actor: agent
 - Depends on: P0-06
@@ -363,6 +363,8 @@ Evidence: `tests/fixtures/legacy/`、`tests/fixtures/ds4/`、`spikes/macos-netwo
 - Verification: Complete example parse、unknown/legacy rejection test
 - Done when: 仕様書第22.2節のexampleがparse可能
 - Stop when: 仕様書にdefaultがないfieldを推測する必要がある
+
+Evidence: `src/config.rs`; schema v2 complete example parse、unknown nested field/legacy root field rejection、typed duration/address/path確認、共通local gate（35 tests）、test-support gate（37 tests）成功; 2026-08-06
 
 #### [ ] P1-02 Config validationとpath expansionを実装する
 
