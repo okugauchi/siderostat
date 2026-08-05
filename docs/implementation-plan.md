@@ -426,7 +426,7 @@ Evidence: `src/admission.rs`; serving/readiness/capacity、drain race、timeout�
 
 Evidence: `src/proxy.rs`、`src/lib.rs`; `ProxyTarget`固定解決、request/response streaming、hop-by-hop・内部cluster header除去、body累積上限、permitのEOF/error/drop保持、transition 503 + `Retry-After`、connect 502、alternate retryなしを実装。mode-aware proxy 8 tests、共通local gate（68 tests）、test-support gate（70 tests）、`cargo check --all-targets --all-features`、`cargo clippy --all-targets --all-features -- -D warnings`成功; 2026-08-06
 
-#### [ ] P1-06 App stateとbasic admin APIを置換する
+#### [x] P1-06 App stateとbasic admin APIを置換する
 
 - Actor: agent
 - Depends on: P1-05
@@ -438,6 +438,8 @@ Evidence: `src/proxy.rs`、`src/lib.rs`; `ProxyTarget`固定解決、request/res
   4. Public/admin listener addressを仕様値へ合わせる。
 - Verification: Admin endpoint status/body test
 - Done when: Solo Standalone targetだけでbinaryが起動可能
+
+Evidence: `src/app.rs`、`src/main.rs`、`src/metrics.rs`、`src/proxy.rs`; schema v2 runtime configから単一target state/client/admissionを構築し、cluster無効時のSolo Standalone、仕様listener、mode-aware public path、`/healthz`・`/readyz`・`/cluster`・`/metrics`を接続。Legacy `/backends`・`/affinity`は新routerから除外。Admin status/body 2 tests、共通local gate（70 tests）、test-support gate（72 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P1-07 Legacy routing codeを除去する
 

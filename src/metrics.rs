@@ -1,4 +1,8 @@
-use crate::{affinity::AffinityStore, backend::BackendRegistry};
+use crate::{
+    admission::{AdmissionSnapshot, AdmissionState},
+    app::target_name,
+    proxy::ModeAwareTargetSnapshot,
+};
 use std::{collections::HashMap, fmt::Write, sync::Mutex};
 
 #[derive(Default)]
@@ -36,7 +40,12 @@ impl Metrics {
         }
     }
 
-    pub fn render(&self, registry: &BackendRegistry, affinity: &AffinityStore) -> String {
+    pub fn render_mode_aware(
+        &self,
+        node_id: &str,
+        target: ModeAwareTargetSnapshot,
+        admission: AdmissionSnapshot,
+    ) -> String {
         let mut output = String::new();
         output.push_str("# TYPE ds4_proxy_requests_total counter\n");
         if let Ok(counters) = self.counters.lock() {
@@ -68,37 +77,26 @@ impl Metrics {
             output,
             "ds4_proxy_time_to_first_byte_seconds_count {ttfb_count}"
         );
-
+        let target_ready = target.ready && admission.state == AdmissionState::Serving;
+        let target = target_name(target.target);
+        let node_id = escape_label(node_id);
         output.push_str("# TYPE ds4_proxy_in_flight gauge\n");
-        output.push_str("# TYPE ds4_proxy_backend_health gauge\n");
-        output.push_str("# TYPE ds4_proxy_affinity_entries gauge\n");
-        for backend in registry.all() {
-            let id = escape_label(&backend.config.id);
-            let state = backend.snapshot();
-            let _ = writeln!(
-                output,
-                "ds4_proxy_in_flight{{backend=\"{id}\"}} {}",
-                backend.in_flight()
-            );
-            for health in [
-                "unknown", "alive", "suspect", "offline", "cooldown", "disabled",
-            ] {
-                let value = u8::from(state.health.as_str() == health);
-                let _ = writeln!(
-                    output,
-                    "ds4_proxy_backend_health{{backend=\"{id}\",state=\"{health}\"}} {value}"
-                );
-            }
-            let entries = affinity
-                .counts_by_backend()
-                .get(&backend.config.id)
-                .copied()
-                .unwrap_or(0);
-            let _ = writeln!(
-                output,
-                "ds4_proxy_affinity_entries{{backend=\"{id}\"}} {entries}"
-            );
-        }
+        let _ = writeln!(
+            output,
+            "ds4_proxy_in_flight{{ingress=\"public\",target=\"{target}\"}} {}",
+            admission.in_flight
+        );
+        output.push_str("# TYPE ds4_proxy_target_ready gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_target_ready{{target=\"{target}\"}} {}",
+            u8::from(target_ready)
+        );
+        output.push_str("# TYPE ds4_proxy_cluster_generation gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_cluster_generation{{node_id=\"{node_id}\"}} 0"
+        );
         output
     }
 }

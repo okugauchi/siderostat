@@ -1,55 +1,88 @@
 use crate::{
-    affinity::AffinityStore, backend::BackendRegistry, config::Config,
-    heartbeat::spawn_heartbeat_tasks, metrics::Metrics, proxy::proxy_handler,
-    routing::Router as TargetRouter,
+    admission::{AdmissionSnapshot, AdmissionState},
+    config::{ModeAwareConfig, ModelVariant, Residency},
+    metrics::Metrics,
+    proxy::{ModeAwareProxyOptions, ModeAwareProxyState, mode_aware_proxy_handler},
+    target::{ProxyTarget, UnavailableReason},
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{Response, StatusCode},
-    routing::{any, delete, get},
+    routing::{any, get},
 };
 use serde_json::{Value, json};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::info;
 
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub public_listen: SocketAddr,
+    pub admin_listen: SocketAddr,
+    pub node_id: String,
+    pub cluster_enabled: bool,
+    pub interface: String,
+    pub standalone_profile_id: String,
+    pub standalone_model_variant: ModelVariant,
+    pub standalone_residency: Residency,
+}
+
 pub struct AppState {
-    pub config: Arc<Config>,
-    pub registry: Arc<BackendRegistry>,
-    pub affinity: Arc<AffinityStore>,
-    pub router: Arc<TargetRouter>,
+    pub config: Arc<AppConfig>,
+    pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
-    pub fn from_config(config: Config) -> anyhow::Result<Arc<Self>> {
-        let registry = Arc::new(BackendRegistry::from_config(&config)?);
-        let affinity = Arc::new(AffinityStore::new(&config.affinity)?);
-        let router = Arc::new(TargetRouter::new(
-            registry.clone(),
-            affinity.clone(),
-            config.routing.clone(),
-        ));
+    pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
+        let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
+        let coordinator_address = SocketAddr::new(
+            config.cluster.coordinator_address,
+            config.cluster.peer_ingress_port,
+        );
+        let local_upstream = url::Url::parse(&format!("http://{local_address}"))?;
+        let coordinator_upstream = url::Url::parse(&format!("http://{coordinator_address}"))?;
+        let proxy = Arc::new(ModeAwareProxyState::new(
+            local_upstream,
+            coordinator_upstream,
+            ModeAwareProxyOptions {
+                max_in_flight: config.proxy.max_in_flight,
+                request_body_limit_bytes: config.proxy.request_body_limit_bytes,
+                response_header_timeout: config.proxy.timeouts.response_headers,
+                first_body_byte_timeout: config.proxy.timeouts.first_body_byte,
+                stream_idle_timeout: config.proxy.timeouts.stream_idle,
+                connect_timeout: config.proxy.timeouts.connect,
+            },
+        )?);
+
+        // Cluster lifecycle/supervisor接続前のP1 baseline。P2で実DS4 readinessに置換する。
+        if !config.cluster.enabled {
+            proxy.set_target(ProxyTarget::LocalStandalone, true);
+            proxy.admission().start_serving();
+        }
+
         Ok(Arc::new(Self {
-            config: Arc::new(config),
-            registry,
-            affinity,
-            router,
+            config: Arc::new(AppConfig {
+                public_listen: config.proxy.public_listen,
+                admin_listen: config.proxy.admin_listen,
+                node_id: config.cluster.node_id,
+                cluster_enabled: config.cluster.enabled,
+                interface: config.cluster.interface,
+                standalone_profile_id: config.ds4.standalone.profile_id,
+                standalone_model_variant: config.ds4.standalone.model_variant,
+                standalone_residency: config.ds4.standalone.residency,
+            }),
+            proxy,
             metrics: Arc::new(Metrics::default()),
         }))
     }
 }
 
-pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let public_addr = config.listen;
-    let admin_addr = config.admin_listen;
+pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let state = AppState::from_config(config)?;
-    spawn_background_tasks(state.clone());
-
+    let public_addr = state.config.public_listen;
+    let admin_addr = state.config.admin_listen;
     let public = public_router(state.clone());
     let admin = admin_router(state);
     let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
@@ -60,7 +93,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     tokio::try_join!(
         axum::serve(
             public_listener,
-            public.into_make_service_with_connect_info::<std::net::SocketAddr>()
+            public.into_make_service_with_connect_info::<SocketAddr>()
         ),
         axum::serve(admin_listener, admin),
     )?;
@@ -69,88 +102,73 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
 pub fn public_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/{*path}", any(proxy_handler))
-        .with_state(state)
+        .route("/", any(mode_aware_proxy_handler))
+        .route("/{*path}", any(mode_aware_proxy_handler))
+        .with_state(state.proxy.clone())
 }
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .route("/backends", get(backends))
+        .route("/cluster", get(cluster))
         .route("/metrics", get(metrics))
-        .route("/affinity", get(affinity_summary))
-        .route("/affinity/{key_hash}", delete(delete_affinity))
         .with_state(state)
 }
 
-fn spawn_background_tasks(state: Arc<AppState>) {
-    spawn_heartbeat_tasks(
-        state.registry.clone(),
-        state.config.heartbeat.clone(),
-        state.config.cooldown.clone(),
-        state.metrics.clone(),
-    );
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            state.affinity.cleanup();
-        }
-    });
-}
-
-async fn health() -> &'static str {
-    "OK"
+async fn health() -> Json<Value> {
+    Json(json!({"status": "ok"}))
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let available = state
-        .registry
-        .all()
-        .iter()
-        .any(|backend| backend.is_available());
-    let ready = available && state.affinity.persistence_healthy();
-    Response::builder()
-        .status(if ready {
+    let target = state.proxy.target_snapshot();
+    let admission = state.proxy.admission().snapshot();
+    let ready = target.ready && admission.state == AdmissionState::Serving;
+    json_response(
+        if ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
-        })
-        .body(Body::from(if ready { "READY" } else { "NOT READY" }))
-        .expect("valid readiness response")
-}
-
-async fn backends(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
-    Json(
-        state
-            .registry
-            .all()
-            .iter()
-            .map(|backend| {
-                let snapshot = backend.snapshot();
-                json!({
-                    "id": backend.config.id,
-                    "kind": format!("{:?}", backend.config.kind).to_ascii_lowercase(),
-                    "local": backend.config.local,
-                    "health": snapshot.health.as_str(),
-                    "in_flight": backend.in_flight(),
-                    "max_in_flight": backend.config.max_in_flight,
-                    "tags": backend.config.tags,
-                    "ewma_latency_ms": snapshot.ewma_latency_ms,
-                    "last_heartbeat_at": iso_time(snapshot.last_heartbeat_at),
-                    "last_success_at": iso_time(snapshot.last_success_at),
-                    "last_failure_at": iso_time(snapshot.last_failure_at),
-                    "cooldown_until": iso_time(snapshot.cooldown_until.map(instant_to_system_time)),
-                    "last_failure_kind": snapshot.last_failure_kind.map(|kind| kind.as_str()),
-                })
-            })
-            .collect(),
+        },
+        json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "target": target_name(target.target),
+            "target_ready": target.ready,
+            "admission": admission_state_name(admission.state),
+        }),
     )
 }
 
+async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let target = state.proxy.target_snapshot();
+    let admission = state.proxy.admission().snapshot();
+    let solo = !state.config.cluster_enabled;
+    Json(json!({
+        "node_id": state.config.node_id,
+        "role": "unknown",
+        "mode": if solo { "solo-standalone" } else { "unknown" },
+        "state": if solo { "solo-standalone-ready" } else { "booting" },
+        "generation": 0,
+        "target": target_name(target.target),
+        "target_ready": target.ready,
+        "admission": admission_json(admission),
+        "peer_ingress_ready": false,
+        "interface": state.config.interface,
+        "active_standalone_profile": {
+            "profile_id": state.config.standalone_profile_id,
+            "model_variant": model_variant_name(state.config.standalone_model_variant),
+            "residency": residency_name(state.config.standalone_residency),
+        },
+        "child": Value::Null,
+    }))
+}
+
 async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let body = state.metrics.render(&state.registry, &state.affinity);
+    let body = state.metrics.render_mode_aware(
+        &state.config.node_id,
+        state.proxy.target_snapshot(),
+        state.proxy.admission().snapshot(),
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")
@@ -158,77 +176,151 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         .expect("valid metrics response")
 }
 
-async fn affinity_summary(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({
-        "entries": state.affinity.len(),
-        "by_backend": state.affinity.counts_by_backend(),
-        "persistence_healthy": state.affinity.persistence_healthy(),
-    }))
-}
-
-async fn delete_affinity(
-    State(state): State<Arc<AppState>>,
-    Path(key_hash): Path<String>,
-) -> StatusCode {
-    let removed = if key_hash.len() == 12 {
-        state.affinity.remove_by_tag(&key_hash)
-    } else if let Some(hash) = parse_hash(&key_hash) {
-        state.affinity.remove(hash)
-    } else {
-        return StatusCode::BAD_REQUEST;
-    };
-    if removed {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
-}
-
-fn parse_hash(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 {
-        return None;
-    }
-    let mut output = [0_u8; 32];
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(output)
-}
-
-fn instant_to_system_time(value: Instant) -> SystemTime {
-    SystemTime::now()
-        + value
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::ZERO)
-}
-
-fn iso_time(value: Option<SystemTime>) -> Option<String> {
-    value.and_then(|value| {
-        let duration = value.duration_since(UNIX_EPOCH).ok()?;
-        let seconds = duration.as_secs();
-        let days = (seconds / 86_400) as i64;
-        let seconds_of_day = seconds % 86_400;
-        let (year, month, day) = civil_from_days(days);
-        Some(format!(
-            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-            seconds_of_day / 3_600,
-            (seconds_of_day % 3_600) / 60,
-            seconds_of_day % 60
+fn json_response(status: StatusCode, value: Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&value).expect("JSON value must serialize"),
         ))
+        .expect("valid JSON response")
+}
+
+fn admission_json(snapshot: AdmissionSnapshot) -> Value {
+    json!({
+        "state": admission_state_name(snapshot.state),
+        "in_flight": snapshot.in_flight,
+        "max_in_flight": snapshot.max_in_flight,
+        "drain_generation": snapshot.drain_generation,
     })
 }
 
-fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_unix_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year as i32, month as u32, day as u32)
+fn admission_state_name(state: AdmissionState) -> &'static str {
+    match state {
+        AdmissionState::Serving => "serving",
+        AdmissionState::Draining => "draining",
+        AdmissionState::Blocked => "blocked",
+    }
+}
+
+pub(crate) fn target_name(target: ProxyTarget) -> &'static str {
+    match target {
+        ProxyTarget::LocalStandalone => "local-standalone",
+        ProxyTarget::Coordinator => "coordinator",
+        ProxyTarget::Unavailable {
+            reason: UnavailableReason::Transition,
+        } => "unavailable-transition",
+        ProxyTarget::Unavailable {
+            reason: UnavailableReason::InconsistentStableState,
+        } => "unavailable-inconsistent-state",
+        ProxyTarget::Unavailable {
+            reason: UnavailableReason::UnknownRoleWithoutLocalStandalone,
+        } => "unavailable-unknown-role",
+    }
+}
+
+fn model_variant_name(value: ModelVariant) -> &'static str {
+    match value {
+        ModelVariant::Q2 => "q2",
+        ModelVariant::Q2Q4 => "q2-q4",
+        ModelVariant::Mxfp4 => "mxfp4",
+    }
+}
+
+fn residency_name(value: Residency) -> &'static str {
+    match value {
+        Residency::Resident => "resident",
+        Residency::SsdStreaming => "ssd-streaming",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::to_bytes, http::Request};
+    use tower::ServiceExt;
+
+    fn test_state(serving: bool) -> Arc<AppState> {
+        let proxy = Arc::new(
+            ModeAwareProxyState::new(
+                url::Url::parse("http://127.0.0.1:8000").unwrap(),
+                url::Url::parse("http://10.99.0.1:18082").unwrap(),
+                ModeAwareProxyOptions {
+                    max_in_flight: 1,
+                    request_body_limit_bytes: 4096,
+                    response_header_timeout: std::time::Duration::from_secs(1),
+                    first_body_byte_timeout: std::time::Duration::from_secs(1),
+                    stream_idle_timeout: std::time::Duration::from_secs(1),
+                    connect_timeout: std::time::Duration::from_secs(1),
+                },
+            )
+            .unwrap(),
+        );
+        if serving {
+            proxy.set_target(ProxyTarget::LocalStandalone, true);
+            proxy.admission().start_serving();
+        }
+        Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                public_listen: "127.0.0.1:18080".parse().unwrap(),
+                admin_listen: "127.0.0.1:18081".parse().unwrap(),
+                node_id: "test-node".into(),
+                cluster_enabled: false,
+                interface: "bridge0".into(),
+                standalone_profile_id: "test-profile".into(),
+                standalone_model_variant: ModelVariant::Q2Q4,
+                standalone_residency: Residency::SsdStreaming,
+            }),
+            proxy,
+            metrics: Arc::new(Metrics::default()),
+        })
+    }
+
+    async fn get(state: Arc<AppState>, path: &'static str) -> (StatusCode, String) {
+        let response = admin_router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn basic_admin_endpoints_report_serving_solo_state() {
+        let state = test_state(true);
+        let (health_status, health_body) = get(state.clone(), "/healthz").await;
+        let (ready_status, ready_body) = get(state.clone(), "/readyz").await;
+        let (cluster_status, cluster_body) = get(state.clone(), "/cluster").await;
+        let (metrics_status, metrics_body) = get(state, "/metrics").await;
+
+        assert_eq!(health_status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&health_body).unwrap()["status"],
+            "ok"
+        );
+        assert_eq!(ready_status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&ready_body).unwrap()["target"],
+            "local-standalone"
+        );
+        assert_eq!(cluster_status, StatusCode::OK);
+        let cluster: Value = serde_json::from_str(&cluster_body).unwrap();
+        assert_eq!(cluster["mode"], "solo-standalone");
+        assert_eq!(
+            cluster["active_standalone_profile"]["profile_id"],
+            "test-profile"
+        );
+        assert_eq!(metrics_status, StatusCode::OK);
+        assert!(metrics_body.contains("ds4_proxy_target_ready{target=\"local-standalone\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_target_is_blocked() {
+        let (status, body) = get(test_state(false), "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["admission"], "blocked");
+    }
 }

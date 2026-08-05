@@ -1,11 +1,12 @@
 use crate::{
     admission::{AdmissionGate, AdmissionPermit},
-    affinity::AffinityKey,
-    app::AppState,
-    backend::BackendRuntime,
+    affinity::{AffinityKey, AffinityStore},
+    backend::{BackendRegistry, BackendRuntime},
+    config::Config,
     error::{FailureKind, ProxyError, format_error_chain},
     heartbeat::try_active_probe,
-    routing::Selection,
+    metrics::Metrics,
+    routing::{Router as TargetRouter, Selection},
     target::ProxyTarget,
 };
 use axum::{
@@ -31,6 +32,34 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+/// P1-07で削除する旧load-balancer request path用の互換state。
+pub struct LegacyAppState {
+    pub config: Arc<Config>,
+    pub registry: Arc<BackendRegistry>,
+    pub affinity: Arc<AffinityStore>,
+    pub router: Arc<TargetRouter>,
+    pub metrics: Arc<Metrics>,
+}
+
+impl LegacyAppState {
+    pub fn from_config(config: Config) -> anyhow::Result<Arc<Self>> {
+        let registry = Arc::new(BackendRegistry::from_config(&config)?);
+        let affinity = Arc::new(AffinityStore::new(&config.affinity)?);
+        let router = Arc::new(TargetRouter::new(
+            registry.clone(),
+            affinity.clone(),
+            config.routing.clone(),
+        ));
+        Ok(Arc::new(Self {
+            config: Arc::new(config),
+            registry,
+            affinity,
+            router,
+            metrics: Arc::new(Metrics::default()),
+        }))
+    }
+}
 
 struct ForwardInput<'a> {
     method: &'a Method,
@@ -89,7 +118,7 @@ impl Drop for StreamLifecycle {
 }
 
 pub async fn proxy_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<LegacyAppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
@@ -192,7 +221,7 @@ pub async fn proxy_handler(
 }
 
 async fn handle_streaming_request(
-    state: Arc<AppState>,
+    state: Arc<LegacyAppState>,
     request: StreamingRequest,
 ) -> Response<Body> {
     let affinity = match state.affinity.extract(&request.headers, &[]) {
@@ -280,7 +309,7 @@ async fn handle_streaming_request(
 }
 
 async fn execute(
-    state: &Arc<AppState>,
+    state: &Arc<LegacyAppState>,
     input: &ForwardInput<'_>,
     affinity: Option<&AffinityKey>,
     inference: bool,
@@ -394,7 +423,7 @@ async fn execute(
 }
 
 async fn forward_once(
-    state: &Arc<AppState>,
+    state: &Arc<LegacyAppState>,
     input: &ForwardInput<'_>,
     selection: Selection,
     affinity: Option<&AffinityKey>,
@@ -503,7 +532,7 @@ async fn forward_once(
 }
 
 async fn forward_streaming_body(
-    state: &Arc<AppState>,
+    state: &Arc<LegacyAppState>,
     input: &ForwardInput<'_>,
     selection: Selection,
     affinity: Option<&AffinityKey>,
@@ -576,7 +605,7 @@ async fn forward_streaming_body(
 }
 
 async fn prepare_first_chunk(
-    state: &AppState,
+    state: &LegacyAppState,
     input: &ForwardInput<'_>,
     backend: &BackendRuntime,
     upstream: reqwest::Response,
@@ -643,7 +672,7 @@ fn phase_timeout(
 }
 
 fn build_response(
-    state: &Arc<AppState>,
+    state: &Arc<LegacyAppState>,
     request_id: &str,
     backend: Arc<BackendRuntime>,
     prepared: PreparedResponse,
@@ -883,7 +912,7 @@ fn insert_request_id(headers: &mut HeaderMap, request_id: &str) {
     }
 }
 
-fn is_inference_request(method: &Method, uri: &Uri, state: &AppState) -> bool {
+fn is_inference_request(method: &Method, uri: &Uri, state: &LegacyAppState) -> bool {
     if *method == Method::HEAD || (*method == Method::GET && uri.path() == "/v1/models") {
         return false;
     }
@@ -913,7 +942,7 @@ fn classify_reqwest_error(error: &reqwest::Error) -> FailureKind {
     }
 }
 
-fn record_failure(state: &AppState, backend: &BackendRuntime, kind: FailureKind) {
+fn record_failure(state: &LegacyAppState, backend: &BackendRuntime, kind: FailureKind) {
     let changed = backend.record_failure(
         kind,
         state.config.cooldown.consecutive_failure_threshold,
@@ -970,6 +999,12 @@ pub struct ProxyRequestContext {
 struct FixedTargetState {
     target: ProxyTarget,
     ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeAwareTargetSnapshot {
+    pub target: ProxyTarget,
+    pub ready: bool,
 }
 
 pub struct ModeAwareProxyState {
@@ -1029,6 +1064,14 @@ impl ModeAwareProxyState {
 
     pub fn admission(&self) -> &AdmissionGate {
         &self.admission
+    }
+
+    pub fn target_snapshot(&self) -> ModeAwareTargetSnapshot {
+        let fixed = self.fixed_target();
+        ModeAwareTargetSnapshot {
+            target: fixed.target,
+            ready: fixed.ready,
+        }
     }
 
     fn fixed_target(&self) -> FixedTargetState {
@@ -1272,7 +1315,7 @@ fn build_mode_aware_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::AppState, config::Config};
+    use crate::config::Config;
     use axum::{Json, Router, routing::any};
     use futures::stream;
     use serde_json::Value;
@@ -1349,8 +1392,8 @@ stream_idle = "2s"
         .unwrap()
     }
 
-    async fn start_proxy(config: Config) -> (TestServer, Arc<AppState>) {
-        let state = AppState::from_config(config).unwrap();
+    async fn start_proxy(config: Config) -> (TestServer, Arc<LegacyAppState>) {
+        let state = LegacyAppState::from_config(config).unwrap();
         for backend in state.registry.all() {
             backend.record_heartbeat_success();
         }

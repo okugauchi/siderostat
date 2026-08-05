@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use ds4_smart_proxy::{
     app,
-    config::{Config, LogFormat},
+    config::{LogFormat, ModeAwareConfig},
 };
 use std::path::PathBuf;
 use tracing::info;
@@ -18,20 +18,21 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (config, config_path) = Config::load(args.config.as_deref()).await?;
+    let (config, config_path) = ModeAwareConfig::load(args.config.as_deref()).await?;
     initialize_logging(&config);
     info!(
         config_path = %config_path.display(),
-        listen = %config.listen,
-        admin_listen = %config.admin_listen,
-        backends = ?config.backends.iter().map(|backend| &backend.id).collect::<Vec<_>>(),
+        public_listen = %config.proxy.public_listen,
+        admin_listen = %config.proxy.admin_listen,
+        node_id = %config.cluster.node_id,
+        cluster_enabled = config.cluster.enabled,
         "configuration loaded"
     );
 
     app::serve(config).await
 }
 
-fn initialize_logging(config: &Config) {
+fn initialize_logging(config: &ModeAwareConfig) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("ds4_smart_proxy={}", config.logging.level)));
     match config.logging.format {
