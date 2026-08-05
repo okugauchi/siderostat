@@ -12,11 +12,12 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use std::{
     collections::HashSet,
-    io,
-    net::SocketAddr,
+    fmt, io,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, RwLock},
 };
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
@@ -131,6 +132,76 @@ pub enum ProxyIngress {
     Peer,
 }
 
+pub struct PeerProxyToken(Vec<u8>);
+
+impl PeerProxyToken {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, PeerIngressError> {
+        let mut bytes = bytes.into();
+        if bytes.len() < 32 {
+            return Err(PeerIngressError::InvalidTokenConfiguration);
+        }
+        let mut encoded = Vec::with_capacity(bytes.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for &byte in &bytes {
+            encoded.push(HEX[usize::from(byte >> 4)]);
+            encoded.push(HEX[usize::from(byte & 0x0f)]);
+        }
+        bytes.fill(0);
+        Ok(Self(encoded))
+    }
+}
+
+impl fmt::Debug for PeerProxyToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PeerProxyToken([REDACTED])")
+    }
+}
+
+impl Drop for PeerProxyToken {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIngressError {
+    InvalidTokenConfiguration,
+    MissingSecurityConfiguration,
+    WrongSource,
+    InvalidToken,
+    InvalidHop,
+}
+
+#[derive(Debug)]
+struct PeerProxySecurity {
+    token: PeerProxyToken,
+    expected_source: IpAddr,
+}
+
+impl PeerProxySecurity {
+    fn verify(&self, source: IpAddr, headers: &HeaderMap) -> Result<(), PeerIngressError> {
+        if source != self.expected_source {
+            return Err(PeerIngressError::WrongSource);
+        }
+        let hop = headers
+            .get("x-ds4-proxy-hop")
+            .and_then(|value| value.to_str().ok());
+        if hop != Some("1") {
+            return Err(PeerIngressError::InvalidHop);
+        }
+        let supplied = headers
+            .get("x-ds4-peer-proxy-token")
+            .map(HeaderValue::as_bytes)
+            .ok_or(PeerIngressError::InvalidToken)?;
+        if supplied.len() != self.token.0.len()
+            || !bool::from(supplied.ct_eq(self.token.0.as_slice()))
+        {
+            return Err(PeerIngressError::InvalidToken);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyRequestContext {
     pub ingress: ProxyIngress,
@@ -155,6 +226,7 @@ pub struct ModeAwareProxyState {
     local_upstream: url::Url,
     coordinator_upstream: url::Url,
     target: RwLock<FixedTargetState>,
+    peer_security: RwLock<Option<Arc<PeerProxySecurity>>>,
     admission: AdmissionGate,
     request_body_limit_bytes: usize,
     response_header_timeout: std::time::Duration,
@@ -190,6 +262,7 @@ impl ModeAwareProxyState {
                 },
                 ready: false,
             }),
+            peer_security: RwLock::new(None),
             admission: AdmissionGate::new(options.max_in_flight),
             request_body_limit_bytes: options.request_body_limit_bytes,
             response_header_timeout: options.response_header_timeout,
@@ -207,6 +280,23 @@ impl ModeAwareProxyState {
 
     pub fn admission(&self) -> &AdmissionGate {
         &self.admission
+    }
+
+    pub fn configure_peer_proxy(&self, token: PeerProxyToken, expected_source: IpAddr) {
+        *self
+            .peer_security
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(PeerProxySecurity {
+            token,
+            expected_source,
+        }));
+    }
+
+    fn peer_security(&self) -> Option<Arc<PeerProxySecurity>> {
+        self.peer_security
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn target_snapshot(&self) -> ModeAwareTargetSnapshot {
@@ -242,6 +332,43 @@ pub async fn mode_aware_proxy_handler(
     .await
 }
 
+pub async fn peer_ingress_handler(
+    State(state): State<Arc<ModeAwareProxyState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let request_id = request_id(request.headers());
+    let Some(security) = state.peer_security() else {
+        return ProxyError::NoBackendAvailable.response(&request_id);
+    };
+    if security.verify(peer.ip(), request.headers()).is_err() {
+        return peer_ingress_rejection(&request_id);
+    }
+    forward_mode_aware(
+        state,
+        ProxyRequestContext {
+            ingress: ProxyIngress::Peer,
+            peer,
+            hop: 1,
+        },
+        request,
+    )
+    .await
+}
+
+fn peer_ingress_rejection(request_id: &str) -> Response<Body> {
+    let mut response = Response::new(Body::from(
+        b"{\"error\":{\"message\":\"peer ingress authentication failed\",\"type\":\"authentication_error\",\"code\":\"peer_authentication_failed\"}}"
+            .as_slice(),
+    ));
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    insert_request_id(response.headers_mut(), request_id);
+    response
+}
+
 pub async fn forward_mode_aware(
     state: Arc<ModeAwareProxyState>,
     context: ProxyRequestContext,
@@ -259,10 +386,13 @@ pub async fn forward_mode_aware(
     }
 
     let fixed = state.fixed_target();
-    let base = match fixed.target {
-        ProxyTarget::LocalStandalone => &state.local_upstream,
-        ProxyTarget::Coordinator => &state.coordinator_upstream,
-        ProxyTarget::Unavailable { .. } => {
+    let base = match (context.ingress, fixed.target) {
+        (ProxyIngress::Public | ProxyIngress::Peer, ProxyTarget::LocalStandalone) => {
+            &state.local_upstream
+        }
+        (ProxyIngress::Public, ProxyTarget::Coordinator) => &state.coordinator_upstream,
+        (ProxyIngress::Peer, ProxyTarget::Coordinator | ProxyTarget::Unavailable { .. })
+        | (ProxyIngress::Public, ProxyTarget::Unavailable { .. }) => {
             return ProxyError::NoBackendAvailable.response(&request_id);
         }
     };
@@ -270,11 +400,25 @@ pub async fn forward_mode_aware(
         Ok(permit) => permit,
         Err(_) => return ProxyError::NoBackendAvailable.response(&request_id),
     };
+    let peer_security = if fixed.target == ProxyTarget::Coordinator {
+        match state.peer_security() {
+            Some(security) => Some(security),
+            None => return ProxyError::NoBackendAvailable.response(&request_id),
+        }
+    } else {
+        None
+    };
     let url = match fixed_upstream_url(base, &parts.uri) {
         Ok(url) => url,
         Err(error) => return error.response(&request_id),
     };
-    let headers = match build_mode_aware_headers(&parts.headers, &parts.uri, &request_id, context) {
+    let headers = match build_mode_aware_headers(
+        &parts.headers,
+        &parts.uri,
+        &request_id,
+        context,
+        peer_security.as_deref(),
+    ) {
         Ok(headers) => headers,
         Err(error) => return error.response(&request_id),
     };
@@ -352,6 +496,7 @@ fn build_mode_aware_headers(
     uri: &Uri,
     request_id: &str,
     context: ProxyRequestContext,
+    peer_security: Option<&PeerProxySecurity>,
 ) -> Result<HeaderMap, ProxyError> {
     let mut headers = build_upstream_headers(incoming, context.peer, uri, request_id)?;
     headers.remove("x-ds4-peer-proxy-token");
@@ -364,8 +509,15 @@ fn build_mode_aware_headers(
     for name in cluster_headers {
         headers.remove(name);
     }
-    // P3のpeer ingress認証でsource/tokenと合わせて検証するため、hopをcontextに保持する。
-    let _peer_hop_validation_hook = (context.ingress == ProxyIngress::Peer).then_some(context.hop);
+    if context.ingress == ProxyIngress::Public
+        && let Some(security) = peer_security
+    {
+        headers.insert(
+            "x-ds4-peer-proxy-token",
+            HeaderValue::from_bytes(&security.token.0).map_err(|_| ProxyError::Internal)?,
+        );
+        headers.insert("x-ds4-proxy-hop", HeaderValue::from_static("1"));
+    }
     Ok(headers)
 }
 
@@ -529,6 +681,23 @@ mod tests {
         let app = Router::new()
             .route("/", any(mode_aware_proxy_handler))
             .route("/{*path}", any(mode_aware_proxy_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        TestServer { address, task }
+    }
+
+    async fn start_peer_ingress(state: Arc<ModeAwareProxyState>) -> TestServer {
+        let app = Router::new()
+            .route("/", any(peer_ingress_handler))
+            .route("/{*path}", any(peer_ingress_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -838,6 +1007,7 @@ mod tests {
                 peer: "127.0.0.1:1234".parse().unwrap(),
                 hop: 1,
             },
+            None,
         )
         .unwrap();
 
@@ -845,5 +1015,230 @@ mod tests {
         assert!(headers.get("x-ds4-proxy-hop").is_none());
         assert!(headers.get("x-ds4-cluster-generation").is_none());
         assert_eq!(headers.get("x-keep").unwrap(), "yes");
+    }
+
+    #[test]
+    fn peer_security_rejects_wrong_source_token_and_hop() {
+        let security = PeerProxySecurity {
+            token: PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            expected_source: IpAddr::from([10, 99, 0, 2]),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ds4-peer-proxy-token",
+            HeaderValue::from_static(
+                "7474747474747474747474747474747474747474747474747474747474747474",
+            ),
+        );
+        headers.insert("x-ds4-proxy-hop", HeaderValue::from_static("1"));
+        assert_eq!(
+            security.verify(IpAddr::from([192, 168, 1, 2]), &headers),
+            Err(PeerIngressError::WrongSource)
+        );
+        headers.insert(
+            "x-ds4-peer-proxy-token",
+            HeaderValue::from_static(
+                "7878787878787878787878787878787878787878787878787878787878787878",
+            ),
+        );
+        assert_eq!(
+            security.verify(IpAddr::from([10, 99, 0, 2]), &headers),
+            Err(PeerIngressError::InvalidToken)
+        );
+        headers.insert(
+            "x-ds4-peer-proxy-token",
+            HeaderValue::from_static(
+                "7474747474747474747474747474747474747474747474747474747474747474",
+            ),
+        );
+        headers.insert("x-ds4-proxy-hop", HeaderValue::from_static("2"));
+        assert_eq!(
+            security.verify(IpAddr::from([10, 99, 0, 2]), &headers),
+            Err(PeerIngressError::InvalidHop)
+        );
+    }
+
+    #[tokio::test]
+    async fn public_coordinator_target_replaces_untrusted_internal_headers() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                Json(serde_json::json!({
+                    "token": request.headers().get("x-ds4-peer-proxy-token").and_then(|v| v.to_str().ok()),
+                    "hop": request.headers().get("x-ds4-proxy-hop").and_then(|v| v.to_str().ok()),
+                }))
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        state.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        state.set_target(ProxyTarget::Coordinator, true);
+        let proxy = start_mode_aware_proxy(state).await;
+        let response: Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/test", proxy.address))
+            .header("x-ds4-peer-proxy-token", "untrusted")
+            .header("x-ds4-proxy-hop", "99")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            response["token"],
+            "7474747474747474747474747474747474747474747474747474747474747474"
+        );
+        assert_eq!(response["hop"], "1");
+    }
+
+    #[tokio::test]
+    async fn peer_ingress_rejects_invalid_auth_before_backend() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = hits.clone();
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = backend_hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "unexpected"
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        state.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        let peer = start_peer_ingress(state).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/v1/test", peer.address))
+            .header(
+                "x-ds4-peer-proxy-token",
+                "7878787878787878787878787878787878787878787878787878787878787878",
+            )
+            .header("x-ds4-proxy-hop", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_ingress_never_forwards_to_another_peer_hop() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = hits.clone();
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = backend_hits.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    "unexpected"
+                }
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        state.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        state.set_target(ProxyTarget::Coordinator, true);
+        let peer = start_peer_ingress(state).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/v1/test", peer.address))
+            .header(
+                "x-ds4-peer-proxy-token",
+                "7474747474747474747474747474747474747474747474747474747474747474",
+            )
+            .header("x-ds4-proxy-hop", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn two_hop_peer_proxy_streams_sse_and_uses_coordinator_admission() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    match index {
+                        0 => Some((
+                            Ok::<_, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            Some((
+                                Ok::<_, Infallible>(Bytes::from_static(b"data: second\n\n")),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                Response::new(Body::from_stream(chunks))
+            }),
+        ))
+        .await;
+        let coordinator = mode_aware_state(backend.address, 4096);
+        coordinator.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        let peer = start_peer_ingress(coordinator.clone()).await;
+
+        let worker = Arc::new(
+            ModeAwareProxyState::new(
+                url::Url::parse("http://127.0.0.1:1").unwrap(),
+                url::Url::parse(&format!("http://{}", peer.address)).unwrap(),
+                ModeAwareProxyOptions {
+                    max_in_flight: 8,
+                    request_body_limit_bytes: 4096,
+                    response_header_timeout: Duration::from_secs(2),
+                    first_body_byte_timeout: Duration::from_secs(2),
+                    stream_idle_timeout: Duration::from_secs(2),
+                    connect_timeout: Duration::from_millis(200),
+                },
+            )
+            .unwrap(),
+        );
+        worker.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        worker.set_target(ProxyTarget::Coordinator, true);
+        worker.admission().start_serving();
+        let public = start_mode_aware_proxy(worker.clone()).await;
+
+        let response = reqwest::get(format!("http://{}/v1/stream", public.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first, Bytes::from_static(b"data: first\n\n"));
+        assert_eq!(coordinator.admission().snapshot().in_flight, 1);
+        let second = body.next().await.unwrap().unwrap();
+        assert_eq!(second, Bytes::from_static(b"data: second\n\n"));
+        drop(body);
+        for _ in 0..30 {
+            if coordinator.admission().snapshot().in_flight == 0
+                && worker.admission().snapshot().in_flight == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(coordinator.admission().snapshot().in_flight, 0);
+        assert_eq!(worker.admission().snapshot().in_flight, 0);
     }
 }

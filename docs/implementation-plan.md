@@ -545,7 +545,7 @@ Evidence: `src/cluster/auth.rs`、`src/cluster/control.rs`; METHOD/path+query/ti
 
 Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`; serde deny-unknown descriptor/message/response、全control commandとrole別許可、HMAC verifierだけが生成できる`AuthenticatedPeer` capability、protocol/node/role/scoped route検証、Pair、5秒descriptor poll renew対応の15秒lease、required stability、route invalidation/expiry、generation 409、deployment 412、request ID idempotency/conflictを実装。Peer presentは認証済みdescriptor + scoped route + stability経過 + 未失効leaseの積だけ。lease interruption/route loss、old generation、duplicate renew、changed duplicate、deployment mismatch、role方向を含む7 tests、共通local gate（72 tests）、test-support gate（75 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P2-07 Peer ingressを実装する
+#### [x] P2-07 Peer ingressを実装する
 
 - Actor: agent
 - Depends on: P2-06
@@ -554,6 +554,8 @@ Evidence: `src/cluster/control.rs`、`src/cluster/coordinator.rs`、`src/cluster
 - Actions: Coordinator-only bind、token、source IP、hop=1、shared admission/in-flightを実装
 - Verification: Invalid token/source/hop、loop prevention、2-hop SSE test
 - Done when: Worker requestがcoordinator local upstreamへ1経路だけで到達
+
+Evidence: `src/proxy.rs`、`src/app.rs`; peer token raw bytesをlowercase hex bearerへ変換しconstant-time比較、expected worker source IP、hop=`1`を検証。Public入力のtoken/hop/cluster headerを除去し、Worker→Coordinator target時だけ内部token/hopを再生成。Peer ingressはCoordinator role + fixed coordinator address以外のbindを拒否し、認証後もLocalStandalone以外へ転送せず2-hop目を明示的に阻止。同じ`ModeAwareProxyState`のstreaming/body limit/admission/in-flightをpublic/peerで共有。invalid token/source/hop、untrusted header置換、wrong-role/wildcard bind、loop prevention、Worker public→Coordinator peer→local backendの2-hop SSEとpermit解放を含む6 tests、共通local gate（78 tests）、test-support gate（81 tests）、check/clippy成功; 2026-08-06
 
 #### [ ] P2-08 Solo/Paired transitionを統合する
 

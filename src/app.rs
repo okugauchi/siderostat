@@ -2,8 +2,11 @@ use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::Metrics,
-    proxy::{ModeAwareProxyOptions, ModeAwareProxyState, mode_aware_proxy_handler},
-    target::{ProxyTarget, UnavailableReason},
+    proxy::{
+        ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
+        peer_ingress_handler,
+    },
+    target::{LocalRole, ProxyTarget, UnavailableReason},
 };
 use axum::{
     Json, Router,
@@ -55,6 +58,14 @@ impl AppState {
                 connect_timeout: config.proxy.timeouts.connect,
             },
         )?);
+        if config.cluster.enabled {
+            let token = std::fs::read(&config.cluster.security.peer_proxy_token_file)?;
+            proxy.configure_peer_proxy(
+                PeerProxyToken::new(token)
+                    .map_err(|_| anyhow::anyhow!("peer proxy token must contain 32 bytes"))?,
+                config.cluster.worker_address,
+            );
+        }
 
         // Cluster lifecycle/supervisor接続前のP1 baseline。P2で実DS4 readinessに置換する。
         if !config.cluster.enabled {
@@ -105,6 +116,46 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         .route("/", any(mode_aware_proxy_handler))
         .route("/{*path}", any(mode_aware_proxy_handler))
         .with_state(state.proxy.clone())
+}
+
+pub fn peer_ingress_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", any(peer_ingress_handler))
+        .route("/{*path}", any(peer_ingress_handler))
+        .with_state(state.proxy.clone())
+}
+
+pub async fn serve_peer_ingress(
+    state: Arc<AppState>,
+    role: LocalRole,
+    listen: SocketAddr,
+    coordinator_address: std::net::IpAddr,
+) -> anyhow::Result<()> {
+    validate_peer_ingress_bind(role, listen, coordinator_address)?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    info!(addr = %listen, "peer ingress listener started");
+    axum::serve(
+        listener,
+        peer_ingress_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn validate_peer_ingress_bind(
+    role: LocalRole,
+    listen: SocketAddr,
+    coordinator_address: std::net::IpAddr,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        role == LocalRole::Coordinator,
+        "peer ingress may only be started by the coordinator"
+    );
+    anyhow::ensure!(
+        listen.ip() == coordinator_address,
+        "peer ingress must bind the fixed coordinator address"
+    );
+    Ok(())
 }
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
@@ -322,5 +373,21 @@ mod tests {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["status"], "not_ready");
         assert_eq!(body["admission"], "blocked");
+    }
+
+    #[test]
+    fn peer_ingress_bind_is_coordinator_only_and_address_scoped() {
+        let coordinator = std::net::IpAddr::from([10, 99, 0, 1]);
+        let listen = SocketAddr::new(coordinator, 18082);
+        assert!(validate_peer_ingress_bind(LocalRole::Coordinator, listen, coordinator).is_ok());
+        assert!(validate_peer_ingress_bind(LocalRole::Worker, listen, coordinator).is_err());
+        assert!(
+            validate_peer_ingress_bind(
+                LocalRole::Coordinator,
+                "0.0.0.0:18082".parse().unwrap(),
+                coordinator,
+            )
+            .is_err()
+        );
     }
 }
