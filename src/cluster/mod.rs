@@ -4,6 +4,7 @@ mod control;
 mod coordinator;
 mod discovery;
 mod ds4_command;
+mod ds4_log;
 mod network_events;
 mod network_snapshot;
 mod platform;
@@ -28,6 +29,10 @@ pub use discovery::{
     ResolvedBonjourService,
 };
 pub use ds4_command::{Ds4Command, Ds4CommandError, Ds4Profile, build_standalone_command};
+pub use ds4_log::{
+    ChildLogForwarders, ChildLogRecord, ChildLogStream, Ds4LogEvent, MAX_CHILD_LOG_LINE_BYTES,
+    parse_ds4_log_event, spawn_child_log_forwarders,
+};
 pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,
     SpawnNetworkMonitorError, spawn_network_event_monitor,
@@ -45,6 +50,7 @@ pub use platform::{
 pub use process::{
     ChildIdentity, ManagedChild, ObservedProcess, ProcessControlError, ProcessController,
     ProcessInspector, ProcessSignal, ProcessSignaler, VerifiedProcess, argv_sha256,
+    wait_for_http_readiness,
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};

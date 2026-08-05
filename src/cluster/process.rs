@@ -1,4 +1,4 @@
-use super::Ds4Command;
+use super::{ChildLogForwarders, ChildLogRecord, Ds4Command, spawn_child_log_forwarders};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
@@ -8,7 +8,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::{
+    process::{Child, ChildStderr, ChildStdout},
+    sync::mpsc,
+    time::Instant,
+};
+use url::Url;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -83,6 +88,16 @@ pub enum ProcessControlError {
     StopTimeout,
     #[error("SIGKILL is not allowed for this child")]
     SigkillNotAllowed,
+    #[error("child stdout/stderr was already taken")]
+    MissingLogPipe,
+    #[error("child log channel capacity must be positive")]
+    InvalidLogCapacity,
+    #[error("child exited before HTTP readiness with status {0}")]
+    EarlyExit(std::process::ExitStatus),
+    #[error("child HTTP readiness timed out")]
+    ReadinessTimeout,
+    #[error("readiness timeout and poll interval must be positive")]
+    InvalidReadinessTiming,
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -205,6 +220,45 @@ impl ManagedChild {
         self.child.stderr.take()
     }
 
+    pub fn start_log_forwarding(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(mpsc::Receiver<ChildLogRecord>, ChildLogForwarders), ProcessControlError> {
+        if capacity == 0 {
+            return Err(ProcessControlError::InvalidLogCapacity);
+        }
+        if self.child.stdout.is_none() || self.child.stderr.is_none() {
+            return Err(ProcessControlError::MissingLogPipe);
+        }
+        let stdout = self.take_stdout().expect("stdout presence checked above");
+        let stderr = self.take_stderr().expect("stderr presence checked above");
+        Ok(spawn_child_log_forwarders(
+            stdout,
+            stderr,
+            Arc::from(self.identity.profile_id.as_str()),
+            self.identity.generation,
+            self.identity.pid,
+            capacity,
+        ))
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub async fn wait_http_ready(
+        &mut self,
+        client: &reqwest::Client,
+        models_url: &Url,
+        startup_timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<(), ProcessControlError> {
+        wait_for_http_readiness(client, models_url, startup_timeout, poll_interval, || {
+            self.child.try_wait()
+        })
+        .await
+    }
+
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
@@ -243,6 +297,45 @@ impl ManagedChild {
                     .map_err(ProcessControlError::Io)
             }
         }
+    }
+}
+
+pub async fn wait_for_http_readiness<F>(
+    client: &reqwest::Client,
+    models_url: &Url,
+    startup_timeout: Duration,
+    poll_interval: Duration,
+    mut try_wait: F,
+) -> Result<(), ProcessControlError>
+where
+    F: FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+{
+    if startup_timeout.is_zero() || poll_interval.is_zero() {
+        return Err(ProcessControlError::InvalidReadinessTiming);
+    }
+    let deadline = Instant::now() + startup_timeout;
+    loop {
+        if let Some(status) = try_wait()? {
+            return Err(ProcessControlError::EarlyExit(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProcessControlError::ReadinessTimeout);
+        }
+        let attempt_timeout = remaining.min(poll_interval);
+        let response =
+            tokio::time::timeout(attempt_timeout, client.get(models_url.clone()).send()).await;
+        if matches!(response, Ok(Ok(response)) if response.status().is_success()) {
+            if let Some(status) = try_wait()? {
+                return Err(ProcessControlError::EarlyExit(status));
+            }
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProcessControlError::ReadinessTimeout);
+        }
+        tokio::time::sleep(remaining.min(poll_interval)).await;
     }
 }
 
@@ -381,6 +474,65 @@ mod tests {
             argv_sha256(OsStr::new("/bin/x"), &["ab".into(), "c".into()]),
             argv_sha256(OsStr::new("/bin/x"), &["a".into(), "bc".into()]),
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_handles_slow_start_timeout_and_early_exit() {
+        use axum::{Router, routing::get};
+        use std::os::unix::process::ExitStatusExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            axum::serve(
+                listener,
+                Router::new().route("/v1/models", get(|| async { "{}" })),
+            )
+            .await
+            .unwrap();
+        });
+        let url = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+        wait_for_http_readiness(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_millis(500),
+            Duration::from_millis(25),
+            || Ok(None),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let unavailable_url =
+            Url::parse(&format!("http://{unavailable_address}/v1/models")).unwrap();
+        assert!(matches!(
+            wait_for_http_readiness(
+                &reqwest::Client::new(),
+                &unavailable_url,
+                Duration::from_millis(80),
+                Duration::from_millis(10),
+                || Ok(None),
+            )
+            .await,
+            Err(ProcessControlError::ReadinessTimeout)
+        ));
+
+        assert!(matches!(
+            wait_for_http_readiness(
+                &reqwest::Client::new(),
+                &unavailable_url,
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+                || Ok(Some(std::process::ExitStatus::from_raw(7 << 8))),
+            )
+            .await,
+            Err(ProcessControlError::EarlyExit(status)) if status.code() == Some(7)
+        ));
     }
 
     #[cfg(target_os = "macos")]

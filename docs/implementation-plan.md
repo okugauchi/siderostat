@@ -594,7 +594,7 @@ Evidence: `src/cluster/ds4_command.rs`、`src/config.rs`; target upstream commit
 
 Evidence: `src/cluster/process.rs`、`src/cluster/platform/process.rs`; Tokio direct spawnと専用process group、canonical executable、length-framed argv SHA-256、profile/generation/spawn timestamp、libprocの`proc_pidpath`/`proc_pidinfo` start timeと`KERN_PROCARGS2` argvを用いたidentityを実装。全signal直前にidentityを再観測し、verified SIGTERM、optional `allow_sigkill`時のみ再検証後SIGKILL、wait/reap、spawn後検証失敗時のkill/wait cleanupを実施。PID reuse、executable/argv/start-time mismatch、unknown process no-signal、hash framing ambiguity、procargs parser、実macOS `/bin/sleep` process group smokeの5 tests、共通local gate（89 tests）、test-support gate（92 tests）、check/clippy成功。初回compileで検出した`PathBuf`から`OsStr`への型変換不足と不要importも修正; 2026-08-06
 
-#### [ ] P3-03 Child logとreadinessを実装する
+#### [x] P3-03 Child logとreadinessを実装する
 
 - Actor: agent
 - Depends on: P3-02
@@ -603,6 +603,8 @@ Evidence: `src/cluster/process.rs`、`src/cluster/platform/process.rs`; Tokio di
 - Actions: Non-blocking stdout/stderr、recognized event parser、HTTP readiness、startup timeoutを実装
 - Verification: Known/unknown/truncated log、slow startup、early exit test
 - Done when: Unknown logでstateが進まない
+
+Evidence: `src/cluster/ds4_log.rs`、`src/cluster/process.rs`; stdout/stderrを独立Tokio taskで継続drainし、16 KiB上限、lossy UTF-8、bounded channelへのnon-blocking転送、profile/generation/PID/stream metadataを実装。専用parserはHTTP(S) listening URLと非空detailを検証した既知5 prefixだけをtyped eventへ変換し、unknown/invalid/truncated logはeventを生成しない。Managed childの生存を各試行前後に確認しつつ`GET /v1/models`成功を期限付きpollするreadiness、slow startup、timeout、early exitを実装。Known/unknown/truncated/metadata/slow startup/timeout/early exitの4 tests、共通local gate（93 tests）、test-support gate（96 tests）、check/clippy成功。初回compileで検出したasync buffer borrow範囲を修正し、loopback bind testはmacOS sandbox外でも成功; 2026-08-06
 
 #### [ ] P3-04 Standalone lifecycleをstate machineへ接続する
 
