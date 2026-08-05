@@ -285,7 +285,7 @@ Evidence: `tests/fixtures/legacy/README.md`、`tests/fixtures/legacy/ds4-smart-p
 
 Evidence: `src/lib.rs`、`tests/support/mod.rs`; `cargo check --all-targets --all-features`、共通local gate、移行前後とも32 tests成功; 2026-08-06
 
-#### [ ] P0-03 DS4 compatibility recordを作成する
+#### [x] P0-03 DS4 compatibility recordを作成する
 
 - Actor: agent + operator for actual command
 - Depends on: P0-02
@@ -299,6 +299,8 @@ Evidence: `src/lib.rs`、`tests/support/mod.rs`; `cargo check --all-targets --al
 - Verification: Fixture parser testを後続P4-03で利用可能な形式にする
 - Done when: Unknown事項が空欄ではなく`未確認`と記録
 - Stop when: DS4 commitが仕様書baselineと異なる。勝手にbaseline更新しない
+
+Evidence: `docs/compatibility/ds4-b7e9f00.md`、`tests/fixtures/ds4/`; 69-byte synthetic frame確認、fixture SHA-256検証、共通local gate、32 tests成功; 2026-08-06
 
 #### [ ] P0-04 macOS network API spikeを完了する
 
