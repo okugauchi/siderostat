@@ -470,7 +470,7 @@ Evidence: `ds4-smart-proxy.example.toml`、`tests/phase1_smoke.rs`; repository e
 
 ### Phase 2: Thunderbolt discoveryとPaired Standalone
 
-#### [ ] P2-01 Cluster module skeletonとsingle-writer state machineを作る
+#### [x] P2-01 Cluster module skeletonとsingle-writer state machineを作る
 
 - Actor: agent
 - Depends on: P1-08
@@ -479,6 +479,8 @@ Evidence: `ds4-smart-proxy.example.toml`、`tests/phase1_smoke.rs`; repository e
 - Actions: Event enum、command channel、single writer loop、read-only snapshotを実装
 - Verification: Old generation、invalid transition、concurrent event unit test
 - Done when: Child/networkをまだ操作せずstate transitionをtest可能
+
+Evidence: `src/cluster/mod.rs`、`src/cluster/state.rs`; bounded command channel、single-writer loop、watch snapshot、generation照合、型付きevent/transition errorを実装。Old generation、invalid transition、16 concurrent same-generation eventsの直列化3 tests、共通local gate（44 tests）、test-support gate（47 tests）、check/clippy成功。Child/network操作なし; 2026-08-06
 
 #### [ ] P2-02 Network snapshotとrole判定を実装する
 
