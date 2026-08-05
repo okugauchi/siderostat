@@ -1,5 +1,5 @@
 use super::{ChildLogForwarders, ChildLogRecord, Ds4Command, spawn_child_log_forwarders};
-use crate::cluster::LocalStandaloneLifecycle;
+use crate::cluster::{DistributedWorkerLifecycle, LocalStandaloneLifecycle};
 use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 use std::{
@@ -230,6 +230,18 @@ pub struct StandaloneSupervisor {
     inner: Arc<StandaloneSupervisorInner>,
 }
 
+#[derive(Clone)]
+pub struct DistributedWorkerSupervisor {
+    inner: Arc<DistributedWorkerSupervisorInner>,
+}
+
+struct DistributedWorkerSupervisorInner {
+    command: Ds4Command,
+    stop_timeout: Duration,
+    allow_sigkill: bool,
+    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+}
+
 struct StandaloneSupervisorInner {
     command: Ds4Command,
     models_url: Url,
@@ -355,7 +367,108 @@ impl StandaloneSupervisor {
     }
 }
 
+impl DistributedWorkerSupervisor {
+    pub fn new(command: Ds4Command, stop_timeout: Duration, allow_sigkill: bool) -> Self {
+        Self {
+            inner: Arc::new(DistributedWorkerSupervisorInner {
+                command,
+                stop_timeout,
+                allow_sigkill,
+                child: tokio::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub async fn child_identity(&self) -> Option<ChildIdentity> {
+        self.inner
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .map(|current| current.child.identity().clone())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
+        let mut slot = self.inner.child.lock().await;
+        if let Some(current) = slot.as_mut()
+            && current.child.try_wait()?.is_none()
+        {
+            return Ok(());
+        }
+        if let Some(stale) = slot.take() {
+            stale.log_task.abort();
+        }
+        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
+        let (mut logs, forwarders) = child.start_log_forwarding(256)?;
+        let log_task = tokio::spawn(async move {
+            while let Some(record) = logs.recv().await {
+                tracing::info!(
+                    profile = %record.profile_id,
+                    generation = record.generation,
+                    pid = record.pid,
+                    stream = ?record.stream,
+                    truncated = record.truncated,
+                    event = ?record.event,
+                    message = %record.line,
+                    "DS4 distributed worker log"
+                );
+            }
+        });
+        *slot = Some(SupervisedChild {
+            child,
+            _log_forwarders: forwarders,
+            log_task,
+        });
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn start_inner(&self, _generation: u64) -> anyhow::Result<()> {
+        anyhow::bail!("managed DS4 supervision requires macOS")
+    }
+
+    async fn stop_inner(&self) -> anyhow::Result<()> {
+        let mut slot = self.inner.child.lock().await;
+        let Some(mut current) = slot.take() else {
+            return Ok(());
+        };
+        let result = current
+            .child
+            .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
+            .await;
+        current.log_task.abort();
+        result?;
+        Ok(())
+    }
+
+    async fn is_running_inner(&self) -> anyhow::Result<bool> {
+        let mut slot = self.inner.child.lock().await;
+        let Some(current) = slot.as_mut() else {
+            return Ok(false);
+        };
+        Ok(current.child.try_wait()?.is_none())
+    }
+}
+
 impl LocalStandaloneLifecycle for StandaloneSupervisor {
+    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.start_inner(generation).await })
+    }
+
+    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.stop_inner().await })
+    }
+
+    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.is_running_inner().await })
+    }
+}
+
+impl DistributedWorkerLifecycle for DistributedWorkerSupervisor {
     fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.start_inner(generation).await })
@@ -778,5 +891,33 @@ mod tests {
         assert_eq!(child.identity().generation, 9);
         let status = child.stop(Duration::from_secs(2), false).await.unwrap();
         assert!(!status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn distributed_worker_supervisor_starts_and_reaps_one_owned_child() {
+        use crate::{
+            cluster::Ds4Profile,
+            config::{ModelVariant, Residency},
+        };
+
+        let command = Ds4Command {
+            executable: PathBuf::from("/bin/sleep"),
+            working_directory: PathBuf::from("/tmp"),
+            argv: vec![OsString::from("30")],
+            profile: Ds4Profile {
+                profile_id: "distributed-worker-smoke".into(),
+                model_variant: ModelVariant::Mxfp4,
+                residency: Residency::Resident,
+            },
+        };
+        let supervisor = DistributedWorkerSupervisor::new(command, Duration::from_secs(2), false);
+        supervisor.start(13).await.unwrap();
+        assert!(supervisor.is_running().await.unwrap());
+        assert_eq!(supervisor.child_identity().await.unwrap().generation, 13);
+
+        supervisor.stop().await.unwrap();
+        assert!(!supervisor.is_running().await.unwrap());
+        assert!(supervisor.child_identity().await.is_none());
     }
 }

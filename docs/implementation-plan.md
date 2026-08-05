@@ -701,14 +701,16 @@ Evidence: `src/cluster/ds4_hello.rs`、`tests/fixtures/ds4/hello40-schema-v1.hex
 
 Evidence: `src/cluster/ds4_hello.rs`、`src/cluster/coordinator.rs`; `RendezvousListener`はAwaitingWorkerHello・valid stable lease・deployment有りの場合だけ固定coordinator addressへbindし、timeout付きone-shot acceptを実施。Accept元IPをworker固定addressと照合し、実socketから1 HELLO frameだけ読み、受信後にcurrent state/lease/generation/deploymentを再検証、expected layer/output/context/modelと照合してstream/listenerをclose。Coordinator control snapshotはlocal descriptor generation/deploymentとauthenticated leaseから生成し、HELLO生成APIは存在しない。Valid real socket frame、wrong state/source/deployment/layer、accept timeoutを含む2追加tests、共通local gate（111 tests）、test-support gate（115 tests）、check/clippy成功; 2026-08-06
 
-#### [ ] P4-05 Worker distributed lifecycleを実装する
+#### [x] P4-05 Worker distributed lifecycleを実装する
 
 - Actor: agent
 - Depends on: P4-04
-- Files: `worker.rs`、`ds4_command.rs`、`process.rs`
+- Files: `worker.rs`、`ds4_command.rs`、`process.rs`、`mod.rs`
 - Actions: Drain、standalone stop、worker argv、HELLO、reconnect、lease、cleanupを実装
 - Verification: Fake worker startup/timeout/exit/retry test
 - Done when: Failure時にorphan workerが残らない
+
+Evidence: `src/cluster/worker.rs`、`src/cluster/ds4_command.rs`、`src/cluster/process.rs`; worker ingress drain→standalone verified stop→MXFP4 worker child起動を実装し、worker argvへrole/layer/coordinator/context/KVと必須`--debug`を一意に生成。Worker childの生存とleaseを監視し、startup timeout、early exit、lease loss、cancelの全経路でadmissionをBlockしてowned childをverified stopする。Valid lease中はchildを維持してDS4自身のHELLO再接続を妨げず、実HELLO acceptanceはcoordinator rendezvousに限定。起動済みhang、early exit、same-generation retry、lease loss、実owned child reapを含む5追加tests、共通local gate（118 tests）、test-support gate（122 tests）、clippy成功; 2026-08-06
 
 #### [ ] P4-06 Coordinator promotion/demotionを実装する
 

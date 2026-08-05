@@ -1,5 +1,5 @@
 use crate::config::{Ds4Config, ModelVariant, Residency, validate_extra_args};
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, net::IpAddr, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,55 @@ pub enum Ds4CommandError {
     SsdOptionsForResident,
     #[error("invalid DS4 extra arguments: {0}")]
     InvalidExtraArguments(String),
+    #[error("distributed DS4 profiles require --debug")]
+    DistributedDebugRequired,
+}
+
+pub fn build_distributed_worker_command(
+    config: &Ds4Config,
+    coordinator_address: IpAddr,
+    distributed_port: u16,
+) -> Result<Ds4Command, Ds4CommandError> {
+    let mxfp4 = &config.mxfp4;
+    validate_extra_args("ds4.mxfp4.extra_args", &mxfp4.extra_args)
+        .map_err(|error| Ds4CommandError::InvalidExtraArguments(error.to_string()))?;
+    if !mxfp4
+        .extra_args
+        .iter()
+        .any(|argument| argument == "--debug")
+    {
+        return Err(Ds4CommandError::DistributedDebugRequired);
+    }
+
+    let mut argv = vec![
+        OsString::from("-m"),
+        mxfp4.model.as_os_str().to_owned(),
+        OsString::from("--role"),
+        OsString::from("worker"),
+        OsString::from("--layers"),
+        OsString::from(&mxfp4.worker_layers),
+        OsString::from("--coordinator"),
+        OsString::from(coordinator_address.to_string()),
+        OsString::from(distributed_port.to_string()),
+        OsString::from("--ctx"),
+        OsString::from(mxfp4.context_size.to_string()),
+        OsString::from("--kv-disk-dir"),
+        mxfp4.kv_disk_dir.as_os_str().to_owned(),
+        OsString::from("--kv-disk-space-mb"),
+        OsString::from(mxfp4.kv_disk_space_mb.to_string()),
+    ];
+    argv.extend(mxfp4.extra_args.iter().map(OsString::from));
+
+    Ok(Ds4Command {
+        executable: config.binary.clone(),
+        working_directory: config.working_directory.clone(),
+        argv,
+        profile: Ds4Profile {
+            profile_id: "distributed-mxfp4-worker".into(),
+            model_variant: ModelVariant::Mxfp4,
+            residency: Residency::Resident,
+        },
+    })
 }
 
 pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4CommandError> {
@@ -233,5 +282,60 @@ mod tests {
             build_standalone_command(&resident),
             Err(Ds4CommandError::SsdOptionsForResident)
         );
+    }
+
+    #[test]
+    fn distributed_worker_argv_is_complete_and_has_no_http_listener() {
+        let command = build_distributed_worker_command(
+            &config(ModelVariant::Q2, Residency::SsdStreaming),
+            IpAddr::from([10, 99, 0, 1]),
+            9911,
+        )
+        .unwrap();
+        assert_eq!(
+            argv(&command),
+            [
+                "-m",
+                "/models/mxfp4.gguf",
+                "--role",
+                "worker",
+                "--layers",
+                "20:output",
+                "--coordinator",
+                "10.99.0.1",
+                "9911",
+                "--ctx",
+                "262144",
+                "--kv-disk-dir",
+                "/cache/distributed",
+                "--kv-disk-space-mb",
+                "262144",
+                "--debug",
+            ]
+        );
+        assert_eq!(command.profile.profile_id, "distributed-mxfp4-worker");
+        assert_eq!(command.profile.model_variant, ModelVariant::Mxfp4);
+        assert!(!command.argv.iter().any(|value| value == "--host"));
+        assert!(!command.argv.iter().any(|value| value == "--port"));
+    }
+
+    #[test]
+    fn distributed_worker_requires_debug_and_rejects_generated_overrides() {
+        let mut missing_debug = config(ModelVariant::Mxfp4, Residency::Resident);
+        missing_debug.mxfp4.extra_args.clear();
+        assert_eq!(
+            build_distributed_worker_command(&missing_debug, IpAddr::from([10, 99, 0, 1]), 9911,),
+            Err(Ds4CommandError::DistributedDebugRequired)
+        );
+
+        let mut override_role = config(ModelVariant::Mxfp4, Residency::Resident);
+        override_role
+            .mxfp4
+            .extra_args
+            .push("--role=coordinator".into());
+        assert!(matches!(
+            build_distributed_worker_command(&override_role, IpAddr::from([10, 99, 0, 1]), 9911,),
+            Err(Ds4CommandError::InvalidExtraArguments(_))
+        ));
     }
 }
