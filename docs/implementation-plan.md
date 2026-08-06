@@ -822,7 +822,7 @@ Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-20
 
 ### Phase 6: 利用者向け文書
 
-#### [ ] P6-01 配布用config exampleを確定する
+#### [x] P6-01 配布用config exampleを確定する
 
 - Actor: agent
 - Depends on: P5-06
@@ -830,6 +830,8 @@ Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-20
 - Actions: 実parserで成功する値だけを記載し、secret/model pathをplaceholder化
 - Verification: Binary/doctorで全example parse
 - Done when: Spec exampleとのfield差分を説明可能
+
+Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値だけを残し、DS4 binary、standalone/MXFP4 model、3つのsecret/token fileを`PLACEHOLDER`へ置換して配布用とした。Headerでvalidation要件（regular/canonical/non-symlink、secret 32+ bytes・0600）とworker nodeの差分（`cluster.node_id`とnode固有pathのみ、roleはinterface addressから決定し設定しない）を明記した。実parserは`parses_repository_schema_v2_example`で成功し、binary `--config`実行はTOML parse後に最初のplaceholder（`ds4.binary`）をactionableに報告することを確認。Spec exampleとの差分はplaceholder化とworker注記のみで、field値は全て一致; 2026-08-06
 
 #### [ ] P6-02 DS4を含む導入ガイドを作る
 

@@ -1,3 +1,10 @@
+# Distribution example for the mode-aware reverse proxy.
+# The TOML parser accepts these placeholder values, but validation requires real files:
+# - ds4.binary and both model_manifest files must be regular, canonical, non-symlink files.
+# - Every secret/token file must contain 32+ distinct bytes with mode 0600.
+# Replace every PLACEHOLDER and fill the secret files before running `ds4-smart-proxy serve --config ...`.
+# On a worker node, change only cluster.node_id and the node-specific paths; role is derived from the
+# interface address, never set directly.
 schema_version = 2
 
 [proxy]
@@ -32,9 +39,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/admin.key"
+control_secret_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-cluster-control.key"
+peer_proxy_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-peer-proxy.key"
+admin_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-admin.key"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -60,7 +67,7 @@ complete_route = "180s"
 standalone_startup = "900s"
 
 [ds4]
-binary = "$HOME/LLM/ds4/ds4-server"
+binary = "$HOME/LLM/ds4/PLACEHOLDER-ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
@@ -68,7 +75,7 @@ allow_sigkill = false
 
 [ds4.standalone]
 profile_id = "flash-0731-q2-q4-ssd"
-model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
+model = "$HOME/Library/Application Support/ds4-smart-proxy/models/PLACEHOLDER-standalone.gguf"
 model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-ssd.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
@@ -80,7 +87,7 @@ ssd_cache_experts = "32GB"
 extra_args = []
 
 [ds4.mxfp4]
-model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
+model = "$HOME/Library/Application Support/ds4-smart-proxy/models/PLACEHOLDER-mxfp4.gguf"
 model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
 context_size = 262144
