@@ -868,7 +868,7 @@ Blocked: Clean user accountと両nodeでのcommand逐次実行は、実DS4 binar
 
 Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷新し、3 mode topology、profile matrix、quick start、security、limitations、関連文書linkを実装済みbehavior（spec第9/13/14/22/23/25/26/27/35/37節と`src/cluster/admin.rs`/`src/metrics.rs`/`src/cli.rs`）から導出。`rg`でlegacy term（least-busy、affinity、SQLite、EWMA、alternate retry、Hermes、sticky、heartbeat、cooldown、circuit breaker、local-first、priority、session/prefix、backend）がREADMEに不在であることを確認し、`docs/spec.md`、`docs/installation.md`、`docs/compatibility/ds4-b7e9f00.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`ds4-smart-proxy.example.toml`、`contrib/launchd/README.md`への全linkが実在することを確認。command smokeとして、記載したserve/cluster CLIとadmin endpoint（healthz/readyz/cluster/metrics）を実装済み`src/cli.rs`/`src/app.rs`と突合。`docs/operations.md`はP6-04で作成予定のため、現時点ではREADMEからdead linkを張らず、P6-04完了後に追加する; 2026-08-06
 
-#### [ ] P6-04 Operationsとtroubleshootingを作る
+#### [x] P6-04 Operationsとtroubleshootingを作る
 
 - Actor: agent
 - Depends on: P6-03
@@ -876,6 +876,8 @@ Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷�
 - Actions: Status、doctor、logs、metrics、manual state、safe restart、rollbackをfailure symptom別に記載
 - Verification: Failure fixtureごとに該当手順がある
 - Done when: Destructive cache削除を通常手順にしない
+
+Evidence: `docs/operations.md`、`docs/troubleshooting.md`; Status（`cluster status`/`GET /cluster`）、doctor（healthy = target_ready && safe_state && admission_serving）、logs（JSON/text、`proxy_request` event、redaction）、metrics（spec第26節の全19 family、`GET /metrics`）、manual state（ManualInterventionRequired、3回連続promotion失敗、`cluster reconcile`）、safe restart（`cluster restart`はmode不変、SIGTERMはdrain完了後、SIGKILLは`allow_sigkill=true`かつidentity再確認済みchildのみ）、rollback（legacy config v1廃止、旧SQLite DB非変更、binary rollback、standalone readiness）をfailure symptom別に記載。troubleshootingのsymptom tableが`ClusterFailure` enum（PeerAbsent、BridgeUnavailable、BridgeAddressInvalid、BonjourUnavailable、UnauthenticatedDiscovery、InvalidControlHmac、InvalidPeerProxyToken、DeploymentMismatch、ManifestStale、HelloTimeout、UnknownDs4Schema、CoordinatorStartupTimeout、RouteIncomplete、PeerLeaseLost、ChildIdentityUnknown、StandaloneStartFailed、DrainTimeout、StateCorrupt）とpromotion backoffを網羅し、各症状に該当手順がある。Destructive cache削除を通常手順にしない旨をoperations第8節とtroubleshooting第4節に明記。READMEに`docs/operations.md`/`docs/troubleshooting.md`のlinkを追加し、P6-03の「operationsへlinkする」要件を完了。全linkが実在し、READMEにlegacy term不在; 2026-08-06
 
 #### [ ] P6-05 文書をclean環境で検証する
 

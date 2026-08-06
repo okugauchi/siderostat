@@ -132,6 +132,8 @@ DS4 native distributed trafficとpeer proxy bodyは暗号化されません。�
 
 - [`docs/spec.md`](docs/spec.md): 完全な仕様と受け入れ条件
 - [`docs/installation.md`](docs/installation.md): 実DS4/modelを使う導入ガイド
+- [`docs/operations.md`](docs/operations.md): 運用ガイド（status、doctor、logs、metrics、manual state、restart、rollback）
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): failure symptom別の診断手順
 - [`docs/compatibility/ds4-b7e9f00.md`](docs/compatibility/ds4-b7e9f00.md): DS4 compatibility記録
 - [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
 - [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml): 配布用config例
