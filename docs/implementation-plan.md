@@ -723,16 +723,18 @@ Evidence: `src/cluster/worker.rs`、`src/cluster/ds4_command.rs`、`src/cluster/
 
 Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`; validated実HELLO値、authenticated worker Ready、live leaseの3条件を満たした場合だけcluster-wide drainを開始し、in-flight完了後にstandaloneをverified stopしてMXFP4 coordinatorを起動。HTTP readiness、lossless worker-registered/complete-route log eventの全条件が揃うまでadmissionをBlockし、route-loss grace後は両distributed childを停止してPaired Standaloneへ復帰。Startup/route timeout・lease lossではorphan cleanupとstandalone recoveryを実施。Coordinator argv、HELLO without Ready、in-flight、startup timeout、lease loss、route incomplete/transient/permanent loss、満杯log queueでもroute event非欠落を含む7追加tests、共通local gate（125 tests）、test-support gate（129 tests）、clippy成功。初回targeted testはcargoへfilterを2個渡したCLI指定誤りで失敗し、`cargo test cluster:: --all-features`（76件）へ修正後成功; 2026-08-06
 
-#### [ ] P4-07 Fake distributed integrationを実行する
+#### [x] P4-07 Fake distributed integrationを実行する
 
 - Actor: agent
 - Depends on: P4-06
-- Files: integration tests、本書Evidence
+- Files: `tests/phase4_distributed.rs`、本書Evidence
 - Actions: Fake child/controlを用い、socket HELLO、complete route、failure recovery、10回promotion/demotionを実行
 - Verification: 仕様書第32.3、33.3節のhardware/model非依存部分
 - Done when: Fake 2-node transitionが成功し、実DS4/GGUFなしで検証できる範囲が確定
 
-#### [ ] P4-08 Distributed actual acceptanceを実行する
+Evidence: `tests/phase4_distributed.rs`; fake worker/coordinator child、authenticated worker Ready、実TCP socket上のknown HELLO frameを結合し、Paired→AwaitingWorkerHello→DistributedReady→Pairedを10回反復。各cycleで両child生存/停止、21回のcluster drain、11回のworker cleanupを確認し、11回目のcoordinator startup timeoutでは両child orphanなしでPaired Standaloneへ復帰。初回はpromotionとdemotionの両方でpeer drainする実数21に対し期待値を11としていたassertが失敗し、期待値修正後成功。Task固有test（1件）、共通local gate（125 tests）、test-support gate（130 tests）、clippy成功; 2026-08-06
+
+#### [!] P4-08 Distributed actual acceptanceを実行する
 
 - Actor: agent + operator
 - Depends on: P3-07、P4-07
@@ -740,6 +742,8 @@ Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/p
 - Actions: 実DS4 HELLO、short prompt、8K prefill、10回promotion/demotionを実行
 - Verification: 仕様書第32.3、32.5、33.3節
 - Done when: 実機結果をpass/blockedで記録し、blocked項目はrelease前に解消
+
+Blocked: ユーザー指定によりGGUFを要する実DS4 HELLO、short prompt、8K prefill、10回promotion/demotionは後日手動実施。再開条件はP3-07のmodel/manifest配置と実機acceptance開始指示。Fake/hardware非依存範囲はP4-07で完了済み; 2026-08-06
 
 ### Phase 5: Recovery、operations、security
 
