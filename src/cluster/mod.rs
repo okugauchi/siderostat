@@ -31,7 +31,7 @@ pub use control::{
 pub use coordinator::{
     CoordinatorControl, CoordinatorDistributedRuntime, CoordinatorLeaseStatus,
     CoordinatorLifecycleError, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
-    DistributedCoordinatorLifecycle,
+    DistributedCoordinatorLifecycle, PromotionRetryPolicy,
 };
 pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
@@ -82,8 +82,9 @@ pub use restart::{
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};
 pub use state::{
-    ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, TransitionError,
-    spawn_state_machine,
+    ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot, FailureAction,
+    PromotionFailureStatus, PromotionFailureTracker, PromotionRetryDecision, PromotionTrackerError,
+    TransitionError, failure_action, spawn_state_machine,
 };
 pub use state_store::{
     PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,

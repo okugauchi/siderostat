@@ -9,8 +9,8 @@ use ds4_smart_proxy::{
         CoordinatorControl, CoordinatorDistributedRuntime, CoordinatorLifecycleError,
         CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedCoordinatorLifecycle,
         DistributedWorkerLifecycle, Ds4Hello, LocalStandaloneLifecycle, NodeDescriptor,
-        RendezvousControlSnapshot, RendezvousListener, WorkerDistributedRuntime, WorkerEventKind,
-        WorkerHelloExpectation, spawn_state_machine,
+        PromotionRetryPolicy, RendezvousControlSnapshot, RendezvousListener,
+        WorkerDistributedRuntime, WorkerEventKind, WorkerHelloExpectation, spawn_state_machine,
     },
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{ClusterState, LocalRole, ProxyTarget, StableMode},
@@ -377,6 +377,10 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
             complete_route: Duration::from_secs(1),
             route_loss_grace: Duration::from_millis(10),
         },
+        PromotionRetryPolicy {
+            backoff: Duration::from_millis(50),
+            maximum_consecutive_failures: 3,
+        },
     )
     .unwrap();
 
@@ -429,10 +433,7 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
             .await,
         Err(CoordinatorLifecycleError::StartupTimeout)
     ));
-    assert_eq!(
-        cluster.snapshot().state,
-        ClusterState::PairedStandaloneReady
-    );
+    assert_eq!(cluster.snapshot().state, ClusterState::Backoff);
     assert!(!coordinator_child.running.load(Ordering::SeqCst));
     assert!(!worker_child.running.load(Ordering::SeqCst));
     assert!(coordinator_standalone.running.load(Ordering::SeqCst));

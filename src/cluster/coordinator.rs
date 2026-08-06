@@ -4,8 +4,9 @@ use super::{
     PeerLease, WorkerEventKind, control::ControlProcessor,
 };
 use super::{
-    ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, Ds4Hello,
-    LocalStandaloneLifecycle, RendezvousControlSnapshot, TransitionError,
+    ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot, Ds4Hello,
+    LocalStandaloneLifecycle, PromotionFailureStatus, PromotionFailureTracker,
+    PromotionRetryDecision, PromotionTrackerError, RendezvousControlSnapshot, TransitionError,
 };
 use crate::{
     admission::DrainError,
@@ -61,6 +62,8 @@ pub enum CoordinatorLifecycleError {
     Recovery(#[source] anyhow::Error),
     #[error("coordinator lifecycle timeouts must be positive")]
     InvalidTiming,
+    #[error(transparent)]
+    PromotionTracker(#[from] PromotionTrackerError),
     #[error("worker HELLO promotion requires ready worker control and a valid lease")]
     PrerequisiteMissing,
     #[error("worker lease was lost during distributed promotion")]
@@ -78,6 +81,7 @@ pub struct CoordinatorDistributedRuntime {
     startup_timeout: Duration,
     complete_route_timeout: Duration,
     route_loss_grace: Duration,
+    failures: Arc<tokio::sync::Mutex<PromotionFailureTracker>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +92,12 @@ pub struct CoordinatorRuntimeTimeouts {
     pub route_loss_grace: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PromotionRetryPolicy {
+    pub backoff: Duration,
+    pub maximum_consecutive_failures: u32,
+}
+
 impl CoordinatorDistributedRuntime {
     pub fn new(
         cluster: ClusterHandle,
@@ -96,6 +106,7 @@ impl CoordinatorDistributedRuntime {
         coordinator: Arc<dyn DistributedCoordinatorLifecycle>,
         peer: Arc<dyn CoordinatorPeerLifecycle>,
         timeouts: CoordinatorRuntimeTimeouts,
+        retry: PromotionRetryPolicy,
     ) -> Result<Self, CoordinatorLifecycleError> {
         if timeouts.drain.is_zero()
             || timeouts.startup.is_zero()
@@ -114,6 +125,10 @@ impl CoordinatorDistributedRuntime {
             startup_timeout: timeouts.startup,
             complete_route_timeout: timeouts.complete_route,
             route_loss_grace: timeouts.route_loss_grace,
+            failures: Arc::new(tokio::sync::Mutex::new(PromotionFailureTracker::new(
+                retry.backoff,
+                retry.maximum_consecutive_failures,
+            )?)),
         })
     }
 
@@ -142,9 +157,19 @@ impl CoordinatorDistributedRuntime {
 
         let result = self.promote_inner(promoting, lease).await;
         match result {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => {
+                self.failures.lock().await.note_success();
+                Ok(snapshot)
+            }
             Err(error) => {
-                self.recover_paired().await?;
+                if matches!(error, CoordinatorLifecycleError::LeaseLost) {
+                    self.recover_solo().await?;
+                } else {
+                    self.recover_paired().await?;
+                    if let Some(failure) = promotion_failure_for_error(&error) {
+                        self.enter_promotion_failure(failure, now_millis).await?;
+                    }
+                }
                 Err(error)
             }
         }
@@ -270,6 +295,58 @@ impl CoordinatorDistributedRuntime {
         Ok(paired)
     }
 
+    pub async fn record_promotion_failure(
+        &self,
+        failure: ClusterFailure,
+        now_millis: u64,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.enter_promotion_failure(failure, now_millis).await
+    }
+
+    pub async fn reconcile_backoff(
+        &self,
+        now_millis: u64,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        let current = self.cluster.snapshot();
+        if current.state != ClusterState::Backoff
+            || !self.failures.lock().await.can_retry(now_millis)
+        {
+            return Ok(current);
+        }
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::BackoffElapsed,
+            })
+            .await?;
+        self.proxy.set_target(ready.target, true);
+        self.proxy.admission().start_serving();
+        Ok(ready)
+    }
+
+    pub async fn operator_reconcile(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.failures.lock().await.operator_reconcile();
+        let current = self.cluster.snapshot();
+        if current.state != ClusterState::ManualInterventionRequired {
+            return Ok(current);
+        }
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::OperatorReconcile,
+            })
+            .await?;
+        self.proxy.set_target(ready.target, true);
+        self.proxy.admission().start_serving();
+        Ok(ready)
+    }
+
+    pub async fn promotion_failure_status(&self) -> PromotionFailureStatus {
+        self.failures.lock().await.status()
+    }
+
     fn block_transition(&self) {
         self.proxy.admission().block();
         self.proxy.set_target(
@@ -309,6 +386,76 @@ impl CoordinatorDistributedRuntime {
         self.proxy.set_target(paired.target, true);
         self.proxy.admission().start_serving();
         Ok(paired)
+    }
+
+    async fn recover_solo(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.block_transition();
+        let generation = self.cluster.snapshot().generation;
+        let coordinator_stop = self.coordinator.stop();
+        let worker_stop = self.peer.stop_worker(generation);
+        let (coordinator_result, worker_result) = tokio::join!(coordinator_stop, worker_stop);
+        coordinator_result.map_err(CoordinatorLifecycleError::Coordinator)?;
+        worker_result.map_err(CoordinatorLifecycleError::Peer)?;
+        let starting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: generation,
+                kind: ClusterEventKind::PeerLost,
+            })
+            .await?;
+        self.standalone
+            .start(starting.generation)
+            .await
+            .map_err(CoordinatorLifecycleError::Standalone)?;
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: starting.generation,
+                kind: ClusterEventKind::LocalStandaloneReady,
+            })
+            .await?;
+        self.proxy.set_target(ready.target, true);
+        self.proxy.admission().start_serving();
+        Ok(ready)
+    }
+
+    async fn enter_promotion_failure(
+        &self,
+        failure: ClusterFailure,
+        now_millis: u64,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        let decision = self.failures.lock().await.record(failure, now_millis)?;
+        let current = self.cluster.snapshot();
+        let kind = match decision {
+            PromotionRetryDecision::Backoff { .. } => ClusterEventKind::EnterBackoff,
+            PromotionRetryDecision::ManualIntervention => {
+                ClusterEventKind::RequireManualIntervention
+            }
+        };
+        let next = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind,
+            })
+            .await?;
+        let ready = !matches!(next.target, ProxyTarget::Unavailable { .. });
+        self.proxy.set_target(next.target, ready);
+        if ready {
+            self.proxy.admission().start_serving();
+        } else {
+            self.proxy.admission().block();
+        }
+        Ok(next)
+    }
+}
+
+fn promotion_failure_for_error(error: &CoordinatorLifecycleError) -> Option<ClusterFailure> {
+    match error {
+        CoordinatorLifecycleError::StartupTimeout => {
+            Some(ClusterFailure::CoordinatorStartupTimeout)
+        }
+        _ => None,
     }
 }
 
@@ -812,6 +959,10 @@ mod tests {
                 complete_route: Duration::from_millis(200),
                 route_loss_grace: Duration::from_millis(10),
             },
+            PromotionRetryPolicy {
+                backoff: Duration::from_millis(50),
+                maximum_consecutive_failures: 3,
+            },
         )
         .unwrap();
         (runtime, proxy, standalone, peer, task)
@@ -1175,7 +1326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_startup_timeout_reaps_children_and_recovers_paired() {
+    async fn coordinator_startup_timeout_reaps_children_and_enters_serving_backoff() {
         let coordinator = Arc::new(FakeDistributedCoordinator::default());
         coordinator.start_hangs.store(true, Ordering::SeqCst);
         let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
@@ -1190,17 +1341,14 @@ mod tests {
         assert!(!coordinator.running.load(Ordering::SeqCst));
         assert!(standalone.running.load(Ordering::SeqCst));
         assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            runtime.cluster.snapshot().state,
-            ClusterState::PairedStandaloneReady
-        );
+        assert_eq!(runtime.cluster.snapshot().state, ClusterState::Backoff);
         assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
         assert!(proxy.target_snapshot().ready);
         task.abort();
     }
 
     #[tokio::test]
-    async fn lease_loss_after_child_start_rejects_route_and_recovers_paired() {
+    async fn lease_loss_after_child_start_rejects_route_and_recovers_solo() {
         let coordinator = Arc::new(FakeDistributedCoordinator::default());
         let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator.clone()).await;
         let control = ready_worker_control();
@@ -1235,7 +1383,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.cluster.snapshot().state,
-            ClusterState::PairedStandaloneReady
+            ClusterState::SoloStandaloneReady
         );
         assert!(!coordinator.running.load(Ordering::SeqCst));
         assert!(standalone.running.load(Ordering::SeqCst));
@@ -1293,6 +1441,52 @@ mod tests {
         assert!(!coordinator.running.load(Ordering::SeqCst));
         assert!(standalone.running.load(Ordering::SeqCst));
         assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn third_same_promotion_failure_stops_auto_retry_but_keeps_serving() {
+        let child = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, _, _, task) = promotion_runtime(child).await;
+
+        for attempt in 1_u64..=3 {
+            let now = (attempt - 1) * 50;
+            let failed = runtime
+                .record_promotion_failure(ClusterFailure::CoordinatorStartupTimeout, now)
+                .await
+                .unwrap();
+            if attempt < 3 {
+                assert_eq!(failed.state, ClusterState::Backoff);
+                assert_eq!(runtime.reconcile_backoff(now + 49).await.unwrap(), failed);
+                let paired = runtime.reconcile_backoff(now + 50).await.unwrap();
+                assert_eq!(paired.state, ClusterState::PairedStandaloneReady);
+                runtime
+                    .cluster
+                    .apply(ClusterEvent {
+                        expected_generation: paired.generation,
+                        kind: ClusterEventKind::BeginPromotion,
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                assert_eq!(failed.state, ClusterState::ManualInterventionRequired);
+            }
+        }
+
+        let status = runtime.promotion_failure_status().await;
+        assert_eq!(status.consecutive, 3);
+        assert!(status.manual);
+        assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
+        assert!(proxy.target_snapshot().ready);
+        assert_eq!(
+            runtime.reconcile_backoff(u64::MAX).await.unwrap().state,
+            ClusterState::ManualInterventionRequired
+        );
+        assert_eq!(
+            runtime.operator_reconcile().await.unwrap().state,
+            ClusterState::PairedStandaloneReady
+        );
+        assert_eq!(runtime.promotion_failure_status().await.consecutive, 0);
         task.abort();
     }
 }

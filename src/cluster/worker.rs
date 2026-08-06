@@ -1,7 +1,8 @@
 use super::{
-    AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
-    ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase, NodeDescriptor,
-    PeerLease, WorkerEventKind, control::ControlProcessor, runtime::LocalStandaloneLifecycle,
+    AuthenticatedPeer, ClusterFailure, ControlCommand, ControlEndpoint, ControlError,
+    ControlMessage, ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase,
+    NodeDescriptor, PeerLease, WorkerEventKind, control::ControlProcessor,
+    runtime::LocalStandaloneLifecycle,
 };
 use crate::admission::{AdmissionGate, DrainError};
 use futures::future::BoxFuture;
@@ -49,6 +50,22 @@ pub enum WorkerLifecycleError {
         #[source]
         cleanup: anyhow::Error,
     },
+}
+
+impl WorkerLifecycleError {
+    pub fn cluster_failure(&self) -> ClusterFailure {
+        match self {
+            Self::StartupTimeout | Self::EarlyExit => ClusterFailure::HelloTimeout,
+            Self::LeaseLost => ClusterFailure::PeerLeaseLost,
+            Self::Drain(_) => ClusterFailure::DrainTimeout,
+            Self::Standalone(_) | Self::Worker(_) | Self::Cleanup { .. } => {
+                ClusterFailure::ChildIdentityUnknown
+            }
+            Self::InvalidTiming => ClusterFailure::StateCorrupt {
+                standalone_safe: false,
+            },
+        }
+    }
 }
 
 #[derive(Clone)]

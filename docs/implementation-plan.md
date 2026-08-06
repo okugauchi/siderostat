@@ -747,15 +747,17 @@ Blocked: ユーザー指定によりGGUFを要する実DS4 HELLO、short prompt�
 
 ### Phase 5: Recovery、operations、security
 
-#### [ ] P5-01 Failure policyとbackoffを完成する
+#### [x] P5-01 Failure policyとbackoffを完成する
 
 - Actor: agent
 - Depends on: P4-07
 - Read: 仕様書第18.6、19、31章
-- Files: `state.rs`、`coordinator.rs`、`worker.rs`
+- Files: `state.rs`、`coordinator.rs`、`worker.rs`、`mod.rs`、`src/target.rs`、`tests/phase5_failure.rs`
 - Actions: Failure table全row、route grace、finite retry、manual stateを実装
 - Verification: Table-driven failure integration test
 - Done when: 同一failure 3回後にpromotion loop停止
+
+Evidence: `src/cluster/state.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`、`src/target.rs`、`tests/phase5_failure.rs`; 仕様第31章の全failure rowをtyped actionへ対応付け、promotion対象failureだけを原因別に連続計数。設定backoff前のretryを拒否し、同一原因3回目でManualInterventionRequiredへ移行、operator reconcileまで自動retry不能とした。Backoff/manual中もverified standalone targetがreadyならServingを維持し、unsafe distributed backoffはUnavailable。Coordinator startup timeoutはPaired backoff、promotion中lease lossは両child cleanup後Soloへ収束し、worker errorもtyped failureへ変換。Table全行、backoff境界、異なる原因でcount reset、3回停止/手動resetを含む3追加tests、共通local gate（128 tests）、test-support gate（133 tests）、clippy成功。初回coordinator test compileはloop変数の整数型推論を`u64`明示で修正。最終target回帰の初回commandはcargoへfilterを2個渡したCLI指定誤りで失敗し、通常全target gateへ修正後成功; 2026-08-06
 
 #### [ ] P5-02 Admin APIとCLIを完成する
 

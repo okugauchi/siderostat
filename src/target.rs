@@ -48,6 +48,21 @@ pub fn resolve_target(
     state: ClusterState,
     local_standalone_ready: bool,
 ) -> ProxyTarget {
+    if state == ClusterState::ManualInterventionRequired && local_standalone_ready {
+        return ProxyTarget::LocalStandalone;
+    }
+    if state == ClusterState::Backoff {
+        return match (stable_mode, role, local_standalone_ready) {
+            (StableMode::SoloStandalone, _, true)
+            | (StableMode::PairedStandalone, LocalRole::Coordinator, true) => {
+                ProxyTarget::LocalStandalone
+            }
+            (StableMode::PairedStandalone, LocalRole::Worker, _) => ProxyTarget::Coordinator,
+            _ => ProxyTarget::Unavailable {
+                reason: UnavailableReason::Transition,
+            },
+        };
+    }
     if !matches!(
         state,
         ClusterState::SoloStandaloneReady
@@ -158,8 +173,6 @@ mod tests {
             ClusterState::Promoting,
             ClusterState::DistributedStarting,
             ClusterState::Demoting,
-            ClusterState::Backoff,
-            ClusterState::ManualInterventionRequired,
         ];
         for state in transitions {
             assert_eq!(
@@ -174,6 +187,46 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn backoff_and_manual_keep_a_safe_standalone_target_serving() {
+        assert_eq!(
+            resolve_target(
+                LocalRole::Coordinator,
+                StableMode::PairedStandalone,
+                ClusterState::Backoff,
+                true,
+            ),
+            ProxyTarget::LocalStandalone
+        );
+        assert_eq!(
+            resolve_target(
+                LocalRole::Worker,
+                StableMode::SoloStandalone,
+                ClusterState::ManualInterventionRequired,
+                true,
+            ),
+            ProxyTarget::LocalStandalone
+        );
+        assert!(matches!(
+            resolve_target(
+                LocalRole::Worker,
+                StableMode::PairedStandalone,
+                ClusterState::ManualInterventionRequired,
+                false,
+            ),
+            ProxyTarget::Unavailable { .. }
+        ));
+        assert!(matches!(
+            resolve_target(
+                LocalRole::Coordinator,
+                StableMode::DistributedMxfp4,
+                ClusterState::Backoff,
+                false,
+            ),
+            ProxyTarget::Unavailable { .. }
+        ));
     }
 
     #[test]

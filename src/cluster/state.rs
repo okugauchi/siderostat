@@ -1,4 +1,5 @@
 use crate::target::{ClusterState, LocalRole, ProxyTarget, StableMode, resolve_target};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -60,7 +61,180 @@ pub enum ClusterEventKind {
     BeginDemotion,
     PeerLost,
     EnterBackoff,
+    BackoffElapsed,
     RequireManualIntervention,
+    OperatorReconcile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterFailure {
+    PeerAbsent,
+    BridgeUnavailable,
+    BridgeAddressInvalid,
+    BonjourUnavailable { static_fallback: bool },
+    UnauthenticatedDiscovery,
+    InvalidControlHmac,
+    InvalidPeerProxyToken,
+    DeploymentMismatch,
+    ManifestStale,
+    HelloTimeout,
+    UnknownDs4Schema,
+    CoordinatorStartupTimeout,
+    RouteIncomplete,
+    PeerLeaseLost,
+    ChildIdentityUnknown,
+    StandaloneStartFailed,
+    DrainTimeout,
+    StateCorrupt { standalone_safe: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    MaintainCurrent,
+    RejectRequest,
+    RetryStaticDiscovery,
+    SoloStandalone,
+    PairedStandalone,
+    PromotionBackoff,
+    ManualIntervention,
+    Unavailable,
+}
+
+pub fn failure_action(failure: ClusterFailure) -> FailureAction {
+    match failure {
+        ClusterFailure::PeerAbsent
+        | ClusterFailure::BridgeUnavailable
+        | ClusterFailure::BridgeAddressInvalid
+        | ClusterFailure::PeerLeaseLost => FailureAction::SoloStandalone,
+        ClusterFailure::BonjourUnavailable {
+            static_fallback: true,
+        } => FailureAction::RetryStaticDiscovery,
+        ClusterFailure::BonjourUnavailable {
+            static_fallback: false,
+        } => FailureAction::SoloStandalone,
+        ClusterFailure::UnauthenticatedDiscovery => FailureAction::MaintainCurrent,
+        ClusterFailure::InvalidControlHmac | ClusterFailure::InvalidPeerProxyToken => {
+            FailureAction::RejectRequest
+        }
+        ClusterFailure::DeploymentMismatch | ClusterFailure::ManifestStale => {
+            FailureAction::PairedStandalone
+        }
+        ClusterFailure::HelloTimeout
+        | ClusterFailure::UnknownDs4Schema
+        | ClusterFailure::CoordinatorStartupTimeout => FailureAction::PromotionBackoff,
+        ClusterFailure::RouteIncomplete => FailureAction::PairedStandalone,
+        ClusterFailure::ChildIdentityUnknown => FailureAction::ManualIntervention,
+        ClusterFailure::StandaloneStartFailed => FailureAction::Unavailable,
+        ClusterFailure::DrainTimeout => FailureAction::ManualIntervention,
+        ClusterFailure::StateCorrupt {
+            standalone_safe: true,
+        } => FailureAction::SoloStandalone,
+        ClusterFailure::StateCorrupt {
+            standalone_safe: false,
+        } => FailureAction::ManualIntervention,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionRetryDecision {
+    Backoff { retry_at_millis: u64 },
+    ManualIntervention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromotionFailureStatus {
+    pub failure: Option<ClusterFailure>,
+    pub consecutive: u32,
+    pub retry_at_millis: Option<u64>,
+    pub manual: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromotionFailureTracker {
+    backoff: Duration,
+    maximum: u32,
+    status: PromotionFailureStatus,
+}
+
+impl PromotionFailureTracker {
+    pub fn new(backoff: Duration, maximum: u32) -> Result<Self, PromotionTrackerError> {
+        if backoff.is_zero() || maximum == 0 {
+            return Err(PromotionTrackerError::InvalidPolicy);
+        }
+        Ok(Self {
+            backoff,
+            maximum,
+            status: PromotionFailureStatus {
+                failure: None,
+                consecutive: 0,
+                retry_at_millis: None,
+                manual: false,
+            },
+        })
+    }
+
+    pub fn record(
+        &mut self,
+        failure: ClusterFailure,
+        now_millis: u64,
+    ) -> Result<PromotionRetryDecision, PromotionTrackerError> {
+        if failure_action(failure) != FailureAction::PromotionBackoff {
+            return Err(PromotionTrackerError::NotPromotionFailure);
+        }
+        self.status.consecutive = if self.status.failure == Some(failure) {
+            self.status.consecutive.saturating_add(1)
+        } else {
+            1
+        };
+        self.status.failure = Some(failure);
+        if self.status.consecutive >= self.maximum {
+            self.status.retry_at_millis = None;
+            self.status.manual = true;
+            return Ok(PromotionRetryDecision::ManualIntervention);
+        }
+        let backoff_millis = self.backoff.as_millis().try_into().unwrap_or(u64::MAX);
+        let retry_at_millis = now_millis.saturating_add(backoff_millis);
+        self.status.retry_at_millis = Some(retry_at_millis);
+        self.status.manual = false;
+        Ok(PromotionRetryDecision::Backoff { retry_at_millis })
+    }
+
+    pub fn can_retry(&self, now_millis: u64) -> bool {
+        !self.status.manual
+            && self
+                .status
+                .retry_at_millis
+                .is_none_or(|retry_at| now_millis >= retry_at)
+    }
+
+    pub fn note_success(&mut self) {
+        self.reset();
+    }
+
+    pub fn operator_reconcile(&mut self) {
+        self.reset();
+    }
+
+    pub fn status(&self) -> PromotionFailureStatus {
+        self.status
+    }
+
+    fn reset(&mut self) {
+        self.status = PromotionFailureStatus {
+            failure: None,
+            consecutive: 0,
+            retry_at_millis: None,
+            manual: false,
+        };
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionTrackerError {
+    #[error("promotion backoff and maximum failures must be positive")]
+    InvalidPolicy,
+    #[error("failure is not eligible for promotion retry")]
+    NotPromotionFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +410,12 @@ fn transition(
             ClusterState::Backoff,
             current.local_standalone_ready,
         ),
+        (ClusterState::Backoff, ClusterEventKind::BackoffElapsed)
+        | (ClusterState::ManualInterventionRequired, ClusterEventKind::OperatorReconcile) => (
+            current.stable_mode,
+            stable_ready_state(current.stable_mode),
+            current.local_standalone_ready,
+        ),
         (_, ClusterEventKind::RequireManualIntervention) => (
             current.stable_mode,
             ClusterState::ManualInterventionRequired,
@@ -255,6 +435,14 @@ fn transition(
         state,
         local_ready,
     ))
+}
+
+fn stable_ready_state(mode: StableMode) -> ClusterState {
+    match mode {
+        StableMode::SoloStandalone => ClusterState::SoloStandaloneReady,
+        StableMode::PairedStandalone => ClusterState::PairedStandaloneReady,
+        StableMode::DistributedMxfp4 => ClusterState::DistributedReady,
+    }
 }
 
 #[cfg(test)]
