@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 mod bonjour;
 mod control;
@@ -18,6 +19,10 @@ mod state;
 mod state_store;
 mod worker;
 
+pub use admin::{
+    AdminAction, AdminController, AdminExecutor, AdminFuture, AdminJob, AdminJobState,
+    FingerprintProfile, encode_token,
+};
 pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };

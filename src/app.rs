@@ -1,10 +1,12 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
-        ClusterHandle, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild,
-        PersistentClusterState, PersistentMode, PersistentProxyTarget, RestartDecision,
-        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
-        platform_process_controller, reconcile_restart, required_port_available,
+        AdminAction, AdminController, AdminExecutor, AdminFuture, ClusterEvent, ClusterEventKind,
+        ClusterHandle, FingerprintProfile, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION,
+        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
+        RestartDecision, StandaloneSupervisor, StateStore, StateStoreError,
+        build_standalone_command, fingerprint_file, platform_process_controller, reconcile_restart,
+        required_port_available,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::Metrics,
@@ -16,14 +18,16 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
-    http::{Response, StatusCode},
-    routing::{any, get},
+    http::{HeaderMap, Response, StatusCode},
+    routing::{any, get, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, RwLock},
 };
 use tracing::info;
@@ -45,6 +49,7 @@ pub struct AppState {
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
     cluster: RwLock<Option<ClusterHandle>>,
+    admin: RwLock<Option<AdminController>>,
 }
 
 impl AppState {
@@ -97,6 +102,7 @@ impl AppState {
             proxy,
             metrics: Arc::new(Metrics::default()),
             cluster: RwLock::new(None),
+            admin: RwLock::new(None),
         }))
     }
 
@@ -114,9 +120,91 @@ impl AppState {
             .as_ref()
             .map(ClusterHandle::snapshot)
     }
+
+    fn attach_admin(&self, admin: AdminController) {
+        *self
+            .admin
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(admin);
+    }
+
+    fn admin_controller(&self) -> Option<AdminController> {
+        self.admin
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+struct RuntimeAdminExecutor {
+    runtime: Arc<ModeRuntime>,
+    supervisor: Arc<StandaloneSupervisor>,
+    standalone_model: PathBuf,
+    distributed_model: PathBuf,
+}
+
+impl AdminExecutor for RuntimeAdminExecutor {
+    fn execute(&self, action: AdminAction) -> AdminFuture {
+        let runtime = self.runtime.clone();
+        let supervisor = self.supervisor.clone();
+        let standalone_model = self.standalone_model.clone();
+        let distributed_model = self.distributed_model.clone();
+        Box::pin(async move {
+            match action {
+                AdminAction::Reconcile => {
+                    let current = runtime.snapshot();
+                    if current.state == ClusterState::ManualInterventionRequired {
+                        runtime
+                            .cluster_handle()
+                            .apply(ClusterEvent {
+                                expected_generation: current.generation,
+                                kind: ClusterEventKind::OperatorReconcile,
+                            })
+                            .await?;
+                    }
+                    let snapshot = runtime.reconcile_local().await?;
+                    Ok(snapshot_json(snapshot))
+                }
+                AdminAction::Restart => {
+                    anyhow::ensure!(
+                        runtime.snapshot().stable_mode == StableMode::SoloStandalone,
+                        "restart of a distributed profile requires its active lifecycle owner"
+                    );
+                    crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await?;
+                    let snapshot = runtime.reconcile_local().await?;
+                    Ok(snapshot_json(snapshot))
+                }
+                AdminAction::Fingerprint { profile } => {
+                    let path = match profile {
+                        FingerprintProfile::Standalone => standalone_model,
+                        FingerprintProfile::Distributed => distributed_model,
+                    };
+                    let fingerprint = fingerprint_file(&path).await?;
+                    Ok(serde_json::to_value(fingerprint)?)
+                }
+                AdminAction::Pair | AdminAction::Promote | AdminAction::Demote { .. } => {
+                    anyhow::bail!(
+                        "operation requires the active peer lifecycle and may not bypass compatibility or lease checks"
+                    )
+                }
+            }
+        })
+    }
+}
+
+fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
+    json!({
+        "generation": snapshot.generation,
+        "role": role_name(snapshot.role),
+        "mode": stable_mode_name(snapshot.stable_mode),
+        "state": cluster_state_name(snapshot.state),
+        "target": target_name(snapshot.target),
+    })
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
+    // Childを起動する前にmutation認証材料を確定し、起動途中のorphanを防ぐ。
+    let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
     let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
     let persisted = match state_store.load() {
         Ok(state) => state,
@@ -185,6 +273,15 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         }
     });
     state.attach_cluster(runtime.cluster_handle());
+    state.attach_admin(AdminController::new(
+        admin_token,
+        Arc::new(RuntimeAdminExecutor {
+            runtime: runtime.clone(),
+            supervisor: supervisor.clone(),
+            standalone_model: config.ds4.standalone.model.clone(),
+            distributed_model: config.ds4.mxfp4.model.clone(),
+        }),
+    )?);
     persist_runtime_state(
         &state_store,
         &runtime,
@@ -377,7 +474,145 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/readyz", get(ready))
         .route("/cluster", get(cluster))
         .route("/metrics", get(metrics))
+        .route("/cluster/reconcile", post(reconcile))
+        .route("/cluster/pair", post(pair))
+        .route("/cluster/promote", post(promote))
+        .route("/cluster/demote", post(demote))
+        .route("/cluster/restart", post(restart))
+        .route("/cluster/fingerprint", post(fingerprint))
         .with_state(state)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DemoteRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FingerprintRequest {
+    profile: String,
+}
+
+async fn reconcile(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    start_admin_job(&headers, &state, AdminAction::Reconcile)
+}
+
+async fn pair(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    start_admin_job(&headers, &state, AdminAction::Pair)
+}
+
+async fn promote(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    start_admin_job(&headers, &state, AdminAction::Promote)
+}
+
+async fn demote(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    let body = if body.is_empty() {
+        DemoteRequest::default()
+    } else {
+        match serde_json::from_slice::<DemoteRequest>(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("invalid demote request: {error}")}),
+                );
+            }
+        }
+    };
+    start_job(
+        admin,
+        AdminAction::Demote {
+            reason: body.reason,
+        },
+    )
+}
+
+async fn restart(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    start_admin_job(&headers, &state, AdminAction::Restart)
+}
+
+async fn fingerprint(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    let body = match serde_json::from_slice::<FingerprintRequest>(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid fingerprint request: {error}")}),
+            );
+        }
+    };
+    let profile = match body.profile.as_str() {
+        "standalone" => FingerprintProfile::Standalone,
+        "distributed" => FingerprintProfile::Distributed,
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "profile must be standalone or distributed"}),
+            );
+        }
+    };
+    start_job(admin, AdminAction::Fingerprint { profile })
+}
+
+fn start_admin_job(headers: &HeaderMap, state: &AppState, action: AdminAction) -> Response<Body> {
+    let admin = match authorized_admin(headers, state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    start_job(admin, action)
+}
+
+fn authorized_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AdminController, Box<Response<Body>>> {
+    let admin = state.admin_controller().ok_or_else(|| {
+        Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "admin lifecycle unavailable"}),
+        ))
+    })?;
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !admin.authorize(authorization) {
+        return Err(Box::new(json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "unauthorized"}),
+        )));
+    }
+    Ok(admin)
+}
+
+fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
+    match admin.start(action) {
+        Ok(job) => json_response(
+            StatusCode::ACCEPTED,
+            serde_json::to_value(job).expect("admin job serializes"),
+        ),
+        Err(profile) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": format!("fingerprint job already running for {}", profile.as_str())}),
+        ),
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -505,6 +740,19 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
 
+    struct TestAdminExecutor;
+
+    impl AdminExecutor for TestAdminExecutor {
+        fn execute(&self, action: AdminAction) -> AdminFuture {
+            Box::pin(async move {
+                if matches!(action, AdminAction::Fingerprint { .. }) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok(json!({"executed": true}))
+            })
+        }
+    }
+
     fn test_state(serving: bool) -> Arc<AppState> {
         let proxy = Arc::new(
             ModeAwareProxyState::new(
@@ -525,7 +773,7 @@ mod tests {
             proxy.set_target(ProxyTarget::LocalStandalone, true);
             proxy.admission().start_serving();
         }
-        Arc::new(AppState {
+        let state = Arc::new(AppState {
             config: Arc::new(AppConfig {
                 public_listen: "127.0.0.1:18080".parse().unwrap(),
                 admin_listen: "127.0.0.1:18081".parse().unwrap(),
@@ -539,12 +787,34 @@ mod tests {
             proxy,
             metrics: Arc::new(Metrics::default()),
             cluster: RwLock::new(None),
-        })
+            admin: RwLock::new(None),
+        });
+        state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
+        state
     }
 
     async fn get(state: Arc<AppState>, path: &'static str) -> (StatusCode, String) {
         let response = admin_router(state)
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post(
+        state: Arc<AppState>,
+        path: &'static str,
+        token: Option<&str>,
+        body: &'static str,
+    ) -> (StatusCode, String) {
+        let mut request = Request::post(path).header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", token);
+        }
+        let response = admin_router(state)
+            .oneshot(request.body(Body::from(body)).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -610,6 +880,61 @@ mod tests {
         assert_eq!(body["state"], "manual-intervention-required");
         assert_eq!(body["generation"], 13);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn mutations_require_bearer_token_and_return_async_job() {
+        let state = test_state(true);
+        let (missing, _) = post(state.clone(), "/cluster/reconcile", None, "{}").await;
+        let (wrong, _) = post(
+            state.clone(),
+            "/cluster/reconcile",
+            Some("Bearer deadbeef"),
+            "{}",
+        )
+        .await;
+        let token = format!("Bearer {}", crate::cluster::encode_token(&[3; 32]));
+        for (path, body) in [
+            ("/cluster/reconcile", "{}"),
+            ("/cluster/pair", "{}"),
+            ("/cluster/promote", "{}"),
+            ("/cluster/demote", r#"{"reason":"operator"}"#),
+            ("/cluster/restart", "{}"),
+        ] {
+            let (status, body) = post(state.clone(), path, Some(&token), body).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{path}: {body}");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["state"], "running");
+            assert!(body["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+        }
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+
+        let (malformed_unauthorized, _) =
+            post(state, "/cluster/fingerprint", None, "not-json").await;
+        assert_eq!(malformed_unauthorized, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn duplicate_fingerprint_for_same_profile_is_rejected() {
+        let state = test_state(true);
+        let token = format!("Bearer {}", crate::cluster::encode_token(&[3; 32]));
+        let (first, _) = post(
+            state.clone(),
+            "/cluster/fingerprint",
+            Some(&token),
+            r#"{"profile":"standalone"}"#,
+        )
+        .await;
+        let (duplicate, _) = post(
+            state,
+            "/cluster/fingerprint",
+            Some(&token),
+            r#"{"profile":"standalone"}"#,
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        assert_eq!(duplicate, StatusCode::CONFLICT);
     }
 
     #[test]

@@ -759,15 +759,17 @@ Blocked: ユーザー指定によりGGUFを要する実DS4 HELLO、short prompt�
 
 Evidence: `src/cluster/state.rs`、`src/cluster/coordinator.rs`、`src/cluster/worker.rs`、`src/target.rs`、`tests/phase5_failure.rs`; 仕様第31章の全failure rowをtyped actionへ対応付け、promotion対象failureだけを原因別に連続計数。設定backoff前のretryを拒否し、同一原因3回目でManualInterventionRequiredへ移行、operator reconcileまで自動retry不能とした。Backoff/manual中もverified standalone targetがreadyならServingを維持し、unsafe distributed backoffはUnavailable。Coordinator startup timeoutはPaired backoff、promotion中lease lossは両child cleanup後Soloへ収束し、worker errorもtyped failureへ変換。Table全行、backoff境界、異なる原因でcount reset、3回停止/手動resetを含む3追加tests、共通local gate（128 tests）、test-support gate（133 tests）、clippy成功。初回coordinator test compileはloop変数の整数型推論を`u64`明示で修正。最終target回帰の初回commandはcargoへfilterを2個渡したCLI指定誤りで失敗し、通常全target gateへ修正後成功; 2026-08-06
 
-#### [ ] P5-02 Admin APIとCLIを完成する
+#### [x] P5-02 Admin APIとCLIを完成する
 
 - Actor: agent
 - Depends on: P5-01
 - Read: 仕様書第23章
-- Files: `src/main.rs`、`src/app.rs`、`src/cluster/admin.rs`または同等module
+- Files: `src/main.rs`、`src/cli.rs`、`src/app.rs`、`src/cluster/admin.rs`
 - Actions: Status、doctor、reconcile、pair、promote、demote、restart、fingerprintを実装
 - Verification: Mutation auth、202 job、CLI does not spawn supervisor test
 - Done when: CLI commandとadmin routeが仕様表に一致
+
+Evidence: `src/cluster/admin.rs`、`src/app.rs`、`src/cli.rs`、`src/main.rs`; read-only 4 routeとmutation 6 routeを実装し、全mutationでbody parse前にhex化Bearer admin tokenをconstant-time検証。MutationをUUID付き202 async jobとしてrunning process内の`AdminExecutor`へ委譲し、同一profileのfingerprint同時実行を409で拒否。Reconcile/manual reset、Solo child restart、standalone/distributed modelのstreaming fingerprintを実runtimeへ接続し、pair/promote/demoteはactive peer lifecycle不在時に安全にjob failureとしてHELLO/compatibility/lease条件の迂回を禁止した。旧`--config`と明示`serve`を同一supervisor pathに保ち、全cluster subcommandをadmin HTTP client pathへ分離。Status human/JSON、doctor checks、demote reason、fingerprint profileを実装。Mutation auth/不正JSONの認証先行、202/job ID、全route、同profile競合、CLI path selectionを含む9 testsを追加。通常全target gate（133 tests）、test-support全target gate（138 tests）、fmt/check/clippy成功。初回全testはsandboxのloopback bind禁止で既存15 testsが失敗したため権限付きで再実行し成功。Targeted test初回はcargoへfilterを2個渡したCLI指定誤りを、個別filter実行へ修正; 2026-08-06
 
 #### [ ] P5-03 Loggingとmetricsを完成する
 
