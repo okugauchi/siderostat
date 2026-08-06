@@ -833,7 +833,7 @@ Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-20
 
 Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値だけを残し、DS4 binary、standalone/MXFP4 model、3つのsecret/token fileを`PLACEHOLDER`へ置換して配布用とした。Headerでvalidation要件（regular/canonical/non-symlink、secret 32+ bytes・0600）とworker nodeの差分（`cluster.node_id`とnode固有pathのみ、roleはinterface addressから決定し設定しない）を明記した。実parserは`parses_repository_schema_v2_example`で成功し、binary `--config`実行はTOML parse後に最初のplaceholder（`ds4.binary`）をactionableに報告することを確認。Spec exampleとの差分はplaceholder化とworker注記のみで、field値は全て一致; 2026-08-06
 
-#### [ ] P6-02 DS4を含む導入ガイドを作る
+#### [!] P6-02 DS4を含む導入ガイドを作る
 
 - Actor: agent + operator for command verification
 - Depends on: P6-01
@@ -848,6 +848,10 @@ Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値�
 - Verification: Clean user accountと両nodeでcommandを順番に実行
 - Done when: 既存DS4環境なしからDistributedReadyへ到達
 - Stop when: Model配布条件や未確認URLを推測しない
+
+Evidence: `docs/installation.md`; 6つのActionsをspecと`docs/compatibility/ds4-b7e9f00.md`に基づき手順化し、DS4 checkout `b7e9f00`のfull SHA未確認・digest記録・model配布URL非推測・実DS4/modelを使う手順をoperator gateと明記。Proxy build、secret/config validation、Pairing/promotion/LaunchAgent/recovery/upgrade/rollback/uninstallをspec第13/14/18/20/22/23/32.5/35/36節と`contrib/launchd/README.md`から導出。Model配布条件や未確認URLを推測せず、production enable前にActual verification checklistとModel/profile matrixのPASSを要求; 2026-08-06
+
+Blocked: Clean user accountと両nodeでのcommand逐次実行は、実DS4 binary `b7e9f00`、実GGUF model、Thunderbolt 2-node、GUI user sessionが必要なoperator作業のため未実施。ユーザー指定によりGGUFを使う検証は後で手動実施する。Guide実装は完了しており、P6-03以降のrepository内作業は継続可能; 2026-08-06
 
 #### [ ] P6-03 READMEを全面刷新する
 
