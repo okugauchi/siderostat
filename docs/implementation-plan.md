@@ -797,7 +797,7 @@ Evidence: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/REA
 
 Blocked: Login起動、実job restart、no duplicate/orphan childの確認は`~/Library/LaunchAgents`と現在のGUI user sessionを変更するoperator作業のため未実施。Artifact実装は完了しており、P5-05以降のrepository内作業は継続可能; 2026-08-06
 
-#### [ ] P5-05 Dependencyとdead codeを整理する
+#### [x] P5-05 Dependencyとdead codeを整理する
 
 - Actor: agent
 - Depends on: P5-04
@@ -805,6 +805,8 @@ Blocked: Login起動、実job restart、no duplicate/orphan childの確認は`~/
 - Actions: Direct usageを`rg`で確認し、unused dependency/module/featureだけ削除
 - Verification: `cargo tree --duplicates`確認、共通local gate
 - Done when: Legacy LB/affinity dependencyが残らない
+
+Evidence: `Cargo.toml`、`Cargo.lock`; 全direct dependencyの`src/`/`tests/`利用を確認し、test専用`tower`をdev-dependencyへ移動。Tokio `full`を実利用するfs/io/macros/net/process/runtime/signal/sync/timeへ限定し、未使用のURL serde featureを削除した結果、parking_lot/lock_api/scopeguard/redox_syscallとURL serde_derive edgeをlockfileから除去。`cargo tree --duplicates`の残存はrustls ring由来getrandom 0.2とUUID v4由来0.4だけで用途が異なり、直接重複なし。Legacy LB/affinity/SQLite/EWMA dependencyとdead-code allow不在を`rg`確認。all-target/all-feature check、通常全target gate（139 tests）、test-support gate（144 tests）、fmt/clippy成功; 2026-08-06
 
 #### [ ] P5-06 Securityとendurance gateを実行する
 
