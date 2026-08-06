@@ -783,15 +783,19 @@ Evidence: `src/cluster/admin.rs`、`src/app.rs`、`src/cli.rs`、`src/main.rs`; 
 
 Evidence: `src/metrics.rs`、`src/proxy.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`、`src/app.rs`; 仕様第26章の19 metric familyをPrometheus textへ実装し、cluster state/mode/generation、target readiness、standalone profile、interface、lease/discovery gaugeをruntime snapshotから描画。Request guardがpublic/peer・有限target/status class別counter、target別duration/TTFB、upstream failure、in-flightをstream完了・error・client cancellationの全経路で確定。Cluster transition monitor、child restart、hello/deployment/discovery用の有限label counterを追加し、profile ID/session/request ID/PID/generation/digestをlabelから排除。Single-writer state machineでfrom/to/reason/result/generation付きeventを一元記録し、request logは任意pathを`/*`へ畳み、header/bodyを受け取らないschemaに限定。DS4 child raw lineをlogせずmetadata/event/line sizeだけ記録。全19 family、Prometheus escape、request completion、finite cluster labels、header/body非出力、arbitrary path秘匿の6 testsを追加。通常全target gate（139 tests）、test-support全target gate（144 tests）、fmt/check/clippy成功; 2026-08-06
 
-#### [ ] P5-04 macOS user serviceを作成する
+#### [!] P5-04 macOS user serviceを作成する
 
 - Actor: agent + operator for install
 - Depends on: P5-03
 - Read: 仕様書第35章
-- Files: `contrib/launchd/ds4-smart-proxy.plist.example`、install guide draft
+- Files: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/README.md`
 - Actions: RunAtLoad、KeepAlive、absolute args、finite throttle、single ownerを定義
 - Verification: `plutil -lint`、login start、restart、no duplicate child
 - Done when: DS4 childを別jobへ登録しない
+
+Evidence: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/README.md`; single user job、absolute binary/config/log path、`serve`、RunAtLoad/KeepAlive、10秒ThrottleInterval、secret非埋込を定義し、DS4 childの別job禁止、install/verify/uninstall手順を記載。`plutil -lint`成功、plist dumpとsecret/job静的検査、共通local gate（139 tests）成功; 2026-08-06
+
+Blocked: Login起動、実job restart、no duplicate/orphan childの確認は`~/Library/LaunchAgents`と現在のGUI user sessionを変更するoperator作業のため未実施。Artifact実装は完了しており、P5-05以降のrepository内作業は継続可能; 2026-08-06
 
 #### [ ] P5-05 Dependencyとdead codeを整理する
 
