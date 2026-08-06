@@ -853,7 +853,7 @@ Evidence: `docs/installation.md`; 6つのActionsをspecと`docs/compatibility/ds
 
 Blocked: Clean user accountと両nodeでのcommand逐次実行は、実DS4 binary `b7e9f00`、実GGUF model、Thunderbolt 2-node、GUI user sessionが必要なoperator作業のため未実施。ユーザー指定によりGGUFを使う検証は後で手動実施する。Guide実装は完了しており、P6-03以降のrepository内作業は継続可能; 2026-08-06
 
-#### [ ] P6-03 READMEを全面刷新する
+#### [x] P6-03 READMEを全面刷新する
 
 - Actor: agent
 - Depends on: P6-02
@@ -865,6 +865,8 @@ Blocked: Clean user accountと両nodeでのcommand逐次実行は、実DS4 binar
   4. Least-busy、affinity、SQLite、EWMA、alternate retry説明を全削除する。
 - Verification: `rg`でlegacy term不在、link check、command smoke
 - Done when: READMEが実装済みbehaviorだけを説明
+
+Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷新し、3 mode topology、profile matrix、quick start、security、limitations、関連文書linkを実装済みbehavior（spec第9/13/14/22/23/25/26/27/35/37節と`src/cluster/admin.rs`/`src/metrics.rs`/`src/cli.rs`）から導出。`rg`でlegacy term（least-busy、affinity、SQLite、EWMA、alternate retry、Hermes、sticky、heartbeat、cooldown、circuit breaker、local-first、priority、session/prefix、backend）がREADMEに不在であることを確認し、`docs/spec.md`、`docs/installation.md`、`docs/compatibility/ds4-b7e9f00.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`ds4-smart-proxy.example.toml`、`contrib/launchd/README.md`への全linkが実在することを確認。command smokeとして、記載したserve/cluster CLIとadmin endpoint（healthz/readyz/cluster/metrics）を実装済み`src/cli.rs`/`src/app.rs`と突合。`docs/operations.md`はP6-04で作成予定のため、現時点ではREADMEからdead linkを張らず、P6-04完了後に追加する; 2026-08-06
 
 #### [ ] P6-04 Operationsとtroubleshootingを作る
 

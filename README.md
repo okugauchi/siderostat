@@ -1,169 +1,138 @@
 # DS4 Smart Proxy
 
-DS4 Smart Proxy は、複数のOpenAI互換DS4 endpointを束ねるRust製の
-reverse proxy / application gatewayです。
+DS4 Smart Proxy は、DS4のHTTP endpointを透過的にstreaming中継し、単一nodeのstandalone実行と、2 nodeのThunderbolt直結によるMXFP4 distributed実行を、ひとつのsupervisorで管理するRust製のmode-aware reverse proxy / cluster supervisorです。
 
-単純なleast-busy方式ではなく、local-firstとsession/prefix affinityを組み合わせ、
-長いHermesセッションのKV cache localityを保ちます。定期監視では推論を実行せず、
-`GET /v1/models` だけをheartbeatとして使用します。
+転送先はmodeだけで一意に決まります。負荷やsession IDで変更しません。公開proxy processとlisten portは、standalone / distributedのmode切替中も維持されます。
 
 ## 主な機能
 
-- OpenAI互換pathと未知pathの透過転送
-- local-first routing
-- Hermes session、conversation、prefixによるsticky routing
-- HMAC-SHA-256によるaffinity key保護
-- SQLite WALによるaffinity永続化
-- backendごとの推論用Semaphore
-- 非推論request用の独立concurrency limit
-- Unknown / Alive / Suspect / Offline / Cooldown状態管理
-- bufferしないresponse streamingとSSE転送
-- connect、response header、first body byte、stream idle timeout
-- response開始前だけの限定的な別backend retry
-- standalone DS4とdistributed coordinatorの共存
-- public listenerとloopback admin listenerの分離
-- 構造化ログとPrometheus互換metrics
+- OpenAI互換pathと未知pathの透過streaming中継（bodyをbufferしない）
+- 3 mode: Solo Standalone、Paired Standalone、Distributed MXFP4
+- peer不在時はlocal standalone profileへ転送し、peer存在時はcoordinatorへ集約
+- standalone profileとしてQ2、Q2-Q4、MXFP4を選択でき、resident常駐またはDS4のSSD streamingを利用
+- compatibleなpeerが揃った場合、実DS4 worker HELLOとcomplete route確認の後、MXFP4 distributedへ自動昇格
+- worker/route喪失時にstandalone profileへ自動降格
+- standaloneとdistributedのKV cacheを分離
+- proxy admissionとDS4 process drainを連動し、mode切替時に新規admissionを閉じる
+- DS4 binary、model、checkpoint、argvの一致をfail closedで検証
+- LaunchAgent、local CLI、構造化log、Prometheus互換metrics、loopback admin APIを提供
+- 外部databaseまたはcluster state serviceなしで動作し、永続化するのはcluster lifecycle stateだけ
 
-## ビルド
+## モードとトポロジ
 
-Rust stable（edition 2024）が必要です。
+初期topologyはThunderbolt Bridgeで直結した2 nodeだけです。
+
+| node | `bridge0` IPv4 | 役割 |
+|---|---|---|
+| coordinator | `10.99.0.1` | standalone実行、peer ingress、rendezvous、distributed coordinator |
+| worker | `10.99.0.2` | standalone実行、distributed worker |
+
+Roleは`bridge0`のIPv4から自動判定します。その他、未設定、競合はunknownとして、cluster listenerを開始しません。Roleはconfigで指定しません。
+
+- クライアントは各nodeのpublic ingress `127.0.0.1:18080`（既定）へ接続します。
+- Solo Standalone: 両nodeとも自身のlocal upstream `127.0.0.1:8000`（既定）へ転送します。
+- Paired Standalone / Distributed MXFP4: workerのrequestはcoordinatorのpeer ingress `10.99.0.1:18082`（既定）へ転送され、coordinatorのupstreamで処理されます。
+- Cluster controlは `10.99.0.1:9920 <-> 10.99.0.2:9920`（既定）。DS4 distributed native protocolはcoordinator `10.99.0.1:9911`（既定）で受けます。
+- DS4 HTTP endpointは両nodeともloopbackにbindし、Thunderbolt Bridgeまたは通常LANへ公開しません。
+
+Peer presentは、`bridge0`の期待address、`bridge0` scoped route、HMAC認証済みnode descriptor、有効なcontrol lease、`required_peer_stability`（既定5秒）の継続をすべて満たす状態だけです。Bonjour結果やICMPだけではpeer presentにしません。
+
+## プロファイル
+
+| standalone profile | residency | DS4起動形態 |
+|---|---|---|
+| Q2 | resident または ssd-streaming | HTTP server |
+| Q2-Q4 | resident または ssd-streaming | HTTP server |
+| MXFP4 | resident または ssd-streaming | HTTP server |
+
+`ssd-streaming`はDS4の`--ssd-streaming`を意味します。model variantと混同しません。`resident`ではSSD streaming optionを生成しません。Standalone profileはnode固有でよく、coordinatorとworkerのmodel variant、residency、tuning値の一致をpairing条件にしません。
+
+Distributed profileはstandalone profileと独立です。初期実装では`distributed-mxfp4`を使い、coordinatorがHTTP + distributed coordinator、workerがdistributed worker（HTTPなし）です。
+
+- coordinator layers: `0:19`、worker layers: `20:output`（既定）。gap、overlap、layer 0欠落、output head欠落は拒否します。
+- Distributedに用いる両nodeのMXFP4 content SHA-256を一致させます。
+- Standaloneとdistributedは異なる`--kv-disk-dir`を必須とし、同じGGUFを使う場合も共有しません。
+
+## クイックスタート
+
+Rust stable（edition 2024）が必要です。実DS4 binaryとmodelを使う準備・検証は [`docs/installation.md`](docs/installation.md) に従います。
 
 ```bash
 cargo build --release
-cargo test --all
+cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
-## 設定
+設定はTOMLで、`ds4-smart-proxy.example.toml`が配布用の完全例です。探索順は次のとおりです。
 
-設定はTOMLです。探索順は次のとおりです。
-
-1. `--config`
+1. `--config PATH`
 2. `DS4_SMART_PROXY_CONFIG`
 3. `./ds4-smart-proxy.toml`
 4. platform既定path
 
-完全な例は [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml) を参照してください。
+Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置します。同じfileを複数roleに流用しません。`openssl rand`などで生成し、configにはfile pathだけを書きます。
 
-`affinity.database_path`の先頭では、`$HOME`、`${HOME}`、`~/`および
-`$VARIABLE`形式の環境変数を展開します。参照した環境変数が未定義の場合は、
-literal名のdirectoryを作成せず起動エラーになります。
-
-affinityを有効にする場合は32 bytes以上のsecretが必要です。
+起動形式です。Subcommandなしは`serve`と同じです。
 
 ```bash
-export DS4_SMART_PROXY_AFFINITY_SECRET='32 bytes以上のランダム値'
-cargo run --release -- --config ./ds4-smart-proxy.toml
+ds4-smart-proxy --config ./node.toml
+# または
+ds4-smart-proxy serve --config ./node.toml
 ```
 
-設定不整合は起動時に検出します。backend IDの重複、複数local backend、userinfoを
-含むURL、無効なtimeout、短いaffinity secretなどは起動エラーになります。
+起動後、loopback admin APIで確認します。
 
-旧版のflat設定（`self_name`、`heartbeat_interval`、backendの`name`など）は
-新仕様では受理しません。exampleに従ってセクション形式へ移行してください。
-
-## Routing
-
-新規requestの基本順序は次のとおりです。
-
-1. 有効な既存affinity
-2. local backend
-3. priorityの高いremote backend
-4. in-flight比率
-5. EWMA latency
-6. backend ID
-
-同じaffinityがbusyの場合、既定では短いgrace期間だけ待ち、別backendへ即座に
-spillせず503を返します。長いprefixを別backendで再prefillすることを避けるためです。
-
-backend slotはSemaphoreで取得し、response bodyのEOF、エラー、client切断まで保持します。
-`GET /v1/models`、`HEAD`、設定されたheartbeat pathは推論slotを消費しません。
-
-`Suspect` backendでは、`GET /v1/models`などの非推論requestを転送できますが、
-その成功だけでは`Alive`へ昇格しません。`Alive`が1台もない状態で実推論requestが
-到着すると、`Unknown`または`Suspect` backendへsingle-flightのhalf-open requestを
-1件だけ送り、最初の正常なresponse body到着で`Alive`へ復帰させます。
-
-## Affinity header
-
-正式なheader：
-
-```text
-X-DS4-Affinity-Key
-X-DS4-Conversation-Id
-X-DS4-Prefix-Hash
+```bash
+curl --fail --silent http://127.0.0.1:18081/healthz
+curl --fail --silent http://127.0.0.1:18081/readyz
+curl --fail --silent http://127.0.0.1:18081/cluster
+curl --fail --silent http://127.0.0.1:18081/metrics
 ```
 
-互換header：
+CLIのcluster commandはrunning processのadmin API clientであり、別supervisorを起動しません。
 
-```text
-X-Hermes-Session-Id
-X-Hermes-Session-Key
-X-Conversation-Id
-Conversation-Id
-Session-Id
-X-Session-Id
+```bash
+ds4-smart-proxy cluster status [--json]
+ds4-smart-proxy cluster doctor [--json]
+ds4-smart-proxy cluster reconcile
+ds4-smart-proxy cluster pair
+ds4-smart-proxy cluster promote
+ds4-smart-proxy cluster demote [--reason TEXT]
+ds4-smart-proxy cluster restart
+ds4-smart-proxy cluster fingerprint --profile standalone|distributed
 ```
 
-Responses APIの`conversation`、`previous_response_id`も認識します。
-raw IDは保存・ログ出力せず、source namespaceを含むHMAC-SHA-256で保存します。
-
-### Hermes連携
-
-Hermesがcustom LLM providerへsession headerを自動転送する保証はないため、
-LLM request middlewareでrequestごとにheaderを追加します。概念例：
-
-```python
-def add_ds4_affinity_header(**kwargs):
-    request = dict(kwargs["request"])
-    session_id = str(kwargs.get("session_id") or "").strip()
-    if not session_id:
-        return None
-
-    headers = dict(request.get("extra_headers") or {})
-    headers["X-DS4-Affinity-Key"] = f"hermes-session:{session_id}"
-    request["extra_headers"] = headers
-    return {"request": request, "name": "ds4-affinity"}
-```
-
-実際の登録方法は使用中のHermes middleware APIに合わせてください。静的な
-`extra_headers`へ固定session IDを書くと、全sessionが同じbackendへ固定されるため避けます。
-
-## Timeoutとretry
-
-- DNS、TCP、TLS接続失敗は、再生可能なrequestに限り別backendへ1回retry
-- HTTP 502 / 503 / 504は、別のavailable backendがある場合だけ1回retry
-- HTTP 4xxはretryしない
-- response header timeoutとfirst body byte timeoutは重複推論防止のためretryしない
-- downstreamへresponseを開始した後はretryしない
-- 2回目は必ず異なるbackendを選択
-
-response bodyはContent-Typeにかかわらずstreamingし、全体をbufferしません。
-first body byteを受信してからdownstream responseをcommitするため、それ以前と
-stream開始後のfailure境界が明確です。
-
-## 管理API
-
-管理APIは既定で `127.0.0.1:18081` にのみbindします。
-
-| Endpoint | 内容 |
-|---|---|
-| `GET /healthz` | process liveness |
-| `GET /readyz` | backendとaffinity storeのreadiness |
-| `GET /backends` | backend状態、in-flight、EWMA |
-| `GET /affinity` | 件数とbackend別集計 |
-| `DELETE /affinity/{tag}` | 12桁hash tagまたは完全hashのentry削除 |
-| `GET /metrics` | Prometheus text format |
-
-admin listenerの非loopback bindは、認証なしで状態を公開しないため起動時に拒否します。
+Mutation（pair/promote/demote/restart/fingerprint/reconcile）はloopbackでもadmin token必須です。Status/doctorはread-onlyです。`promote`は実HELLO/compatibility条件を迂回しません。
 
 ## セキュリティ
 
-- backend TLS証明書検証は既定で有効
-- `Authorization`は転送するがログには出さない
-- request/response body、session ID、conversation ID、完全affinity hashをログへ出さない
-- affinity keyはrouting hintであり、認証・認可には使用しない
-- backend URLにuserinfoを含めない
-- affinity SQLiteにはraw identifierを保存しない
+- Public/admin listenerはloopback既定。peer ingress/control/DS4 distributedはThunderbolt Bridgeだけにbindします。
+- Peer ingressはsource IP、token、hopを検証します。Control planeはHMAC、timestamp、nonce、source IPを検証します。
+- Admin mutationはtoken必須です。
+- Secret/token fileは32 bytes以上、mode `0600`。control secret、peer token、admin tokenを共有しません。
+- DS4 childをTokio process APIでspawnし、shellを介しません。Unknown processをkillしません。
+- Model fingerprint時にregular file/canonical pathを確認します。書換可能なsymlinkをmodel pathに使いません。
+- Authorization/API key、request/response body、prompt、session/conversation ID、peer proxy token、HMAC secret、完全model digest/deployment IDをlogしません。
 
-詳細な要件と受け入れ条件は [`docs/spec.md`](docs/spec.md) を参照してください。
+DS4 native distributed trafficとpeer proxy bodyは暗号化されません。専用の物理Thunderbolt linkを信頼境界とします。
+
+## 制限事項
+
+- standalone/distributed切替中は503の短いwindowがあります。
+- Workerからcoordinatorへのrequestはproxyを2 hop通ります。
+- Peer data/DS4 native trafficは暗号化されません。
+- 2 node固定です。3 node以上の任意topologyは対象外です。
+- Peer discoveryは自動ですが、role addressは`10.99.0.1` / `10.99.0.2`固定で、DHCP based electionは行いません。
+- standalone/distributed間でlive KVを引き継ぎません。mode切替後はtranscriptから再構築します。
+- DS4 log textへの依存があります。
+- MXFP4 SSD streaming on MetalとMXFP4 distributedのproduction可否は、実DS4/modelを使うactual acceptance結果で決めます。
+
+## 関連文書
+
+- [`docs/spec.md`](docs/spec.md): 完全な仕様と受け入れ条件
+- [`docs/installation.md`](docs/installation.md): 実DS4/modelを使う導入ガイド
+- [`docs/compatibility/ds4-b7e9f00.md`](docs/compatibility/ds4-b7e9f00.md): DS4 compatibility記録
+- [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
+- [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml): 配布用config例
+- [`contrib/launchd/README.md`](contrib/launchd/README.md): macOS LaunchAgentのinstall/verify/uninstall
