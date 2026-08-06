@@ -1,6 +1,7 @@
 use crate::{
     admission::{AdmissionGate, AdmissionPermit},
     error::{ProxyError, format_error_chain},
+    metrics::{Metrics, RequestMetricGuard},
     target::ProxyTarget,
 };
 use axum::{
@@ -232,6 +233,7 @@ pub struct ModeAwareProxyState {
     response_header_timeout: std::time::Duration,
     first_body_byte_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
+    metrics: RwLock<Option<Arc<Metrics>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +270,7 @@ impl ModeAwareProxyState {
             response_header_timeout: options.response_header_timeout,
             first_body_byte_timeout: options.first_body_byte_timeout,
             stream_idle_timeout: options.stream_idle_timeout,
+            metrics: RwLock::new(None),
         })
     }
 
@@ -290,6 +293,39 @@ impl ModeAwareProxyState {
             token,
             expected_source,
         }));
+    }
+
+    pub(crate) fn configure_metrics(&self, metrics: Arc<Metrics>) {
+        *self
+            .metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(metrics);
+    }
+
+    fn begin_request_metrics(
+        &self,
+        ingress: ProxyIngress,
+        target: ProxyTarget,
+        request_id: String,
+        method: String,
+        path_template: &'static str,
+    ) -> Option<RequestMetricGuard> {
+        self.metrics
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|metrics| {
+                metrics.begin_request(
+                    match ingress {
+                        ProxyIngress::Public => "public",
+                        ProxyIngress::Peer => "peer",
+                    },
+                    crate::app::target_name(target),
+                    request_id,
+                    method,
+                    path_template,
+                )
+            })
     }
 
     fn peer_security(&self) -> Option<Arc<PeerProxySecurity>> {
@@ -374,18 +410,26 @@ pub async fn forward_mode_aware(
     context: ProxyRequestContext,
     request: Request<Body>,
 ) -> Response<Body> {
+    let started = std::time::Instant::now();
     let (parts, body) = request.into_parts();
     let request_id = request_id(&parts.headers);
+    let fixed = state.fixed_target();
+    let mut observation = state.begin_request_metrics(
+        context.ingress,
+        fixed.target,
+        request_id.clone(),
+        parts.method.as_str().to_owned(),
+        safe_path_template(parts.uri.path()),
+    );
     let declared_length = parts
         .headers
         .get("content-length")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
     if declared_length.is_some_and(|length| length > state.request_body_limit_bytes) {
-        return ProxyError::BodyTooLarge.response(&request_id);
+        return observed_error(ProxyError::BodyTooLarge, &request_id, &mut observation);
     }
 
-    let fixed = state.fixed_target();
     let base = match (context.ingress, fixed.target) {
         (ProxyIngress::Public | ProxyIngress::Peer, ProxyTarget::LocalStandalone) => {
             &state.local_upstream
@@ -393,24 +437,40 @@ pub async fn forward_mode_aware(
         (ProxyIngress::Public, ProxyTarget::Coordinator) => &state.coordinator_upstream,
         (ProxyIngress::Peer, ProxyTarget::Coordinator | ProxyTarget::Unavailable { .. })
         | (ProxyIngress::Public, ProxyTarget::Unavailable { .. }) => {
-            return ProxyError::NoBackendAvailable.response(&request_id);
+            return observed_error(
+                ProxyError::NoBackendAvailable,
+                &request_id,
+                &mut observation,
+            );
         }
     };
     let permit = match state.admission.try_acquire(fixed.ready) {
         Ok(permit) => permit,
-        Err(_) => return ProxyError::NoBackendAvailable.response(&request_id),
+        Err(_) => {
+            return observed_error(
+                ProxyError::NoBackendAvailable,
+                &request_id,
+                &mut observation,
+            );
+        }
     };
     let peer_security = if fixed.target == ProxyTarget::Coordinator {
         match state.peer_security() {
             Some(security) => Some(security),
-            None => return ProxyError::NoBackendAvailable.response(&request_id),
+            None => {
+                return observed_error(
+                    ProxyError::NoBackendAvailable,
+                    &request_id,
+                    &mut observation,
+                );
+            }
         }
     } else {
         None
     };
     let url = match fixed_upstream_url(base, &parts.uri) {
         Ok(url) => url,
-        Err(error) => return error.response(&request_id),
+        Err(error) => return observed_error(error, &request_id, &mut observation),
     };
     let headers = match build_mode_aware_headers(
         &parts.headers,
@@ -420,7 +480,7 @@ pub async fn forward_mode_aware(
         peer_security.as_deref(),
     ) {
         Ok(headers) => headers,
-        Err(error) => return error.response(&request_id),
+        Err(error) => return observed_error(error, &request_id, &mut observation),
     };
     let method = convert_method(&parts.method);
     let body_limit = state.request_body_limit_bytes;
@@ -456,26 +516,68 @@ pub async fn forward_mode_aware(
         .headers(headers)
         .body(reqwest::Body::wrap_stream(request_stream));
     let upstream = match tokio::time::timeout(state.response_header_timeout, builder.send()).await {
-        Err(_) => return ProxyError::ResponseHeaderTimeout.response(&request_id),
+        Err(_) => {
+            return observed_error(
+                ProxyError::ResponseHeaderTimeout,
+                &request_id,
+                &mut observation,
+            );
+        }
         Ok(Err(error)) => {
             let chain = format_error_chain(&error);
             if chain.contains("request body limit exceeded") {
-                return ProxyError::BodyTooLarge.response(&request_id);
+                return observed_error(ProxyError::BodyTooLarge, &request_id, &mut observation);
             }
             let proxy_error = if error.is_connect() {
                 ProxyError::Connect
             } else {
                 ProxyError::Protocol
             };
-            return proxy_error.response(&request_id);
+            return observed_error(proxy_error, &request_id, &mut observation);
         }
         Ok(Ok(response)) => response,
     };
 
     match prepare_mode_aware_response(&state, upstream).await {
-        Ok(prepared) => build_mode_aware_response(&state, &request_id, prepared, permit),
-        Err(error) => error.response(&request_id),
+        Ok(prepared) => {
+            if let Some(observation) = observation.as_mut() {
+                observation.set_status(prepared.status.as_u16());
+                observation.set_ttfb(started.elapsed().as_secs_f64());
+            }
+            build_mode_aware_response(&state, &request_id, prepared, permit, observation)
+        }
+        Err(error) => observed_error(error, &request_id, &mut observation),
     }
+}
+
+fn safe_path_template(path: &str) -> &'static str {
+    match path {
+        "/v1/chat/completions" => "/v1/chat/completions",
+        "/v1/completions" => "/v1/completions",
+        "/v1/models" => "/v1/models",
+        "/health" => "/health",
+        _ => "/*",
+    }
+}
+
+fn observed_error(
+    error: ProxyError,
+    request_id: &str,
+    observation: &mut Option<RequestMetricGuard>,
+) -> Response<Body> {
+    if let Some(observation) = observation {
+        observation.set_status(error.status().as_u16());
+        if matches!(
+            error,
+            ProxyError::Connect
+                | ProxyError::ResponseHeaderTimeout
+                | ProxyError::FirstByteTimeout
+                | ProxyError::Protocol
+        ) {
+            observation.set_failure(error.code());
+        }
+    }
+    error.response(request_id)
 }
 
 fn fixed_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
@@ -567,33 +669,45 @@ fn build_mode_aware_response(
     request_id: &str,
     prepared: ModeAwarePreparedResponse,
     permit: AdmissionPermit,
+    observation: Option<RequestMetricGuard>,
 ) -> Response<Body> {
     let status = prepared.status;
     let headers = prepared.headers;
     let idle_timeout = state.stream_idle_timeout;
     let stream = stream::unfold(
-        (prepared.first_chunk, prepared.stream, Some(permit)),
-        move |(first, mut upstream, permit)| async move {
+        (
+            prepared.first_chunk,
+            prepared.stream,
+            Some(permit),
+            observation,
+        ),
+        move |(first, mut upstream, permit, mut observation)| async move {
             if let Some(chunk) = first {
-                return Some((Ok(chunk), (None, upstream, permit)));
+                return Some((Ok(chunk), (None, upstream, permit, observation)));
             }
             match tokio::time::timeout(idle_timeout, upstream.next()).await {
-                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (None, upstream, permit))),
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (None, upstream, permit, observation))),
                 Ok(Some(Err(_))) => {
+                    if let Some(observation) = observation.as_mut() {
+                        observation.set_failure("stream-error");
+                    }
                     upstream = Box::pin(stream::empty());
                     Some((
                         Err(io::Error::other("upstream stream error")),
-                        (None, upstream, None),
+                        (None, upstream, None, observation),
                     ))
                 }
                 Err(_) => {
+                    if let Some(observation) = observation.as_mut() {
+                        observation.set_failure("stream-idle-timeout");
+                    }
                     upstream = Box::pin(stream::empty());
                     Some((
                         Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "upstream stream idle timeout",
                         )),
-                        (None, upstream, None),
+                        (None, upstream, None, observation),
                     ))
                 }
                 Ok(None) => None,
@@ -1015,6 +1129,16 @@ mod tests {
         assert!(headers.get("x-ds4-proxy-hop").is_none());
         assert!(headers.get("x-ds4-cluster-generation").is_none());
         assert_eq!(headers.get("x-keep").unwrap(), "yes");
+    }
+
+    #[test]
+    fn request_log_path_template_never_exposes_arbitrary_path_segments() {
+        assert_eq!(
+            safe_path_template("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(safe_path_template("/sessions/private-session-id"), "/*");
+        assert_eq!(safe_path_template("/prompt/do-not-log"), "/*");
     }
 
     #[test]

@@ -301,8 +301,28 @@ pub fn spawn_state_machine(
         while let Some(command) = receiver.recv().await {
             let result = transition(current, command.event);
             if let Ok(next) = result {
+                tracing::info!(
+                    event = cluster_event_name(command.event.kind, next.state),
+                    from = ?current.state,
+                    to = ?next.state,
+                    reason = ?command.event.kind,
+                    result = "success",
+                    generation = next.generation,
+                    "cluster state transition"
+                );
                 current = next;
                 publisher.send_replace(next);
+            } else if let Err(error) = &result {
+                tracing::warn!(
+                    event = "cluster_transition",
+                    from = ?current.state,
+                    to = ?current.state,
+                    reason = ?command.event.kind,
+                    result = "rejected",
+                    generation = current.generation,
+                    error = %error,
+                    "cluster state transition rejected"
+                );
             }
             let _ = command.reply.send(result);
         }
@@ -314,6 +334,21 @@ pub fn spawn_state_machine(
         },
         task,
     )
+}
+
+fn cluster_event_name(event: ClusterEventKind, state: ClusterState) -> &'static str {
+    match (event, state) {
+        (_, ClusterState::SoloStandaloneReady) => "solo_standalone_ready",
+        (ClusterEventKind::BeginPairing, _) => "pairing_started",
+        (_, ClusterState::PairedStandaloneReady) => "paired_standalone_ready",
+        (ClusterEventKind::BeginPromotion, _) => "promotion_started",
+        (ClusterEventKind::WorkerHelloAccepted, _) => "ds4_hello_received",
+        (_, ClusterState::DistributedReady) => "distributed_route_ready",
+        (ClusterEventKind::BeginDemotion, _) => "demotion_started",
+        (ClusterEventKind::PeerLost, _) => "fallback_ready",
+        (ClusterEventKind::RequireManualIntervention, _) => "manual_intervention_required",
+        _ => "cluster_transition",
+    }
 }
 
 fn transition(

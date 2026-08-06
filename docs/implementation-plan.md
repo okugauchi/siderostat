@@ -771,7 +771,7 @@ Evidence: `src/cluster/state.rs`、`src/cluster/coordinator.rs`、`src/cluster/w
 
 Evidence: `src/cluster/admin.rs`、`src/app.rs`、`src/cli.rs`、`src/main.rs`; read-only 4 routeとmutation 6 routeを実装し、全mutationでbody parse前にhex化Bearer admin tokenをconstant-time検証。MutationをUUID付き202 async jobとしてrunning process内の`AdminExecutor`へ委譲し、同一profileのfingerprint同時実行を409で拒否。Reconcile/manual reset、Solo child restart、standalone/distributed modelのstreaming fingerprintを実runtimeへ接続し、pair/promote/demoteはactive peer lifecycle不在時に安全にjob failureとしてHELLO/compatibility/lease条件の迂回を禁止した。旧`--config`と明示`serve`を同一supervisor pathに保ち、全cluster subcommandをadmin HTTP client pathへ分離。Status human/JSON、doctor checks、demote reason、fingerprint profileを実装。Mutation auth/不正JSONの認証先行、202/job ID、全route、同profile競合、CLI path selectionを含む9 testsを追加。通常全target gate（133 tests）、test-support全target gate（138 tests）、fmt/check/clippy成功。初回全testはsandboxのloopback bind禁止で既存15 testsが失敗したため権限付きで再実行し成功。Targeted test初回はcargoへfilterを2個渡したCLI指定誤りを、個別filter実行へ修正; 2026-08-06
 
-#### [ ] P5-03 Loggingとmetricsを完成する
+#### [x] P5-03 Loggingとmetricsを完成する
 
 - Actor: agent
 - Depends on: P5-02
@@ -780,6 +780,8 @@ Evidence: `src/cluster/admin.rs`、`src/app.rs`、`src/cli.rs`、`src/main.rs`; 
 - Actions: Spec metric/eventを実装し、high-cardinality/secret labelを禁止
 - Verification: Metrics golden test、header/body redaction test
 - Done when: Transition原因をpromptなしで診断可能
+
+Evidence: `src/metrics.rs`、`src/proxy.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`、`src/app.rs`; 仕様第26章の19 metric familyをPrometheus textへ実装し、cluster state/mode/generation、target readiness、standalone profile、interface、lease/discovery gaugeをruntime snapshotから描画。Request guardがpublic/peer・有限target/status class別counter、target別duration/TTFB、upstream failure、in-flightをstream完了・error・client cancellationの全経路で確定。Cluster transition monitor、child restart、hello/deployment/discovery用の有限label counterを追加し、profile ID/session/request ID/PID/generation/digestをlabelから排除。Single-writer state machineでfrom/to/reason/result/generation付きeventを一元記録し、request logは任意pathを`/*`へ畳み、header/bodyを受け取らないschemaに限定。DS4 child raw lineをlogせずmetadata/event/line sizeだけ記録。全19 family、Prometheus escape、request completion、finite cluster labels、header/body非出力、arbitrary path秘匿の6 testsを追加。通常全target gate（139 tests）、test-support全target gate（144 tests）、fmt/check/clippy成功; 2026-08-06
 
 #### [ ] P5-04 macOS user serviceを作成する
 

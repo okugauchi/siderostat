@@ -340,7 +340,7 @@ impl StandaloneSupervisor {
                     stream = ?record.stream,
                     truncated = record.truncated,
                     event = ?record.event,
-                    message = %record.line,
+                    line_bytes = record.line.len(),
                     "DS4 child log"
                 );
             }
@@ -439,7 +439,7 @@ impl DistributedWorkerSupervisor {
                     stream = ?record.stream,
                     truncated = record.truncated,
                     event = ?record.event,
-                    message = %record.line,
+                    line_bytes = record.line.len(),
                     "DS4 distributed worker log"
                 );
             }
@@ -560,7 +560,7 @@ impl DistributedCoordinatorSupervisor {
                             stream = ?record.stream,
                             truncated = record.truncated,
                             event = ?record.event,
-                            message = %record.line,
+                            line_bytes = record.line.len(),
                             "DS4 distributed coordinator log"
                         );
                     }

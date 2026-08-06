@@ -9,7 +9,7 @@ use crate::{
         required_port_available,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
-    metrics::Metrics,
+    metrics::{MetricSnapshot, Metrics},
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
@@ -54,6 +54,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
+        let metrics = Arc::new(Metrics::default());
         let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
         let coordinator_address = SocketAddr::new(
             config.cluster.coordinator_address,
@@ -73,6 +74,7 @@ impl AppState {
                 connect_timeout: config.proxy.timeouts.connect,
             },
         )?);
+        proxy.configure_metrics(metrics.clone());
         if config.cluster.enabled {
             let token = std::fs::read(&config.cluster.security.peer_proxy_token_file)?;
             proxy.configure_peer_proxy(
@@ -100,7 +102,7 @@ impl AppState {
                 standalone_residency: config.ds4.standalone.residency,
             }),
             proxy,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
         }))
@@ -282,6 +284,24 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             distributed_model: config.ds4.mxfp4.model.clone(),
         }),
     )?);
+    let mut transition_snapshots = runtime.cluster_handle().subscribe();
+    let transition_metrics = state.metrics.clone();
+    let transition_monitor = tokio::spawn(async move {
+        let mut previous = *transition_snapshots.borrow_and_update();
+        let mut transition_started = std::time::Instant::now();
+        while transition_snapshots.changed().await.is_ok() {
+            let current = *transition_snapshots.borrow_and_update();
+            transition_metrics.transition(
+                cluster_state_name(previous.state),
+                cluster_state_name(current.state),
+                "success",
+                "state-change",
+                transition_started.elapsed().as_secs_f64(),
+            );
+            previous = current;
+            transition_started = std::time::Instant::now();
+        }
+    });
     persist_runtime_state(
         &state_store,
         &runtime,
@@ -293,6 +313,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
     let local_monitor_profile = config.ds4.standalone.profile_id.clone();
+    let local_monitor_metrics = state.metrics.clone();
     let local_monitor = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -301,6 +322,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             let before = local_monitor_runtime.snapshot().generation;
             match local_monitor_runtime.reconcile_local().await {
                 Ok(snapshot) if snapshot.generation != before => {
+                    local_monitor_metrics.child_restart("standalone", "unexpected-exit");
                     if let Err(error) = persist_runtime_state(
                         &local_monitor_store,
                         &local_monitor_runtime,
@@ -336,6 +358,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         axum::serve(admin_listener, admin),
     );
     local_monitor.abort();
+    transition_monitor.abort();
     drop(runtime);
     serve_result?;
     Ok(())
@@ -664,11 +687,18 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let body = state.metrics.render_mode_aware(
-        &state.config.node_id,
-        state.proxy.target_snapshot(),
-        state.proxy.admission().snapshot(),
-    );
+    let body = state.metrics.render_mode_aware(MetricSnapshot {
+        node_id: &state.config.node_id,
+        interface: &state.config.interface,
+        target: state.proxy.target_snapshot(),
+        admission: state.proxy.admission().snapshot(),
+        cluster: state.cluster_snapshot(),
+        peer_lease_seconds: 0.0,
+        thunderbolt_ip_state: "unknown",
+        discovery_results: 0,
+        model_variant: state.config.standalone_model_variant,
+        residency: state.config.standalone_residency,
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")
