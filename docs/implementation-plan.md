@@ -808,15 +808,17 @@ Blocked: Login起動、実job restart、no duplicate/orphan childの確認は`~/
 
 Evidence: `Cargo.toml`、`Cargo.lock`; 全direct dependencyの`src/`/`tests/`利用を確認し、test専用`tower`をdev-dependencyへ移動。Tokio `full`を実利用するfs/io/macros/net/process/runtime/signal/sync/timeへ限定し、未使用のURL serde featureを削除した結果、parking_lot/lock_api/scopeguard/redox_syscallとURL serde_derive edgeをlockfileから除去。`cargo tree --duplicates`の残存はrustls ring由来getrandom 0.2とUUID v4由来0.4だけで用途が異なり、直接重複なし。Legacy LB/affinity/SQLite/EWMA dependencyとdead-code allow不在を`rg`確認。all-target/all-feature check、通常全target gate（139 tests）、test-support gate（144 tests）、fmt/clippy成功; 2026-08-06
 
-#### [ ] P5-06 Securityとendurance gateを実行する
+#### [x] P5-06 Securityとendurance gateを実行する
 
 - Actor: agent + operator
 - Depends on: P5-05
 - Read: 仕様書第27、28、32、33.4節
-- Files: tests、compatibility record、本書Evidence
+- Files: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-2026-08-06.md`、本書Evidence
 - Actions: Secret permission、replay、wrong interface、unknown PID、cancellation storm、10 cable cycles、restartを検証
 - Verification: 仕様書の該当acceptance checklist
 - Done when: Safety/operations criteriaが全てpassまたは理由付きblocked
+
+Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-2026-08-06.md`、`tests/phase2_pairing.rs`、`tests/phase3_supervisor.rs`、`tests/phase4_distributed.rs`; secret permission、HMAC/clock skew/nonce replay、wrong interface/subnet/address/route、peer ingress wrong source/token/hop、unknown/reused PID signal拒否、cancellation storm後in-flight=0、streaming cancel permit解放、state file secret非保存、header/body/token非logを既存unit testsで証跡化。Route detach/attach 10 cycleのintegration testを追加し、各cycleでPaired Standalone→Solo Standaloneへ収束、stop 10/start 11、generation 42、orphan stateなしを確認。Fake child crash/restartとfake distributed promotion/demotion 10 cycleは既存test-support integrationでPASS。共通local gate（138 tests）、test-support gate（145 tests）、fmt/clippy成功; 2026-08-06
 
 ### Phase 6: 利用者向け文書
 
