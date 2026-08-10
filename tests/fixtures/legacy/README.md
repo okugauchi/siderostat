@@ -9,7 +9,7 @@
 - `config::tests::parses_repository_example`
 - `config::tests::rejects_duplicate_backend_ids`
 
-入力fixtureは [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml) を使用する。
+入力fixtureは [`siderostat.example.toml`](siderostat.example.toml) を使用する。
 
 ## Public proxy streaming
 

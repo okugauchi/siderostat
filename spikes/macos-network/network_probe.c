@@ -31,7 +31,7 @@ static bool bridge_service_enabled(void) {
     bool found = false;
     bool enabled = false;
     SCPreferencesRef preferences =
-        SCPreferencesCreate(NULL, CFSTR("ds4-smart-proxy-network-spike"), NULL);
+        SCPreferencesCreate(NULL, CFSTR("siderostat-network-spike"), NULL);
     if (preferences == NULL) {
         fprintf(stderr, "SCPreferencesCreate failed: %s\n", SCErrorString(SCError()));
         return false;
@@ -63,7 +63,7 @@ static bool bridge_service_enabled(void) {
 
 static void dynamic_store_snapshot(void) {
     SCDynamicStoreRef store =
-        SCDynamicStoreCreate(NULL, CFSTR("ds4-smart-proxy-network-spike"), NULL, NULL);
+        SCDynamicStoreCreate(NULL, CFSTR("siderostat-network-spike"), NULL, NULL);
     if (store == NULL) {
         fprintf(stderr, "SCDynamicStoreCreate failed: %s\n", SCErrorString(SCError()));
         return;
@@ -151,7 +151,7 @@ static void store_changed(SCDynamicStoreRef store, CFArrayRef changed_keys, void
 static int watch(unsigned seconds) {
     SCDynamicStoreContext context = {0, NULL, NULL, NULL, NULL};
     SCDynamicStoreRef store = SCDynamicStoreCreate(
-        NULL, CFSTR("ds4-smart-proxy-network-spike"), store_changed, &context);
+        NULL, CFSTR("siderostat-network-spike"), store_changed, &context);
     if (store == NULL) {
         fprintf(stderr, "SCDynamicStoreCreate failed: %s\n", SCErrorString(SCError()));
         return EXIT_FAILURE;

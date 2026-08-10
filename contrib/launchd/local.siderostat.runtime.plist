@@ -3,14 +3,14 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.github.okugauchi.ds4-smart-proxy</string>
+  <string>local.siderostat.runtime</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/ds4-smart-proxy</string>
+    <string>/usr/local/bin/siderostat</string>
     <string>serve</string>
     <string>--config</string>
-    <string>/Users/USERNAME/Library/Application Support/ds4-smart-proxy/config.toml</string>
+    <string>/Users/USERNAME/Library/Application Support/siderostat/config.toml</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -23,8 +23,8 @@
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/USERNAME/Library/Logs/ds4-smart-proxy/stdout.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/USERNAME/Library/Logs/ds4-smart-proxy/stderr.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/stderr.log</string>
 </dict>
 </plist>

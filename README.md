@@ -1,6 +1,6 @@
-# DS4 Smart Proxy
+# siderostat
 
-DS4 Smart Proxy は、DS4のHTTP endpointを透過的にstreaming中継し、単一nodeのstandalone実行と、2 nodeのThunderbolt直結によるMXFP4 distributed実行を、ひとつのsupervisorで管理するRust製のmode-aware reverse proxy / cluster supervisorです。
+siderostat は、DS4のHTTP endpointを透過的にstreaming中継し、単一nodeのstandalone実行と、2 nodeのThunderbolt直結によるMXFP4 distributed実行を、ひとつのsupervisorで管理するRust製のmode-aware reverse proxy / cluster supervisorです。
 
 転送先はmodeだけで一意に決まります。負荷やsession IDで変更しません。公開proxy processとlisten portは、standalone / distributedのmode切替中も維持されます。
 
@@ -67,11 +67,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-設定はTOMLで、`ds4-smart-proxy.example.toml`が配布用の完全例です。探索順は次のとおりです。
+設定はTOMLで、`siderostat.example.toml`が配布用の完全例です。探索順は次のとおりです。
 
 1. `--config PATH`
-2. `DS4_SMART_PROXY_CONFIG`
-3. `./ds4-smart-proxy.toml`
+2. `SIDEROSTAT_CONFIG`
+3. `./siderostat.toml`
 4. platform既定path
 
 Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置します。Control secretとpeer proxy tokenはそれぞれ両nodeで同じ値を使い、admin tokenはnodeごとに生成します。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。`openssl rand`などで生成し、configにはfile pathだけを書きます。
@@ -79,9 +79,9 @@ Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで�
 起動形式です。Subcommandなしは`serve`と同じです。
 
 ```bash
-ds4-smart-proxy --config ./node.toml
+siderostat --config ./node.toml
 # または
-ds4-smart-proxy serve --config ./node.toml
+siderostat serve --config ./node.toml
 ```
 
 起動後、loopback admin APIで確認します。
@@ -96,18 +96,18 @@ curl --fail --silent http://127.0.0.1:18081/metrics
 CLIのcluster commandはrunning processのadmin API clientであり、別supervisorを起動しません。
 
 ```bash
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster status --json
-ds4-smart-proxy cluster doctor
-ds4-smart-proxy cluster doctor --json
-ds4-smart-proxy cluster reconcile
-ds4-smart-proxy cluster pair
-ds4-smart-proxy cluster promote
-ds4-smart-proxy cluster demote
-ds4-smart-proxy cluster demote --reason "operator-requested"
-ds4-smart-proxy cluster restart
-ds4-smart-proxy cluster fingerprint --profile standalone
-ds4-smart-proxy cluster fingerprint --profile distributed
+siderostat cluster status
+siderostat cluster status --json
+siderostat cluster doctor
+siderostat cluster doctor --json
+siderostat cluster reconcile
+siderostat cluster pair
+siderostat cluster promote
+siderostat cluster demote
+siderostat cluster demote --reason "operator-requested"
+siderostat cluster restart
+siderostat cluster fingerprint --profile standalone
+siderostat cluster fingerprint --profile distributed
 ```
 
 Mutation（pair/promote/demote/restart/fingerprint/reconcile）はloopbackでもadmin token必須です。Status/doctorはread-onlyです。`promote`は実HELLO/compatibility条件を迂回しません。
@@ -145,5 +145,5 @@ DS4 native distributed trafficとpeer proxy bodyは暗号化されません。�
 - [`docs/compatibility/ds4-b7e9f00.md`](docs/compatibility/ds4-b7e9f00.md): DS4 compatibility記録
 - [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
 - [`docs/compatibility/documentation-clean-install-2026-08-10.md`](docs/compatibility/documentation-clean-install-2026-08-10.md): P6-05導入文書検証記録
-- [`ds4-smart-proxy.example.toml`](ds4-smart-proxy.example.toml): 配布用config例
+- [`siderostat.example.toml`](siderostat.example.toml): 配布用config例
 - [`contrib/launchd/README.md`](contrib/launchd/README.md): macOS LaunchAgentのinstall/verify/uninstall

@@ -1,14 +1,14 @@
-# DS4 Smart Proxy 運用ガイド
+# siderostat 運用ガイド
 
-この文書は、`docs/spec.md`と実装済みのadmin API / CLI / logging / metricsに基づき、DS4 Smart Proxyの運用手順を定める。実DS4 binaryとmodelを使う導入は [`docs/installation.md`](installation.md) を参照する。
+この文書は、`docs/spec.md`と実装済みのadmin API / CLI / logging / metricsに基づき、siderostatの運用手順を定める。実DS4 binaryとmodelを使う導入は [`docs/installation.md`](installation.md) を参照する。
 
 ## 1. Status確認
 
 Running processの状態を `cluster status` または `GET /cluster` で確認する。CLIはadmin API clientであり、別supervisorを起動しない。
 
 ```sh
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster status --json
+siderostat cluster status
+siderostat cluster status --json
 curl --fail --silent http://127.0.0.1:18081/cluster
 ```
 
@@ -36,8 +36,8 @@ Roleは`bridge0`のIPv4から決定する。`10.99.0.1`がcoordinator、`10.99.0
 - `admission_serving`: admission stateが `serving` である。
 
 ```sh
-ds4-smart-proxy cluster doctor
-ds4-smart-proxy cluster doctor --json
+siderostat cluster doctor
+siderostat cluster doctor --json
 ```
 
 `healthy` は `target_ready && safe_state && admission_serving` の論理積である。`cluster doctor`はread-onlyで、状態を変更しない。
@@ -48,7 +48,7 @@ Log形式とlevelはconfigの `[logging]` で決める。
 
 - `format = "json"`（既定）: tracing-subscriberのJSON形式。
 - `format = "text"`: 平文形式。
-- `level`: `ds4_smart_proxy=<level>` として適用する。既定は `info`。環境変数`RUST_LOG`が設定されていればそれを優先する。
+- `level`: `siderostat=<level>` として適用する。既定は `info`。環境変数`RUST_LOG`が設定されていればそれを優先する。
 
 Request完了ごとに `proxy_request` eventが出力される。path_templateは実pathを隠したtemplate（`/*` fallback）で、header/bodyをlogしない。Cluster transition、child restart、HELLO、deployment mismatch、peer discoveryは専用のmetrics/eventで記録される（spec第25.2節）。
 
@@ -96,9 +96,9 @@ Spec第26節のfamilyを確認する。
 同一原因のpromotion失敗が3回連続したらauto promotionを止める。Standalone upstreamがreadyならproxyはServingを継続し、cluster stateだけ `ManualInterventionRequired` とする。Operator reconcileまで再試行しない（spec第18.6節）。
 
 ```sh
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster doctor
-ds4-smart-proxy cluster reconcile
+siderostat cluster status
+siderostat cluster doctor
+siderostat cluster reconcile
 ```
 
 `cluster reconcile` はobserved stateをdesired stateへ収束させる。原因を先に特定し、deployment mismatch、manifest stale、Hello timeoutなどの原因を取り除いてから実行する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
@@ -108,7 +108,7 @@ ds4-smart-proxy cluster reconcile
 `cluster restart` はcurrent profileのchildを再起動する。Modeを変えず、admission/drainに連動する。
 
 ```sh
-ds4-smart-proxy cluster restart
+siderostat cluster restart
 ```
 
 - 通常停止はSIGTERM。Drain完了後にsignalする（spec第20.3節）。

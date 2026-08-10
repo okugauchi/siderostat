@@ -60,7 +60,7 @@ fn run_dynamic_store(
             events,
         },
     };
-    let Some(store) = SCDynamicStoreBuilder::new("ds4-smart-proxy-network-events")
+    let Some(store) = SCDynamicStoreBuilder::new("siderostat-network-events")
         .callback_context(callback_context)
         .build()
     else {

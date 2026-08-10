@@ -1,4 +1,4 @@
-# DS4 Smart Proxy 導入ガイド
+# siderostat 導入ガイド
 
 この文書は、`docs/spec.md` と `docs/compatibility/ds4-b7e9f00.md` を根拠に、既存DS4環境がない状態から2-nodeの`DistributedReady`へ到達する手順を定める。実DS4 binaryとmodelを使う手順はoperatorが実行し、本guideはその手順と記録方法を定義する。
 
@@ -67,7 +67,7 @@ ls -l "$MODEL_PATH"
 
 Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
 
-Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`ds4-smart-proxy.example.toml`のplaceholder pathへ合わせる。
+Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`siderostat.example.toml`のplaceholder pathへ合わせる。
 
 Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributedのdigest情報をJSONで作る。DSpark有効なStandalone manifestには`dspark_enabled`、support digest/size、confidence、strictを記録する。起動時に実support fileとtyped configへ一致しなければchildはspawnされない。Standalone manifestはpeer間compatibilityの比較対象にしない（spec第15.3節）。
 
@@ -119,7 +119,7 @@ Appleの公式手順を参照する（spec第39節）: [Apple: ThunderboltでIP�
 Rust stable（edition 2024）でbuildする。Common local gateを実行する。
 
 ```sh
-REPOSITORY="/absolute/path/to/ds4-smart-proxy"
+REPOSITORY="/absolute/path/to/siderostat"
 cd "$REPOSITORY"
 cargo build --release
 cargo fmt --check
@@ -128,12 +128,12 @@ cargo test --all-targets
 git diff --check
 ```
 
-Binaryは`target/release/ds4-smart-proxy`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/ds4-smart-proxy`へinstallする。`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
+Binaryは`target/release/siderostat`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/siderostat`へinstallする。`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
 
 ```sh
 sudo install -d -m 0755 /usr/local/bin
-sudo install -m 0755 target/release/ds4-smart-proxy /usr/local/bin/ds4-smart-proxy
-/usr/local/bin/ds4-smart-proxy --help
+sudo install -m 0755 target/release/siderostat /usr/local/bin/siderostat
+/usr/local/bin/siderostat --help
 ```
 
 ### Secret file
@@ -143,7 +143,7 @@ Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで�
 まずcoordinator上で共有する2値とcoordinatorのadmin tokenを生成する。`umask 077`により生成時からownerだけが読み書きできる。
 
 ```sh
-SECRET_DIR="$HOME/Library/Application Support/ds4-smart-proxy/secrets"
+SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 umask 077
 mkdir -p "$SECRET_DIR"
 openssl rand -out "$SECRET_DIR/cluster-control.key" 32
@@ -155,7 +155,7 @@ chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRE
 `cluster-control.key`と`peer-proxy.key`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
 
 ```sh
-SECRET_DIR="$HOME/Library/Application Support/ds4-smart-proxy/secrets"
+SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 SHARED_SECRET_SOURCE="/Volumes/OPERATOR-APPROVED-ENCRYPTED-MEDIA"
 umask 077
 mkdir -p "$SECRET_DIR"
@@ -169,10 +169,10 @@ chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRE
 
 ### Config
 
-`ds4-smart-proxy.example.toml`をnode別の作業fileへcopyし、全ての`PLACEHOLDER`を実在するabsolute pathへ置換する。`$HOME`と`~/`だけを展開する（spec第22.1節）。Worker nodeは`cluster.node_id`とnode固有pathだけを変更する。Roleはinterface addressから決定し、設定で直接指定しない（spec第22.2節）。
+`siderostat.example.toml`をnode別の作業fileへcopyし、全ての`PLACEHOLDER`を実在するabsolute pathへ置換する。`$HOME`と`~/`だけを展開する（spec第22.1節）。Worker nodeは`cluster.node_id`とnode固有pathだけを変更する。Roleはinterface addressから決定し、設定で直接指定しない（spec第22.2節）。
 
 ```sh
-cp ds4-smart-proxy.example.toml "$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
+cp siderostat.example.toml "$HOME/Library/Application Support/siderostat/config.toml"
 ```
 
 置換対象：
@@ -199,9 +199,9 @@ Validation要件（spec第22.3節）を満たすことを確認する。
 Foregroundで起動し、起動形式を確認する。Subcommandなしは`serve`と同じ（spec第23.2節）。
 
 ```sh
-ds4-smart-proxy --config "$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
+siderostat --config "$HOME/Library/Application Support/siderostat/config.toml"
 # または
-ds4-smart-proxy serve --config "$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
+siderostat serve --config "$HOME/Library/Application Support/siderostat/config.toml"
 ```
 
 Admin APIでhealth/readiness/cluster stateを確認する。
@@ -210,8 +210,8 @@ Admin APIでhealth/readiness/cluster stateを確認する。
 curl --fail --silent http://127.0.0.1:18081/healthz
 curl --fail --silent http://127.0.0.1:18081/readyz
 curl --fail --silent http://127.0.0.1:18081/cluster
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster doctor
+siderostat cluster status
+siderostat cluster doctor
 ```
 
 `doctor`がThunderbolt IP readiness、discovery、state、target readinessを報告する。`ReadyNoPeer`以前はpeer presentにしない。Secretをlogしない（spec第32.4節）。
@@ -230,9 +230,9 @@ Standalone起動完了後の期待結果は次のとおりである。起動中�
 両nodeでSolo Standalone ready後、Bonjour discoveryが`bridge0`に限定される。Bonjour結果だけではpairingせず、`bridge0` route、HMAC control handshake、leaseを必須とする（spec第13.3節、第38節）。`AuthenticatedPeer`でpairing候補になり、peer stability（既定5秒）後にpairする。
 
 ```sh
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster doctor
-ds4-smart-proxy cluster pair
+siderostat cluster status
+siderostat cluster doctor
+siderostat cluster pair
 ```
 
 WorkerはtargetがCoordinatorへ、Coordinatorはtarget=LocalStandaloneのままPairedStandaloneReadyへ入る（spec第18.2節）。両nodeのstandalone profileが異なってもpairingできる（spec第14.1節、第32.5節）。
@@ -244,8 +244,8 @@ Pairing完了後は両nodeで`mode=paired-standalone`、`state=paired-standalone
 MXFP4 promotionにはdeployment matchと実HELLOとcomplete routeが必須（spec第33.3節）。まずfingerprintを実行する。
 
 ```sh
-ds4-smart-proxy cluster fingerprint --profile standalone
-ds4-smart-proxy cluster fingerprint --profile distributed
+siderostat cluster fingerprint --profile standalone
+siderostat cluster fingerprint --profile distributed
 ```
 
 Fingerprint jobは202 + job IDを返し、同一profileの同時jobを拒否する（spec第23.1節）。数百GBを読む処理をHTTP handler内で同期実行しない（spec第15.2節）。
@@ -253,7 +253,7 @@ Fingerprint jobは202 + job IDを返し、同一profileの同時jobを拒否す�
 Binary/model/checkpoint/context/layer split/wire schema/argv profileが一致する場合だけ、実HELLOを受けてpromotionする（spec第15.3節）。`cluster promote`はHELLO/compatibility条件を迂回しない（spec第23.2節）。実HELLOなしでpromotionしない。
 
 ```sh
-ds4-smart-proxy cluster promote
+siderostat cluster promote
 ```
 
 Cluster-wide drain後にDS4を停止し、coordinator MXFP4起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
@@ -270,17 +270,17 @@ Promotion完了後は両nodeで`mode=distributed-mxfp4`、`state=distributed-rea
 - Secret/tokenをplist、`EnvironmentVariables`、command lineへ書かない。
 
 ```sh
-mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ds4-smart-proxy"
-PLIST="$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
-CONFIG="$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
-cp contrib/launchd/ds4-smart-proxy.plist.example "$PLIST"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/siderostat"
+PLIST="$HOME/Library/LaunchAgents/local.siderostat.runtime.plist"
+CONFIG="$HOME/Library/Application Support/siderostat/config.toml"
+cp contrib/launchd/local.siderostat.runtime.plist "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/ds4-smart-proxy/stdout.log" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/ds4-smart-proxy/stderr.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/stdout.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/stderr.log" "$PLIST"
 plutil -lint "$PLIST"
 if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-launchctl kickstart -k "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
+launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
 
 Verification（`contrib/launchd/README.md`）:
@@ -319,8 +319,8 @@ DS4 update時は`docs/spec.md`第36節のcompatibility trackingに従う。
 `contrib/launchd/README.md`に従う。先にjobを停止してからplistを移動する。Model、KV cache、secret、runtime stateは自動削除しない。
 
 ```sh
-launchctl bootout "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
-mv "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist" "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist.disabled"
+launchctl bootout "gui/$(id -u)/local.siderostat.runtime"
+mv "$HOME/Library/LaunchAgents/local.siderostat.runtime.plist" "$HOME/Library/LaunchAgents/local.siderostat.runtime.plist.disabled"
 ```
 
 ## 検証とproduction gate

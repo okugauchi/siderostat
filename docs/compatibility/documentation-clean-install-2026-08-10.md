@@ -28,7 +28,7 @@ Repository内で実行できる文書・command・artifact検証と、P3-07/P4-0
 | Config example | PASS | `config::tests::parses_repository_schema_v2_example` |
 | CLI synopsis | PASS | top-level、cluster、status、doctor、demote、fingerprintの`--help`を実binaryと突合 |
 | Local Markdown links | PASS | 11 Markdown filesのrelative link 22件が実在 |
-| LaunchAgent template | PASS | `plutil -lint contrib/launchd/ds4-smart-proxy.plist.example` |
+| LaunchAgent template | PASS | `plutil -lint contrib/launchd/local.siderostat.runtime.plist` |
 | LaunchAgent path replacement | PASS after correction | Spaceを含むtemporary pathで`PlistBuddy` replacement、placeholder不在、`plutil -lint` |
 | Whitespace errors | PASS | `git diff --check` |
 

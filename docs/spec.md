@@ -17,7 +17,7 @@
 
 ## 2. 目的
 
-`ds4-smart-proxy` は、固定されたOpenAI互換HTTP endpointを提供し、cluster modeに応じて転送先を一意に切り替えるmode-aware reverse proxyである。同じbinaryがDS4 child processと2 node clusterのlifecycleも管理する。
+`siderostat` は、固定されたOpenAI互換HTTP endpointを提供し、cluster modeに応じて転送先を一意に切り替えるmode-aware reverse proxyである。同じbinaryがDS4 child processと2 node clusterのlifecycleも管理する。
 
 期待する基本動作：
 
@@ -145,7 +145,7 @@ DS4 HTTP endpointは両nodeともloopbackにbindする。Worker requestはcoordi
 ## 8. Process architecture
 
 ```text
-ds4-smart-proxy process
+siderostat process
   +-- Public ingress
   +-- Coordinator-only peer ingress
   +-- Streaming forwarder
@@ -964,8 +964,8 @@ ds4: DSpark target-hidden capture enabled: layers=...
 TOML。探索順：
 
 1. `--config PATH`
-2. `DS4_SMART_PROXY_CONFIG`
-3. `./ds4-smart-proxy.toml`
+2. `SIDEROSTAT_CONFIG`
+3. `./siderostat.toml`
 4. platform default
 
 Path先頭の `$VARIABLE`、`${VARIABLE}`、`~/` だけを展開する。Shell expansion、command substitutionは行わない。Unknown fieldを拒否する。
@@ -996,8 +996,8 @@ worker_address = "10.99.0.2"
 control_port = 9920
 ds4_distributed_port = 9911
 peer_ingress_port = 18082
-state_path = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-state.json"
-manifest_cache_dir = "$HOME/Library/Application Support/ds4-smart-proxy/manifests"
+state_path = "$HOME/Library/Application Support/siderostat/cluster-state.json"
+manifest_cache_dir = "$HOME/Library/Application Support/siderostat/manifests"
 
 [cluster.discovery]
 mode = "bonjour-with-static-fallback"
@@ -1007,9 +1007,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
+admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -1050,7 +1050,7 @@ strict = false
 [ds4.standalone]
 profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
 residency = "resident"
@@ -1061,7 +1061,7 @@ extra_args = []
 
 [ds4.mxfp4]
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/mxfp4-0731.json"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
 context_size = 262144
 coordinator_layers = "0:19"
@@ -1156,21 +1156,21 @@ GETはsecretを返さない。Mutationはloopbackでもadmin token必須。Finge
 既存起動形式との互換性：
 
 ```text
-ds4-smart-proxy --config PATH
-ds4-smart-proxy serve --config PATH
+siderostat --config PATH
+siderostat serve --config PATH
 ```
 
 Subcommandなしは `serve` と同じ。
 
 ```text
-ds4-smart-proxy cluster status [--json]
-ds4-smart-proxy cluster doctor [--json]
-ds4-smart-proxy cluster reconcile
-ds4-smart-proxy cluster pair
-ds4-smart-proxy cluster promote
-ds4-smart-proxy cluster demote [--reason TEXT]
-ds4-smart-proxy cluster restart
-ds4-smart-proxy cluster fingerprint --profile standalone|distributed
+siderostat cluster status [--json]
+siderostat cluster doctor [--json]
+siderostat cluster reconcile
+siderostat cluster pair
+siderostat cluster promote
+siderostat cluster demote [--reason TEXT]
+siderostat cluster restart
+siderostat cluster fingerprint --profile standalone|distributed
 ```
 
 CLIはrunning processのadmin API clientであり、別supervisorを起動しない。Status/doctorはread-only。Restartはmodeを変えず、promoteはHELLO/compatibility条件を迂回しない。
@@ -1583,7 +1583,7 @@ persistence.rs（cluster state_storeへ置換）
 
 ```text
 macOS user service manager
-  -> ds4-smart-proxy serve
+  -> siderostat serve
        -> owned ds4-server child
 ```
 

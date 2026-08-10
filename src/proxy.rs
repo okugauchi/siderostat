@@ -48,7 +48,7 @@ fn build_upstream_headers(
             HeaderValue::from_str(protocol).map_err(|_| ProxyError::Internal)?,
         );
     }
-    append_forwarded(&mut output, "via", "1.1 ds4-smart-proxy")?;
+    append_forwarded(&mut output, "via", "1.1 siderostat")?;
     insert_request_id(&mut output, request_id);
     Ok(output)
 }

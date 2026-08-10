@@ -1,4 +1,4 @@
-use ds4_smart_proxy::cluster::{
+use siderostat::cluster::{
     ClusterFailure, FailureAction, PromotionFailureTracker, PromotionRetryDecision, failure_action,
 };
 use std::time::Duration;

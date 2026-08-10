@@ -1,7 +1,8 @@
 #![cfg(feature = "test-support")]
 
 use anyhow::Result;
-use ds4_smart_proxy::{
+use futures::future::BoxFuture;
+use siderostat::{
     admission::AdmissionGate,
     cluster::{
         AuthenticatedPeer, ClusterEvent, ClusterEventKind, ClusterSnapshot, ControlAuthenticator,
@@ -15,7 +16,6 @@ use ds4_smart_proxy::{
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{ClusterState, LocalRole, ProxyTarget, StableMode},
 };
-use futures::future::BoxFuture;
 use std::{
     net::IpAddr,
     sync::{

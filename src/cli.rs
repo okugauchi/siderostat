@@ -12,7 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "ds4-smart-proxy")]
+#[command(name = "siderostat")]
 pub struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, short, global = true)]
@@ -219,7 +219,7 @@ fn print_human_status(value: &Value) {
 
 fn initialize_logging(config: &ModeAwareConfig) {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("ds4_smart_proxy={}", config.logging.level)));
+        .unwrap_or_else(|_| EnvFilter::new(format!("siderostat={}", config.logging.level)));
     match config.logging.format {
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
@@ -241,9 +241,9 @@ mod tests {
 
     #[test]
     fn legacy_and_explicit_serve_select_the_supervisor_path() {
-        let legacy = Args::try_parse_from(["ds4-smart-proxy", "--config", "node.toml"]).unwrap();
+        let legacy = Args::try_parse_from(["siderostat", "--config", "node.toml"]).unwrap();
         let explicit =
-            Args::try_parse_from(["ds4-smart-proxy", "serve", "--config", "node.toml"]).unwrap();
+            Args::try_parse_from(["siderostat", "serve", "--config", "node.toml"]).unwrap();
         assert!(legacy.command.is_none());
         assert!(matches!(explicit.command, Some(Command::Serve)));
     }
@@ -251,15 +251,15 @@ mod tests {
     #[test]
     fn every_cluster_command_selects_only_the_admin_client_path() {
         for args in [
-            vec!["ds4-smart-proxy", "cluster", "status"],
-            vec!["ds4-smart-proxy", "cluster", "doctor"],
-            vec!["ds4-smart-proxy", "cluster", "reconcile"],
-            vec!["ds4-smart-proxy", "cluster", "pair"],
-            vec!["ds4-smart-proxy", "cluster", "promote"],
-            vec!["ds4-smart-proxy", "cluster", "demote"],
-            vec!["ds4-smart-proxy", "cluster", "restart"],
+            vec!["siderostat", "cluster", "status"],
+            vec!["siderostat", "cluster", "doctor"],
+            vec!["siderostat", "cluster", "reconcile"],
+            vec!["siderostat", "cluster", "pair"],
+            vec!["siderostat", "cluster", "promote"],
+            vec!["siderostat", "cluster", "demote"],
+            vec!["siderostat", "cluster", "restart"],
             vec![
-                "ds4-smart-proxy",
+                "siderostat",
                 "cluster",
                 "fingerprint",
                 "--profile",

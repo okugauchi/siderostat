@@ -1,5 +1,6 @@
 use anyhow::Result;
-use ds4_smart_proxy::{
+use futures::future::BoxFuture;
+use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
         ControlRole, ControlSecret, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
@@ -8,7 +9,6 @@ use ds4_smart_proxy::{
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{ClusterState, LocalRole, ProxyTarget},
 };
-use futures::future::BoxFuture;
 use std::{
     net::IpAddr,
     sync::{
@@ -63,7 +63,7 @@ fn descriptor(role: ControlRole, node_id: &str, generation: u64) -> NodeDescript
     }
 }
 
-fn authenticated_coordinator() -> ds4_smart_proxy::cluster::AuthenticatedPeer {
+fn authenticated_coordinator() -> siderostat::cluster::AuthenticatedPeer {
     let authenticator = ControlAuthenticator::new(
         ControlSecret::new(vec![0x6b; 32]).unwrap(),
         "coordinator",

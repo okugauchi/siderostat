@@ -1,6 +1,7 @@
 use anyhow::Result;
 use axum::{Router, body::Body, extract::Request, routing::any};
-use ds4_smart_proxy::{
+use futures::future::BoxFuture;
+use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
         ControlRole, ControlSecret, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
@@ -12,7 +13,6 @@ use ds4_smart_proxy::{
     },
     target::LocalRole,
 };
-use futures::future::BoxFuture;
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 
@@ -94,7 +94,7 @@ fn descriptor(role: ControlRole, node_id: &str) -> NodeDescriptor {
     }
 }
 
-fn authenticated_coordinator() -> ds4_smart_proxy::cluster::AuthenticatedPeer {
+fn authenticated_coordinator() -> siderostat::cluster::AuthenticatedPeer {
     let authenticator = ControlAuthenticator::new(
         ControlSecret::new(vec![0x5a; 32]).unwrap(),
         "coordinator",
@@ -132,7 +132,7 @@ async fn fake_upstreams_converge_solo_paired_solo() {
         PeerProxyToken::new(vec![0x22; 32]).unwrap(),
         IpAddr::from([127, 0, 0, 1]),
     );
-    coordinator_state.set_target(ds4_smart_proxy::target::ProxyTarget::LocalStandalone, true);
+    coordinator_state.set_target(siderostat::target::ProxyTarget::LocalStandalone, true);
     coordinator_state.admission().start_serving();
     let peer_ingress = serve(
         Router::new()
