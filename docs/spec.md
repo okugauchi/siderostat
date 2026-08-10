@@ -1575,7 +1575,7 @@ persistence.rs（cluster state_storeへ置換）
 
 ## 34. Implementation plan
 
-実装順序、migration、verification、rollback、および利用者向け文書の整備は [`implementation-plan.md`](implementation-plan.md) で管理する。本書はtarget behaviorとacceptance criteriaを定義し、作業進捗やcommit分割を管理しない。
+v0.1.0の実装順序、migration、verification、rollback記録は [`implementation-plan-v0.1.0.md`](archive/implementation-plan-v0.1.0.md) にarchiveした。本書はtarget behaviorとacceptance criteriaを定義し、作業進捗やcommit分割を管理しない。
 
 ## 35. macOS service
 
