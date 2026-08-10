@@ -24,7 +24,7 @@
 | Criterion | Result | Blocker / procedure |
 |---|---|---|
 | Thunderbolt cable着脱10回、event-driven rescan | BLOCKED | 2台の対象Macと物理cableが必要。仕様第32.5節どおり実施する。 |
-| RunAtLoad、proxy restart、single owner | PARTIAL | `RunAtLoad=true`、P4-08 LaunchAgent稼働、single proxy listener、health/readiness、owned child/orphan cleanupはPASS。Acceptance終了後にP4-08 jobを両nodeからbootoutし、disabled plistとして保全、proxy/DS4 PIDとlistener不在を確認。P5-04標準jobは未installで、localの旧DS4専用plistがenabledのため、operatorが旧job disable・標準job install・restart復帰を確認する。 |
+| RunAtLoad、proxy restart、single owner | PASS | MacBook ProとMac Studioで旧DS4/proxy labelをdisable/unloadしてplistを退避し、P5-04標準`local.siderostat.runtime`をinstall/bootstrap。`RunAtLoad=true`（login再現の代替静的検証）、`KeepAlive=true`、`ThrottleInterval=10`、absolute args、`kickstart -k`後のrunning/last exit 0、proxy 1、owned DS4 child 1、旧PID/orphanなし、health/readiness/doctor復帰を両nodeで確認。 |
 | 実DS4 HELLO、route、short prompt、8K prefill | BLOCKED | ユーザー指定によりGGUFを使う検証は後で手動実施する。 |
 | Memory pressure/startup/2-hop p50 | BLOCKED | 実modelと対象M4 Max/M5 Max topologyが必要。 |
 

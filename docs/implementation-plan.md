@@ -791,7 +791,7 @@ Evidence: `src/cluster/admin.rs`、`src/app.rs`、`src/cli.rs`、`src/main.rs`; 
 
 Evidence: `src/metrics.rs`、`src/proxy.rs`、`src/cluster/state.rs`、`src/cluster/process.rs`、`src/app.rs`; 仕様第26章の19 metric familyをPrometheus textへ実装し、cluster state/mode/generation、target readiness、standalone profile、interface、lease/discovery gaugeをruntime snapshotから描画。Request guardがpublic/peer・有限target/status class別counter、target別duration/TTFB、upstream failure、in-flightをstream完了・error・client cancellationの全経路で確定。Cluster transition monitor、child restart、hello/deployment/discovery用の有限label counterを追加し、profile ID/session/request ID/PID/generation/digestをlabelから排除。Single-writer state machineでfrom/to/reason/result/generation付きeventを一元記録し、request logは任意pathを`/*`へ畳み、header/bodyを受け取らないschemaに限定。DS4 child raw lineをlogせずmetadata/event/line sizeだけ記録。全19 family、Prometheus escape、request completion、finite cluster labels、header/body非出力、arbitrary path秘匿の6 testsを追加。通常全target gate（139 tests）、test-support全target gate（144 tests）、fmt/check/clippy成功; 2026-08-06
 
-#### [!] P5-04 macOS user serviceを作成する
+#### [x] P5-04 macOS user serviceを作成する
 
 - Actor: agent + operator for install
 - Depends on: P5-03
@@ -807,7 +807,7 @@ Resume evidence: Cleanup前のlocal nodeでP4-08 LaunchAgentをread-only確認�
 
 Cleanup evidence: MacBook ProとMac StudioのP4-08 jobを両方ともbootoutし、plistを`.disabled-p4-08-cleanup-20260810`へ移動。両nodeでjob unloaded、P4-08 proxy/DS4 PIDなし、18080/18081/8000 listenerなしを確認。受入artifactのmodel、secret、config、binary、logは削除せず復旧可能に残した; 2026-08-10
 
-Blocked: P5-04配布artifactの標準labelは両nodeとも未installで、local nodeには旧DS4専用LaunchAgent plistがenabledで残っている。完了にはoperatorがmaintenance windowで旧DS4 jobをdisableし、P5-04標準jobをinstall/bootstrapし、`kickstart -k`後のproxy 1 process・DS4 child最大1・health/readiness復帰を確認する。Login再現は必須とせず、`RunAtLoad=true`の静的検証で代替する; 2026-08-10
+Resolved actual evidence: MacBook ProとMac Studioで旧`com.local.ds4`、`com.local.ds4-smart-proxy`、P4-08 labelをdisable/unloadし、旧plistを復元可能な`.disabled-p5-04-20260811`として退避。両nodeへ標準`local.siderostat.runtime`をinstall/bootstrapし、plist lint、absolute binary/config/log path、`RunAtLoad=true`、`KeepAlive=true`、`ThrottleInterval=10`を確認した。保存済みP4-08 configは現行のtyped DSpark契約へ移行し、Standaloneの`--mtp`/`--dspark`を`[ds4.dspark]`へ移し、Distributed extra argsを`--debug`だけに限定。Support GGUFは両nodeでSHA-256 `7e319924…1885360`、size 5989114272が一致し、manifest binding後に起動した。`launchctl kickstart -k`後は両nodeともstandard jobがrunning、runs=3、last exit=0、proxy 1 process、proxy所有のDS4 child 1 process、18080/18081はproxy単独、8000はchild単独、旧PID/orphanなし。`/healthz`、`/readyz`、`cluster doctor --json`は両nodeでPASSし、SoloStandaloneReadyへ復帰。旧3 labelはdisabledかつunloadedで、DS4 childを所有する別jobはない。Login再現は計画どおり`RunAtLoad=true`の静的検証で代替した; 2026-08-11
 
 #### [x] P5-05 Dependencyとdead codeを整理する
 
