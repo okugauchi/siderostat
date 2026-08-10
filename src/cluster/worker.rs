@@ -242,6 +242,7 @@ impl WorkerControl {
             ControlCommand::Pair { .. }
                 | ControlCommand::PrepareWorker
                 | ControlCommand::BeginDrain
+                | ControlCommand::DistributedReady
                 | ControlCommand::CancelGeneration
                 | ControlCommand::Demote
         ) {
@@ -262,6 +263,7 @@ impl WorkerControl {
                 ControlCommand::Pair { .. } => DistributedControlPhase::Paired,
                 ControlCommand::PrepareWorker => DistributedControlPhase::WorkerPreparing,
                 ControlCommand::BeginDrain => DistributedControlPhase::Draining,
+                ControlCommand::DistributedReady => DistributedControlPhase::WorkerReady,
                 ControlCommand::CancelGeneration | ControlCommand::Demote => {
                     DistributedControlPhase::Paired
                 }
@@ -334,6 +336,7 @@ fn validate_worker_command(
         ControlCommand::Pair { .. } => true,
         ControlCommand::PrepareWorker => phase == DistributedControlPhase::Paired,
         ControlCommand::BeginDrain => phase == DistributedControlPhase::WorkerReady,
+        ControlCommand::DistributedReady => phase == DistributedControlPhase::Drained,
         ControlCommand::CancelGeneration => matches!(
             phase,
             DistributedControlPhase::WorkerPreparing

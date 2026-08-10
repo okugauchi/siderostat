@@ -505,6 +505,15 @@ impl DistributedCoordinatorSupervisor {
         }
     }
 
+    pub async fn child_identity(&self) -> Option<ChildIdentity> {
+        self.inner
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .map(|current| current.child.identity().clone())
+    }
+
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
         let mut slot = self.inner.child.lock().await;
@@ -843,27 +852,42 @@ impl ManagedChild {
             .signal_owned(&self.identity, ProcessSignal::Terminate)
         {
             Ok(()) => {}
-            Err(ProcessControlError::NotRunning) => return Ok(self.child.wait().await?),
+            Err(ProcessControlError::NotRunning) => {}
             Err(error) => return Err(error),
         }
-        match tokio::time::timeout(timeout, self.child.wait()).await {
-            Ok(status) => Ok(status?),
-            Err(_) if !allow_sigkill => Err(ProcessControlError::SigkillNotAllowed),
-            Err(_) => {
-                match self
-                    .controller
-                    .signal_owned(&self.identity, ProcessSignal::Kill)
-                {
-                    Ok(()) => {}
-                    Err(ProcessControlError::NotRunning) => return Ok(self.child.wait().await?),
-                    Err(error) => return Err(error),
-                }
-                tokio::time::timeout(timeout, self.child.wait())
-                    .await
-                    .map_err(|_| ProcessControlError::StopTimeout)?
-                    .map_err(ProcessControlError::Io)
-            }
+        if let Some(status) = wait_child_exit(&mut self.child, timeout).await? {
+            return Ok(status);
         }
+        if !allow_sigkill {
+            return Err(ProcessControlError::SigkillNotAllowed);
+        }
+        match self
+            .controller
+            .signal_owned(&self.identity, ProcessSignal::Kill)
+        {
+            Ok(()) | Err(ProcessControlError::NotRunning) => {}
+            Err(error) => return Err(error),
+        }
+        wait_child_exit(&mut self.child, timeout)
+            .await?
+            .ok_or(ProcessControlError::StopTimeout)
+    }
+}
+
+async fn wait_child_exit(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>, ProcessControlError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
     }
 }
 

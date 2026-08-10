@@ -150,7 +150,7 @@ pub enum AuthError {
 
 #[derive(Debug, Clone)]
 struct ExpectedPeer {
-    node_id: String,
+    node_id: Option<String>,
     source_ip: IpAddr,
 }
 
@@ -179,7 +179,20 @@ impl ControlAuthenticator {
         Self {
             secret,
             expected: ExpectedPeer {
-                node_id: expected_node_id.into(),
+                node_id: Some(expected_node_id.into()),
+                source_ip: expected_source_ip,
+            },
+            nonce_expiry: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Authenticates the sole peer reachable at a fixed cluster address. The signed node ID is
+    /// subsequently bound to the paired descriptor by `ControlProcessor`.
+    pub fn new_at_source(secret: ControlSecret, expected_source_ip: IpAddr) -> Self {
+        Self {
+            secret,
+            expected: ExpectedPeer {
+                node_id: None,
                 source_ip: expected_source_ip,
             },
             nonce_expiry: Mutex::new(BTreeMap::new()),
@@ -226,7 +239,12 @@ impl ControlAuthenticator {
     ) -> Result<AuthenticatedPeer, AuthError> {
         validate_body_and_fields(method, path_and_query, body)?;
         validate_nonce(&headers.nonce)?;
-        if headers.node_id != self.expected.node_id {
+        if self
+            .expected
+            .node_id
+            .as_ref()
+            .is_some_and(|expected| headers.node_id != *expected)
+        {
             return Err(AuthError::WrongNode);
         }
         if source_ip != self.expected.source_ip {

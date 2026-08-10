@@ -186,9 +186,6 @@ impl ModeRuntime {
             ) => self.fallback_to_solo(current).await,
             _ => Ok(current),
         }?;
-        if next.generation != current.generation {
-            control.advance_generation(next.generation);
-        }
         Ok(next)
     }
 

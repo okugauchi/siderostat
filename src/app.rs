@@ -2,11 +2,11 @@ use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ClusterEvent, ClusterEventKind,
-        ClusterHandle, FingerprintProfile, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION,
-        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
-        RestartDecision, StandaloneSupervisor, StateStore, StateStoreError,
-        build_standalone_command, fingerprint_file, platform_process_controller, reconcile_restart,
-        required_port_available,
+        ClusterHandle, DistributedManifest, FingerprintProfile, ModeRuntime,
+        PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState, PersistentMode,
+        PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneSupervisor,
+        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
+        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
@@ -16,6 +16,7 @@ use crate::{
     },
     target::{ClusterState, LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -143,6 +144,7 @@ struct RuntimeAdminExecutor {
     supervisor: Arc<StandaloneSupervisor>,
     standalone_model: PathBuf,
     distributed_model: PathBuf,
+    production: Option<ProductionClusterRuntime>,
 }
 
 impl AdminExecutor for RuntimeAdminExecutor {
@@ -151,6 +153,7 @@ impl AdminExecutor for RuntimeAdminExecutor {
         let supervisor = self.supervisor.clone();
         let standalone_model = self.standalone_model.clone();
         let distributed_model = self.distributed_model.clone();
+        let production = self.production.clone();
         Box::pin(async move {
             match action {
                 AdminAction::Reconcile => {
@@ -164,7 +167,11 @@ impl AdminExecutor for RuntimeAdminExecutor {
                             })
                             .await?;
                     }
-                    let snapshot = runtime.reconcile_local().await?;
+                    let snapshot = if let Some(production) = &production {
+                        production.reconcile().await?
+                    } else {
+                        runtime.reconcile_local().await?
+                    };
                     Ok(snapshot_json(snapshot))
                 }
                 AdminAction::Restart => {
@@ -184,11 +191,24 @@ impl AdminExecutor for RuntimeAdminExecutor {
                     let fingerprint = fingerprint_file(&path).await?;
                     Ok(serde_json::to_value(fingerprint)?)
                 }
-                AdminAction::Pair | AdminAction::Promote | AdminAction::Demote { .. } => {
-                    anyhow::bail!(
-                        "operation requires the active peer lifecycle and may not bypass compatibility or lease checks"
-                    )
-                }
+                AdminAction::Pair => Ok(snapshot_json(
+                    production
+                        .context("cluster runtime is disabled")?
+                        .pair()
+                        .await?,
+                )),
+                AdminAction::Promote => Ok(snapshot_json(
+                    production
+                        .context("cluster runtime is disabled")?
+                        .promote()
+                        .await?,
+                )),
+                AdminAction::Demote { .. } => Ok(snapshot_json(
+                    production
+                        .context("cluster runtime is disabled")?
+                        .demote()
+                        .await?,
+                )),
             }
         })
     }
@@ -207,6 +227,26 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     // Childを起動する前にmutation認証材料を確定し、起動途中のorphanを防ぐ。
     let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
+    let control_secret = if config.cluster.enabled {
+        Some(std::fs::read(&config.cluster.security.control_secret_file)?)
+    } else {
+        None
+    };
+    let distributed_manifest = if config.cluster.enabled {
+        let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
+        Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
+    } else {
+        None
+    };
+    let role = if config.cluster.enabled {
+        detect_cluster_role(
+            &config.cluster.interface,
+            config.cluster.coordinator_address,
+            config.cluster.worker_address,
+        )?
+    } else {
+        LocalRole::Unknown
+    };
     let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
     let persisted = match state_store.load() {
         Ok(state) => state,
@@ -251,7 +291,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             baseline_generation,
         } => {
             ModeRuntime::spawn_ready_at(
-                LocalRole::Unknown,
+                role,
                 state.proxy.clone(),
                 supervisor.clone(),
                 config.cluster.timeouts.drain,
@@ -265,7 +305,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         } => {
             tracing::error!(?reason, "restart reconcile requires manual intervention");
             ModeRuntime::spawn_manual_at(
-                LocalRole::Unknown,
+                role,
                 state.proxy.clone(),
                 supervisor.clone(),
                 config.cluster.timeouts.drain,
@@ -274,6 +314,19 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             .await?
         }
     });
+    let production = if config.cluster.enabled {
+        Some(ProductionClusterRuntime::new(
+            config.clone(),
+            role,
+            runtime.clone(),
+            state.proxy.clone(),
+            supervisor.clone(),
+            distributed_manifest.context("distributed manifest is unavailable")?,
+            control_secret.context("control secret is unavailable")?,
+        )?)
+    } else {
+        None
+    };
     state.attach_cluster(runtime.cluster_handle());
     state.attach_admin(AdminController::new(
         admin_token,
@@ -282,10 +335,16 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             supervisor: supervisor.clone(),
             standalone_model: config.ds4.standalone.model.clone(),
             distributed_model: config.ds4.mxfp4.model.clone(),
+            production: production.clone(),
         }),
     )?);
     let mut transition_snapshots = runtime.cluster_handle().subscribe();
     let transition_metrics = state.metrics.clone();
+    let transition_store = state_store.clone();
+    let transition_runtime = runtime.clone();
+    let transition_supervisor = supervisor.clone();
+    let transition_production = production.clone();
+    let transition_profile = config.ds4.standalone.profile_id.clone();
     let transition_monitor = tokio::spawn(async move {
         let mut previous = *transition_snapshots.borrow_and_update();
         let mut transition_started = std::time::Instant::now();
@@ -300,12 +359,24 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             );
             previous = current;
             transition_started = std::time::Instant::now();
+            if let Err(error) = persist_runtime_state(
+                &transition_store,
+                &transition_runtime,
+                &transition_supervisor,
+                transition_production.as_ref(),
+                &transition_profile,
+            )
+            .await
+            {
+                tracing::error!(error = %error, "persistent cluster transition write failed");
+            }
         }
     });
     persist_runtime_state(
         &state_store,
         &runtime,
         &supervisor,
+        production.as_ref(),
         &config.ds4.standalone.profile_id,
     )
     .await?;
@@ -327,6 +398,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
                         &local_monitor_store,
                         &local_monitor_runtime,
                         &local_monitor_supervisor,
+                        None,
                         &local_monitor_profile,
                     )
                     .await
@@ -347,10 +419,56 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let admin = admin_router(state.clone());
     let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    let control_listener = if let Some(production) = &production {
+        Some(tokio::net::TcpListener::bind(production.listen_addr()).await?)
+    } else {
+        None
+    };
+    let peer_listener = if role == LocalRole::Coordinator {
+        Some(
+            tokio::net::TcpListener::bind(SocketAddr::new(
+                config.cluster.coordinator_address,
+                config.cluster.peer_ingress_port,
+            ))
+            .await?,
+        )
+    } else {
+        None
+    };
     info!(addr = %public_addr, "public listener started");
     info!(addr = %admin_addr, "admin listener started");
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let reconcile_task = production
+        .as_ref()
+        .map(ProductionClusterRuntime::start_reconcile_task);
+    let control_task = control_listener
+        .zip(production.clone())
+        .map(|(listener, production)| {
+            let shutdown = shutdown_receiver.clone();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    production
+                        .router()
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_requested(shutdown))
+                .await
+            })
+        });
+    let peer_task = peer_listener.map(|listener| {
+        let shutdown = shutdown_receiver.clone();
+        let router = peer_ingress_router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_requested(shutdown))
+            .await
+        })
+    });
     let public_server = axum::serve(
         public_listener,
         public.into_make_service_with_connect_info::<SocketAddr>(),
@@ -370,8 +488,21 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             (&mut servers).await
         }
     };
+    shutdown_sender.send_replace(true);
     local_monitor.abort();
     transition_monitor.abort();
+    if let Some(task) = reconcile_task {
+        task.abort();
+    }
+    if let Some(task) = control_task {
+        task.await??;
+    }
+    if let Some(task) = peer_task {
+        task.await??;
+    }
+    if let Some(production) = &production {
+        production.stop_distributed().await?;
+    }
     let stop_result = crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await;
     drop(runtime);
     serve_result?;
@@ -409,23 +540,33 @@ async fn persist_runtime_state(
     store: &StateStore,
     runtime: &ModeRuntime,
     supervisor: &StandaloneSupervisor,
+    production: Option<&ProductionClusterRuntime>,
     active_profile: &str,
 ) -> anyhow::Result<()> {
     let snapshot = runtime.snapshot();
-    let child = supervisor
-        .child_identity()
-        .await
-        .map(|identity| PersistentChild {
-            pid: identity.pid,
-            executable: identity.executable,
-            argv_sha256: identity
-                .argv_sha256
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            spawned_at_millis: identity.spawned_at_millis,
-            process_start_micros: identity.process_start_micros,
-        });
+    let distributed = if snapshot.stable_mode == StableMode::DistributedMxfp4 {
+        match production {
+            Some(production) => production.distributed_child_identity().await,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let child = match distributed {
+        Some(child) => Some(child),
+        None => supervisor.child_identity().await,
+    }
+    .map(|identity| PersistentChild {
+        pid: identity.pid,
+        executable: identity.executable,
+        argv_sha256: identity
+            .argv_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        spawned_at_millis: identity.spawned_at_millis,
+        process_start_micros: identity.process_start_micros,
+    });
     store.save(&PersistentClusterState {
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
@@ -437,7 +578,11 @@ async fn persist_runtime_state(
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
             ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
         },
-        active_profile: Some(active_profile.into()),
+        active_profile: Some(if snapshot.stable_mode == StableMode::DistributedMxfp4 {
+            "distributed-mxfp4".into()
+        } else {
+            active_profile.into()
+        }),
         child,
         last_failure: None,
     })?;

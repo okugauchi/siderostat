@@ -65,6 +65,7 @@ pub enum ControlCommand {
     Drained,
     CancelGeneration,
     WorkerEvent { event: WorkerEventKind },
+    DistributedReady,
     Demote,
 }
 
@@ -77,6 +78,7 @@ impl ControlCommand {
             Self::Drained => ControlEndpoint::Drained,
             Self::CancelGeneration => ControlEndpoint::CancelGeneration,
             Self::WorkerEvent { .. } => ControlEndpoint::WorkerEvent,
+            Self::DistributedReady => ControlEndpoint::DistributedReady,
             Self::Demote => ControlEndpoint::Demote,
         }
     }
@@ -324,6 +326,11 @@ impl ControlProcessor {
         if message.request_id.is_empty() || message.request_id.len() > 128 {
             return Err(ControlError::InvalidRequestId);
         }
+        if matches!(message.command, ControlCommand::Pair { .. })
+            && message.generation > self.local.generation
+        {
+            self.advance_generation(message.generation);
+        }
         if message.generation != self.local.generation {
             return Err(ControlError::GenerationMismatch {
                 expected: self.local.generation,
@@ -452,6 +459,7 @@ pub enum ControlEndpoint {
     Drained,
     CancelGeneration,
     WorkerEvent,
+    DistributedReady,
     Demote,
 }
 
@@ -465,6 +473,7 @@ impl ControlEndpoint {
             ("POST", "/v1/drained") => Some(Self::Drained),
             ("POST", "/v1/cancel-generation") => Some(Self::CancelGeneration),
             ("POST", "/v1/worker-event") => Some(Self::WorkerEvent),
+            ("POST", "/v1/distributed-ready") => Some(Self::DistributedReady),
             ("POST", "/v1/demote") => Some(Self::Demote),
             _ => None,
         }

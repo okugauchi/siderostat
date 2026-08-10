@@ -139,10 +139,22 @@ impl CoordinatorDistributedRuntime {
         now_millis: u64,
         lease: Arc<dyn CoordinatorLeaseStatus>,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
-        if control.phase() != DistributedControlPhase::WorkerReady
-            || !control.peer_present(now_millis)
-            || !lease.is_valid()
-        {
+        let prerequisites_ready = control.phase() == DistributedControlPhase::WorkerReady
+            && control.peer_present(now_millis);
+        self.promote_validated(_validated_hello, prerequisites_ready, lease, now_millis)
+            .await
+    }
+
+    /// Starts the coordinator after the production control plane has atomically validated its
+    /// WorkerReady phase and lease. This avoids retaining a control mutex across drain/startup.
+    pub async fn promote_validated(
+        &self,
+        _validated_hello: Ds4Hello,
+        prerequisites_ready: bool,
+        lease: Arc<dyn CoordinatorLeaseStatus>,
+        now_millis: u64,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        if !prerequisites_ready || !lease.is_valid() {
             return Err(CoordinatorLifecycleError::PrerequisiteMissing);
         }
         let current = self.cluster.snapshot();
@@ -241,14 +253,29 @@ impl CoordinatorDistributedRuntime {
         &self,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         loop {
-            self.coordinator
-                .wait_route_loss()
-                .await
-                .map_err(CoordinatorLifecycleError::Coordinator)?;
+            if let Err(error) = self.coordinator.wait_route_loss().await {
+                let current = self.cluster.snapshot();
+                if current.state != ClusterState::DistributedReady {
+                    return Ok(current);
+                }
+                return Err(CoordinatorLifecycleError::Coordinator(error));
+            }
             match tokio::time::timeout(self.route_loss_grace, self.coordinator.wait_ready()).await {
                 Ok(Ok(())) => continue,
-                Ok(Err(error)) => return Err(CoordinatorLifecycleError::Coordinator(error)),
-                Err(_) => return self.demote().await,
+                Ok(Err(error)) => {
+                    let current = self.cluster.snapshot();
+                    if current.state != ClusterState::DistributedReady {
+                        return Ok(current);
+                    }
+                    return Err(CoordinatorLifecycleError::Coordinator(error));
+                }
+                Err(_) => {
+                    let current = self.cluster.snapshot();
+                    if current.state != ClusterState::DistributedReady {
+                        return Ok(current);
+                    }
+                    return self.demote().await;
+                }
             }
         }
     }
@@ -607,6 +634,59 @@ impl CoordinatorControl {
         self.phase
     }
 
+    pub fn distributed_ready_message(
+        &mut self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase != DistributedControlPhase::Drained {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::WorkerReady;
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::DistributedReady))
+    }
+
+    pub fn cancel_generation_message(
+        &mut self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if !matches!(
+            self.phase,
+            DistributedControlPhase::WorkerPreparing
+                | DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ) {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::Paired;
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::CancelGeneration))
+    }
+
+    pub fn demote_message(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase != DistributedControlPhase::Drained {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::Demote))
+    }
+
+    pub fn note_demote_complete(&mut self, generation: u64) -> Result<(), ControlError> {
+        self.require_generation(generation)?;
+        if self.phase != DistributedControlPhase::Drained {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::Paired;
+        Ok(())
+    }
+
     pub fn rendezvous_snapshot(
         &self,
         state: ClusterState,
@@ -644,6 +724,7 @@ fn validate_coordinator_command(
         } => phase == DistributedControlPhase::WorkerPreparing,
         ControlCommand::WorkerEvent { .. } => !matches!(phase, DistributedControlPhase::Unpaired),
         ControlCommand::Drained => phase == DistributedControlPhase::Draining,
+        ControlCommand::DistributedReady => false,
         ControlCommand::CancelGeneration => matches!(
             phase,
             DistributedControlPhase::WorkerPreparing
@@ -1231,6 +1312,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(control.phase(), DistributedControlPhase::Drained);
+        let demote = control.demote_message("demote-1").unwrap();
+        assert_eq!(demote.generation, 7);
+        control.note_demote_complete(demote.generation).unwrap();
+        assert_eq!(control.phase(), DistributedControlPhase::Paired);
 
         control.advance_generation(8);
         assert_eq!(
@@ -1441,6 +1526,45 @@ mod tests {
         assert!(!coordinator.running.load(Ordering::SeqCst));
         assert!(standalone.running.load(Ordering::SeqCst));
         assert!(proxy.target_snapshot().ready);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_demotion_wins_route_loss_monitor_race() {
+        let coordinator = Arc::new(FakeDistributedCoordinator::default());
+        let (runtime, proxy, _, peer, task) = promotion_runtime(coordinator.clone()).await;
+        coordinator.set_route_ready(true);
+        runtime
+            .promote_after_hello(
+                validated_hello(),
+                &ready_worker_control(),
+                NOW + 5_000,
+                Arc::new(|| true),
+            )
+            .await
+            .unwrap();
+
+        let permit = proxy.admission().try_acquire(true).unwrap();
+        coordinator.lose_route();
+        let route_monitor = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait_route_loss_and_demote().await }
+        });
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let manual = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.demote().await }
+        });
+        tokio::time::sleep(Duration::from_millis(12)).await;
+
+        let monitored = route_monitor.await.unwrap().unwrap();
+        assert_eq!(monitored.state, ClusterState::Demoting);
+        assert_eq!(peer.drains.load(Ordering::SeqCst), 2);
+
+        drop(permit);
+        let paired = manual.await.unwrap().unwrap();
+        assert_eq!(paired.state, ClusterState::PairedStandaloneReady);
+        assert_eq!(peer.drains.load(Ordering::SeqCst), 2);
         task.abort();
     }
 

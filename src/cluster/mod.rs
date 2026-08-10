@@ -12,6 +12,7 @@ mod network_events;
 mod network_snapshot;
 mod platform;
 mod process;
+mod production;
 mod restart;
 mod role;
 mod runtime;
@@ -80,6 +81,7 @@ pub use process::{
     ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
     ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
 };
+pub use production::{ProductionClusterRuntime, ProductionControlClient, detect_cluster_role};
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
     required_port_available,

@@ -141,12 +141,13 @@ pub fn validate_worker_hello(
     hello: &Ds4Hello,
     expectation: &WorkerHelloExpectation,
 ) -> Result<(), Ds4HelloError> {
-    if (hello.layer_start, hello.layer_end, hello.has_output)
-        != (
-            expectation.layer_start,
-            expectation.layer_end,
-            expectation.has_output,
-        )
+    let output_end_matches = expectation.has_output
+        && expectation.layer_end == u32::MAX
+        && hello.has_output
+        && hello.layer_end.checked_add(1) == Some(hello.layer_count);
+    if hello.layer_start != expectation.layer_start
+        || hello.has_output != expectation.has_output
+        || (!output_end_matches && hello.layer_end != expectation.layer_end)
     {
         return Err(Ds4HelloError::LayerMismatch);
     }

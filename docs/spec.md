@@ -707,6 +707,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | `POST` | `/v1/drained` | drain完了ack |
 | `POST` | `/v1/cancel-generation` | 未完了transition中止 |
 | `POST` | `/v1/worker-event` | worker child event push |
+| `POST` | `/v1/distributed-ready` | complete route成立後にworker admissionを再開 |
 | `POST` | `/v1/demote` | Paired/Solo Standaloneへの復帰要求 |
 
 同一generationの再送はidempotent。古いgenerationは409、deployment不一致は412。`GET /v1/node` はDS4 inference health queryではなく、process membershipとcluster stateだけを返す。

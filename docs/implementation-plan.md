@@ -742,7 +742,7 @@ Evidence: `src/cluster/coordinator.rs`、`src/cluster/state.rs`、`src/cluster/p
 
 Evidence: `tests/phase4_distributed.rs`; fake worker/coordinator child、authenticated worker Ready、実TCP socket上のknown HELLO frameを結合し、Paired→AwaitingWorkerHello→DistributedReady→Pairedを10回反復。各cycleで両child生存/停止、21回のcluster drain、11回のworker cleanupを確認し、11回目のcoordinator startup timeoutでは両child orphanなしでPaired Standaloneへ復帰。初回はpromotionとdemotionの両方でpeer drainする実数21に対し期待値を11としていたassertが失敗し、期待値修正後成功。Task固有test（1件）、共通local gate（125 tests）、test-support gate（130 tests）、clippy成功; 2026-08-06
 
-#### [!] P4-08 Distributed actual acceptanceを実行する
+#### [x] P4-08 Distributed actual acceptanceを実行する
 
 - Actor: agent + operator
 - Depends on: P3-07、P4-07
@@ -751,7 +751,7 @@ Evidence: `tests/phase4_distributed.rs`; fake worker/coordinator child、authent
 - Verification: 仕様書第32.3、32.5、33.3節
 - Done when: 実機結果をpass/blockedで記録し、blocked項目はrelease前に解消
 
-Blocked: ユーザー指定によりGGUFを要する実DS4 HELLO、short prompt、8K prefill、10回promotion/demotionは後日手動実施。再開条件はP3-07のmodel/manifest配置と実機acceptance開始指示。Fake/hardware非依存範囲はP4-07で完了済み; 2026-08-06
+Evidence: `src/app.rs`、`src/cluster/production.rs`、`src/cluster/{auth,control,coordinator,ds4_hello,process,runtime,worker}.rs`、`docs/compatibility/ds4-b7e9f00.md`; production `app::serve`へ固定bridge IP上のsource-pinned signed control HTTP client/server、static discovery reconciliationと15秒lease更新、実role判定、admin pair/promote/demote/reconcile、coordinator peer ingress、実DS4 HELLO rendezvous、worker/coordinator supervisorを接続。MacBook worker `10.99.0.2`とMac Studio coordinator `10.99.0.1`を独立LaunchAgentとして起動し、schema v2 manifestの機種別native binary digestを許可した。実HELLO、`WorkerRegistered`、`CompleteRouteReady`（local 0:19 → worker 20:output、Q2、ctx 262144）を確認。worker公開port経由short promptはHTTP 200/1.68s、8K prefillは9,005 prompt tokens・HTTP 200/20.33s。正式10回のpromotion/demotionは全回で両nodeが`DistributedReady`/`PairedStandaloneReady`へ一致し、各DistributedReadyでworker経由`/v1/models` HTTP 200、promotion 19–29s（平均21.0s）、demotion 24–25s（平均24.9s）。実機反復で検出したgeneration非対称、worker二重drain、手動/自動demotion競合、完了前Demote応答、HTTP timeoutによる副作用cancel、coordinator control phase未復帰を修正し回帰testを追加。DS4 workerがSIGTERMで停止しないため、受入configでは`allow_sigkill=true`、`stop=5s`とし、PID/executable/argv/start time再検証済みowned process groupだけをSIGKILLした。最終状態は両node Paired Standalone ready。Bonjour経路は本acceptanceでは使用せずstatic discoveryを使用。共通gateは142 unit testsと全integration tests、Clippy `-D warnings`、release build成功; 2026-08-10
 
 ### Phase 5: Recovery、operations、security
 
