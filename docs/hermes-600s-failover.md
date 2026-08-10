@@ -60,7 +60,7 @@ process-localである。他proxyの進行中requestは直接観測できない�
 
 両Macについて次を記録する。
 
-- DS4 Smart Proxy設定
+- siderostat設定
 - Hermes provider timeout/retry設定
 - DS4起動引数
 - Caddy等の中間proxy設定
@@ -76,7 +76,7 @@ Hermesまたは外側のgatewayから `X-Request-Id` を付ける。proxyは値�
 同じIDについて次を並べる。
 
 - Hermes log
-- client側DS4 Smart Proxy log
+- client側siderostat log
 - DS4 backend log
 - Caddy access log
 - GPU activity

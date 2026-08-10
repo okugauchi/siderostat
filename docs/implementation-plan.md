@@ -1,4 +1,4 @@
-# DS4 Smart Proxy 実装計画
+# siderostat 実装計画
 
 ## 1. 文書の目的と寿命
 
@@ -115,7 +115,7 @@ Plan作成時点：
 
 | 項目 | 値 |
 |---|---|
-| Package | `ds4-smart-proxy 0.1.0` |
+| Package | `siderostat 0.1.0` |
 | Rust | edition 2024 |
 | Current load-balancer candidate | commit `b66ba1c` |
 | Existing integration test directory | なし |
@@ -267,7 +267,7 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 - Verification: `cargo test --all-targets`
 - Done when: 後続migrationで退行比較できるfixtureが存在
 
-Evidence: `tests/fixtures/legacy/README.md`、`tests/fixtures/legacy/ds4-smart-proxy.example.toml`; legacy exampleとの`cmp`、共通local gate、32 tests成功; 2026-08-06
+Evidence: `tests/fixtures/legacy/README.md`、`tests/fixtures/legacy/siderostat.example.toml`; legacy exampleとの`cmp`、共通local gate、32 tests成功; 2026-08-06
 
 #### [x] P0-02 Library/test harnessへ挙動不変で分離する
 
@@ -461,12 +461,12 @@ Evidence: `src/proxy.rs`へstreaming/header helperを保持したまま、`src/r
 
 - Actor: agent
 - Depends on: P1-07
-- Files: `ds4-smart-proxy.example.toml`、本書
+- Files: `siderostat.example.toml`、本書
 - Actions: Exampleをparse可能なschema v2へ更新し、fake local upstreamでsmoke test
 - Verification: 共通local gate、example parse、Solo streaming
 - Done when: Phase 1 exit conditionとEvidenceを記録
 
-Evidence: `ds4-smart-proxy.example.toml`、`tests/phase1_smoke.rs`; repository exampleをschema v2 parserで固定し、Fake DS4 → Solo Standalone fixed target → clientのunknown path/body/SSE逐次転送smoke成功。Phase 1 exit condition「Solo Standalone fixed targetでproxy test成功」を充足。共通local gate（41 tests）、test-support gate（44 tests）、check/clippy成功; 2026-08-06
+Evidence: `siderostat.example.toml`、`tests/phase1_smoke.rs`; repository exampleをschema v2 parserで固定し、Fake DS4 → Solo Standalone fixed target → clientのunknown path/body/SSE逐次転送smoke成功。Phase 1 exit condition「Solo Standalone fixed targetでproxy test成功」を充足。共通local gate（41 tests）、test-support gate（44 tests）、check/clippy成功; 2026-08-06
 
 ### Phase 2: Thunderbolt discoveryとPaired Standalone
 
@@ -796,12 +796,12 @@ Evidence: `src/metrics.rs`、`src/proxy.rs`、`src/cluster/state.rs`、`src/clus
 - Actor: agent + operator for install
 - Depends on: P5-03
 - Read: 仕様書第35章
-- Files: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/README.md`
+- Files: `contrib/launchd/local.siderostat.runtime.plist`、`contrib/launchd/README.md`
 - Actions: RunAtLoad、KeepAlive、absolute args、finite throttle、single ownerを定義
 - Verification: `plutil -lint`、login start、restart、no duplicate child
 - Done when: DS4 childを別jobへ登録しない
 
-Evidence: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/README.md`; single user job、absolute binary/config/log path、`serve`、RunAtLoad/KeepAlive、10秒ThrottleInterval、secret非埋込を定義し、DS4 childの別job禁止、install/verify/uninstall手順を記載。`plutil -lint`成功、plist dumpとsecret/job静的検査、共通local gate（139 tests）成功; 2026-08-06
+Evidence: `contrib/launchd/local.siderostat.runtime.plist`、`contrib/launchd/README.md`; single user job、absolute binary/config/log path、`serve`、RunAtLoad/KeepAlive、10秒ThrottleInterval、secret非埋込を定義し、DS4 childの別job禁止、install/verify/uninstall手順を記載。`plutil -lint`成功、plist dumpとsecret/job静的検査、共通local gate（139 tests）成功; 2026-08-06
 
 Resume evidence: Cleanup前のlocal nodeでP4-08 LaunchAgentをread-only確認。Plist lint、`RunAtLoad=true`、launchd state=running、runs=7、last exit=0、proxy listenerが18080/18081の同一PIDに限定、`/healthz` 200、`/readyz` 200、workerが`paired-standalone-ready`をPASS。P3-07/P4-06/P4-08でowned child stop、orphan cleanup、10回promotion/demotionは検証済み。したがってno orphan child全体を未検証とした従来の記載は訂正する; 2026-08-10
 
@@ -838,12 +838,12 @@ Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-20
 
 - Actor: agent
 - Depends on: P5-06
-- Files: `ds4-smart-proxy.example.toml`、必要ならcoordinator/worker examples
+- Files: `siderostat.example.toml`、必要ならcoordinator/worker examples
 - Actions: 実parserで成功する値だけを記載し、secret/model pathをplaceholder化
 - Verification: Binary/doctorで全example parse
 - Done when: Spec exampleとのfield差分を説明可能
 
-Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値だけを残し、DS4 binary、standalone/MXFP4 model、3つのsecret/token fileを`PLACEHOLDER`へ置換して配布用とした。Headerでvalidation要件（regular/canonical/non-symlink、secret 32+ bytes・0600）とworker nodeの差分（`cluster.node_id`とnode固有pathのみ、roleはinterface addressから決定し設定しない）を明記した。実parserは`parses_repository_schema_v2_example`で成功し、binary `--config`実行はTOML parse後に最初のplaceholder（`ds4.binary`）をactionableに報告することを確認。Spec exampleとの差分はplaceholder化とworker注記のみで、field値は全て一致; 2026-08-06
+Evidence: `siderostat.example.toml`; spec第22.2節のcomplete example値だけを残し、DS4 binary、standalone/MXFP4 model、3つのsecret/token fileを`PLACEHOLDER`へ置換して配布用とした。Headerでvalidation要件（regular/canonical/non-symlink、secret 32+ bytes・0600）とworker nodeの差分（`cluster.node_id`とnode固有pathのみ、roleはinterface addressから決定し設定しない）を明記した。実parserは`parses_repository_schema_v2_example`で成功し、binary `--config`実行はTOML parse後に最初のplaceholder（`ds4.binary`）をactionableに報告することを確認。Spec exampleとの差分はplaceholder化とworker注記のみで、field値は全て一致; 2026-08-06
 
 #### [x] P6-02 DS4を含む導入ガイドを作る
 
@@ -878,7 +878,7 @@ Acceptance relaxation: 現在利用中の2-node環境でclean user accountを用
 - Verification: `rg`でlegacy term不在、link check、command smoke
 - Done when: READMEが実装済みbehaviorだけを説明
 
-Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷新し、3 mode topology、profile matrix、quick start、security、limitations、関連文書linkを実装済みbehavior（spec第9/13/14/22/23/25/26/27/35/37節と`src/cluster/admin.rs`/`src/metrics.rs`/`src/cli.rs`）から導出。`rg`でlegacy term（least-busy、affinity、SQLite、EWMA、alternate retry、Hermes、sticky、heartbeat、cooldown、circuit breaker、local-first、priority、session/prefix、backend）がREADMEに不在であることを確認し、`docs/spec.md`、`docs/installation.md`、`docs/compatibility/ds4-b7e9f00.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`ds4-smart-proxy.example.toml`、`contrib/launchd/README.md`への全linkが実在することを確認。command smokeとして、記載したserve/cluster CLIとadmin endpoint（healthz/readyz/cluster/metrics）を実装済み`src/cli.rs`/`src/app.rs`と突合。`docs/operations.md`はP6-04で作成予定のため、現時点ではREADMEからdead linkを張らず、P6-04完了後に追加する; 2026-08-06
+Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷新し、3 mode topology、profile matrix、quick start、security、limitations、関連文書linkを実装済みbehavior（spec第9/13/14/22/23/25/26/27/35/37節と`src/cluster/admin.rs`/`src/metrics.rs`/`src/cli.rs`）から導出。`rg`でlegacy term（least-busy、affinity、SQLite、EWMA、alternate retry、Hermes、sticky、heartbeat、cooldown、circuit breaker、local-first、priority、session/prefix、backend）がREADMEに不在であることを確認し、`docs/spec.md`、`docs/installation.md`、`docs/compatibility/ds4-b7e9f00.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`siderostat.example.toml`、`contrib/launchd/README.md`への全linkが実在することを確認。command smokeとして、記載したserve/cluster CLIとadmin endpoint（healthz/readyz/cluster/metrics）を実装済み`src/cli.rs`/`src/app.rs`と突合。`docs/operations.md`はP6-04で作成予定のため、現時点ではREADMEからdead linkを張らず、P6-04完了後に追加する; 2026-08-06
 
 #### [x] P6-04 Operationsとtroubleshootingを作る
 
@@ -900,7 +900,7 @@ Evidence: `docs/operations.md`、`docs/troubleshooting.md`; Status（`cluster st
 - Verification: Repository-local document gate + P3-07 standalone acceptance + P4-08 2-node distributed acceptance
 - Done when: Phase 6 exit conditionをevidence付きで満たす
 
-Evidence: `docs/compatibility/documentation-clean-install-2026-08-10.md`、`docs/compatibility/ds4-b7e9f00.md`、`README.md`、`docs/installation.md`、`docs/spec.md`、`contrib/launchd/README.md`、`ds4-smart-proxy.example.toml`; repository-localでrelease build、fmt、clippy、全target 145 tests、実CLI help突合、relative Markdown link 22件、plist lint、spaceを含むpathへのLaunchAgent placeholder置換、`git diff --check`をPASS。P3-07で利用対象standalone、P4-08で固定IPの両role、LaunchAgent起動、Paired/Distributed state、worker 2-hop request、10回promotion/demotionを実機確認。Copy/paste検証で見つけたREADMEの省略command、cluster間secret/token生成手順、`/usr/local/bin` install、LaunchAgentの未置換`USERNAME`、期待出力不足を修正。`plutil -replace ProgramArguments.3`がarray要素を追加する実測failureを経て、`PlistBuddy` replacementとplaceholder guardを採用; 2026-08-10
+Evidence: `docs/compatibility/documentation-clean-install-2026-08-10.md`、`docs/compatibility/ds4-b7e9f00.md`、`README.md`、`docs/installation.md`、`docs/spec.md`、`contrib/launchd/README.md`、`siderostat.example.toml`; repository-localでrelease build、fmt、clippy、全target 145 tests、実CLI help突合、relative Markdown link 22件、plist lint、spaceを含むpathへのLaunchAgent placeholder置換、`git diff --check`をPASS。P3-07で利用対象standalone、P4-08で固定IPの両role、LaunchAgent起動、Paired/Distributed state、worker 2-hop request、10回promotion/demotionを実機確認。Copy/paste検証で見つけたREADMEの省略command、cluster間secret/token生成手順、`/usr/local/bin` install、LaunchAgentの未置換`USERNAME`、期待出力不足を修正。`plutil -replace ProgramArguments.3`がarray要素を追加する実測failureを経て、`PlistBuddy` replacementとplaceholder guardを採用; 2026-08-10
 
 Acceptance relaxation: Clean user accountの2-node sequential run、GUI login/restart、Thunderbolt detach/reconnectの再実行はP6 exit conditionから除外。Q2 residentは任意profileのためblockerから除外。Expected baseline `b7e9f00`とactual acceptance済み`b0309611041655f4e45671cfd9c9886aff161406`の整合はP7 final release acceptanceで解決し、文書gateを過去のbaseline確定待ちにしない; 2026-08-10
 
@@ -910,7 +910,7 @@ Acceptance relaxation: Clean user accountの2-node sequential run、GUI login/re
 - Depends on: P6-05
 - Read: DS4 source commit `b0309611041655f4e45671cfd9c9886aff161406`の`--mtp`、`--dspark`、`--dspark-confidence`、`--dspark-strict`契約
 - Scope: 現DS4はsupport GGUFを`distributed.role == none`の場合だけloadするため、DSpark対応はStandaloneに限定する。Distributed MXFP4へ昇格中はDSparkを使用せず、DS4側のdistributed supportが実装・検証されるまでproxyから有効化済みと表示しない。
-- Files: `src/config.rs`、`src/cluster/ds4_command.rs`、`src/cluster/manifest.rs`、`src/cluster/ds4_log.rs`、`src/cluster/process.rs`、`src/app.rs`、関連test、`ds4-smart-proxy.example.toml`、利用者文書、compatibility evidence
+- Files: `src/config.rs`、`src/cluster/ds4_command.rs`、`src/cluster/manifest.rs`、`src/cluster/ds4_log.rs`、`src/cluster/process.rs`、`src/app.rs`、関連test、`siderostat.example.toml`、利用者文書、compatibility evidence
 - Actions:
   1. Standalone production profileに、DSpark enable、support GGUF path、任意のconfidence/strictを型付き設定として追加する。
   2. Support GGUFをregular file、canonical path、非symlinkとして検証し、digestとsizeを算出する。`extra_args`から`--mtp`、`--dspark`、`--dspark-confidence`、`--dspark-strict`を禁止し、型付き設定の上書きや重複を防ぐ。

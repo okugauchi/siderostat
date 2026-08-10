@@ -5,7 +5,7 @@
 # - Every secret/token file must contain 32+ bytes with mode 0600; the three files and values differ.
 # - The control secret and peer proxy token values are each shared between the two nodes. The admin
 #   token is node-local.
-# Replace every PLACEHOLDER and fill the secret files before running `ds4-smart-proxy serve --config ...`.
+# Replace every PLACEHOLDER and fill the secret files before running `siderostat serve --config ...`.
 # On a worker node, change only cluster.node_id and the node-specific paths; role is derived from the
 # interface address, never set directly.
 schema_version = 2
@@ -31,8 +31,8 @@ worker_address = "10.99.0.2"
 control_port = 9920
 ds4_distributed_port = 9911
 peer_ingress_port = 18082
-state_path = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-state.json"
-manifest_cache_dir = "$HOME/Library/Application Support/ds4-smart-proxy/manifests"
+state_path = "$HOME/Library/Application Support/siderostat/cluster-state.json"
+manifest_cache_dir = "$HOME/Library/Application Support/siderostat/manifests"
 
 [cluster.discovery]
 mode = "bonjour-with-static-fallback"
@@ -42,9 +42,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/secrets/PLACEHOLDER-admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-cluster-control.key"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-peer-proxy.key"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-admin.key"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -80,14 +80,14 @@ allow_sigkill = false
 # to Distributed coordinator/worker argv after promotion.
 [ds4.dspark]
 enabled = true
-support_model = "$HOME/Library/Application Support/ds4-smart-proxy/models/PLACEHOLDER-dspark-support-0731.gguf"
+support_model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-dspark-support-0731.gguf"
 confidence = 0.7
 strict = false
 
 [ds4.standalone]
 profile_id = "flash-0731-q2-q4-resident-dspark"
-model = "$HOME/Library/Application Support/ds4-smart-proxy/models/PLACEHOLDER-standalone.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
+model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-standalone.gguf"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
 residency = "resident"
@@ -97,8 +97,8 @@ kv_disk_space_mb = 262144
 extra_args = []
 
 [ds4.mxfp4]
-model = "$HOME/Library/Application Support/ds4-smart-proxy/models/PLACEHOLDER-mxfp4.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/mxfp4-0731.json"
+model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
 context_size = 262144
 coordinator_layers = "0:19"

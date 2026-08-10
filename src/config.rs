@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_CONFIG_FILE: &str = "ds4-smart-proxy.toml";
+const DEFAULT_CONFIG_FILE: &str = "siderostat.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -795,7 +795,7 @@ fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = env::var_os("DS4_SMART_PROXY_CONFIG") {
+    if let Some(path) = env::var_os("SIDEROSTAT_CONFIG") {
         return Ok(PathBuf::from(path));
     }
     let current = PathBuf::from(DEFAULT_CONFIG_FILE);
@@ -805,7 +805,7 @@ fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     let platform = platform_default_path();
     anyhow::ensure!(
         platform.exists(),
-        "configuration not found; tried {}, DS4_SMART_PROXY_CONFIG, {}, and {}",
+        "configuration not found; tried {}, SIDEROSTAT_CONFIG, {}, and {}",
         "--config",
         current.display(),
         platform.display()
@@ -818,9 +818,9 @@ fn platform_default_path() -> PathBuf {
         env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default()
-            .join("Library/Application Support/ds4-smart-proxy/config.toml")
+            .join("Library/Application Support/siderostat/config.toml")
     } else {
-        PathBuf::from("/etc/ds4-smart-proxy/config.toml")
+        PathBuf::from("/etc/siderostat/config.toml")
     }
 }
 
@@ -893,8 +893,8 @@ worker_address = "10.99.0.2"
 control_port = 9920
 ds4_distributed_port = 9911
 peer_ingress_port = 18082
-state_path = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-state.json"
-manifest_cache_dir = "$HOME/Library/Application Support/ds4-smart-proxy/manifests"
+state_path = "$HOME/Library/Application Support/siderostat/cluster-state.json"
+manifest_cache_dir = "$HOME/Library/Application Support/siderostat/manifests"
 
 [cluster.discovery]
 mode = "bonjour-with-static-fallback"
@@ -904,9 +904,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/ds4-smart-proxy/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/ds4-smart-proxy/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
+admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -947,7 +947,7 @@ strict = false
 [ds4.standalone]
 profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-ssd.json"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-ssd.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
 residency = "resident"
@@ -958,7 +958,7 @@ extra_args = []
 
 [ds4.mxfp4]
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/mxfp4-0731.json"
+model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
 context_size = 262144
 coordinator_layers = "0:19"
@@ -979,10 +979,8 @@ level = "info"
 
     impl ConfigTestFiles {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "ds4-smart-proxy-config-test-{}",
-                uuid::Uuid::new_v4()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("siderostat-config-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&root).unwrap();
             Self {
                 root: fs::canonicalize(root).unwrap(),
@@ -1055,7 +1053,7 @@ level = "info"
 
     #[test]
     fn parses_repository_schema_v2_example() {
-        let config = ModeAwareConfig::parse(include_str!("../ds4-smart-proxy.example.toml"))
+        let config = ModeAwareConfig::parse(include_str!("../siderostat.example.toml"))
             .expect("repository example must remain parseable");
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);

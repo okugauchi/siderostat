@@ -4,8 +4,8 @@
 mod support;
 
 use anyhow::{Context, Result};
-use ds4_smart_proxy::{app, config::ModeAwareConfig};
 use futures::StreamExt;
+use siderostat::{app, config::ModeAwareConfig};
 use std::{ffi::OsString, time::Duration};
 use support::FakeDs4Process;
 
@@ -13,7 +13,7 @@ use support::FakeDs4Process;
 async fn solo_standalone_streams_through_schema_v2_runtime() -> Result<()> {
     let fake =
         FakeDs4Process::spawn([OsString::from("--chunk-count"), OsString::from("2")]).await?;
-    let mut config = ModeAwareConfig::parse(include_str!("../ds4-smart-proxy.example.toml"))?;
+    let mut config = ModeAwareConfig::parse(include_str!("../siderostat.example.toml"))?;
     config.cluster.enabled = false;
     config.ds4.http_host = fake.address.ip();
     config.ds4.http_port = fake.address.port();

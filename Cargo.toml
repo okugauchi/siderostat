@@ -1,5 +1,5 @@
 [package]
-name = "ds4-smart-proxy"
+name = "siderostat"
 version = "0.1.0"
 edition = "2024"
 

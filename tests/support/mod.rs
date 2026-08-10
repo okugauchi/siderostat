@@ -64,7 +64,7 @@ impl FakeDs4Process {
 }
 
 pub fn temporary_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ds4-smart-proxy-{name}-{}", uuid::Uuid::new_v4()))
+    std::env::temp_dir().join(format!("siderostat-{name}-{}", uuid::Uuid::new_v4()))
 }
 
 pub async fn wait_until_file_exists(path: &Path) -> Result<()> {

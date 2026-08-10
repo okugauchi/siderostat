@@ -1,4 +1,4 @@
-# DS4 Smart Proxy troubleshooting
+# siderostat troubleshooting
 
 この文書は、`docs/spec.md`と実装済みのadmin API / CLI / logging / metricsに基づき、failure symptom別に該当手順を定める。運用の基本は [`docs/operations.md`](operations.md) を参照する。実DS4/modelを使う検証は [`docs/installation.md`](installation.md) に従う。
 
@@ -7,8 +7,8 @@
 症状が出たら、次の順で現状を把握する。いずれもread-onlyで状態を変更しない。
 
 ```sh
-ds4-smart-proxy cluster status
-ds4-smart-proxy cluster doctor
+siderostat cluster status
+siderostat cluster doctor
 curl --fail --silent http://127.0.0.1:18081/readyz
 curl --fail --silent http://127.0.0.1:18081/cluster
 curl --fail --silent http://127.0.0.1:18081/metrics

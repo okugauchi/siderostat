@@ -99,7 +99,7 @@ impl PersistentClusterState {
 
 #[derive(Debug, Error)]
 pub enum StateStoreError {
-    #[error("another ds4-smart-proxy instance holds {0}")]
+    #[error("another siderostat instance holds {0}")]
     Locked(PathBuf),
     #[error("unsupported persistent state schema version {0}")]
     UnsupportedSchema(u32),

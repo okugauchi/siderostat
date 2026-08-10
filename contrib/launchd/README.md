@@ -1,29 +1,29 @@
 # macOS user service draft
 
-`ds4-smart-proxy`だけを1つのLaunchAgentとして登録します。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
+`siderostat`だけを1つのLaunchAgentとして登録します。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
 
 ## Install前の準備
 
 Exampleを作業用fileへcopyし、次の全pathを実在するabsolute pathへ置換します。
 
-- `/usr/local/bin/ds4-smart-proxy`: installしたproxy binary
-- `/Users/USERNAME/Library/Application Support/ds4-smart-proxy/config.toml`: node別config
-- `/Users/USERNAME/Library/Logs/ds4-smart-proxy/`: stdout/stderr directory
+- `/usr/local/bin/siderostat`: installしたproxy binary
+- `/Users/USERNAME/Library/Application Support/siderostat/config.toml`: node別config
+- `/Users/USERNAME/Library/Logs/siderostat/`: stdout/stderr directory
 
 Tokenやsecret値をplist、`EnvironmentVariables`、command lineへ書きません。Configにはpermission `0600`のsecret file pathだけを設定します。
 
 ```sh
-mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ds4-smart-proxy"
-PLIST="$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
-CONFIG="$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
-cp contrib/launchd/ds4-smart-proxy.plist.example "$PLIST"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/siderostat"
+PLIST="$HOME/Library/LaunchAgents/local.siderostat.runtime.plist"
+CONFIG="$HOME/Library/Application Support/siderostat/config.toml"
+cp contrib/launchd/local.siderostat.runtime.plist "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/ds4-smart-proxy/stdout.log" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/ds4-smart-proxy/stderr.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/stdout.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/stderr.log" "$PLIST"
 plutil -lint "$PLIST"
 if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-launchctl kickstart -k "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
+launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
 
 `ProgramArguments`の各要素がabsolute pathまたは固定subcommandであり、placeholderが残っていないことを登録前に確認します。
@@ -31,8 +31,8 @@ launchctl kickstart -k "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
 ## Verification
 
 ```sh
-launchctl print "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
-pgrep -alf ds4-smart-proxy
+launchctl print "gui/$(id -u)/local.siderostat.runtime"
+pgrep -alf siderostat
 pgrep -alf ds4-server
 curl --fail --silent http://127.0.0.1:18081/healthz
 ```
@@ -49,6 +49,6 @@ curl --fail --silent http://127.0.0.1:18081/healthz
 先にjobを停止してからplistを移動します。Model、KV cache、secret、runtime stateは自動削除しません。
 
 ```sh
-launchctl bootout "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
-mv "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist" "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist.disabled"
+launchctl bootout "gui/$(id -u)/local.siderostat.runtime"
+mv "$HOME/Library/LaunchAgents/local.siderostat.runtime.plist" "$HOME/Library/LaunchAgents/local.siderostat.runtime.plist.disabled"
 ```

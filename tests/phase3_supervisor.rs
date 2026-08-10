@@ -1,6 +1,6 @@
 #![cfg(all(feature = "test-support", target_os = "macos"))]
 
-use ds4_smart_proxy::{
+use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
         ControlRole, ControlSecret, Ds4Command, Ds4Profile, LocalStandaloneLifecycle, ModeRuntime,
@@ -23,7 +23,7 @@ fn descriptor(role: ControlRole, node_id: &str) -> NodeDescriptor {
     }
 }
 
-fn authenticated() -> ds4_smart_proxy::cluster::AuthenticatedPeer {
+fn authenticated() -> siderostat::cluster::AuthenticatedPeer {
     let authenticator = ControlAuthenticator::new(
         ControlSecret::new(vec![0x5a; 32]).unwrap(),
         "coordinator",

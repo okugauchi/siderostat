@@ -1,4 +1,4 @@
-# Contributing to DS4 Smart Proxy
+# Contributing to siderostat
 
 ## Git運用方針
 
