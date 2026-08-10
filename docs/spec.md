@@ -54,8 +54,8 @@ peerまたはdistributed route喪失
 - worker/route喪失時にstandalone profileへ自動降格する。
 - standalone deploymentとdistributed deploymentのKV cacheを分離する。
 - proxy admissionとDS4 process drainを連動する。
-- DS4 binary、model、checkpoint、argvの一致をfail closedで検証する。
-- coordinator/worker両nodeで同じbinaryを利用する。
+- DS4 source/protocol contract、承認済みbinary集合、model、checkpoint、argvの互換性をfail closedで検証する。
+- coordinator/worker両nodeで、実機acceptance済みの同一binary compatibility集合を利用する。
 - LaunchAgent、local CLI、構造化log、metrics、admin APIを提供する。
 - 外部databaseまたはcluster state serviceなしで動作する。
 - 実装順序、migration、verification、rollback、README全面刷新、およびDS4本体のセットアップを含む導入ガイド作成を扱う実装計画を、仕様書から独立した文書として維持する。
@@ -604,10 +604,11 @@ Standaloneとdistributedでは異なる `--kv-disk-dir` を必須とする。同
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile": "distributed-mxfp4",
-  "ds4_binary_sha256": "...",
-  "ds4_source_commit": "b7e9f00...",
+  "ds4_binary_sha256": "<node-local digest>",
+  "compatible_ds4_binary_sha256": ["<coordinator digest>", "<worker digest>"],
+  "ds4_source_commit": "<full Git object ID>",
   "model_sha256": "...",
   "model_size": 167503724544,
   "checkpoint": "flash-0731",
@@ -625,7 +626,7 @@ Standalone manifestも同じdigest情報に加え、次を持つ。
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile": "standalone",
   "profile_id": "flash-0731-q2-q4-ssd",
   "ds4_binary_sha256": "...",
@@ -640,7 +641,9 @@ Standalone manifestも同じdigest情報に加え、次を持つ。
 
 Standalone manifestはlocal childのidentity、設定drift、診断に使用する。Peerへdescriptorとして通知してよいが、両nodeのstandalone profile不一致をpairing failureにしてはならない。
 
-`deployment_id` はkey昇順、UTF-8、余分な空白なしのcanonical JSONをSHA-256した値とする。Local path、hostname、PID、log pathは含めない。
+`compatible_ds4_binary_sha256` は実機acceptanceで相互運用を確認したbinary digestの、昇順・重複なしの集合である。各nodeの `ds4_binary_sha256` はこの集合に含まれなければならない。未知のrebuildや集合の片側だけの変更ではpromotionしない。
+
+`deployment_id` はnode-localな `ds4_binary_sha256` を除くdistributed compatibility fieldを、key昇順、UTF-8、余分な空白なしのcanonical JSONにしてSHA-256した値とする。Local path、hostname、PID、log pathは含めない。同じ承認集合に属する異なるnative buildは同じdeployment IDを持つ。
 
 ### 15.2 Fingerprint
 
@@ -653,9 +656,11 @@ Standalone manifestはlocal childのidentity、設定drift、診断に使用す�
 
 ### 15.3 Compatibility
 
-Distributed profileのbinary digest、model digest、checkpoint、context、layer split、wire schema、argv profileを比較する。1つでも不一致/不明ならMXFP4 promotionを拒否するが、Paired Standaloneは維持できる。Node固有のstandalone manifestは診断とlocal child identity検証に使い、peer間compatibilityの比較対象にしない。
+Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。1つでも不一致/不明ならPaired Standaloneを維持する。
 
-Source commitは診断情報でありbinary digestを代替しない。
+Binary digestはnode-local child identityと未知rebuildの検出に引き続き使用するが、cross-nodeでのbyte-for-byte一致は要求しない。`-mcpu=native`等による機種別binaryを承認集合へ追加するには、そのdigest pair、full source commit、wire schema、対象model/topologyでactual acceptanceを完了してcompatibility recordへ記録する。Source commitや自己申告のwire schemaだけで未知binaryを自動承認してはならない。
+
+現行DS4 HELLOはprotocol version/source commit/build profileを通知しない。将来DS4がauthenticated handshakeでprotocol versionとcapabilityを通知できるまでは、承認済みbinary集合をoperator-controlled compatibility allowlistとして扱う。
 
 ## 16. Peer control protocol
 
@@ -1467,8 +1472,8 @@ persistence.rs（cluster state_storeへ置換）
 ### 32.5 macOS actual acceptance
 
 - M4 Max 128GB coordinator、M5 Max 128GB worker、Thunderbolt 5直結。
-- 同一DS4 binary/MXFP4 0731 digest。
-- Q2 resident standaloneでrequest成功。
+- 同一full DS4 source commit/wire schemaと、相互運用を実測して承認したnode別binary digest集合。MXFP4 0731 digestは同一。
+- 利用対象のresident standaloneでrequest成功。現行targetはQ2-Q4 residentとし、Q2は対応するfull standalone modelが配置された場合に追加確認する。
 - Q2-Q4 SSD streaming standaloneでrequest成功。
 - MXFP4 SSD streaming standaloneでrequest成功。対象DS4 build/Metal backendで未確認の場合は、そのprofileだけをproduction enable不可とする。
 - 両nodeが異なるstandalone profileでもpairingでき、worker requestがcoordinatorのprofileで処理される。

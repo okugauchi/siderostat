@@ -61,7 +61,7 @@ shasum -a 256 <model-path>
 ls -l <model-path>
 ```
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。
+Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`ds4-smart-proxy.example.toml`のplaceholder pathへ合わせる。
 
@@ -71,7 +71,7 @@ Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributed
 
 実DS4とmodelを使うため、この手順はoperator gateである。`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixを基準とし、次の対象を確認する。
 
-- Q2 resident standaloneでrequest成功。
+- Q2-Q4 resident standaloneでrequest成功。Q2は対応するfull standalone modelを利用する構成だけで追加確認する。
 - Q2-Q4 SSD streaming standaloneでrequest成功。
 - MXFP4 SSD streaming standaloneでrequest成功。対象DS4 build/Metal backendで未確認の場合は、そのprofileだけをproduction enable不可とする。
 - `ssd-streaming`はDS4の`--ssd-streaming`を意味し、model variantと混同しない（spec第14.1節）。`residency="resident"`ではSSD streaming optionを生成しない。

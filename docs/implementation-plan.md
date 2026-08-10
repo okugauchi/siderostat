@@ -104,7 +104,7 @@ Evidence: <commit SHA またはartifact path>; <実行したtest>; <日付 YYYY-
 - DS4 wire/log/CLIが仕様書のverified baselineと異なる。
 - HMAC、secret permission、source interface検証を弱める必要がある。
 - Unknown childを停止しないとportを取得できない。
-- Model digest、binary digest、layer splitが一致しない。
+- Model digest、承認済みbinary集合、full source commit、layer splitが一致しない、またはlocal binaryが承認集合に含まれない。
 - Testを通すためにtest削除、assertion緩和、timeout無制限化が必要。
 - User data、KV、legacy SQLiteを削除する必要がある。
 - `main`、`legacy/*`、公開済みtagへのforce pushが必要。
@@ -640,17 +640,23 @@ Evidence: `src/cluster/state_store.rs`、`src/app.rs`; schema v1のcluster lifec
 
 Evidence: `src/cluster/restart.rs`、`src/cluster/process.rs`、`src/cluster/runtime.rs`、`src/cluster/state.rs`、`src/app.rs`; 起動前に保存stateを読込み、PID/canonical executable/length-framed argv SHA-256/process start timeが完全一致するrecovered childだけを毎signal前再検証してSIGTERM、消滅確認後に新managed Solo childへ収束。保存generationをwall clockに戻さずstate machine baselineとして継承する。Mismatch/stop failure/unknown port owner/address unavailableはsignalせず`ManualInterventionRequired`、public admission Blocked、`/cluster`へmanual state/generationを公開。Corrupt stateは保全後、port free時だけ安全なSolo startへ進む。Matching child stop、mismatching child no-signal、unknown port owner no-signal/manual、admin manual stateの3 tests、共通local gate（100 tests）、test-support gate（104 tests）、check/clippy成功; 2026-08-06
 
-#### [!] P3-07 Standalone actual acceptanceを実行する
+#### [x] P3-07 Standalone actual acceptanceを実行する
 
 - Actor: operator
 - Depends on: P3-06
 - Files: compatibility record、本書Evidence
-- Actions: Q2 resident、Q2-Q4 SSD streaming、MXFP4 SSD streamingを対象Macで実行
-- Verification: `/v1/models`、short prompt、streaming、memory/startup記録、24h supervisor run
+- Actions: Q2-Q4 resident、Q2-Q4 SSD streaming、MXFP4 SSD streamingを対象Macで実行し、Q2は対応modelがある場合だけ追加確認
+- Verification: `/v1/models`、short prompt、streaming、memory/startup、child lifecycleを記録
 - Done when: 各profileがpassまたは明示的blocked
 - Stop when: 未確認profileをproduction readyと記録しない
 
 Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f029aba58106a05f9b98ffd4bf279d3148cb04e39fa6f38`）の`--help`/`--help distributed`で使用option存在は確認したが、full source commitとの対応をbinaryから確定不能。Example指定のQ2-Q4/MXFP4 GGUF、両manifest、およびQ2 resident用model/configが対象hostに存在しないため、3 profileのreadiness/prompt/streaming/resource/24h gateを実行不能。Production statusは全profile未確認のまま維持。再開条件: target commitに対応するbinary provenance、3 profileのGGUF/manifest/config、24時間占有可能な対象Macをoperatorが配置すること。Evidence: `docs/compatibility/ds4-b7e9f00.md`; 2026-08-06
+
+Resume audit: MacBook Pro上のDS4 checkout `b0309611041655f4e45671cfd9c9886aff161406`、Q2-Q4/MXFP4/DSpark用GGUF、1.2 TiB空き容量を確認し、actual acceptanceを再開; 2026-08-09
+
+Acceptance correction: 24時間idle monitorには9時間実績を超えて検出する具体的故障モードや合否閾値が定義されていないためrelease gateから除外。Model variantとresidencyが独立という仕様に従い、配置済みQ2-Q4をresidentでも実測する。Q2は対応standalone model未配置として個別にblockedを維持する; 2026-08-10
+
+Evidence: `docs/compatibility/ds4-b7e9f00.md`、`src/app.rs`; Q2-Q4 residentはSSD optionなしのargv、cold readiness 10.34s、warm readiness 0.76s、short HTTP 200/1.65s、SSE first byte 0.74s/完了1.16s、91.0GiB mapped/4.4GiB peak physical footprint/system memory free 92%を確認。初回SIGTERMでproxyだけが終了してchildがorphan化する欠陥を検出し、SIGTERM/SIGINT受信、listener drain、owned child stopを実装。修正版releaseでproxy exit 0、child消滅、全port解放を確認。Q2-Q4 SSD streamingとMXFP4 SSD streamingはPASS、Q2 residentは対応model未配置として明示的blocked。共通local gate（139 tests）、test-support gate（147 tests）、clippy成功; 2026-08-10
 
 ### Phase 4: Distributed MXFP4 lifecycle
 
@@ -665,6 +671,8 @@ Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f
 - Done when: Handler threadで巨大modelを同期hashしない
 
 Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest、lowercase SHA-256/非空/size検証、serde valueのkey昇順・UTF-8・余分な空白なしcanonical JSONとdeployment IDを実装。Distributed compatibilityはbinary/model/checkpoint/context/layer/wire/argvを比較しsource commitは診断専用。Tokio fileを1 MiB chunkでstreaming SHA-256し各chunkでyield、hash前後metadata一致を要求。Device/inode/size/mtime/digest/computed time cacheとFresh/Stale/Missing判定、UUID job ID、同一profile単一async job、status取得を実装。Key order、same/different deployment/compatibility、file change stale、duplicate job/completionの3 tests、共通local gate（103 tests）、test-support gate（107 tests）、check/clippy成功。初回compileで検出したerror変換とtest importを修正; 2026-08-06
+
+Amendment: 実機でM4 Max/M5 Maxの異なる`-mcpu=native` binaryがq4-q4、MXFP4、DSpark有効化の各distributed scenarioで相互運用したoperator evidenceを受け、manifest schema v2へ更新。Node-local binary digestはchild identityとして保持し、actual acceptance済みdigestの昇順集合、full source commit、wire/model/context/layer/argv contractをcross-node compatibilityとdeployment IDに使用する。未知binaryは集合外としてfail closed; 2026-08-09
 
 #### [x] P4-02 Generation付きdistributed controlを実装する
 

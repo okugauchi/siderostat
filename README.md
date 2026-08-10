@@ -14,7 +14,7 @@ DS4 Smart Proxy は、DS4のHTTP endpointを透過的にstreaming中継し、単
 - worker/route喪失時にstandalone profileへ自動降格
 - standaloneとdistributedのKV cacheを分離
 - proxy admissionとDS4 process drainを連動し、mode切替時に新規admissionを閉じる
-- DS4 binary、model、checkpoint、argvの一致をfail closedで検証
+- DS4 source/protocol contract、承認済みbinary集合、model、checkpoint、argvの互換性をfail closedで検証
 - LaunchAgent、local CLI、構造化log、Prometheus互換metrics、loopback admin APIを提供
 - 外部databaseまたはcluster state serviceなしで動作し、永続化するのはcluster lifecycle stateだけ
 

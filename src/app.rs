@@ -344,24 +344,65 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let public_addr = state.config.public_listen;
     let admin_addr = state.config.admin_listen;
     let public = public_router(state.clone());
-    let admin = admin_router(state);
+    let admin = admin_router(state.clone());
     let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
     info!(addr = %public_addr, "public listener started");
     info!(addr = %admin_addr, "admin listener started");
 
-    let serve_result = tokio::try_join!(
-        axum::serve(
-            public_listener,
-            public.into_make_service_with_connect_info::<SocketAddr>()
-        ),
-        axum::serve(admin_listener, admin),
-    );
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let public_server = axum::serve(
+        public_listener,
+        public.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_requested(shutdown_receiver.clone()));
+    let admin_server = axum::serve(admin_listener, admin)
+        .with_graceful_shutdown(shutdown_requested(shutdown_receiver));
+    let servers = async { tokio::try_join!(public_server, admin_server).map(|_| ()) };
+    tokio::pin!(servers);
+    let serve_result = tokio::select! {
+        result = &mut servers => result,
+        signal = termination_signal() => {
+            signal?;
+            info!("termination signal received; draining listeners and stopping owned child");
+            state.proxy.admission().block();
+            shutdown_sender.send_replace(true);
+            (&mut servers).await
+        }
+    };
     local_monitor.abort();
     transition_monitor.abort();
+    let stop_result = crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await;
     drop(runtime);
     serve_result?;
+    stop_result?;
     Ok(())
+}
+
+async fn shutdown_requested(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn termination_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = terminate.recv() => {},
+        _ = interrupt.recv() => {},
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn termination_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 async fn persist_runtime_state(
@@ -781,6 +822,25 @@ mod tests {
                 Ok(json!({"executed": true}))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_notification_reaches_both_listeners() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let public = tokio::spawn(shutdown_requested(receiver.clone()));
+        let admin = tokio::spawn(shutdown_requested(receiver));
+        tokio::task::yield_now().await;
+
+        sender.send_replace(true);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), public)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), admin)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn test_state(serving: bool) -> Arc<AppState> {

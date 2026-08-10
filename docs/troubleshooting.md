@@ -66,7 +66,7 @@ Bonjour advertisement/browseは`bridge0`に限定される。Resolved addressが
 
 ### 3.4 Deployment mismatch / promotion拒否
 
-Distributed profileのbinary digest、model digest、checkpoint、context、layer split、wire schema、argv profileを比較する。1つでも不一致/不明ならMXFP4 promotionを拒否するが、Paired Standaloneは維持できる（spec第15.3節）。`ds4_proxy_cluster_deployment_mismatch_total{field}`で不一致fieldを確認する。両nodeのMXFP4 content SHA-256を一致させ、manifestを再fingerprintしてから再試行する。実HELLOなしでpromotionしない（spec第33.3節）。
+Distributed profileの承認済みbinary digest集合、full source commit、model digest、checkpoint、context、layer split、wire schema、argv profileを比較する。各nodeのlocal binary digestが共通の承認集合に含まれない場合、またはcompatibility fieldが1つでも不一致/不明ならMXFP4 promotionを拒否するが、Paired Standaloneは維持できる（spec第15.3節）。`ds4_proxy_cluster_deployment_mismatch_total{field}`で不一致fieldを確認する。未知binaryを集合へ自動追加せず、対象digest pairのactual acceptanceをcompatibility recordへ記録してから両manifestの集合を同時更新する。両nodeのMXFP4 content SHA-256を一致させ、manifestを再fingerprintしてから再試行する。実HELLOなしでpromotionしない（spec第33.3節）。
 
 ### 3.5 Hello / route
 

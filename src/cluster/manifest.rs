@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
-pub const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +18,7 @@ pub struct DistributedManifest {
     pub schema_version: u32,
     pub profile: String,
     pub ds4_binary_sha256: String,
+    pub compatible_ds4_binary_sha256: Vec<String>,
     pub ds4_source_commit: String,
     pub model_sha256: String,
     pub model_size: u64,
@@ -43,6 +44,26 @@ impl DistributedManifest {
         ] {
             validate_sha256(digest)?;
         }
+        if self.compatible_ds4_binary_sha256.is_empty()
+            || self.compatible_ds4_binary_sha256.len() > 8
+            || !self
+                .compatible_ds4_binary_sha256
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(ManifestError::InvalidBinaryCompatibilitySet);
+        }
+        for digest in &self.compatible_ds4_binary_sha256 {
+            validate_sha256(digest)?;
+        }
+        if self
+            .compatible_ds4_binary_sha256
+            .binary_search(&self.ds4_binary_sha256)
+            .is_err()
+        {
+            return Err(ManifestError::BinaryNotApproved);
+        }
+        validate_source_commit(&self.ds4_source_commit)?;
         for value in [
             &self.profile,
             &self.ds4_source_commit,
@@ -69,13 +90,32 @@ impl DistributedManifest {
     }
 
     pub fn deployment_id(&self) -> Result<String, ManifestError> {
-        Ok(lower_hex(&Sha256::digest(self.canonical_json()?)))
+        self.validate()?;
+        let compatibility = DistributedCompatibilityManifest {
+            schema_version: self.schema_version,
+            profile: &self.profile,
+            compatible_ds4_binary_sha256: &self.compatible_ds4_binary_sha256,
+            ds4_source_commit: &self.ds4_source_commit,
+            model_sha256: &self.model_sha256,
+            model_size: self.model_size,
+            checkpoint: &self.checkpoint,
+            model_family: &self.model_family,
+            quantization: &self.quantization,
+            context_size: self.context_size,
+            coordinator_layers: &self.coordinator_layers,
+            worker_layers: &self.worker_layers,
+            ds4_wire_schema: &self.ds4_wire_schema,
+            argv_profile_sha256: &self.argv_profile_sha256,
+        };
+        Ok(lower_hex(&Sha256::digest(canonical_json(&compatibility)?)))
     }
 
     pub fn compatible_with(&self, other: &Self) -> Result<bool, ManifestError> {
         self.validate()?;
         other.validate()?;
-        Ok(self.ds4_binary_sha256 == other.ds4_binary_sha256
+        Ok(self.profile == other.profile
+            && self.compatible_ds4_binary_sha256 == other.compatible_ds4_binary_sha256
+            && self.ds4_source_commit == other.ds4_source_commit
             && self.model_sha256 == other.model_sha256
             && self.model_size == other.model_size
             && self.checkpoint == other.checkpoint
@@ -87,6 +127,24 @@ impl DistributedManifest {
             && self.ds4_wire_schema == other.ds4_wire_schema
             && self.argv_profile_sha256 == other.argv_profile_sha256)
     }
+}
+
+#[derive(Serialize)]
+struct DistributedCompatibilityManifest<'a> {
+    schema_version: u32,
+    profile: &'a str,
+    compatible_ds4_binary_sha256: &'a [String],
+    ds4_source_commit: &'a str,
+    model_sha256: &'a str,
+    model_size: u64,
+    checkpoint: &'a str,
+    model_family: &'a str,
+    quantization: &'a str,
+    context_size: u64,
+    coordinator_layers: &'a str,
+    worker_layers: &'a str,
+    ds4_wire_schema: &'a str,
+    argv_profile_sha256: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +365,12 @@ pub enum ManifestError {
     UnsupportedSchema(u32),
     #[error("manifest SHA-256 fields must contain 64 lowercase hexadecimal characters")]
     InvalidSha256,
+    #[error("compatible DS4 binary SHA-256 values must be a sorted, unique list of 1 to 8 digests")]
+    InvalidBinaryCompatibilitySet,
+    #[error("local DS4 binary SHA-256 is not in the approved compatibility set")]
+    BinaryNotApproved,
+    #[error("DS4 source commit must be a full lowercase hexadecimal Git object ID")]
+    InvalidSourceCommit,
     #[error("manifest string fields must be non-empty")]
     EmptyField,
     #[error("manifest size fields must be positive")]
@@ -394,6 +458,18 @@ fn validate_sha256(value: &str) -> Result<(), ManifestError> {
     }
 }
 
+fn validate_source_commit(value: &str) -> Result<(), ManifestError> {
+    if matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ManifestError::InvalidSourceCommit)
+    }
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -405,10 +481,11 @@ mod tests {
 
     fn manifest() -> DistributedManifest {
         DistributedManifest {
-            schema_version: 1,
+            schema_version: 2,
             profile: "distributed-mxfp4".into(),
             ds4_binary_sha256: "11".repeat(32),
-            ds4_source_commit: "b7e9f00".into(),
+            compatible_ds4_binary_sha256: vec!["11".repeat(32), "44".repeat(32)],
+            ds4_source_commit: "b0309611041655f4e45671cfd9c9886aff161406".into(),
             model_sha256: "22".repeat(32),
             model_size: 100,
             checkpoint: "flash-0731".into(),
@@ -429,6 +506,7 @@ mod tests {
         let keys = [
             "argv_profile_sha256",
             "checkpoint",
+            "compatible_ds4_binary_sha256",
             "context_size",
             "coordinator_layers",
             "ds4_binary_sha256",
@@ -458,12 +536,37 @@ mod tests {
             different.deployment_id().unwrap()
         );
         different.context_size -= 1;
-        different.ds4_source_commit = "diagnostic-only-change".into();
+        different.ds4_source_commit = "55".repeat(20);
         assert_ne!(
             manifest.deployment_id().unwrap(),
             different.deployment_id().unwrap()
         );
-        assert!(manifest.compatible_with(&different).unwrap());
+        assert!(!manifest.compatible_with(&different).unwrap());
+    }
+
+    #[test]
+    fn approved_native_builds_share_one_deployment_but_unknown_builds_fail_closed() {
+        let coordinator = manifest();
+        let mut worker = coordinator.clone();
+        worker.ds4_binary_sha256 = "44".repeat(32);
+        assert!(coordinator.compatible_with(&worker).unwrap());
+        assert_eq!(
+            coordinator.deployment_id().unwrap(),
+            worker.deployment_id().unwrap()
+        );
+
+        worker.ds4_binary_sha256 = "55".repeat(32);
+        assert!(matches!(
+            worker.validate(),
+            Err(ManifestError::BinaryNotApproved)
+        ));
+
+        let mut changed_approval = coordinator.clone();
+        changed_approval.compatible_ds4_binary_sha256 = vec!["11".repeat(32), "55".repeat(32)];
+        assert_ne!(
+            coordinator.deployment_id().unwrap(),
+            changed_approval.deployment_id().unwrap()
+        );
     }
 
     #[tokio::test]
