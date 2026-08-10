@@ -25,7 +25,7 @@
 |---|---|---|
 | Thunderbolt cable着脱10回、event-driven rescan | BLOCKED | 2台の対象Macと物理cableが必要。仕様第32.5節どおり実施する。 |
 | RunAtLoad、proxy restart、single owner | PASS | MacBook ProとMac Studioで旧DS4/proxy labelをdisable/unloadしてplistを退避し、P5-04標準`local.siderostat.runtime`をinstall/bootstrap。`RunAtLoad=true`（login再現の代替静的検証）、`KeepAlive=true`、`ThrottleInterval=10`、absolute args、`kickstart -k`後のrunning/last exit 0、proxy 1、owned DS4 child 1、旧PID/orphanなし、health/readiness/doctor復帰を両nodeで確認。 |
-| 実DS4 HELLO、route、short prompt、8K prefill | BLOCKED | ユーザー指定によりGGUFを使う検証は後で手動実施する。 |
-| Memory pressure/startup/2-hop p50 | BLOCKED | 実modelと対象M4 Max/M5 Max topologyが必要。 |
+| 実DS4 HELLO、route、short prompt、8K prefill | PASS | P4-08で実HELLO、worker registration、complete route、short HTTP 200/1.68秒、8K prefill 9,005 tokens/20.33秒、10回promotion/demotionを確認。 |
+| Memory pressure/startup/2-hop p50 | PASS | P3-07でQ2-Q4 resident/SSD streamingとMXFP4 SSD streamingのstartup/resourceを確認。P7-03で`/v1/models`を51 samples測定し、direct p50 0.244ms、worker 2-hop p50 1.289ms、差分1.045msで目標5ms未満。 |
 
 Agent gateではsecret、model、runtime stateを生成物へ含めていない。Operator gateのBLOCKED項目をproduction enable前にPASSへ更新する。

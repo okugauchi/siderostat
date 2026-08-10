@@ -56,7 +56,7 @@ Actual evidenceにはcommandごとにtimestamp、exit status、上記のsanitize
 
 ## Non-blocking release follow-up
 
-- Expected baseline `b7e9f00`のfull source commitは未確認。Actual distributed acceptanceはsource commit `b0309611041655f4e45671cfd9c9886aff161406`であり、P7 final release acceptanceでbaselineを確定する。
+- P7 final acceptanceでactual distributed acceptance済みのfull source commit `b0309611041655f4e45671cfd9c9886aff161406`をv0.1.0 baselineとして確定した。現行記録は`ds4-b030961.md`を正本とする。
 - Q2 residentは任意profileで、対応full standalone GGUF未配置はP6 / release blockerにしない。
 - Login start、LaunchAgent restart、physical cable detach/reconnectの再実行は、必要に応じてoperatorが既存環境を保全した上で個別に行う。
 

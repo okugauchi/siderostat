@@ -1,6 +1,6 @@
 # siderostat 導入ガイド
 
-この文書は、`docs/spec.md` と `docs/compatibility/ds4-b7e9f00.md` を根拠に、既存DS4環境がない状態から2-nodeの`DistributedReady`へ到達する手順を定める。実DS4 binaryとmodelを使う手順はoperatorが実行し、本guideはその手順と記録方法を定義する。
+この文書は、`docs/spec.md` と `docs/compatibility/ds4-b030961.md` を根拠に、既存DS4環境がない状態から2-nodeの`DistributedReady`へ到達する手順を定める。実DS4 binaryとmodelを使う手順はoperatorが実行し、本guideはその手順と記録方法を定義する。
 
 ## 対象と前提
 
@@ -9,7 +9,7 @@
 - Role addressは`bridge0`のIPv4から決定する。`10.99.0.1`がcoordinator、`10.99.0.2`がworker、その他/未設定/競合はunknown（spec第13.2節）。Roleはconfigで指定しない。
 - Proxyは`rewrite/mode-aware`branchでbuildする。
 
-実DS4 source commit `b7e9f00`は仕様書記載の短縮SHAであり、full SHAは未確認である。利用対象profileとdistributed acceptanceの結果は`docs/compatibility/ds4-b7e9f00.md`で確認する。Source baselineの不一致はfinal release acceptanceまでに解決し、model配布条件や未確認URLを推測しない。
+v0.1.0の実DS4 source baselineはfull commit `b0309611041655f4e45671cfd9c9886aff161406`である。利用対象profile、機種別native binary digest集合、distributed acceptanceの結果は`docs/compatibility/ds4-b030961.md`で確認する。Model配布条件や未確認URLは推測しない。
 
 ## 1. 前提、DS4 checkout/build、digest記録
 
@@ -19,18 +19,18 @@
 - Rust stable（edition 2024）が利用可能。
 - Thunderbolt Bridge `bridge0`がSystem Configurationのnetwork serviceとして存在し、enabledである。
 
-DS4 binaryはoperatorの既知のsourceから取得する。Repository URLや配布条件は推測しない。対象commitを`b7e9f00`へ固定する。
+DS4 binaryはoperatorの既知のsourceから取得する。Repository URLや配布条件は推測しない。対象commitをfull SHAへ固定する。
 
 ```sh
 DS4_CHECKOUT="/absolute/path/to/ds4-checkout"
 git -C "$DS4_CHECKOUT" rev-parse HEAD
-git -C "$DS4_CHECKOUT" checkout b7e9f00
+git -C "$DS4_CHECKOUT" checkout b0309611041655f4e45671cfd9c9886aff161406
 git -C "$DS4_CHECKOUT" rev-parse HEAD
 ```
 
-`rev-parse HEAD`が仕様書記載のexpected baseline `b7e9f00`に対応しない場合、baselineを更新せず作業を停止する。対応する場合のみ続行する。
+`rev-parse HEAD`がverified baseline `b0309611041655f4e45671cfd9c9886aff161406`と一致しない場合、baselineを更新せず作業を停止する。一致する場合のみ続行する。
 
-DS4 binaryをbuildし、digestを記録する。Build手順はoperatorの既知のsourceに従う。Binary pathとSHA-256を`docs/compatibility/ds4-b7e9f00.md`へ追記する。
+DS4 binaryをbuildし、digestを記録する。Build手順はoperatorの既知のsourceに従う。Binary pathとSHA-256を`docs/compatibility/ds4-b030961.md`へ追記する。
 
 ```sh
 DS4_BINARY="/absolute/path/to/ds4-server"
@@ -46,7 +46,7 @@ sha256(<absolute-ds4-binary>)
 git -C <ds4-checkout> rev-parse HEAD
 ```
 
-Supervisorが使用予定のoptionがCLI helpに存在することを確認する（`docs/compatibility/ds4-b7e9f00.md`のCLI compatibility一覧）。`--version`はunknown optionとして拒否されるため、binary単体からcommitは確定できない。
+Supervisorが使用予定のoptionがCLI helpに存在することを確認する（`docs/compatibility/ds4-b030961.md`のCLI compatibility一覧）。`--version`はunknown optionとして拒否されるため、binary単体ではなくsource checkoutでcommitを確定する。
 
 ## 2. Model選択/取得/checksum/配置
 
@@ -73,7 +73,7 @@ Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributed
 
 ## 3. Resident/SSD streaming standalone smoke
 
-実DS4とmodelを使うため、この手順はoperator gateである。`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixを基準とし、次の対象を確認する。
+実DS4とmodelを使うため、この手順はoperator gateである。`docs/compatibility/ds4-b030961.md`のModel/profile matrixを基準とし、次の対象を確認する。
 
 - Q2-Q4 resident standaloneでrequest成功。Q2は対応するfull standalone modelを利用する構成だけで追加確認する。
 - Q2-Q4 resident + DSparkでsanitized `dspark-activated` log、HTTP readiness、short requestを確認する。
@@ -82,7 +82,7 @@ Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributed
 - `ssd-streaming`はDS4の`--ssd-streaming`を意味し、model variantと混同しない（spec第14.1節）。`residency="resident"`ではSSD streaming optionを生成しない。
 - HTTP readiness、short prompt、streaming、memory/startup timeを確認する。
 
-実測結果を`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixへ追記し、productionで利用するprofileのstatusをPASSへ更新してから次へ進む。利用対象外のQ2 resident、Q2 SSD streaming、MXFP4 residentはPhase 6 / release gateにしない。
+実測結果を`docs/compatibility/ds4-b030961.md`のModel/profile matrixへ追記し、productionで利用するprofileのstatusをPASSへ更新してから次へ進む。利用対象外のQ2 resident、Q2 SSD streaming、MXFP4 residentはrelease gateにしない。
 
 ## 4. Thunderbolt固定IPv4、bridge/route確認
 
@@ -303,7 +303,7 @@ Login起動、proxy restart、no duplicate childはoperator gateである（GUI 
 
 DS4 update時は`docs/spec.md`第36節のcompatibility trackingに従う。
 
-- Verified DS4 commit、binary digest、wire/log fixture digest、recognized event、tested model/topology、dateを`docs/compatibility/ds4-b7e9f00.md`へ記録する。
+- Verified DS4 commit、binary digest、wire/log fixture digest、recognized event、tested model/topology、dateを`docs/compatibility/ds4-b030961.md`へ記録する。
 - `ds4_distributed.c/.h`、model ID/name/quant/layer API、server signal handling、server/distributed log、GGUF/checkpoint、CLI option、distributed QAを確認する。
 - Unknown changeではpromotionをfail closedにする。
 
@@ -327,4 +327,4 @@ mv "$HOME/Library/LaunchAgents/local.siderostat.runtime.plist" "$HOME/Library/La
 
 現在利用中の2-node環境を初期化してclean user accountを用意することは必須としない。文書gateは、repository-localなcommand/config/link/plist検証と、既存環境で取得済みの2-node actual acceptance証跡を組み合わせて判定できる。Install、login restart、cable detach/reconnectを再実行する場合は、既存model、secret、config、runtime stateを削除または上書きせず、operatorが承認した隔離pathかbackupを使う。
 
-Production enableには`docs/compatibility/ds4-b7e9f00.md`の利用対象profileとdistributed acceptanceがPASSであることを要求する。利用対象外profileの未検証はblockerにしない。DS4 source baselineの不一致は文書gateと分離し、final release acceptanceで解決する。
+Production enableには`docs/compatibility/ds4-b030961.md`のsource commit、approved native binary集合、利用対象profile、distributed acceptanceがPASSであることを要求する。利用対象外profileの未検証はblockerにしない。

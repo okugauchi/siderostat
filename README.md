@@ -142,8 +142,10 @@ DS4 native distributed trafficとpeer proxy bodyは暗号化されません。�
 - [`docs/installation.md`](docs/installation.md): 実DS4/modelを使う導入ガイド
 - [`docs/operations.md`](docs/operations.md): 運用ガイド（status、doctor、logs、metrics、manual state、restart、rollback）
 - [`docs/troubleshooting.md`](docs/troubleshooting.md): failure symptom別の診断手順
-- [`docs/compatibility/ds4-b7e9f00.md`](docs/compatibility/ds4-b7e9f00.md): DS4 compatibility記録
+- [`docs/compatibility/ds4-b030961.md`](docs/compatibility/ds4-b030961.md): v0.1.0 DS4 compatibility記録
 - [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
 - [`docs/compatibility/documentation-clean-install-2026-08-10.md`](docs/compatibility/documentation-clean-install-2026-08-10.md): P6-05導入文書検証記録
+- [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md): v0.1.0 release notes
+- [`docs/releases/v0.1.0-acceptance.md`](docs/releases/v0.1.0-acceptance.md): final acceptanceとrelease artifact checksum
 - [`siderostat.example.toml`](siderostat.example.toml): 配布用config例
 - [`contrib/launchd/README.md`](contrib/launchd/README.md): macOS LaunchAgentのinstall/verify/uninstall
