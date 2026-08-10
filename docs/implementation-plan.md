@@ -945,7 +945,7 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 
 Evidence: `.github/workflows/ci.yml`、PR #1、GitHub Actions run `31420776183`; macOS runnerで`fmt`（9秒）、`clippy`（32秒）、通常/all-feature test（1分10秒）がPASS。Rust 1.97で追加されたClippy `question_mark`指摘を等価変換で修正し、localでもfmt、clippy、通常148 unit + 3 integration、all-feature 148 unit + 9 integration、`git diff --check`をPASS。3 protected branchはstrict required contexts `fmt`/`clippy`/`test`を満たさないPRをmerge不能とした; 2026-08-11
 
-#### [ ] P7-02 Legacy migrationとrollback rehearsalを行う
+#### [x] P7-02 Legacy migrationとrollback rehearsalを行う
 
 - Actor: operator
 - Depends on: P7-01
@@ -953,6 +953,8 @@ Evidence: `.github/workflows/ci.yml`、PR #1、GitHub Actions run `31420776183`;
 - Actions: Legacy config rejection、旧SQLite非変更、新旧config分離、binary rollback、standalone readinessを確認
 - Verification: Upgrade後にrollbackし、再度upgrade
 - Done when: User data削除なしで往復成功
+
+Evidence: `docs/compatibility/migration-rollback-2026-08-11.md`、`docs/releases/v0.1.0.md`; MacBook Proでlegacy fixtureをcandidateへ渡すとlegacy 6 fieldを列挙したactionable errorでexit 1となり、旧affinity SQLiteのSHA-256/size 16384/mtimeが実行前後で一致。新旧configは別absolute path。配備済みbinary（SHA-256 `47d5488b…760e841`）を隔離保全し、release candidate（`cb2ae7c4…31fbc17`）へupgrade、previousへrollback、candidateへ再upgradeした。各段階で約30秒以内にSoloStandaloneReady、proxy 1、owned DS4 child 1、health/readinessを確認し、最終candidateでdoctor healthy。Model、KV、secret、state、SQLiteは削除・移動・上書きせず、両binaryを復旧可能に保持した; 2026-08-11
 
 #### [ ] P7-03 Final acceptanceとrelease artifactを作る
 
