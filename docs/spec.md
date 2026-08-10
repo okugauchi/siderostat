@@ -1508,7 +1508,7 @@ persistence.rs（cluster state_storeへ置換）
 - Memory pressure/startup time許容。
 - Cable disconnectで両node local standalone復帰。
 - Reconnect/backoff後Paired Standalone、次いでMXFP4再昇格。
-- Proxy起動中に10回cable着脱し、eventごとにpolling待ちなしでrescanが開始され、orphan transitionがない。
+- Proxy起動中に2回連続で実cable着脱し、eventごとにpolling待ちなしでrescanが開始され、orphan transitionがない。反復耐久性はfake route detach/attach 10回とpromotion/demotion 10回の自動testで補完する。
 - Thunderbolt dockだけの着脱ではpeer presentにならない。
 - Bonjour advertisementを通常LANでも観測できる環境で、`bridge0` 以外のresultを拒否する。
 - Login起動、proxy restart、child restart成功。
