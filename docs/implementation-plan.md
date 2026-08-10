@@ -242,7 +242,7 @@ Evidence: local branch `legacy/load-balancer-v1` とannotated tag `load-balancer
 
 Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementation-plan.md`; `git diff --check`、4文書だけのstatus/diff確認、`rewrite/mode-aware`への到達性確認; 2026-08-06
 
-#### [-] T-04 Repository protectionを設定する
+#### [x] T-04 Repository protectionを設定する
 
 - Actor: operator
 - Depends on: T-03
@@ -251,6 +251,8 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 - Verification: Force push禁止とrequired checksをhost UI/APIで確認
 - Done when: 設定のscreenshotまたはURLをevidenceに記録
 - Stop when: Required CI自体が未作成。P7-01へ延期してよい
+
+Evidence: GitHub branch protection APIで`main`、`rewrite/mode-aware`、`legacy/load-balancer-v1`にrequired checks `fmt`/`clippy`/`test`、PR必須、admin適用、conversation resolution必須、force push禁止、branch deletion禁止を設定。各protection URLとAPI responseを確認した; 2026-08-11
 
 ### Phase 0: Baselineとtest基盤
 
@@ -932,7 +934,7 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 
 ### Phase 7: Migrationとrelease
 
-#### [-] P7-01 CIとbranch protectionをrelease条件へ合わせる
+#### [x] P7-01 CIとbranch protectionをrelease条件へ合わせる
 
 - Actor: agent + operator
 - Depends on: P6-06
@@ -940,6 +942,8 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 - Actions: fmt、clippy、unit/integration testをrequired checkにする
 - Verification: PR上で各check成功、failure時merge不可
 - Done when: `CONTRIBUTING.md`のprotectionを満たす
+
+Evidence: `.github/workflows/ci.yml`、PR #1、GitHub Actions run `31420776183`; macOS runnerで`fmt`（9秒）、`clippy`（32秒）、通常/all-feature test（1分10秒）がPASS。Rust 1.97で追加されたClippy `question_mark`指摘を等価変換で修正し、localでもfmt、clippy、通常148 unit + 3 integration、all-feature 148 unit + 9 integration、`git diff --check`をPASS。3 protected branchはstrict required contexts `fmt`/`clippy`/`test`を満たさないPRをmerge不能とした; 2026-08-11
 
 #### [ ] P7-02 Legacy migrationとrollback rehearsalを行う
 
