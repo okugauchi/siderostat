@@ -242,7 +242,7 @@ Evidence: local branch `legacy/load-balancer-v1` とannotated tag `load-balancer
 
 Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementation-plan.md`; `git diff --check`、4文書だけのstatus/diff確認、`rewrite/mode-aware`への到達性確認; 2026-08-06
 
-#### [ ] T-04 Repository protectionを設定する
+#### [-] T-04 Repository protectionを設定する
 
 - Actor: operator
 - Depends on: T-03
@@ -932,7 +932,7 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 
 ### Phase 7: Migrationとrelease
 
-#### [ ] P7-01 CIとbranch protectionをrelease条件へ合わせる
+#### [-] P7-01 CIとbranch protectionをrelease条件へ合わせる
 
 - Actor: agent + operator
 - Depends on: P6-06
