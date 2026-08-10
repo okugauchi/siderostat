@@ -3,8 +3,8 @@
 use ds4_smart_proxy::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
-        ControlRole, ControlSecret, Ds4Command, Ds4Profile, ModeRuntime, NodeDescriptor,
-        StandaloneSupervisor, WorkerControl,
+        ControlRole, ControlSecret, Ds4Command, Ds4Profile, LocalStandaloneLifecycle, ModeRuntime,
+        NodeDescriptor, StandaloneSupervisor, WorkerControl,
     },
     config::{ModelVariant, Residency},
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
@@ -64,11 +64,13 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
             OsString::from(address.to_string()),
             OsString::from("--exit-after-ms"),
             OsString::from("500"),
+            OsString::from("--emit-dspark-activation"),
         ],
         profile: Ds4Profile {
             profile_id: "phase3-fake".into(),
             model_variant: ModelVariant::Q2,
             residency: Residency::Resident,
+            dspark_required: true,
         },
     };
     let models_url = url::Url::parse(&format!("http://{address}/v1/models")).unwrap();
@@ -165,4 +167,36 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
             .status()
             .is_success()
     );
+}
+
+#[tokio::test]
+async fn dspark_profile_without_activation_event_fails_readiness_and_reaps_child() {
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let command = Ds4Command {
+        executable: PathBuf::from(env!("CARGO_BIN_EXE_fake-ds4")),
+        working_directory: std::env::temp_dir(),
+        argv: vec![
+            OsString::from("--listen"),
+            OsString::from(address.to_string()),
+        ],
+        profile: Ds4Profile {
+            profile_id: "phase3-dspark-missing-activation".into(),
+            model_variant: ModelVariant::Q2Q4,
+            residency: Residency::Resident,
+            dspark_required: true,
+        },
+    };
+    let supervisor = StandaloneSupervisor::new(
+        command,
+        url::Url::parse(&format!("http://{address}/v1/models")).unwrap(),
+        Duration::from_secs(1),
+        Duration::from_millis(20),
+        Duration::from_secs(1),
+        false,
+    );
+    let error = supervisor.start(1).await.unwrap_err();
+    assert!(format!("{error:#}").contains("DSpark activation"));
+    assert!(supervisor.child_identity().await.is_none());
 }

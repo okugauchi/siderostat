@@ -103,6 +103,8 @@ pub enum ProcessControlError {
     EarlyExit(std::process::ExitStatus),
     #[error("child HTTP readiness timed out")]
     ReadinessTimeout,
+    #[error("DSpark activation was not observed before standalone readiness deadline")]
+    DsparkActivationTimeout,
     #[error("readiness timeout and poll interval must be positive")]
     InvalidReadinessTiming,
     #[error(transparent)]
@@ -329,20 +331,52 @@ impl StandaloneSupervisor {
             return Ok(());
         }
         *slot = None;
+        let startup_deadline = Instant::now() + self.inner.startup_timeout;
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let (mut logs, forwarders) = child.start_log_forwarding(256)?;
+        let stdout = child
+            .take_stdout()
+            .ok_or(ProcessControlError::MissingLogPipe)?;
+        let stderr = child
+            .take_stderr()
+            .ok_or(ProcessControlError::MissingLogPipe)?;
+        let (mut logs, mut events, forwarders) = spawn_child_log_forwarders_with_events(
+            stdout,
+            stderr,
+            Arc::from(child.identity().profile_id.as_str()),
+            child.identity().generation,
+            child.identity().pid,
+            256,
+        );
+        let (dspark_activation, mut dspark_activation_rx) = tokio::sync::watch::channel(false);
+        let activation_profile = self.inner.command.profile.profile_id.clone();
         let log_task = tokio::spawn(async move {
-            while let Some(record) = logs.recv().await {
-                tracing::info!(
-                    profile = %record.profile_id,
-                    generation = record.generation,
-                    pid = record.pid,
-                    stream = ?record.stream,
-                    truncated = record.truncated,
-                    event = ?record.event,
-                    line_bytes = record.line.len(),
-                    "DS4 child log"
-                );
+            loop {
+                tokio::select! {
+                    Some(event) = events.recv() => {
+                        if event == Ds4LogEvent::DsparkActivated {
+                            dspark_activation.send_replace(true);
+                            tracing::info!(
+                                event = "dspark-activated",
+                                profile = %activation_profile,
+                                generation,
+                                "DS4 standalone feature activated"
+                            );
+                        }
+                    }
+                    Some(record) = logs.recv() => {
+                        tracing::info!(
+                            profile = %record.profile_id,
+                            generation = record.generation,
+                            pid = record.pid,
+                            stream = ?record.stream,
+                            truncated = record.truncated,
+                            event = ?record.event,
+                            line_bytes = record.line.len(),
+                            "DS4 child log"
+                        );
+                    }
+                    else => break,
+                }
             }
         });
         if let Err(error) = child
@@ -359,6 +393,25 @@ impl StandaloneSupervisor {
                 .await;
             log_task.abort();
             return Err(error.into());
+        }
+        if self.inner.command.profile.dspark_required && !*dspark_activation_rx.borrow() {
+            let remaining = startup_deadline.saturating_duration_since(Instant::now());
+            let activation_observed = match tokio::time::timeout(
+                remaining,
+                dspark_activation_rx.wait_for(|activated| *activated),
+            )
+            .await
+            {
+                Ok(Ok(activated)) => *activated,
+                Ok(Err(_)) | Err(_) => false,
+            };
+            if !activation_observed {
+                let _ = child
+                    .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
+                    .await;
+                log_task.abort();
+                return Err(ProcessControlError::DsparkActivationTimeout.into());
+            }
         }
         *slot = Some(SupervisedChild {
             child,
@@ -557,7 +610,7 @@ impl DistributedCoordinatorSupervisor {
                                 state.complete_route = false;
                             }
                             Ds4LogEvent::RouteIncomplete { .. } => state.complete_route = false,
-                            Ds4LogEvent::HttpListening { .. } => {}
+                            Ds4LogEvent::HttpListening { .. } | Ds4LogEvent::DsparkActivated => {}
                         }
                         route.send_replace(state);
                     }
@@ -1142,6 +1195,7 @@ mod tests {
                 profile_id: "process-smoke".into(),
                 model_variant: ModelVariant::Q2,
                 residency: Residency::Resident,
+                dspark_required: false,
             },
         };
         let mut child = ManagedChild::spawn(&command, 9).await.unwrap();
@@ -1166,6 +1220,7 @@ mod tests {
                 profile_id: "distributed-worker-smoke".into(),
                 model_variant: ModelVariant::Mxfp4,
                 residency: Residency::Resident,
+                dspark_required: false,
             },
         };
         let supervisor = DistributedWorkerSupervisor::new(command, Duration::from_secs(2), false);

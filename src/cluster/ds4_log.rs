@@ -17,6 +17,7 @@ pub enum ChildLogStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ds4LogEvent {
     HttpListening { url: Url },
+    DsparkActivated,
     WorkerRegistered { detail: String },
     CompleteRouteReady { detail: String },
     WorkerRemoved { detail: String },
@@ -147,6 +148,7 @@ pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
     const COMPLETE: &str = "ds4: distributed coordinator: complete route ready: ";
     const REMOVED: &str = "ds4: distributed coordinator: removed worker ";
     const INCOMPLETE: &str = "ds4: distributed coordinator: route incomplete; ";
+    const DSPARK_ACTIVATED: &str = "ds4: DSpark target-hidden capture enabled: layers=";
 
     if let Some(value) = line.strip_prefix(LISTENING) {
         let url = Url::parse(value.trim()).ok()?;
@@ -154,6 +156,12 @@ pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
             return None;
         }
         return Some(Ds4LogEvent::HttpListening { url });
+    }
+    if line
+        .strip_prefix(DSPARK_ACTIVATED)
+        .is_some_and(|layers| !layers.trim().is_empty())
+    {
+        return Some(Ds4LogEvent::DsparkActivated);
     }
     let parsed = [
         (REGISTERED, 0_u8),
@@ -258,6 +266,10 @@ mod tests {
             parse_ds4_log_event("ds4-server: listening on http://127.0.0.1:8080"),
             Some(Ds4LogEvent::HttpListening { .. })
         ));
+        assert_eq!(
+            parse_ds4_log_event("ds4: DSpark target-hidden capture enabled: layers=3,7,11"),
+            Some(Ds4LogEvent::DsparkActivated)
+        );
         assert_eq!(
             parse_ds4_log_event("ds4: distributed coordinator: registered worker node-b"),
             Some(Ds4LogEvent::WorkerRegistered {

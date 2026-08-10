@@ -4,9 +4,10 @@ use crate::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ClusterEvent, ClusterEventKind,
         ClusterHandle, DistributedManifest, FingerprintProfile, ModeRuntime,
         PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState, PersistentMode,
-        PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneSupervisor,
-        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
-        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
+        PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
+        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
+        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
+        required_port_available,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
@@ -226,6 +227,22 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     // Childを起動する前にmutation認証材料を確定し、起動途中のorphanを防ぐ。
+    if config.ds4.dspark.enabled {
+        let manifest_bytes = std::fs::read(&config.ds4.standalone.model_manifest)?;
+        let manifest = serde_json::from_slice::<StandaloneManifest>(&manifest_bytes)?;
+        let support_model = config
+            .ds4
+            .dspark
+            .support_model
+            .as_deref()
+            .context("DSpark support model is unavailable")?;
+        let fingerprint = fingerprint_file(support_model).await?;
+        manifest.validate_dspark_binding(
+            &fingerprint,
+            config.ds4.dspark.confidence,
+            config.ds4.dspark.strict,
+        )?;
+    }
     let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
     let control_secret = if config.cluster.enabled {
         Some(std::fs::read(&config.cluster.security.control_secret_file)?)

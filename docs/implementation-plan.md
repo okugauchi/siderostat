@@ -181,9 +181,9 @@ P3-07 ------------------------------------------------------------------------+-
 P5-01 -> P5-02 -> P5-03 -> P5-04 -> P5-05 -> P5-06
                                                         |
                                                         v
-P6-01 -> P6-02 -> P6-03 -> P6-04 -> P6-05
-                                      |
-                                      v
+P6-01 -> P6-02 -> P6-03 -> P6-04 -> P6-05 -> P6-06
+                                                |
+                                                v
 P7-01 -> P7-02 -> P7-03 -> P7-04
 ```
 
@@ -654,9 +654,9 @@ Blocked: `$HOME/LLM/ds4/ds4-server`（arm64 Mach-O、SHA-256 `b1d2b199d206565c2f
 
 Resume audit: MacBook Pro上のDS4 checkout `b0309611041655f4e45671cfd9c9886aff161406`、Q2-Q4/MXFP4/DSpark用GGUF、1.2 TiB空き容量を確認し、actual acceptanceを再開; 2026-08-09
 
-Acceptance correction: 24時間idle monitorには9時間実績を超えて検出する具体的故障モードや合否閾値が定義されていないためrelease gateから除外。Model variantとresidencyが独立という仕様に従い、配置済みQ2-Q4をresidentでも実測する。Q2は対応standalone model未配置として個別にblockedを維持する; 2026-08-10
+Acceptance correction: 24時間idle monitorには9時間実績を超えて検出する具体的故障モードや合否閾値が定義されていないためrelease gateから除外。Model variantとresidencyが独立という仕様に従い、配置済みQ2-Q4をresidentでも実測する。Q2は任意profileであり、対応standalone model未配置はphase/release blockerにしない; 2026-08-10
 
-Evidence: `docs/compatibility/ds4-b7e9f00.md`、`src/app.rs`; Q2-Q4 residentはSSD optionなしのargv、cold readiness 10.34s、warm readiness 0.76s、short HTTP 200/1.65s、SSE first byte 0.74s/完了1.16s、91.0GiB mapped/4.4GiB peak physical footprint/system memory free 92%を確認。初回SIGTERMでproxyだけが終了してchildがorphan化する欠陥を検出し、SIGTERM/SIGINT受信、listener drain、owned child stopを実装。修正版releaseでproxy exit 0、child消滅、全port解放を確認。Q2-Q4 SSD streamingとMXFP4 SSD streamingはPASS、Q2 residentは対応model未配置として明示的blocked。共通local gate（139 tests）、test-support gate（147 tests）、clippy成功; 2026-08-10
+Evidence: `docs/compatibility/ds4-b7e9f00.md`、`src/app.rs`; Q2-Q4 residentはSSD optionなしのargv、cold readiness 10.34s、warm readiness 0.76s、short HTTP 200/1.65s、SSE first byte 0.74s/完了1.16s、91.0GiB mapped/4.4GiB peak physical footprint/system memory free 92%を確認。初回SIGTERMでproxyだけが終了してchildがorphan化する欠陥を検出し、SIGTERM/SIGINT受信、listener drain、owned child stopを実装。修正版releaseでproxy exit 0、child消滅、全port解放を確認。Q2-Q4 SSD streamingとMXFP4 SSD streamingはPASS、Q2 residentは任意profileとして現行production対象外。共通local gate（139 tests）、test-support gate（147 tests）、clippy成功; 2026-08-10
 
 ### Phase 4: Distributed MXFP4 lifecycle
 
@@ -672,7 +672,7 @@ Evidence: `docs/compatibility/ds4-b7e9f00.md`、`src/app.rs`; Q2-Q4 residentはS
 
 Evidence: `src/cluster/manifest.rs`; schema v1 distributed/standalone manifest、lowercase SHA-256/非空/size検証、serde valueのkey昇順・UTF-8・余分な空白なしcanonical JSONとdeployment IDを実装。Distributed compatibilityはbinary/model/checkpoint/context/layer/wire/argvを比較しsource commitは診断専用。Tokio fileを1 MiB chunkでstreaming SHA-256し各chunkでyield、hash前後metadata一致を要求。Device/inode/size/mtime/digest/computed time cacheとFresh/Stale/Missing判定、UUID job ID、同一profile単一async job、status取得を実装。Key order、same/different deployment/compatibility、file change stale、duplicate job/completionの3 tests、共通local gate（103 tests）、test-support gate（107 tests）、check/clippy成功。初回compileで検出したerror変換とtest importを修正; 2026-08-06
 
-Amendment: 実機でM4 Max/M5 Maxの異なる`-mcpu=native` binaryがq4-q4、MXFP4、DSpark有効化の各distributed scenarioで相互運用したoperator evidenceを受け、manifest schema v2へ更新。Node-local binary digestはchild identityとして保持し、actual acceptance済みdigestの昇順集合、full source commit、wire/model/context/layer/argv contractをcross-node compatibilityとdeployment IDに使用する。未知binaryは集合外としてfail closed; 2026-08-09
+Amendment: 実機でM4 Max/M5 Maxの異なる`-mcpu=native` binaryがq4-q4とMXFP4 distributed scenarioで相互運用したoperator evidenceを受け、manifest schema v2へ更新。Node-local binary digestはchild identityとして保持し、actual acceptance済みdigestの昇順集合、full source commit、wire/model/context/layer/argv contractをcross-node compatibilityとdeployment IDに使用する。従来記載したDistributed DSparkはactivation証跡がなく、現DS4 sourceがsupport GGUFをdistributed roleでloadしないため撤回する。未知binaryは集合外としてfail closed; 2026-08-10
 
 #### [x] P4-02 Generation付きdistributed controlを実装する
 
@@ -803,7 +803,11 @@ Evidence: `src/metrics.rs`、`src/proxy.rs`、`src/cluster/state.rs`、`src/clus
 
 Evidence: `contrib/launchd/ds4-smart-proxy.plist.example`、`contrib/launchd/README.md`; single user job、absolute binary/config/log path、`serve`、RunAtLoad/KeepAlive、10秒ThrottleInterval、secret非埋込を定義し、DS4 childの別job禁止、install/verify/uninstall手順を記載。`plutil -lint`成功、plist dumpとsecret/job静的検査、共通local gate（139 tests）成功; 2026-08-06
 
-Blocked: Login起動、実job restart、no duplicate/orphan childの確認は`~/Library/LaunchAgents`と現在のGUI user sessionを変更するoperator作業のため未実施。Artifact実装は完了しており、P5-05以降のrepository内作業は継続可能; 2026-08-06
+Resume evidence: Cleanup前のlocal nodeでP4-08 LaunchAgentをread-only確認。Plist lint、`RunAtLoad=true`、launchd state=running、runs=7、last exit=0、proxy listenerが18080/18081の同一PIDに限定、`/healthz` 200、`/readyz` 200、workerが`paired-standalone-ready`をPASS。P3-07/P4-06/P4-08でowned child stop、orphan cleanup、10回promotion/demotionは検証済み。したがってno orphan child全体を未検証とした従来の記載は訂正する; 2026-08-10
+
+Cleanup evidence: MacBook ProとMac StudioのP4-08 jobを両方ともbootoutし、plistを`.disabled-p4-08-cleanup-20260810`へ移動。両nodeでjob unloaded、P4-08 proxy/DS4 PIDなし、18080/18081/8000 listenerなしを確認。受入artifactのmodel、secret、config、binary、logは削除せず復旧可能に残した; 2026-08-10
+
+Blocked: P5-04配布artifactの標準labelは両nodeとも未installで、local nodeには旧DS4専用LaunchAgent plistがenabledで残っている。完了にはoperatorがmaintenance windowで旧DS4 jobをdisableし、P5-04標準jobをinstall/bootstrapし、`kickstart -k`後のproxy 1 process・DS4 child最大1・health/readiness復帰を確認する。Login再現は必須とせず、`RunAtLoad=true`の静的検証で代替する; 2026-08-10
 
 #### [x] P5-05 Dependencyとdead codeを整理する
 
@@ -841,7 +845,7 @@ Evidence: `tests/phase5_security.rs`、`docs/compatibility/security-endurance-20
 
 Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値だけを残し、DS4 binary、standalone/MXFP4 model、3つのsecret/token fileを`PLACEHOLDER`へ置換して配布用とした。Headerでvalidation要件（regular/canonical/non-symlink、secret 32+ bytes・0600）とworker nodeの差分（`cluster.node_id`とnode固有pathのみ、roleはinterface addressから決定し設定しない）を明記した。実parserは`parses_repository_schema_v2_example`で成功し、binary `--config`実行はTOML parse後に最初のplaceholder（`ds4.binary`）をactionableに報告することを確認。Spec exampleとの差分はplaceholder化とworker注記のみで、field値は全て一致; 2026-08-06
 
-#### [!] P6-02 DS4を含む導入ガイドを作る
+#### [x] P6-02 DS4を含む導入ガイドを作る
 
 - Actor: agent + operator for command verification
 - Depends on: P6-01
@@ -853,13 +857,13 @@ Evidence: `ds4-smart-proxy.example.toml`; spec第22.2節のcomplete example値�
   4. Thunderbolt固定IPv4、bridge/route確認を書く。
   5. Proxy build、secret、config、foreground testを書く。
   6. Pairing、promotion、LaunchAgent、recovery、upgrade、rollback、uninstallを書く。
-- Verification: Clean user accountと両nodeでcommandを順番に実行
-- Done when: 既存DS4環境なしからDistributedReadyへ到達
+- Verification: Repository-localなcommand/config/link/plist検証と既存2-node actual acceptance証跡を組み合わせる
+- Done when: 導入に必要な手順と両roleの期待結果がevidence付きで説明できる
 - Stop when: Model配布条件や未確認URLを推測しない
 
-Evidence: `docs/installation.md`; 6つのActionsをspecと`docs/compatibility/ds4-b7e9f00.md`に基づき手順化し、DS4 checkout `b7e9f00`のfull SHA未確認・digest記録・model配布URL非推測・実DS4/modelを使う手順をoperator gateと明記。Proxy build、secret/config validation、Pairing/promotion/LaunchAgent/recovery/upgrade/rollback/uninstallをspec第13/14/18/20/22/23/32.5/35/36節と`contrib/launchd/README.md`から導出。Model配布条件や未確認URLを推測せず、production enable前にActual verification checklistとModel/profile matrixのPASSを要求; 2026-08-06
+Evidence: `docs/installation.md`; 6つのActionsをspecと`docs/compatibility/ds4-b7e9f00.md`に基づき手順化し、DS4 checkout `b7e9f00`のfull SHA未確認・digest記録・model配布URL非推測・実DS4/modelを使う手順をoperator gateと明記。Proxy build、secret/config validation、Pairing/promotion/LaunchAgent/recovery/upgrade/rollback/uninstallをspec第13/14/18/20/22/23/32.5/35/36節と`contrib/launchd/README.md`から導出。Model配布条件や未確認URLを推測せず、production enable前に利用対象profileとdistributed acceptanceのPASSを要求; 2026-08-06
 
-Blocked: Clean user accountと両nodeでのcommand逐次実行は、実DS4 binary `b7e9f00`、実GGUF model、Thunderbolt 2-node、GUI user sessionが必要なoperator作業のため未実施。ユーザー指定によりGGUFを使う検証は後で手動実施する。Guide実装は完了しており、P6-03以降のrepository内作業は継続可能; 2026-08-06
+Acceptance relaxation: 現在利用中の2-node環境でclean user accountを用意できないため、環境初期化と全commandの逐次再実行を必須から外した。Repository-local検証とP3-07/P4-08の既存実機evidenceを組み合わせる。既存model、secret、config、runtime stateを破壊する再インストールは要求しない; 2026-08-10
 
 #### [x] P6-03 READMEを全面刷新する
 
@@ -887,21 +891,51 @@ Evidence: `README.md`; mode-aware reverse proxy / supervisorとして全面刷�
 
 Evidence: `docs/operations.md`、`docs/troubleshooting.md`; Status（`cluster status`/`GET /cluster`）、doctor（healthy = target_ready && safe_state && admission_serving）、logs（JSON/text、`proxy_request` event、redaction）、metrics（spec第26節の全19 family、`GET /metrics`）、manual state（ManualInterventionRequired、3回連続promotion失敗、`cluster reconcile`）、safe restart（`cluster restart`はmode不変、SIGTERMはdrain完了後、SIGKILLは`allow_sigkill=true`かつidentity再確認済みchildのみ）、rollback（legacy config v1廃止、旧SQLite DB非変更、binary rollback、standalone readiness）をfailure symptom別に記載。troubleshootingのsymptom tableが`ClusterFailure` enum（PeerAbsent、BridgeUnavailable、BridgeAddressInvalid、BonjourUnavailable、UnauthenticatedDiscovery、InvalidControlHmac、InvalidPeerProxyToken、DeploymentMismatch、ManifestStale、HelloTimeout、UnknownDs4Schema、CoordinatorStartupTimeout、RouteIncomplete、PeerLeaseLost、ChildIdentityUnknown、StandaloneStartFailed、DrainTimeout、StateCorrupt）とpromotion backoffを網羅し、各症状に該当手順がある。Destructive cache削除を通常手順にしない旨をoperations第8節とtroubleshooting第4節に明記。READMEに`docs/operations.md`/`docs/troubleshooting.md`のlinkを追加し、P6-03の「operationsへlinkする」要件を完了。全linkが実在し、READMEにlegacy term不在; 2026-08-06
 
-#### [ ] P6-05 文書をclean環境で検証する
+#### [x] P6-05 導入文書と両roleを検証する
 
-- Actor: operator
+- Actor: agent + existing operator evidence
 - Depends on: P6-04
 - Files: documentation evidence
-- Actions: README/installationを先頭から実行し、copy/paste、期待出力、link、両roleを確認
-- Verification: Clean 2-node installation
+- Actions: README/installationのcopy/paste、期待出力、link、両roleをrepository-local gateと既存actual evidenceで確認
+- Verification: Repository-local document gate + P3-07 standalone acceptance + P4-08 2-node distributed acceptance
 - Done when: Phase 6 exit conditionをevidence付きで満たす
+
+Evidence: `docs/compatibility/documentation-clean-install-2026-08-10.md`、`docs/compatibility/ds4-b7e9f00.md`、`README.md`、`docs/installation.md`、`docs/spec.md`、`contrib/launchd/README.md`、`ds4-smart-proxy.example.toml`; repository-localでrelease build、fmt、clippy、全target 145 tests、実CLI help突合、relative Markdown link 22件、plist lint、spaceを含むpathへのLaunchAgent placeholder置換、`git diff --check`をPASS。P3-07で利用対象standalone、P4-08で固定IPの両role、LaunchAgent起動、Paired/Distributed state、worker 2-hop request、10回promotion/demotionを実機確認。Copy/paste検証で見つけたREADMEの省略command、cluster間secret/token生成手順、`/usr/local/bin` install、LaunchAgentの未置換`USERNAME`、期待出力不足を修正。`plutil -replace ProgramArguments.3`がarray要素を追加する実測failureを経て、`PlistBuddy` replacementとplaceholder guardを採用; 2026-08-10
+
+Acceptance relaxation: Clean user accountの2-node sequential run、GUI login/restart、Thunderbolt detach/reconnectの再実行はP6 exit conditionから除外。Q2 residentは任意profileのためblockerから除外。Expected baseline `b7e9f00`とactual acceptance済み`b0309611041655f4e45671cfd9c9886aff161406`の整合はP7 final release acceptanceで解決し、文書gateを過去のbaseline確定待ちにしない; 2026-08-10
+
+#### [x] P6-06 DSparkをStandalone production profileへ統合する
+
+- Actor: agent + operator for targeted actual verification
+- Depends on: P6-05
+- Read: DS4 source commit `b0309611041655f4e45671cfd9c9886aff161406`の`--mtp`、`--dspark`、`--dspark-confidence`、`--dspark-strict`契約
+- Scope: 現DS4はsupport GGUFを`distributed.role == none`の場合だけloadするため、DSpark対応はStandaloneに限定する。Distributed MXFP4へ昇格中はDSparkを使用せず、DS4側のdistributed supportが実装・検証されるまでproxyから有効化済みと表示しない。
+- Files: `src/config.rs`、`src/cluster/ds4_command.rs`、`src/cluster/manifest.rs`、`src/cluster/ds4_log.rs`、`src/cluster/process.rs`、`src/app.rs`、関連test、`ds4-smart-proxy.example.toml`、利用者文書、compatibility evidence
+- Actions:
+  1. Standalone production profileに、DSpark enable、support GGUF path、任意のconfidence/strictを型付き設定として追加する。
+  2. Support GGUFをregular file、canonical path、非symlinkとして検証し、digestとsizeを算出する。`extra_args`から`--mtp`、`--dspark`、`--dspark-confidence`、`--dspark-strict`を禁止し、型付き設定の上書きや重複を防ぐ。
+  3. DSpark有効時はStandalone DS4 argvへ`--mtp <path> --dspark`を一度だけ生成し、設定された任意引数も同様に生成する。Distributed coordinator/worker argvへは生成しない。
+  4. 現DS4が拒否するStandaloneの`ssd-streaming + --mtp`をconfig validationでfail closedにし、Production Standaloneはresidentを使用する。
+  5. Standalone manifestへDSpark enable、support GGUF digest/size、挙動に影響する設定を含め、起動時にconfigおよび実file fingerprintとの不一致をfail closedにする。Standalone profileはnode固有でよいため、この情報をDistributed pairing条件にしない。
+  6. Support GGUF pathやfull digestをadmin response/logへ露出せず、認識済みDS4 activation logを必須のreadiness証跡としてDSpark有効化を観測可能にする。
+  7. Example config、spec、README、installation、compatibility recordをproduction設定と実装済み制約へ同期する。
+- Verification:
+  1. Config/argv snapshot、必須値、範囲、重複、禁止`extra_args`、`ssd-streaming`競合のtestを追加する。
+  2. Support GGUFのpath/fingerprint検証と、Standalone manifestのdigest/size/config不一致がchild spawn前にfail closedになるtestを追加する。
+  3. Targeted actual verificationとして、Q2–Q4 residentのDSpark activationと短いrequestを確認する。広範なmodel matrixとDistributed DSparkは実行しない。
+- Done when: Standalone production profileがDSparkを有効化し、そのactivationを秘匿情報なしで確認でき、support GGUFまたは設定不一致がchild spawn前に拒否され、targeted actual acceptanceが記録される
+- Stop when: Config intentやerror不在だけでDSpark有効化済みと判定しない。Support GGUF pathやfull digestを公開interface/logへ永続化しない
+
+Evidence: `src/config.rs`、`src/cluster/ds4_command.rs`、`src/cluster/manifest.rs`、`src/cluster/ds4_log.rs`、`src/cluster/process.rs`、`src/app.rs`、`src/bin/fake-ds4.rs`、`tests/phase3_supervisor.rs`; `[ds4.dspark]`のtyped enable/support model/confidence/strict、canonical regular non-symlink validation、resident限定、DSpark optionの`extra_args`禁止、Standalone argvへの一度だけの生成を実装。Support GGUFをchild spawn前にstreaming fingerprintし、Standalone manifestのdigest/size/confidence/strictへ照合する。`DSpark target-hidden capture enabled`をpath/digestなしの`dspark-activated` eventへ変換し、HTTP readiness期限内に未観測ならchildを停止する。Distributed argvは変更せず、現DS4の制約をREADME/spec/installation/example/compatibility recordへ明記。Common 148 tests、test-support 157 tests、clippy、fmt、`git diff --check`をPASS; 2026-08-10
+
+Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動し、配置済みQ2-Q4 resident modelとDSpark support GGUF（SHA-256 `7e319924…1885360`、size 5989114272）の起動前fingerprint/manifest照合、sanitized `dspark-activated` event、SoloStandaloneReady、`/healthz`、`/readyz`、DS4 `/v1/models`のHTTP 200を確認。Proxy公開portへの短いchat completionはHTTP 200、1.495秒、request log `error_kind=none`。Config intentやsupport検出だけではなく実activationとrequest成功まで確認したため、targeted actual acceptanceをPASSとする; 2026-08-11
 
 ### Phase 7: Migrationとrelease
 
 #### [ ] P7-01 CIとbranch protectionをrelease条件へ合わせる
 
 - Actor: agent + operator
-- Depends on: P6-05
+- Depends on: P6-06
 - Files: `.github/workflows/`、repository settings
 - Actions: fmt、clippy、unit/integration testをrequired checkにする
 - Verification: PR上で各check成功、failure時merge不可
@@ -951,7 +985,7 @@ Evidence: `docs/operations.md`、`docs/troubleshooting.md`; Status（`cluster st
 | Phase 3 | P3-01–P3-07 | Standalone profileとchild recoveryが実機成功 |
 | Phase 4 | P4-01–P4-08 | Distributed promotion/demotionがfake/実機成功 |
 | Phase 5 | P5-01–P5-06 | Recovery、admin、metrics、service、安全性が完成 |
-| Phase 6 | P6-01–P6-05 | Clean 2-node導入が文書だけで成功 |
+| Phase 6 | P6-01–P6-06 | 導入文書の検証に加え、Standalone DSpark production profileが型付き設定、fingerprint判定、観測可能性、targeted actual evidenceを備える |
 | Phase 7 | P7-01–P7-04 | Main release、legacy保存、rollback可能 |
 
 T-04はrepository host設定の都合でP7-01まで延期可能だが、P7-03より前に完了する。

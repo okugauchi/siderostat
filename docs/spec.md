@@ -589,7 +589,15 @@ worker:      20:output
 
 `residency = "resident"` では上記設定を指定してはならず、SSD streaming optionを生成しない。MXFP4 + SSD streamingを含む各組合せは設定として受理できることと、対象macOS/DS4 buildでproduction利用可能であることを分けて扱い、第32.5節のactual acceptanceをproduction gateとする。
 
-### 14.5 KV cache
+### 14.5 DSpark
+
+DSparkは現行DS4 baselineではresident Standaloneだけで使用する。`[ds4.dspark]`で`enabled = true`、canonicalかつ非symlinkのsupport GGUF、任意の`confidence`（0以上1以下）と`strict`を型付き指定する。Supervisorは`--mtp <support-model> --dspark`を一度だけ生成し、任意値から`--dspark-confidence`と`--dspark-strict`を生成する。
+
+現DS4は`--ssd-streaming + --mtp`を拒否するため、DSpark有効時のStandaloneは`residency = "resident"`に限定する。DSpark optionはDistributed coordinator/worker argvへ追加しない。MXFP4 Distributedへの昇格中はDSpark非適用であり、DS4本体がdistributed supportを実装するまで有効化済みと表示しない。
+
+Standalone childをspawnする前にsupport GGUFをstreaming SHA-256し、size、confidence、strictをStandalone manifestと照合する。不一致はfail closedとする。DS4が出力する`DSpark target-hidden capture enabled`をsanitized eventとして認識し、DSpark有効profileではHTTP readinessとこのeventの両方をstartup deadline内に要求する。Support pathとfull digestはadmin response/logへ出力しない。
+
+### 14.6 KV cache
 
 ```text
 Standalone:  ~/Library/Caches/ds4-kv/standalone/<profile-id>/
@@ -628,18 +636,23 @@ Standalone manifestも同じdigest情報に加え、次を持つ。
 {
   "schema_version": 2,
   "profile": "standalone",
-  "profile_id": "flash-0731-q2-q4-ssd",
+  "profile_id": "flash-0731-q2-q4-resident-dspark",
   "ds4_binary_sha256": "...",
   "model_sha256": "...",
   "checkpoint": "flash-0731",
   "model_variant": "q2-q4",
-  "residency": "ssd-streaming",
+  "residency": "resident",
   "context_size": 262144,
-  "argv_profile_sha256": "..."
+  "argv_profile_sha256": "...",
+  "dspark_enabled": true,
+  "dspark_support_sha256": "...",
+  "dspark_support_size": 5989114272,
+  "dspark_confidence": 0.7,
+  "dspark_strict": false
 }
 ```
 
-Standalone manifestはlocal childのidentity、設定drift、診断に使用する。Peerへdescriptorとして通知してよいが、両nodeのstandalone profile不一致をpairing failureにしてはならない。
+Standalone manifestはlocal childのidentity、設定drift、診断に使用する。DSpark有効時はsupport GGUFのdigest/sizeと挙動設定を必須とし、実file fingerprintおよびtyped configと一致しなければchildを起動しない。Peerへdescriptorとして通知してよいが、両nodeのstandalone profile不一致をpairing failureにしてはならない。
 
 `compatible_ds4_binary_sha256` は実機acceptanceで相互運用を確認したbinary digestの、昇順・重複なしの集合である。各nodeの `ds4_binary_sha256` はこの集合に含まれなければならない。未知のrebuildや集合の片側だけの変更ではpromotionしない。
 
@@ -916,6 +929,7 @@ ds4: distributed coordinator: registered worker ...
 ds4: distributed coordinator: complete route ready: ...
 ds4: distributed coordinator: removed worker ...
 ds4: distributed coordinator: route incomplete; ...
+ds4: DSpark target-hidden capture enabled: layers=...
 ```
 
 専用parserで必要fieldを検証する。Unknown formatはlog転送だけ行いstateを進めない。
@@ -926,7 +940,7 @@ ds4: distributed coordinator: route incomplete; ...
 
 | Profile | Ready condition |
 |---|---|
-| Standalone（Q2/Q2-Q4/MXFP4、各residency） | child生存、HTTP listening、`GET /v1/models`成功 |
+| Standalone（Q2/Q2-Q4/MXFP4、各residency） | child生存、HTTP listening、`GET /v1/models`成功。DSpark有効時はactivation eventも必須 |
 | MXFP4 coordinator | child生存、HTTP listening、worker registered、complete route |
 | MXFP4 worker | child生存、実HELLO受信、lease有効 |
 
@@ -1027,17 +1041,22 @@ http_host = "127.0.0.1"
 http_port = 8000
 allow_sigkill = false
 
+[ds4.dspark]
+enabled = true
+support_model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+confidence = 0.7
+strict = false
+
 [ds4.standalone]
-profile_id = "flash-0731-q2-q4-ssd"
+profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
-model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-ssd.json"
+model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
-residency = "ssd-streaming"
+residency = "resident"
 context_size = 262144
-kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-ssd"
+kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 262144
-ssd_cache_experts = "32GB"
 extra_args = []
 
 [ds4.mxfp4]
@@ -1066,10 +1085,11 @@ Worker nodeは `cluster.node_id` とnode固有pathだけを変更する。Role�
 - Bonjour service type/domainがDNS-SDのsyntaxと長さ制約を満たす。
 - `event_debounce` と `reconcile_interval` が0/無制限でない。
 - DS4 binaryがregular executable file。
-- Model/manifestがregular file、canonical absolute path、書換可能symlinkでない。
+- Model、DSpark support GGUF、manifestがregular file、canonical absolute path、書換可能symlinkでない。
 - `model_variant` が `q2`、`q2-q4`、`mxfp4` のいずれかである。
 - `residency` が `resident` または `ssd-streaming` である。
 - `resident` ではSSD streaming設定が未指定またはdefault値、`ssd-streaming` ではsupervisorが `--ssd-streaming` を一度だけ生成する。
+- DSpark有効時はsupport modelが必須、confidenceは0以上1以下、Standaloneは`resident`である。
 - Standalone/distributedのKV directoryが異なる。同じmodel pathであっても共有しない。
 - Layer splitにgap/overlapがなく、workerがoutputを所有する。
 - Secret/token fileが各32 bytes以上、mode `0600`、相互に異なる。
@@ -1094,6 +1114,10 @@ Worker nodeは `cluster.node_id` とnode固有pathだけを変更する。Role�
 --ssd-streaming-full-layers
 --ssd-streaming-preload-experts
 --ssd-streaming-cold
+--mtp
+--dspark
+--dspark-confidence
+--dspark-strict
 ```
 
 ### 22.4 Legacy configuration
@@ -1279,7 +1303,7 @@ ds4_proxy_cluster_deployment_mismatch_total{field}
 - Peer ingress/control/DS4 distributedはThunderbolt Bridgeだけにbind。
 - Peer ingressはsource IP、token、hopを検証。
 - Control planeはHMAC、timestamp、nonce、source IPを検証。
-- Affinity secret、control secret、peer token、admin tokenを共有しない。
+- Control secretとpeer tokenはそれぞれ両nodeで同じ値を使う。Control、peer、adminの用途間で値またはfileを流用しない。
 - Secret/token fileは32 bytes以上、mode `0600`。
 - DS4 HTTPはloopbackだけ。
 - Shellを介してchildをspawnしない。

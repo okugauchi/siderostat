@@ -147,7 +147,7 @@ struct DistributedCompatibilityManifest<'a> {
     argv_profile_sha256: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandaloneManifest {
     pub schema_version: u32,
@@ -160,6 +160,16 @@ pub struct StandaloneManifest {
     pub residency: String,
     pub context_size: u64,
     pub argv_profile_sha256: String,
+    #[serde(default)]
+    pub dspark_enabled: bool,
+    #[serde(default)]
+    pub dspark_support_sha256: Option<String>,
+    #[serde(default)]
+    pub dspark_support_size: Option<u64>,
+    #[serde(default)]
+    pub dspark_confidence: Option<f64>,
+    #[serde(default)]
+    pub dspark_strict: bool,
 }
 
 impl StandaloneManifest {
@@ -188,12 +198,52 @@ impl StandaloneManifest {
         if self.context_size == 0 {
             return Err(ManifestError::ZeroSize);
         }
+        if self.dspark_enabled {
+            let digest = self
+                .dspark_support_sha256
+                .as_ref()
+                .ok_or(ManifestError::IncompleteDspark)?;
+            validate_sha256(digest)?;
+            if self.dspark_support_size.is_none_or(|size| size == 0) {
+                return Err(ManifestError::IncompleteDspark);
+            }
+            if self
+                .dspark_confidence
+                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            {
+                return Err(ManifestError::InvalidDsparkConfidence);
+            }
+        } else if self.dspark_support_sha256.is_some()
+            || self.dspark_support_size.is_some()
+            || self.dspark_confidence.is_some()
+            || self.dspark_strict
+        {
+            return Err(ManifestError::IncompleteDspark);
+        }
         Ok(())
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
         Ok(canonical_json(self)?)
+    }
+
+    pub fn validate_dspark_binding(
+        &self,
+        fingerprint: &FileFingerprint,
+        confidence: Option<f64>,
+        strict: bool,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        if !self.dspark_enabled
+            || self.dspark_support_sha256.as_deref() != Some(fingerprint.sha256.as_str())
+            || self.dspark_support_size != Some(fingerprint.size)
+            || self.dspark_confidence != confidence
+            || self.dspark_strict != strict
+        {
+            return Err(ManifestError::DsparkBindingMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -375,6 +425,12 @@ pub enum ManifestError {
     EmptyField,
     #[error("manifest size fields must be positive")]
     ZeroSize,
+    #[error("DSpark manifest fields must be complete when DSpark is enabled and absent otherwise")]
+    IncompleteDspark,
+    #[error("DSpark confidence must be between 0 and 1")]
+    InvalidDsparkConfidence,
+    #[error("DSpark support fingerprint or typed settings do not match the standalone manifest")]
+    DsparkBindingMismatch,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -499,6 +555,26 @@ mod tests {
         }
     }
 
+    fn standalone_manifest() -> StandaloneManifest {
+        StandaloneManifest {
+            schema_version: 2,
+            profile: "standalone".into(),
+            profile_id: "q2-q4-resident-dspark".into(),
+            ds4_binary_sha256: "11".repeat(32),
+            model_sha256: "22".repeat(32),
+            checkpoint: "flash-0731".into(),
+            model_variant: "q2-q4".into(),
+            residency: "resident".into(),
+            context_size: 262_144,
+            argv_profile_sha256: "33".repeat(32),
+            dspark_enabled: true,
+            dspark_support_sha256: Some("44".repeat(32)),
+            dspark_support_size: Some(1024),
+            dspark_confidence: Some(0.7),
+            dspark_strict: false,
+        }
+    }
+
     #[test]
     fn canonical_json_sorts_keys_and_deployment_changes_only_with_content() {
         let manifest = manifest();
@@ -567,6 +643,54 @@ mod tests {
             coordinator.deployment_id().unwrap(),
             changed_approval.deployment_id().unwrap()
         );
+    }
+
+    #[test]
+    fn standalone_dspark_binding_fails_closed_on_any_mismatch() {
+        let manifest = standalone_manifest();
+        let fingerprint = FileFingerprint {
+            device_id: 1,
+            inode: 2,
+            size: 1024,
+            modified_nanos: 3,
+            sha256: "44".repeat(32),
+            computed_at_millis: 4,
+        };
+        manifest
+            .validate_dspark_binding(&fingerprint, Some(0.7), false)
+            .unwrap();
+
+        let mut changed = fingerprint.clone();
+        changed.size += 1;
+        assert!(matches!(
+            manifest.validate_dspark_binding(&changed, Some(0.7), false),
+            Err(ManifestError::DsparkBindingMismatch)
+        ));
+        assert!(matches!(
+            manifest.validate_dspark_binding(&fingerprint, Some(0.6), false),
+            Err(ManifestError::DsparkBindingMismatch)
+        ));
+        assert!(matches!(
+            manifest.validate_dspark_binding(&fingerprint, Some(0.7), true),
+            Err(ManifestError::DsparkBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn standalone_dspark_manifest_rejects_partial_or_disabled_fields() {
+        let mut partial = standalone_manifest();
+        partial.dspark_support_sha256 = None;
+        assert!(matches!(
+            partial.validate(),
+            Err(ManifestError::IncompleteDspark)
+        ));
+
+        let mut disabled = standalone_manifest();
+        disabled.dspark_enabled = false;
+        assert!(matches!(
+            disabled.validate(),
+            Err(ManifestError::IncompleteDspark)
+        ));
     }
 
     #[tokio::test]
