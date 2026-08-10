@@ -1,8 +1,10 @@
-# siderostat 実装計画
+# siderostat v0.1.0 実装計画（archive）
+
+Status: **COMPLETE — archived 2026-08-11**
 
 ## 1. 文書の目的と寿命
 
-本書は [`spec.md`](spec.md) を実装可能な作業単位へ分解し、作業順序、依存関係、検証、evidence、rollbackを管理する。低い推論能力の実行者でも、未記載の設計判断を極力行わずに1 taskずつ進められることを目的とする。
+本書は [`spec.md`](../spec.md) を実装可能な作業単位へ分解し、作業順序、依存関係、検証、evidence、rollbackを管理した履歴である。
 
 本書はmode-aware architectureへの刷新期間中に使用する時限的な計画文書である。Release完了後は必要な記録をrelease recordへ移し、本書をarchiveまたは削除できる。
 
@@ -10,9 +12,9 @@
 
 | 対象 | 正本 |
 |---|---|
-| 製品behavior、protocol、acceptance criteria | [`spec.md`](spec.md) |
-| Git、branch、commit、review | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
-| Agent固有の必須指示 | [`../AGENTS.md`](../AGENTS.md) |
+| 製品behavior、protocol、acceptance criteria | [`spec.md`](../spec.md) |
+| Git、branch、commit、review | [`CONTRIBUTING.md`](../../CONTRIBUTING.md) |
+| Agent固有の必須指示 | [`AGENTS.md`](../../AGENTS.md) |
 | 今回の作業順序、task状態、evidence | 本書 |
 
 本書と仕様書が矛盾する場合は仕様書を優先し、実装を止めて本書を修正する。実装で仕様書を暗黙に変更してはならない。
@@ -967,7 +969,7 @@ Evidence: `docs/compatibility/migration-rollback-2026-08-11.md`、`docs/releases
 
 Evidence: `docs/releases/v0.1.0-acceptance.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`docs/compatibility/ds4-b030961.md`; 全共通gate、CI、migration/rollback、DS4 baseline、artifact/checksum、profile/distributed、2-hop p50をPASS。対象2台で物理Thunderbolt cable detach/reconnectを2回連続実施し、各回でWorkerは約2秒でSolo Standalone ready、再接続後7–21秒で双方Paired Standalone readyへ自動復帰、proxy各1、DS4 child各node最大1、orphan transition/PID/port残留なしを確認。反復耐久性はroute detach/attach 10回とpromotion/demotion 10回の自動test、実DS4 promotion/demotion 10回で補完。別taskのHermes gatewayがMac StudioのDS4を利用中だったため、物理反復を10回から2回連続へ変更するrisk acceptanceをoperatorが2026-08-11に承認し、仕様第32.5節とacceptance recordを同時更新した。全項目PASS、blocked 0; 2026-08-11
 
-#### [ ] P7-04 Mainへ統合して計画を閉じる
+#### [x] P7-04 Mainへ統合して計画を閉じる
 
 - Actor: operator
 - Depends on: P7-03
@@ -981,6 +983,8 @@ Evidence: `docs/releases/v0.1.0-acceptance.md`、`docs/compatibility/security-en
 - Verification: Main CI、tag target、rollback ref
 - Done when: Mainが新仕様を提供し、legacyとrollbackが到達可能
 - Stop when: Integration branch全体を1 commitへsquashする必要がある
+
+Evidence: PR #1で`phase/7-release`を`rewrite/mode-aware`へ通常merge（`6dedfd0`）、PR #2でintegration branch全履歴を保持して`main`へ通常merge（`b3c6fff`）。`main` CI run `31424091480`はfmt 10秒、Clippy 47秒、通常/all-feature test 1分6秒でPASS。Annotated tag `v0.1.0`はrelease merge commit `b3c6fffc514a9ad96b735d9b788048c975c48d0c`を指す。Rollback ref `legacy/load-balancer-v1`とannotated tag `load-balancer-v1-final`はいずれも`b66ba1cff29da4b8dc2edd34870c62595ee1dfdd`へ到達可能。本計画を`docs/archive/implementation-plan-v0.1.0.md`へarchiveし、release evidenceを`docs/releases/v0.1.0.md`とfinal acceptance recordに保持した; 2026-08-11
 
 ## 8. Phase gate一覧
 
