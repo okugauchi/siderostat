@@ -851,10 +851,8 @@ fn parse_duration(value: &str) -> Option<Duration> {
         (v, 60_000)
     } else if let Some(v) = value.strip_suffix('h') {
         (v, 3_600_000)
-    } else if let Some(v) = value.strip_suffix('d') {
-        (v, 86_400_000)
     } else {
-        return None;
+        (value.strip_suffix('d')?, 86_400_000)
     };
     number
         .parse::<u64>()

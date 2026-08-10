@@ -97,4 +97,4 @@ State fileはtemp write、file sync、atomic renameで保全する。Secret/toke
 - Destructive cache削除を通常手順にしない。KV cache、state file、secretの削除は自動で行わず、operatorが明示的に判断する場合だけ実施する。
 - Mode切替は503の短いwindowを含む。切替中に新規requestは503 + `Retry-After`で拒否され、既存streamは完走する。Requestを二重実行しない（spec第5節）。
 - Workerからcoordinatorへのrequestはproxyを2 hop通る。Peer data/DS4 native trafficは暗号化されない。専用の物理Thunderbolt linkを信頼境界とする。
-- 実DS4 binary `b7e9f00`、実GGUF modelを使う検証は後で手動実施する。Production enable前に `docs/compatibility/ds4-b7e9f00.md` のActual verification checklistとModel/profile matrixをPASSへ更新する。
+- v0.1.0の実DS4 baselineはfull commit `b0309611041655f4e45671cfd9c9886aff161406`である。Production enable前に `docs/compatibility/ds4-b030961.md` のapproved native binary集合とModel/profile matrixに一致することを確認する。
