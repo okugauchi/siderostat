@@ -242,7 +242,7 @@ Evidence: local branch `legacy/load-balancer-v1` とannotated tag `load-balancer
 
 Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementation-plan.md`; `git diff --check`、4文書だけのstatus/diff確認、`rewrite/mode-aware`への到達性確認; 2026-08-06
 
-#### [ ] T-04 Repository protectionを設定する
+#### [x] T-04 Repository protectionを設定する
 
 - Actor: operator
 - Depends on: T-03
@@ -251,6 +251,8 @@ Evidence: `AGENTS.md`、`CONTRIBUTING.md`、`docs/spec.md`、`docs/implementatio
 - Verification: Force push禁止とrequired checksをhost UI/APIで確認
 - Done when: 設定のscreenshotまたはURLをevidenceに記録
 - Stop when: Required CI自体が未作成。P7-01へ延期してよい
+
+Evidence: GitHub branch protection APIで`main`、`rewrite/mode-aware`、`legacy/load-balancer-v1`にrequired checks `fmt`/`clippy`/`test`、PR必須、admin適用、conversation resolution必須、force push禁止、branch deletion禁止を設定。各protection URLとAPI responseを確認した; 2026-08-11
 
 ### Phase 0: Baselineとtest基盤
 
@@ -932,7 +934,7 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 
 ### Phase 7: Migrationとrelease
 
-#### [ ] P7-01 CIとbranch protectionをrelease条件へ合わせる
+#### [x] P7-01 CIとbranch protectionをrelease条件へ合わせる
 
 - Actor: agent + operator
 - Depends on: P6-06
@@ -941,7 +943,9 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 - Verification: PR上で各check成功、failure時merge不可
 - Done when: `CONTRIBUTING.md`のprotectionを満たす
 
-#### [ ] P7-02 Legacy migrationとrollback rehearsalを行う
+Evidence: `.github/workflows/ci.yml`、PR #1、GitHub Actions run `31420776183`; macOS runnerで`fmt`（9秒）、`clippy`（32秒）、通常/all-feature test（1分10秒）がPASS。Rust 1.97で追加されたClippy `question_mark`指摘を等価変換で修正し、localでもfmt、clippy、通常148 unit + 3 integration、all-feature 148 unit + 9 integration、`git diff --check`をPASS。3 protected branchはstrict required contexts `fmt`/`clippy`/`test`を満たさないPRをmerge不能とした; 2026-08-11
+
+#### [x] P7-02 Legacy migrationとrollback rehearsalを行う
 
 - Actor: operator
 - Depends on: P7-01
@@ -950,7 +954,9 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 - Verification: Upgrade後にrollbackし、再度upgrade
 - Done when: User data削除なしで往復成功
 
-#### [ ] P7-03 Final acceptanceとrelease artifactを作る
+Evidence: `docs/compatibility/migration-rollback-2026-08-11.md`、`docs/releases/v0.1.0.md`; MacBook Proでlegacy fixtureをcandidateへ渡すとlegacy 6 fieldを列挙したactionable errorでexit 1となり、旧affinity SQLiteのSHA-256/size 16384/mtimeが実行前後で一致。新旧configは別absolute path。配備済みbinary（SHA-256 `47d5488b…760e841`）を隔離保全し、release candidate（`cb2ae7c4…31fbc17`）へupgrade、previousへrollback、candidateへ再upgradeした。各段階で約30秒以内にSoloStandaloneReady、proxy 1、owned DS4 child 1、health/readinessを確認し、最終candidateでdoctor healthy。Model、KV、secret、state、SQLiteは削除・移動・上書きせず、両binaryを復旧可能に保持した; 2026-08-11
+
+#### [x] P7-03 Final acceptanceとrelease artifactを作る
 
 - Actor: agent + operator
 - Depends on: P7-02
@@ -958,6 +964,8 @@ Resolved actual acceptance: 通常のGUI Terminalからoperator configを起動�
 - Actions: 仕様書第33章を全確認し、binary checksum、DS4 baseline、known limitationsを記録
 - Verification: 共通local gate、actual acceptance、document gate
 - Done when: Blocked項目が0。例外は仕様変更として承認が必要
+
+Evidence: `docs/releases/v0.1.0-acceptance.md`、`docs/compatibility/security-endurance-2026-08-06.md`、`docs/compatibility/ds4-b030961.md`; 全共通gate、CI、migration/rollback、DS4 baseline、artifact/checksum、profile/distributed、2-hop p50をPASS。対象2台で物理Thunderbolt cable detach/reconnectを2回連続実施し、各回でWorkerは約2秒でSolo Standalone ready、再接続後7–21秒で双方Paired Standalone readyへ自動復帰、proxy各1、DS4 child各node最大1、orphan transition/PID/port残留なしを確認。反復耐久性はroute detach/attach 10回とpromotion/demotion 10回の自動test、実DS4 promotion/demotion 10回で補完。別taskのHermes gatewayがMac StudioのDS4を利用中だったため、物理反復を10回から2回連続へ変更するrisk acceptanceをoperatorが2026-08-11に承認し、仕様第32.5節とacceptance recordを同時更新した。全項目PASS、blocked 0; 2026-08-11
 
 #### [ ] P7-04 Mainへ統合して計画を閉じる
 

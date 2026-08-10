@@ -8,7 +8,7 @@
 | 最終更新日 | 2026-08-06 |
 | 対象platform | macOS 26系、Apple Silicon |
 | 初期topology | Thunderbolt Bridgeで直結した2 node |
-| DS4互換性基準 | `main` commit `b7e9f00` |
+| DS4互換性基準 | full commit `b0309611041655f4e45671cfd9c9886aff161406` |
 | 実装言語 | Rust stable、edition 2024 |
 
 本書の `MUST`、`MUST NOT`、`SHOULD`、`SHOULD NOT`、`MAY` は、それぞれ必須、禁止、推奨、非推奨、任意を表す。実装者は明示的な仕様変更なしに `MUST` と `MUST NOT` を変更してはならない。
@@ -1508,7 +1508,7 @@ persistence.rs（cluster state_storeへ置換）
 - Memory pressure/startup time許容。
 - Cable disconnectで両node local standalone復帰。
 - Reconnect/backoff後Paired Standalone、次いでMXFP4再昇格。
-- Proxy起動中に10回cable着脱し、eventごとにpolling待ちなしでrescanが開始され、orphan transitionがない。
+- Proxy起動中に2回連続で実cable着脱し、eventごとにpolling待ちなしでrescanが開始され、orphan transitionがない。反復耐久性はfake route detach/attach 10回とpromotion/demotion 10回の自動testで補完する。
 - Thunderbolt dockだけの着脱ではpeer presentにならない。
 - Bonjour advertisementを通常LANでも観測できる環境で、`bridge0` 以外のresultを拒否する。
 - Login起動、proxy restart、child restart成功。
