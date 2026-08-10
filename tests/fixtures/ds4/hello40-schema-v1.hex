@@ -1,0 +1,12 @@
+# Synthetic DS4D HELLO frame derived from docs/spec.md section 17.2.
+# This is not an actual DS4 capture and must not be used as actual acceptance evidence.
+# header: magic=DS4D kind=1 bytes=57
+44 53 34 44 00 00 00 01 00 00 00 39
+# fixed payload: model_id=1 quant_bits=2 layer_start=20 layer_end=42
+00 00 00 01 00 00 00 02 00 00 00 14 00 00 00 2a
+# has_output=1 has_hidden=1 ctx_size=262144 n_layers=43
+00 00 00 01 00 00 00 01 00 04 00 00 00 00 00 2b
+# listen_port=8000 model_name_len=17
+00 00 1f 40 00 00 00 11
+# model_name="deepseek-v4-flash"
+64 65 65 70 73 65 65 6b 2d 76 34 2d 66 6c 61 73 68

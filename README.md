@@ -1,231 +1,151 @@
-# DS4 Smart Proxy
+# siderostat
 
-DS4 Smart Proxy は、OpenAI互換のリバースプロキシを Rust で実装したものです。
-ローカルに立ち上げ、複数の DwarfStar 4 (DS4) サーバーへリクエストをインテリジェントにルーティングします。
+siderostat は、DS4のHTTP endpointを透過的にstreaming中継し、単一nodeのstandalone実行と、2 nodeのThunderbolt直結によるMXFP4 distributed実行を、ひとつのsupervisorで管理するRust製のmode-aware reverse proxy / cluster supervisorです。
 
-## アーキテクチャ
+転送先はmodeだけで一意に決まります。負荷やsession IDで変更しません。公開proxy processとlisten portは、standalone / distributedのmode切替中も維持されます。
 
-```
-          +--------------------------+
-          |      ローカルクライアント   |
-          |---------------------------|
-          | Codex / Hermes / curl     |
-          | OpenAI SDK                |
-          +------------+-------------+
-                       |
-                localhost:18080
-                       |
-                DS4 Smart Proxy
-                       |
-          +------------+------------+
-          |                         |
-      Local DS4               Remote DS4
-```
+## 主な機能
 
-- 各マシンに DS4 サーバーと DS4 Smart Proxy の両方を配置
-- クライアントは常にローカルプロキシとのみ通信
-- プロキシが自動的に最適なバックエンドを選択
+- OpenAI互換pathと未知pathの透過streaming中継（bodyをbufferしない）
+- 3 mode: Solo Standalone、Paired Standalone、Distributed MXFP4
+- peer不在時はlocal standalone profileへ転送し、peer存在時はcoordinatorへ集約
+- standalone profileとしてQ2、Q2-Q4、MXFP4を選択でき、resident常駐またはDS4のSSD streamingを利用
+- resident StandaloneでDSpark support GGUFを型付き設定し、fingerprintと実activation logをfail closedで検証
+- compatibleなpeerが揃った場合、実DS4 worker HELLOとcomplete route確認の後、MXFP4 distributedへ自動昇格
+- worker/route喪失時にstandalone profileへ自動降格
+- standaloneとdistributedのKV cacheを分離
+- proxy admissionとDS4 process drainを連動し、mode切替時に新規admissionを閉じる
+- DS4 source/protocol contract、承認済みbinary集合、model、checkpoint、argvの互換性をfail closedで検証
+- LaunchAgent、local CLI、構造化log、Prometheus互換metrics、loopback admin APIを提供
+- 外部databaseまたはcluster state serviceなしで動作し、永続化するのはcluster lifecycle stateだけ
 
-## 機能
+## モードとトポロジ
 
-- **OpenAI API 互換**: すべてのエンドポイント（`/v1/chat/completions`, `/v1/responses`, `/v1/models` 等）を透過的にプロキシ
-- **自動ルーティング**: ローカルバックエンドを最優先、使用中ならリモートへフォールバック
-- **Heartbeat / Active Probe**: 軽量 heartbeat で到達性を確認し、active probe は障害後など推論状態が不明な場合に限定
-- **ストリーミング対応**: SSE (`text/event-stream`) を検出し、バッファリングなしで透過ストリーム
-- **RAII Drop ガード**: panic・タイムアウト・切断時でも確実に `in_flight` をデクリメント
-- **リトライポリシー**: 接続失敗 / 5xx → 別バックエンドへ1回再試行、4xx / ストリーム開始後 → 再試行なし
-- **管理エンドポイント**: `/healthz`, `/backends`, `/metrics`
-- **構造化ログ**: tracing でリクエストID・選択バックエンド・レイテンシ・ステータス・リトライ回数を出力
+初期topologyはThunderbolt Bridgeで直結した2 nodeだけです。
 
-## 要件
+| node | `bridge0` IPv4 | 役割 |
+|---|---|---|
+| coordinator | `10.99.0.1` | standalone実行、peer ingress、rendezvous、distributed coordinator |
+| worker | `10.99.0.2` | standalone実行、distributed worker |
 
-- Rust 1.96 以上（edition 2024）
-- Apple Silicon Mac（推奨）、または任意の Linux 環境
+Roleは`bridge0`のIPv4から自動判定します。その他、未設定、競合はunknownとして、cluster listenerを開始しません。Roleはconfigで指定しません。
 
-## ビルド方法
+- クライアントは各nodeのpublic ingress `127.0.0.1:18080`（既定）へ接続します。
+- Solo Standalone: 両nodeとも自身のlocal upstream `127.0.0.1:8000`（既定）へ転送します。
+- Paired Standalone / Distributed MXFP4: workerのrequestはcoordinatorのpeer ingress `10.99.0.1:18082`（既定）へ転送され、coordinatorのupstreamで処理されます。
+- Cluster controlは `10.99.0.1:9920 <-> 10.99.0.2:9920`（既定）。DS4 distributed native protocolはcoordinator `10.99.0.1:9911`（既定）で受けます。
+- DS4 HTTP endpointは両nodeともloopbackにbindし、Thunderbolt Bridgeまたは通常LANへ公開しません。
+
+Peer presentは、`bridge0`の期待address、`bridge0` scoped route、HMAC認証済みnode descriptor、有効なcontrol lease、`required_peer_stability`（既定5秒）の継続をすべて満たす状態だけです。Bonjour結果やICMPだけではpeer presentにしません。
+
+## プロファイル
+
+| standalone profile | residency | DS4起動形態 |
+|---|---|---|
+| Q2 | resident または ssd-streaming | HTTP server |
+| Q2-Q4 | resident または ssd-streaming | HTTP server |
+| MXFP4 | resident または ssd-streaming | HTTP server |
+
+`ssd-streaming`はDS4の`--ssd-streaming`を意味します。model variantと混同しません。`resident`ではSSD streaming optionを生成しません。Standalone profileはnode固有でよく、coordinatorとworkerのmodel variant、residency、tuning値の一致をpairing条件にしません。
+
+DSparkは現行DS4ではresident Standalone限定です。`[ds4.dspark]`の型付き設定から`--mtp`、`--dspark`と任意のconfidence/strictだけを生成します。Support GGUFのSHA-256/sizeはStandalone manifestとchild spawn前に照合し、DS4 activation eventをreadiness期限内に確認できなければ起動を失敗させます。Pathとfull digestはadmin response/logへ出しません。
+
+Distributed profileはstandalone profileと独立です。初期実装では`distributed-mxfp4`を使い、coordinatorがHTTP + distributed coordinator、workerがdistributed worker（HTTPなし）です。
+
+- coordinator layers: `0:19`、worker layers: `20:output`（既定）。gap、overlap、layer 0欠落、output head欠落は拒否します。
+- Distributedに用いる両nodeのMXFP4 content SHA-256を一致させます。
+- Standaloneとdistributedは異なる`--kv-disk-dir`を必須とし、同じGGUFを使う場合も共有しません。
+
+## クイックスタート
+
+Rust stable（edition 2024）が必要です。実DS4 binaryとmodelを使う準備・検証は [`docs/installation.md`](docs/installation.md) に従います。
 
 ```bash
-# クローン
-git clone <repository-url>
-cd ds4-smart-proxy
-
-# ビルド（リリース）
 cargo build --release
-
-# 確認
-cargo check
-cargo test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
-依存クレートは `Cargo.toml` に記載されており、ビルド時に自動的にダウンロードされます。
+設定はTOMLで、`siderostat.example.toml`が配布用の完全例です。探索順は次のとおりです。
 
-## 設定
+1. `--config PATH`
+2. `SIDEROSTAT_CONFIG`
+3. `./siderostat.toml`
+4. platform既定path
 
-`config.toml` を作成します。
+Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置します。Control secretとpeer proxy tokenはそれぞれ両nodeで同じ値を使い、admin tokenはnodeごとに生成します。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。`openssl rand`などで生成し、configにはfile pathだけを書きます。
 
-```toml
-listen = "127.0.0.1:18080"
-
-self_name = "macbook"
-tls_accept_invalid_certs = false
-
-heartbeat_interval = "5s"
-heartbeat_timeout = "2s"
-heartbeat_path = "/v1/models"
-
-active_probe_timeout = "3s"
-log_timezone = "Asia/Tokyo"
-
-[[backends]]
-name = "macbook"
-url = "http://127.0.0.1:8000"
-max_in_flight = 1
-
-[[backends]]
-name = "macstudio"
-url = "https://macstudio.example.internal"
-max_in_flight = 1
-```
-
-| 項目 | 説明 |
-|---|---|
-| `listen` | プロキシがリッスンするアドレス:ポート |
-| `self_name` | このインスタンスのバックエンド名（ローカル優先） |
-| `tls_accept_invalid_certs` | HTTPS バックエンドの証明書検証を無効化します。自己署名証明書などローカル検証用途のみ `true` にしてください |
-| `heartbeat_interval` | heartbeat 間隔（例: `5s`） |
-| `heartbeat_timeout` | heartbeat タイムアウト（例: `2s`） |
-| `heartbeat_path` | heartbeat に使うパス（デフォルト `/v1/models`） |
-| `active_probe_timeout` | 回復確認時の active probe タイムアウト（例: `3s`） |
-| `log_timezone` | ログ時刻のタイムゾーン。未指定時は `GMT`。`Asia/Tokyo`, `JST`, `UTC`, `GMT`, `+09:00` 形式に対応 |
-| `[[backends]]` | バックエンド定義（複数可能） |
-| `name` | バックエンド名 |
-| `url` | DS4 サーバーの URL |
-| `max_in_flight` | 同時実行数の上限（デフォルト 1） |
-
-同じバイナリを全マシンで使い、設定ファイルだけを変更します。
-
-## 使い方
-
-### 1. 設定ファイルを作成
+起動形式です。Subcommandなしは`serve`と同じです。
 
 ```bash
-cat > config.toml << EOF
-listen = "127.0.0.1:18080"
-self_name = "macbook"
-tls_accept_invalid_certs = false
-
-heartbeat_interval = "5s"
-heartbeat_timeout = "2s"
-heartbeat_path = "/v1/models"
-
-active_probe_timeout = "3s"
-log_timezone = "Asia/Tokyo"
-
-[[backends]]
-name = "macbook"
-url = "http://127.0.0.1:8000"
-max_in_flight = 1
-
-[[backends]]
-name = "macstudio"
-url = "https://macstudio.example.internal"
-max_in_flight = 1
-EOF
+siderostat --config ./node.toml
+# または
+siderostat serve --config ./node.toml
 ```
 
-### 2. プロキシを起動
+起動後、loopback admin APIで確認します。
 
 ```bash
-cargo run --release -- config.toml
+curl --fail --silent http://127.0.0.1:18081/healthz
+curl --fail --silent http://127.0.0.1:18081/readyz
+curl --fail --silent http://127.0.0.1:18081/cluster
+curl --fail --silent http://127.0.0.1:18081/metrics
 ```
 
-またはビルド済みバイナリを直接実行:
+CLIのcluster commandはrunning processのadmin API clientであり、別supervisorを起動しません。
 
 ```bash
-./target/release/ds4-smart-proxy config.toml
+siderostat cluster status
+siderostat cluster status --json
+siderostat cluster doctor
+siderostat cluster doctor --json
+siderostat cluster reconcile
+siderostat cluster pair
+siderostat cluster promote
+siderostat cluster demote
+siderostat cluster demote --reason "operator-requested"
+siderostat cluster restart
+siderostat cluster fingerprint --profile standalone
+siderostat cluster fingerprint --profile distributed
 ```
 
-### 3. クライアントからアクセス
+Mutation（pair/promote/demote/restart/fingerprint/reconcile）はloopbackでもadmin token必須です。Status/doctorはread-onlyです。`promote`は実HELLO/compatibility条件を迂回しません。
 
-```bash
-# OpenAI SDK / Codex / Hermes から localhost:18080 を指定
-# curl での確認例
-curl http://localhost:18080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"stream":false}'
-```
+## セキュリティ
 
-クライアント側の設定変更は不要です。通常 DS4 サーバーを指すエンドポイントを `localhost:18080` に変更するだけです。
+- Public/admin listenerはloopback既定。peer ingress/control/DS4 distributedはThunderbolt Bridgeだけにbindします。
+- Peer ingressはsource IP、token、hopを検証します。Control planeはHMAC、timestamp、nonce、source IPを検証します。
+- Admin mutationはtoken必須です。
+- Secret/token fileは32 bytes以上、mode `0600`。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。
+- DS4 childをTokio process APIでspawnし、shellを介しません。Unknown processをkillしません。
+- Model fingerprint時にregular file/canonical pathを確認します。書換可能なsymlinkをmodel pathに使いません。
+- Authorization/API key、request/response body、prompt、session/conversation ID、peer proxy token、HMAC secret、完全model digest/deployment IDをlogしません。
 
-## 管理エンドポイント
+DS4 native distributed trafficとpeer proxy bodyは暗号化されません。専用の物理Thunderbolt linkを信頼境界とします。
 
-| エンドポイント | 説明 |
-|---|---|
-| `GET /healthz` | ヘルスチェック（`ok` を返します） |
-| `GET /backends` | 全バックエンドの状態を JSON で返します |
-| `GET /metrics` | メトリクス（プレースホルダ） |
+## 制限事項
 
-### `/backends` レスポンス例
+- standalone/distributed切替中は503の短いwindowがあります。
+- Workerからcoordinatorへのrequestはproxyを2 hop通ります。
+- Peer data/DS4 native trafficは暗号化されません。
+- 2 node固定です。3 node以上の任意topologyは対象外です。
+- Peer discoveryは自動ですが、role addressは`10.99.0.1` / `10.99.0.2`固定で、DHCP based electionは行いません。
+- standalone/distributed間でlive KVを引き継ぎません。mode切替後はtranscriptから再構築します。
+- DS4 log textへの依存があります。
+- MXFP4 SSD streaming on MetalとMXFP4 distributedのproduction可否は、実DS4/modelを使うactual acceptance結果で決めます。
+- 現行DS4はsupport GGUFをdistributed roleでloadしないため、DSparkはMXFP4 Distributedへの昇格中には適用されません。
 
-```json
-[
-  {
-    "name": "macbook",
-    "healthy": true,
-    "busy": false,
-    "in_flight": 0,
-    "latency_ms": 84
-  },
-  {
-    "name": "macstudio",
-    "healthy": true,
-    "busy": true,
-    "in_flight": 1,
-    "latency_ms": 76
-  }
-]
-```
+## 関連文書
 
-## ルーティングポリシー
-
-1. **ローカルバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
-2. **リモートバックエンド**（到達可能かつ busy でなく、cooldown / suspect 状態ではない）
-3. 該当なし → **HTTP 503**
-
-Hermes で観測した約600秒待機後の遅延フェイルオーバーに関する調査・実装設計は
-[`docs/hermes-600s-failover.md`](docs/hermes-600s-failover.md) を参照してください。
-
-## リトライポリシー
-
-| 状況 | 動作 |
-|---|---|
-| 接続失敗 | 別の healthy なバックエンドへ再試行 |
-| HTTP 5xx | 別のバックエンドへ1回再試行 |
-| HTTP 4xx | 再試行なし |
-| ストリーム開始後 | 再試行なし |
-
-## ログ
-
-`tracing` による構造化ログを出力します。環境変数 `RUST_LOG` でフィルタリングできます。
-
-```bash
-RUST_LOG=ds4_smart_proxy=info cargo run --release -- config.toml
-```
-
-各リクエストに以下の情報が含まれます:
-- `request_id` (UUID)
-- `backend` (選択されたバックエンド名)
-- `latency_ms` (レイテンシミリ秒)
-- `status` (HTTP ステータスコード)
-- `retry` (リトライ回数)
-
-## 設計原則
-
-- インフラストラクチャ非依存（DNS / mDNS / クラウド / Kubernetes / Docker / Prometheus / Redis に依存しない）
-- バックエンド検出は設定駆動型
-- GPU 使用率・CPU 使用率・メモリ使用量で選択しない（DS4 の直列推論モデルに合わせる）
-- 最小依存、シングルバイナリ
-
-## ライセンス
-
-MIT
+- [`docs/spec.md`](docs/spec.md): 完全な仕様と受け入れ条件
+- [`docs/installation.md`](docs/installation.md): 実DS4/modelを使う導入ガイド
+- [`docs/operations.md`](docs/operations.md): 運用ガイド（status、doctor、logs、metrics、manual state、restart、rollback）
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): failure symptom別の診断手順
+- [`docs/compatibility/ds4-b030961.md`](docs/compatibility/ds4-b030961.md): v0.1.0 DS4 compatibility記録
+- [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
+- [`docs/compatibility/documentation-clean-install-2026-08-10.md`](docs/compatibility/documentation-clean-install-2026-08-10.md): P6-05導入文書検証記録
+- [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md): v0.1.0 release notes
+- [`docs/releases/v0.1.0-acceptance.md`](docs/releases/v0.1.0-acceptance.md): final acceptanceとrelease artifact checksum
+- [`siderostat.example.toml`](siderostat.example.toml): 配布用config例
+- [`contrib/launchd/README.md`](contrib/launchd/README.md): macOS LaunchAgentのinstall/verify/uninstall
