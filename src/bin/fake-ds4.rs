@@ -37,6 +37,9 @@ struct Args {
 
     #[arg(long)]
     argv_capture: Option<PathBuf>,
+
+    #[arg(long)]
+    emit_dspark_activation: bool,
 }
 
 #[derive(Debug)]
@@ -73,6 +76,9 @@ async fn run() -> Result<u8> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     let address = listener.local_addr().context("read listener address")?;
+    if args.emit_dspark_activation {
+        eprintln!("ds4: DSpark target-hidden capture enabled: layers=3,7,11");
+    }
     println!("fake-ds4 listening on {address}");
 
     let server = axum::serve(listener, app);

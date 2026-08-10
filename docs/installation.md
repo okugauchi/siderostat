@@ -9,7 +9,7 @@
 - Role addressは`bridge0`のIPv4から決定する。`10.99.0.1`がcoordinator、`10.99.0.2`がworker、その他/未設定/競合はunknown（spec第13.2節）。Roleはconfigで指定しない。
 - Proxyは`rewrite/mode-aware`branchでbuildする。
 
-実DS4 source commit `b7e9f00`は仕様書記載の短縮SHAであり、full SHAは未確認である。`docs/compatibility/ds4-b7e9f00.md`のActual verification checklistが全て完了するまで、本guideの手順はproduction enableしない。Model配布条件や未確認URLを推測しない。
+実DS4 source commit `b7e9f00`は仕様書記載の短縮SHAであり、full SHAは未確認である。利用対象profileとdistributed acceptanceの結果は`docs/compatibility/ds4-b7e9f00.md`で確認する。Source baselineの不一致はfinal release acceptanceまでに解決し、model配布条件や未確認URLを推測しない。
 
 ## 1. 前提、DS4 checkout/build、digest記録
 
@@ -22,9 +22,10 @@
 DS4 binaryはoperatorの既知のsourceから取得する。Repository URLや配布条件は推測しない。対象commitを`b7e9f00`へ固定する。
 
 ```sh
-git -C <ds4-checkout> rev-parse HEAD
-git -C <ds4-checkout> checkout b7e9f00
-git -C <ds4-checkout> rev-parse HEAD
+DS4_CHECKOUT="/absolute/path/to/ds4-checkout"
+git -C "$DS4_CHECKOUT" rev-parse HEAD
+git -C "$DS4_CHECKOUT" checkout b7e9f00
+git -C "$DS4_CHECKOUT" rev-parse HEAD
 ```
 
 `rev-parse HEAD`が仕様書記載のexpected baseline `b7e9f00`に対応しない場合、baselineを更新せず作業を停止する。対応する場合のみ続行する。
@@ -32,7 +33,8 @@ git -C <ds4-checkout> rev-parse HEAD
 DS4 binaryをbuildし、digestを記録する。Build手順はoperatorの既知のsourceに従う。Binary pathとSHA-256を`docs/compatibility/ds4-b7e9f00.md`へ追記する。
 
 ```sh
-shasum -a 256 <absolute-ds4-binary>
+DS4_BINARY="/absolute/path/to/ds4-server"
+shasum -a 256 "$DS4_BINARY"
 ```
 
 Sanitized CLI確認だけを保存する。Model path、user path、prompt、body、secretは記録しない。
@@ -52,32 +54,35 @@ Standalone profileとdistributed profileは独立した設定である（spec第
 
 - Standalone model variant: `q2`、`q2-q4`、`mxfp4`。
 - Standalone residency: `resident`または`ssd-streaming`。
+- Production Standalone: resident + DSpark support GGUF（現行DS4ではSSD streamingおよびDistributedとの併用不可）。
 - Distributed profile: `distributed-mxfp4`。
 
 Modelはoperatorの既知のsourceから取得する。URLや配布条件は推測しない。取得後、両nodeでchecksumとsizeを記録する。
 
 ```sh
-shasum -a 256 <model-path>
-ls -l <model-path>
+MODEL_PATH="/absolute/path/to/model.gguf"
+shasum -a 256 "$MODEL_PATH"
+ls -l "$MODEL_PATH"
 ```
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
+Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`ds4-smart-proxy.example.toml`のplaceholder pathへ合わせる。
 
-Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributedのdigest情報をJSONで作る。Standalone manifestはlocal childのidentity、設定drift、診断に使い、peer間compatibilityの比較対象にしない（spec第15.3節）。
+Manifestは`docs/spec.md`第15.1節のschemaに従い、standaloneとdistributedのdigest情報をJSONで作る。DSpark有効なStandalone manifestには`dspark_enabled`、support digest/size、confidence、strictを記録する。起動時に実support fileとtyped configへ一致しなければchildはspawnされない。Standalone manifestはpeer間compatibilityの比較対象にしない（spec第15.3節）。
 
 ## 3. Resident/SSD streaming standalone smoke
 
 実DS4とmodelを使うため、この手順はoperator gateである。`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixを基準とし、次の対象を確認する。
 
 - Q2-Q4 resident standaloneでrequest成功。Q2は対応するfull standalone modelを利用する構成だけで追加確認する。
+- Q2-Q4 resident + DSparkでsanitized `dspark-activated` log、HTTP readiness、short requestを確認する。
 - Q2-Q4 SSD streaming standaloneでrequest成功。
 - MXFP4 SSD streaming standaloneでrequest成功。対象DS4 build/Metal backendで未確認の場合は、そのprofileだけをproduction enable不可とする。
 - `ssd-streaming`はDS4の`--ssd-streaming`を意味し、model variantと混同しない（spec第14.1節）。`residency="resident"`ではSSD streaming optionを生成しない。
 - HTTP readiness、short prompt、streaming、memory/startup timeを確認する。
 
-実測結果を`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixへ追記し、production statusをPASSへ更新してから次へ進む。
+実測結果を`docs/compatibility/ds4-b7e9f00.md`のModel/profile matrixへ追記し、productionで利用するprofileのstatusをPASSへ更新してから次へ進む。利用対象外のQ2 resident、Q2 SSD streaming、MXFP4 residentはPhase 6 / release gateにしない。
 
 ## 4. Thunderbolt固定IPv4、bridge/route確認
 
@@ -114,7 +119,8 @@ Appleの公式手順を参照する（spec第39節）: [Apple: ThunderboltでIP�
 Rust stable（edition 2024）でbuildする。Common local gateを実行する。
 
 ```sh
-cd <repository>
+REPOSITORY="/absolute/path/to/ds4-smart-proxy"
+cd "$REPOSITORY"
 cargo build --release
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -122,25 +128,44 @@ cargo test --all-targets
 git diff --check
 ```
 
-Binaryは`target/release/ds4-smart-proxy`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/ds4-smart-proxy`へinstallする。
+Binaryは`target/release/ds4-smart-proxy`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/ds4-smart-proxy`へinstallする。`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
 
 ```sh
-cp target/release/ds4-smart-proxy /usr/local/bin/ds4-smart-proxy
+sudo install -d -m 0755 /usr/local/bin
+sudo install -m 0755 target/release/ds4-smart-proxy /usr/local/bin/ds4-smart-proxy
+/usr/local/bin/ds4-smart-proxy --help
 ```
 
 ### Secret file
 
-Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。同じfileを複数roleに流用しない。`openssl rand`で生成する。
+Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。Control secretとpeer proxy tokenは、それぞれclusterの両nodeで同じ値が必要である。Admin tokenはnode-localとする。Control secret、peer proxy token、admin token間でfileまたは値を流用しない。
+
+まずcoordinator上で共有する2値とcoordinatorのadmin tokenを生成する。`umask 077`により生成時からownerだけが読み書きできる。
 
 ```sh
-mkdir -p "$HOME/Library/Application Support/ds4-smart-proxy/secrets"
-openssl rand -out "$HOME/Library/Application Support/ds4-smart-proxy/secrets/<NODE>-cluster-control.key" 32
-openssl rand -out "$HOME/Library/Application Support/ds4-smart-proxy/secrets/<NODE>-peer-proxy.key" 32
-openssl rand -out "$HOME/Library/Application Support/ds4-smart-proxy/secrets/<NODE>-admin.key" 32
-chmod 600 "$HOME/Library/Application Support/ds4-smart-proxy/secrets/"*.key
+SECRET_DIR="$HOME/Library/Application Support/ds4-smart-proxy/secrets"
+umask 077
+mkdir -p "$SECRET_DIR"
+openssl rand -out "$SECRET_DIR/cluster-control.key" 32
+openssl rand -out "$SECRET_DIR/peer-proxy.key" 32
+openssl rand -out "$SECRET_DIR/admin.key" 32
+chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
 ```
 
-`<NODE>`はnode固有の識別子（例: `macstudio-coordinator`、`macstudio-worker`）で、configの`cluster.node_id`と一致させると区別しやすい。
+`cluster-control.key`と`peer-proxy.key`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
+
+```sh
+SECRET_DIR="$HOME/Library/Application Support/ds4-smart-proxy/secrets"
+SHARED_SECRET_SOURCE="/Volumes/OPERATOR-APPROVED-ENCRYPTED-MEDIA"
+umask 077
+mkdir -p "$SECRET_DIR"
+install -m 0600 "$SHARED_SECRET_SOURCE/cluster-control.key" "$SECRET_DIR/cluster-control.key"
+install -m 0600 "$SHARED_SECRET_SOURCE/peer-proxy.key" "$SECRET_DIR/peer-proxy.key"
+openssl rand -out "$SECRET_DIR/admin.key" 32
+chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
+```
+
+両nodeの共有2 fileがbyte-for-byteで一致し、各node内の3 fileがそれぞれ異なることを安全な経路上で確認する。Digestやsecret値はdocumentation evidenceに保存しない。
 
 ### Config
 
@@ -153,8 +178,9 @@ cp ds4-smart-proxy.example.toml "$HOME/Library/Application Support/ds4-smart-pro
 置換対象：
 
 - `ds4.binary`の`PLACEHOLDER-ds4-server`。
+- `ds4.dspark.support_model`の`PLACEHOLDER-dspark-support-0731.gguf`。
 - `ds4.standalone.model`と`ds4.mxfp4.model`の`PLACEHOLDER-*.gguf`。
-- Secret fileの`PLACEHOLDER-*-cluster-control.key`、`PLACEHOLDER-*-peer-proxy.key`、`PLACEHOLDER-*-admin.key`。
+- Secret fileの`PLACEHOLDER-*-cluster-control.key`、`PLACEHOLDER-*-peer-proxy.key`、`PLACEHOLDER-*-admin.key`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
 - Manifest pathの`PLACEHOLDER-standalone.gguf`相当のmanifest JSON。
 
 Validation要件（spec第22.3節）を満たすことを確認する。
@@ -162,10 +188,11 @@ Validation要件（spec第22.3節）を満たすことを確認する。
 - `schema_version == 2`。
 - 各portが衝突しない。
 - DS4 binaryがregular executable file。
-- Model/manifestがregular file、canonical absolute path、書換可能symlinkでない。
+- Model、DSpark support GGUF、manifestがregular file、canonical absolute path、書換可能symlinkでない。
 - Secret/token fileが各32 bytes以上、mode `0600`、相互に異なる。
 - Timeoutが0/無制限でない。
 - `extra_args`が生成引数を上書きしない。
+- DSpark有効時はStandaloneが`resident`、confidenceが0以上1以下で、support fingerprint/configがStandalone manifestと一致する。
 
 ### Foreground test
 
@@ -189,6 +216,13 @@ ds4-smart-proxy cluster doctor
 
 `doctor`がThunderbolt IP readiness、discovery、state、target readinessを報告する。`ReadyNoPeer`以前はpeer presentにしない。Secretをlogしない（spec第32.4節）。
 
+Standalone起動完了後の期待結果は次のとおりである。起動中の一時的な503は完了まで待って再確認する。
+
+- `/healthz`: HTTP 200、`{"status":"ok"}`。
+- `/readyz`: HTTP 200、`status="ready"`、`target_ready=true`、`admission="serving"`。
+- `cluster status`: `role`がcoordinator/workerの期待role、`mode=solo-standalone`、`state=solo-standalone-ready`、`ready=true`。
+- `cluster doctor`: `doctor=ok state=solo-standalone-ready target_ready=true`。
+
 ## 6. Pairing、promotion、LaunchAgent、recovery、upgrade、rollback、uninstall
 
 ### Pairing
@@ -202,6 +236,8 @@ ds4-smart-proxy cluster pair
 ```
 
 WorkerはtargetがCoordinatorへ、Coordinatorはtarget=LocalStandaloneのままPairedStandaloneReadyへ入る（spec第18.2節）。両nodeのstandalone profileが異なってもpairingできる（spec第14.1節、第32.5節）。
+
+Pairing完了後は両nodeで`mode=paired-standalone`、`state=paired-standalone-ready`、`ready=true`を確認する。Workerの`target=coordinator`、coordinatorの`target=local-standalone`とならない場合はpromotionへ進まない。
 
 ### Promotion
 
@@ -222,9 +258,11 @@ ds4-smart-proxy cluster promote
 
 Cluster-wide drain後にDS4を停止し、coordinator MXFP4起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
 
+Promotion完了後は両nodeで`mode=distributed-mxfp4`、`state=distributed-ready`、`ready=true`を確認する。Fingerprint commandは受付時にjob ID付きJSONを返す。Compatibility不一致、HELLO timeout、route incompleteのいずれかがある場合は`distributed-ready`を期待せず、[`docs/troubleshooting.md`](troubleshooting.md)に従う。
+
 ### LaunchAgent
 
-`contrib/launchd/README.md`に従い、1つのuser service jobだけを登録する。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しない（spec第35節）。
+`contrib/launchd/README.md`に従い、1つのuser service jobだけを登録する。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しない（spec第35節）。Exampleの`USERNAME`はそのままでは動作しないため、登録前に次の手順で全pathを実在値へ置換する。
 
 - `RunAtLoad=true`、`KeepAlive=true`。
 - Absolute ProgramArguments。
@@ -233,9 +271,15 @@ Cluster-wide drain後にDS4を停止し、coordinator MXFP4起動（`--debug`）
 
 ```sh
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ds4-smart-proxy"
-cp contrib/launchd/ds4-smart-proxy.plist.example "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
-plutil -lint "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
+PLIST="$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
+CONFIG="$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
+cp contrib/launchd/ds4-smart-proxy.plist.example "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/ds4-smart-proxy/stdout.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/ds4-smart-proxy/stderr.log" "$PLIST"
+plutil -lint "$PLIST"
+if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
 ```
 
@@ -281,4 +325,6 @@ mv "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist" "$HOME
 
 ## 検証とproduction gate
 
-このguideの手順をclean user accountと両nodeで順番に実行する。実DS4 binary、model、Thunderbolt 2-node、GUI user sessionが必要なため、本guideの作成時点ではoperator gateである。`docs/compatibility/ds4-b7e9f00.md`のActual verification checklistが全て完了し、Model/profile matrixのproduction statusがPASSになるまで`DistributedReady`をproduction enableしない。
+現在利用中の2-node環境を初期化してclean user accountを用意することは必須としない。文書gateは、repository-localなcommand/config/link/plist検証と、既存環境で取得済みの2-node actual acceptance証跡を組み合わせて判定できる。Install、login restart、cable detach/reconnectを再実行する場合は、既存model、secret、config、runtime stateを削除または上書きせず、operatorが承認した隔離pathかbackupを使う。
+
+Production enableには`docs/compatibility/ds4-b7e9f00.md`の利用対象profileとdistributed acceptanceがPASSであることを要求する。利用対象外profileの未検証はblockerにしない。DS4 source baselineの不一致は文書gateと分離し、final release acceptanceで解決する。

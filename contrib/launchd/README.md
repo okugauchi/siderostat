@@ -14,17 +14,19 @@ Tokenやsecret値をplist、`EnvironmentVariables`、command lineへ書きませ
 
 ```sh
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ds4-smart-proxy"
-cp contrib/launchd/ds4-smart-proxy.plist.example /tmp/io.github.okugauchi.ds4-smart-proxy.plist
-plutil -lint /tmp/io.github.okugauchi.ds4-smart-proxy.plist
-```
-
-Placeholderを置換した後、`ProgramArguments`の各要素がabsolute pathまたは固定subcommandであることを再確認します。完成したplistを次へinstallします。
-
-```sh
-cp /tmp/io.github.okugauchi.ds4-smart-proxy.plist "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
+PLIST="$HOME/Library/LaunchAgents/io.github.okugauchi.ds4-smart-proxy.plist"
+CONFIG="$HOME/Library/Application Support/ds4-smart-proxy/config.toml"
+cp contrib/launchd/ds4-smart-proxy.plist.example "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/ds4-smart-proxy/stdout.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/ds4-smart-proxy/stderr.log" "$PLIST"
+plutil -lint "$PLIST"
+if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/io.github.okugauchi.ds4-smart-proxy"
 ```
+
+`ProgramArguments`の各要素がabsolute pathまたは固定subcommandであり、placeholderが残っていないことを登録前に確認します。
 
 ## Verification
 

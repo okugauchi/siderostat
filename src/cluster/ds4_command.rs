@@ -7,6 +7,7 @@ pub struct Ds4Profile {
     pub profile_id: String,
     pub model_variant: ModelVariant,
     pub residency: Residency,
+    pub dspark_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,10 @@ pub enum Ds4CommandError {
     InvalidExtraArguments(String),
     #[error("distributed DS4 profiles require --debug")]
     DistributedDebugRequired,
+    #[error("DSpark requires a support model")]
+    DsparkSupportModelRequired,
+    #[error("DSpark is not compatible with standalone SSD streaming")]
+    DsparkSsdStreaming,
 }
 
 pub fn build_distributed_worker_command(
@@ -122,6 +127,7 @@ fn distributed_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> D
             profile_id: format!("distributed-mxfp4-{role}"),
             model_variant: ModelVariant::Mxfp4,
             residency: Residency::Resident,
+            dspark_required: false,
         },
     }
 }
@@ -136,6 +142,9 @@ pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4Com
         || standalone.ssd_cold;
     if standalone.residency == Residency::Resident && has_ssd_options {
         return Err(Ds4CommandError::SsdOptionsForResident);
+    }
+    if config.dspark.enabled && standalone.residency == Residency::SsdStreaming {
+        return Err(Ds4CommandError::DsparkSsdStreaming);
     }
 
     let mut argv = vec![
@@ -176,6 +185,23 @@ pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4Com
             argv.push(OsString::from("--ssd-streaming-cold"));
         }
     }
+    if config.dspark.enabled {
+        let support_model = config
+            .dspark
+            .support_model
+            .as_ref()
+            .ok_or(Ds4CommandError::DsparkSupportModelRequired)?;
+        argv.push(OsString::from("--mtp"));
+        argv.push(support_model.as_os_str().to_owned());
+        argv.push(OsString::from("--dspark"));
+        if let Some(confidence) = config.dspark.confidence {
+            argv.push(OsString::from("--dspark-confidence"));
+            argv.push(OsString::from(confidence.to_string()));
+        }
+        if config.dspark.strict {
+            argv.push(OsString::from("--dspark-strict"));
+        }
+    }
     argv.extend(standalone.extra_args.iter().map(OsString::from));
 
     Ok(Ds4Command {
@@ -186,6 +212,7 @@ pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4Com
             profile_id: standalone.profile_id.clone(),
             model_variant: standalone.model_variant,
             residency: standalone.residency,
+            dspark_required: config.dspark.enabled,
         },
     })
 }
@@ -200,7 +227,7 @@ fn push_option(argv: &mut Vec<OsString>, name: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Ds4Mxfp4Config, Ds4StandaloneConfig};
+    use crate::config::{Ds4DsparkConfig, Ds4Mxfp4Config, Ds4StandaloneConfig};
     use std::{net::IpAddr, path::PathBuf};
 
     fn config(variant: ModelVariant, residency: Residency) -> Ds4Config {
@@ -210,6 +237,7 @@ mod tests {
             http_host: IpAddr::from([127, 0, 0, 1]),
             http_port: 8000,
             allow_sigkill: false,
+            dspark: Ds4DsparkConfig::default(),
             standalone: Ds4StandaloneConfig {
                 profile_id: format!("{variant:?}-{residency:?}"),
                 model: PathBuf::from("/models/DeepSeek V4.gguf"),
@@ -324,6 +352,60 @@ mod tests {
         assert_eq!(
             build_standalone_command(&resident),
             Err(Ds4CommandError::SsdOptionsForResident)
+        );
+    }
+
+    #[test]
+    fn standalone_dspark_argv_is_typed_and_emitted_once() {
+        let mut config = config(ModelVariant::Q2Q4, Residency::Resident);
+        config.dspark = Ds4DsparkConfig {
+            enabled: true,
+            support_model: Some(PathBuf::from("/models/DSpark support.gguf")),
+            confidence: Some(0.7),
+            strict: true,
+        };
+        let command = build_standalone_command(&config).unwrap();
+        let values = argv(&command);
+        assert!(command.profile.dspark_required);
+        assert_eq!(values.iter().filter(|value| *value == "--mtp").count(), 1);
+        assert_eq!(
+            values.iter().filter(|value| *value == "--dspark").count(),
+            1
+        );
+        assert!(
+            values
+                .windows(2)
+                .any(|pair| pair == ["--mtp", "/models/DSpark support.gguf"])
+        );
+        assert!(
+            values
+                .windows(2)
+                .any(|pair| pair == ["--dspark-confidence", "0.7"])
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| *value == "--dspark-strict")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn standalone_dspark_rejects_missing_support_and_ssd_streaming() {
+        let mut missing = config(ModelVariant::Q2, Residency::Resident);
+        missing.dspark.enabled = true;
+        assert_eq!(
+            build_standalone_command(&missing),
+            Err(Ds4CommandError::DsparkSupportModelRequired)
+        );
+
+        let mut streaming = config(ModelVariant::Q2, Residency::SsdStreaming);
+        streaming.dspark.enabled = true;
+        streaming.dspark.support_model = Some(PathBuf::from("/models/support.gguf"));
+        assert_eq!(
+            build_standalone_command(&streaming),
+            Err(Ds4CommandError::DsparkSsdStreaming)
         );
     }
 

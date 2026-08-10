@@ -176,8 +176,19 @@ pub struct Ds4Config {
     pub http_host: IpAddr,
     pub http_port: u16,
     pub allow_sigkill: bool,
+    #[serde(default)]
+    pub dspark: Ds4DsparkConfig,
     pub standalone: Ds4StandaloneConfig,
     pub mxfp4: Ds4Mxfp4Config,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ds4DsparkConfig {
+    pub enabled: bool,
+    pub support_model: Option<PathBuf>,
+    pub confidence: Option<f64>,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +289,9 @@ impl ModeAwareConfig {
             expand_config_path(&self.cluster.security.admin_token_file)?;
         self.ds4.binary = expand_config_path(&self.ds4.binary)?;
         self.ds4.working_directory = expand_config_path(&self.ds4.working_directory)?;
+        if let Some(path) = &mut self.ds4.dspark.support_model {
+            *path = expand_config_path(path)?;
+        }
         self.ds4.standalone.model = expand_config_path(&self.ds4.standalone.model)?;
         self.ds4.standalone.model_manifest =
             expand_config_path(&self.ds4.standalone.model_manifest)?;
@@ -310,6 +324,7 @@ impl ModeAwareConfig {
         )?;
         validate_durations(self)?;
         validate_paths(self)?;
+        validate_dspark(self)?;
         validate_ssd_streaming(&self.ds4.standalone)?;
         anyhow::ensure!(
             self.ds4.standalone.kv_disk_dir != self.ds4.mxfp4.kv_disk_dir,
@@ -479,6 +494,9 @@ fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
 fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
     validate_regular_file("ds4.binary", &config.ds4.binary, true)?;
     validate_directory("ds4.working_directory", &config.ds4.working_directory)?;
+    if let Some(path) = &config.ds4.dspark.support_model {
+        validate_regular_file("ds4.dspark.support_model", path, false)?;
+    }
     validate_regular_file("ds4.standalone.model", &config.ds4.standalone.model, false)?;
     validate_regular_file(
         "ds4.standalone.model_manifest",
@@ -570,6 +588,32 @@ fn validate_ssd_streaming(config: &Ds4StandaloneConfig) -> anyhow::Result<()> {
         anyhow::ensure!(
             number.parse::<u64>().is_ok_and(|number| number > 0),
             "ds4.standalone.ssd_cache_experts must be a positive integer or <number>GB"
+        );
+    }
+    Ok(())
+}
+
+fn validate_dspark(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    let dspark = &config.ds4.dspark;
+    if dspark.enabled {
+        anyhow::ensure!(
+            dspark.support_model.is_some(),
+            "ds4.dspark.support_model is required when DSpark is enabled"
+        );
+        anyhow::ensure!(
+            config.ds4.standalone.residency == Residency::Resident,
+            "DSpark requires standalone residency = 'resident'; current DS4 does not support --ssd-streaming with --mtp"
+        );
+    } else {
+        anyhow::ensure!(
+            dspark.support_model.is_none() && dspark.confidence.is_none() && !dspark.strict,
+            "ds4.dspark support_model/confidence/strict require enabled = true"
+        );
+    }
+    if let Some(confidence) = dspark.confidence {
+        anyhow::ensure!(
+            confidence.is_finite() && (0.0..=1.0).contains(&confidence),
+            "ds4.dspark.confidence must be between 0 and 1"
         );
     }
     Ok(())
@@ -672,6 +716,10 @@ pub(crate) fn validate_extra_args(name: &str, arguments: &[String]) -> anyhow::R
         "--ssd-streaming-full-layers",
         "--ssd-streaming-preload-experts",
         "--ssd-streaming-cold",
+        "--mtp",
+        "--dspark",
+        "--dspark-confidence",
+        "--dspark-strict",
     ];
     for argument in arguments {
         if let Some(forbidden) = FORBIDDEN.iter().find(|forbidden| {
@@ -890,17 +938,22 @@ http_host = "127.0.0.1"
 http_port = 8000
 allow_sigkill = false
 
+[ds4.dspark]
+enabled = true
+support_model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+confidence = 0.7
+strict = false
+
 [ds4.standalone]
-profile_id = "flash-0731-q2-q4-ssd"
+profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/ds4-smart-proxy/manifests/standalone-flash-0731-q2-q4-ssd.json"
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
-residency = "ssd-streaming"
+residency = "resident"
 context_size = 262144
-kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-ssd"
+kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 262144
-ssd_cache_experts = "32GB"
 extra_args = []
 
 [ds4.mxfp4]
@@ -948,6 +1001,8 @@ level = "info"
             let mut config = ModeAwareConfig::parse(mode_aware_config()).unwrap();
             config.ds4.binary = self.file("ds4-server", b"fake binary", 0o700);
             config.ds4.working_directory = self.root.clone();
+            config.ds4.dspark.support_model =
+                Some(self.file("dspark-support.gguf", b"support", 0o600));
             config.ds4.standalone.model = self.file("standalone.gguf", b"model", 0o600);
             config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
             config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
@@ -989,7 +1044,9 @@ level = "info"
             DiscoveryMode::BonjourWithStaticFallback
         );
         assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
-        assert_eq!(config.ds4.standalone.residency, Residency::SsdStreaming);
+        assert_eq!(config.ds4.standalone.residency, Residency::Resident);
+        assert!(config.ds4.dspark.enabled);
+        assert_eq!(config.ds4.dspark.confidence, Some(0.7));
         assert_eq!(
             config.cluster.timeouts.rendezvous_hello,
             Duration::from_secs(900)
@@ -1003,6 +1060,7 @@ level = "info"
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
         assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
+        assert!(config.ds4.dspark.enabled);
     }
 
     #[test]
@@ -1133,8 +1191,8 @@ level = "info"
         let bad_variant =
             mode_aware_config().replace("model_variant = \"q2-q4\"", "model_variant = \"q8\"");
         assert!(toml::from_str::<ModeAwareConfig>(&bad_variant).is_err());
-        let bad_residency = mode_aware_config()
-            .replace("residency = \"ssd-streaming\"", "residency = \"automatic\"");
+        let bad_residency =
+            mode_aware_config().replace("residency = \"resident\"", "residency = \"automatic\"");
         assert!(toml::from_str::<ModeAwareConfig>(&bad_residency).is_err());
     }
 
@@ -1143,6 +1201,7 @@ level = "info"
         let files = ConfigTestFiles::new();
         let mut config = files.config();
         config.ds4.standalone.residency = Residency::Resident;
+        config.ds4.standalone.ssd_cache_experts = Some("32GB".into());
         assert!(
             config
                 .validate()
@@ -1245,5 +1304,71 @@ level = "info"
                 .to_string()
                 .contains("generated option --port")
         );
+    }
+
+    #[test]
+    fn validates_dspark_requirements_and_confidence() {
+        let files = ConfigTestFiles::new();
+
+        let mut missing = files.config();
+        missing.ds4.dspark.support_model = None;
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("support_model is required")
+        );
+
+        let mut streaming = files.config();
+        streaming.ds4.standalone.residency = Residency::SsdStreaming;
+        assert!(
+            streaming
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("DSpark requires standalone residency")
+        );
+
+        let mut confidence = files.config();
+        confidence.ds4.dspark.confidence = Some(1.01);
+        assert!(
+            confidence
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("between 0 and 1")
+        );
+
+        let mut disabled = files.config();
+        disabled.ds4.dspark.enabled = false;
+        assert!(
+            disabled
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("require enabled = true")
+        );
+    }
+
+    #[test]
+    fn rejects_dspark_override_in_extra_args() {
+        let files = ConfigTestFiles::new();
+        for argument in [
+            "--mtp",
+            "--dspark",
+            "--dspark-confidence=0",
+            "--dspark-strict",
+        ] {
+            let mut config = files.config();
+            config.ds4.standalone.extra_args = vec![argument.into()];
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not override generated option")
+            );
+        }
     }
 }
