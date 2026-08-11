@@ -223,11 +223,30 @@ pub enum ModelVariant {
     Mxfp4,
 }
 
+impl ModelVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            ModelVariant::Q2 => "q2",
+            ModelVariant::Q2Q4 => "q2-q4",
+            ModelVariant::Mxfp4 => "mxfp4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Residency {
     Resident,
     SsdStreaming,
+}
+
+impl Residency {
+    pub fn name(self) -> &'static str {
+        match self {
+            Residency::Resident => "resident",
+            Residency::SsdStreaming => "ssd-streaming",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1366,5 +1385,15 @@ level = "info"
                     .contains("must not override generated option")
             );
         }
+    }
+
+    #[test]
+    fn enum_names_are_stable_metric_labels() {
+        assert_eq!(ModelVariant::Q2.name(), "q2");
+        assert_eq!(ModelVariant::Q2Q4.name(), "q2-q4");
+        assert_eq!(ModelVariant::Mxfp4.name(), "mxfp4");
+
+        assert_eq!(Residency::Resident.name(), "resident");
+        assert_eq!(Residency::SsdStreaming.name(), "ssd-streaming");
     }
 }

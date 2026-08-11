@@ -218,9 +218,9 @@ impl AdminExecutor for RuntimeAdminExecutor {
 fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
     json!({
         "generation": snapshot.generation,
-        "role": role_name(snapshot.role),
-        "mode": stable_mode_name(snapshot.stable_mode),
-        "state": cluster_state_name(snapshot.state),
+        "role": snapshot.role.name(),
+        "mode": snapshot.stable_mode.name(),
+        "state": snapshot.state.name(),
         "target": target_name(snapshot.target),
     })
 }
@@ -368,8 +368,8 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         while transition_snapshots.changed().await.is_ok() {
             let current = *transition_snapshots.borrow_and_update();
             transition_metrics.transition(
-                cluster_state_name(previous.state),
-                cluster_state_name(current.state),
+                previous.state.name(),
+                current.state.name(),
                 "success",
                 "state-change",
                 transition_started.elapsed().as_secs_f64(),
@@ -589,7 +589,7 @@ async fn persist_runtime_state(
         generation: snapshot.generation,
         desired_mode: persistent_mode(snapshot.stable_mode),
         last_stable_mode: persistent_mode(snapshot.stable_mode),
-        cluster_state: cluster_state_name(snapshot.state).into(),
+        cluster_state: snapshot.state.name().into(),
         proxy_target: match snapshot.target {
             ProxyTarget::LocalStandalone => PersistentProxyTarget::LocalStandalone,
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
@@ -611,39 +611,6 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
         StableMode::SoloStandalone => PersistentMode::SoloStandalone,
         StableMode::PairedStandalone => PersistentMode::PairedStandalone,
         StableMode::DistributedMxfp4 => PersistentMode::DistributedMxfp4,
-    }
-}
-
-fn stable_mode_name(mode: StableMode) -> &'static str {
-    match mode {
-        StableMode::SoloStandalone => "solo-standalone",
-        StableMode::PairedStandalone => "paired-standalone",
-        StableMode::DistributedMxfp4 => "distributed-mxfp4",
-    }
-}
-
-fn role_name(role: LocalRole) -> &'static str {
-    match role {
-        LocalRole::Coordinator => "coordinator",
-        LocalRole::Worker => "worker",
-        LocalRole::Unknown => "unknown",
-    }
-}
-
-fn cluster_state_name(state: ClusterState) -> &'static str {
-    match state {
-        ClusterState::Booting => "booting",
-        ClusterState::SoloStandaloneStarting => "solo-standalone-starting",
-        ClusterState::SoloStandaloneReady => "solo-standalone-ready",
-        ClusterState::Pairing => "pairing",
-        ClusterState::PairedStandaloneReady => "paired-standalone-ready",
-        ClusterState::AwaitingWorkerHello => "awaiting-worker-hello",
-        ClusterState::Promoting => "promoting",
-        ClusterState::DistributedStarting => "distributed-starting",
-        ClusterState::DistributedReady => "distributed-ready",
-        ClusterState::Demoting => "demoting",
-        ClusterState::Backoff => "backoff",
-        ClusterState::ManualInterventionRequired => "manual-intervention-required",
     }
 }
 
@@ -871,9 +838,9 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snapshot = state.cluster_snapshot();
     Json(json!({
         "node_id": state.config.node_id,
-        "role": snapshot.map_or("unknown", |snapshot| role_name(snapshot.role)),
-        "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| stable_mode_name(snapshot.stable_mode)),
-        "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| cluster_state_name(snapshot.state)),
+        "role": snapshot.map_or("unknown", |snapshot| snapshot.role.name()),
+        "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| snapshot.stable_mode.name()),
+        "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| snapshot.state.name()),
         "generation": snapshot.map_or(0, |snapshot| snapshot.generation),
         "target": target_name(target.target),
         "target_ready": target.ready,
@@ -882,8 +849,8 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
         "interface": state.config.interface,
         "active_standalone_profile": {
             "profile_id": state.config.standalone_profile_id,
-            "model_variant": model_variant_name(state.config.standalone_model_variant),
-            "residency": residency_name(state.config.standalone_residency),
+            "model_variant": state.config.standalone_model_variant.name(),
+            "residency": state.config.standalone_residency.name(),
         },
         "child": Value::Null,
     }))
@@ -949,21 +916,6 @@ pub(crate) fn target_name(target: ProxyTarget) -> &'static str {
         ProxyTarget::Unavailable {
             reason: UnavailableReason::UnknownRoleWithoutLocalStandalone,
         } => "unavailable-unknown-role",
-    }
-}
-
-fn model_variant_name(value: ModelVariant) -> &'static str {
-    match value {
-        ModelVariant::Q2 => "q2",
-        ModelVariant::Q2Q4 => "q2-q4",
-        ModelVariant::Mxfp4 => "mxfp4",
-    }
-}
-
-fn residency_name(value: Residency) -> &'static str {
-    match value {
-        Residency::Resident => "resident",
-        Residency::SsdStreaming => "ssd-streaming",
     }
 }
 

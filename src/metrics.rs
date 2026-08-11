@@ -169,8 +169,8 @@ impl Metrics {
                 .cluster
                 .map_or(("booting", "unknown", 0), |cluster| {
                     (
-                        cluster_state_name(cluster),
-                        cluster_mode_name(cluster),
+                        cluster.state.name(),
+                        cluster.stable_mode.name(),
                         cluster.generation,
                     )
                 });
@@ -212,8 +212,8 @@ impl Metrics {
         let _ = writeln!(
             output,
             "ds4_proxy_standalone_profile_info{{node_id=\"{node_id}\",model_variant=\"{}\",residency=\"{}\"}} 1",
-            model_variant_name(snapshot.model_variant),
-            residency_name(snapshot.residency),
+            snapshot.model_variant.name(),
+            snapshot.residency.name(),
         );
         output
     }
@@ -408,48 +408,6 @@ fn transition_name(from: &str, to: &str) -> &'static str {
         | ("distributed-starting", "distributed-ready") => "promote",
         ("distributed-ready", "demoting") | ("demoting", "paired-standalone-ready") => "demote",
         _ => "reconcile",
-    }
-}
-
-fn cluster_state_name(snapshot: ClusterSnapshot) -> &'static str {
-    use crate::target::ClusterState::*;
-    match snapshot.state {
-        Booting => "booting",
-        SoloStandaloneStarting => "solo-standalone-starting",
-        SoloStandaloneReady => "solo-standalone-ready",
-        Pairing => "pairing",
-        PairedStandaloneReady => "paired-standalone-ready",
-        AwaitingWorkerHello => "awaiting-worker-hello",
-        Promoting => "promoting",
-        DistributedStarting => "distributed-starting",
-        DistributedReady => "distributed-ready",
-        Demoting => "demoting",
-        Backoff => "backoff",
-        ManualInterventionRequired => "manual-intervention-required",
-    }
-}
-
-fn cluster_mode_name(snapshot: ClusterSnapshot) -> &'static str {
-    use crate::target::StableMode::*;
-    match snapshot.stable_mode {
-        SoloStandalone => "solo-standalone",
-        PairedStandalone => "paired-standalone",
-        DistributedMxfp4 => "distributed-mxfp4",
-    }
-}
-
-fn model_variant_name(value: ModelVariant) -> &'static str {
-    match value {
-        ModelVariant::Q2 => "q2",
-        ModelVariant::Q2Q4 => "q2-q4",
-        ModelVariant::Mxfp4 => "mxfp4",
-    }
-}
-
-fn residency_name(value: Residency) -> &'static str {
-    match value {
-        Residency::Resident => "resident",
-        Residency::SsdStreaming => "ssd-streaming",
     }
 }
 
