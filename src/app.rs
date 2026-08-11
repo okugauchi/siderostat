@@ -226,53 +226,10 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
-    // Childを起動する前にmutation認証材料を確定し、起動途中のorphanを防ぐ。
-    if config.ds4.dspark.enabled {
-        let manifest_bytes = std::fs::read(&config.ds4.standalone.model_manifest)?;
-        let manifest = serde_json::from_slice::<StandaloneManifest>(&manifest_bytes)?;
-        let support_model = config
-            .ds4
-            .dspark
-            .support_model
-            .as_deref()
-            .context("DSpark support model is unavailable")?;
-        let fingerprint = fingerprint_file(support_model).await?;
-        manifest.validate_dspark_binding(
-            &fingerprint,
-            config.ds4.dspark.confidence,
-            config.ds4.dspark.strict,
-        )?;
-    }
-    let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
-    let control_secret = if config.cluster.enabled {
-        Some(std::fs::read(&config.cluster.security.control_secret_file)?)
-    } else {
-        None
-    };
-    let distributed_manifest = if config.cluster.enabled {
-        let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
-        Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
-    } else {
-        None
-    };
-    let role = if config.cluster.enabled {
-        detect_cluster_role(
-            &config.cluster.interface,
-            config.cluster.coordinator_address,
-            config.cluster.worker_address,
-        )?
-    } else {
-        LocalRole::Unknown
-    };
+    validate_dspark_binding(&config).await?;
+    let boot = BootInputs::load(&config).await?;
     let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
-    let persisted = match state_store.load() {
-        Ok(state) => state,
-        Err(StateStoreError::CorruptPreserved { path, reason }) => {
-            tracing::warn!(preserved = %path.display(), reason, "corrupt cluster state preserved");
-            None
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let persisted = load_persisted_state(&state_store)?;
     let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
     let restart = reconcile_restart(
         persisted.as_ref(),
@@ -290,20 +247,146 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         },
         false,
     );
+    let supervisor = build_standalone_supervisor(&config)?;
+    let role = boot.role;
+    let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
+    let production = attach_control_plane(&config, boot, &state, &runtime, &supervisor)?;
+    let transition_monitor = spawn_transition_monitor(
+        &state,
+        &state_store,
+        &runtime,
+        &supervisor,
+        production.as_ref(),
+        &config.ds4.standalone.profile_id,
+    );
+    persist_runtime_state(
+        &state_store,
+        &runtime,
+        &supervisor,
+        production.as_ref(),
+        &config.ds4.standalone.profile_id,
+    )
+    .await?;
+    let local_monitor = spawn_local_monitor(
+        &state,
+        &state_store,
+        &runtime,
+        &supervisor,
+        &config.ds4.standalone.profile_id,
+    );
+    run_servers(
+        &config,
+        state,
+        production,
+        role,
+        supervisor,
+        runtime,
+        transition_monitor,
+        local_monitor,
+    )
+    .await
+}
+
+/// Child起動前にmutation認証材料を確定し、起動途中のorphanを防ぐDSparkバインド検証。
+async fn validate_dspark_binding(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    if config.ds4.dspark.enabled {
+        let manifest_bytes = std::fs::read(&config.ds4.standalone.model_manifest)?;
+        let manifest = serde_json::from_slice::<StandaloneManifest>(&manifest_bytes)?;
+        let support_model = config
+            .ds4
+            .dspark
+            .support_model
+            .as_deref()
+            .context("DSpark support model is unavailable")?;
+        let fingerprint = fingerprint_file(support_model).await?;
+        manifest.validate_dspark_binding(
+            &fingerprint,
+            config.ds4.dspark.confidence,
+            config.ds4.dspark.strict,
+        )?;
+    }
+    Ok(())
+}
+
+/// 起動前に一度だけ読み取る認証材料と役割のまとまり。
+struct BootInputs {
+    admin_token: Vec<u8>,
+    control_secret: Option<Vec<u8>>,
+    distributed_manifest: Option<DistributedManifest>,
+    role: LocalRole,
+}
+
+impl BootInputs {
+    async fn load(config: &ModeAwareConfig) -> anyhow::Result<Self> {
+        let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
+        let control_secret = if config.cluster.enabled {
+            Some(std::fs::read(&config.cluster.security.control_secret_file)?)
+        } else {
+            None
+        };
+        let distributed_manifest = if config.cluster.enabled {
+            let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
+            Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
+        } else {
+            None
+        };
+        let role = if config.cluster.enabled {
+            detect_cluster_role(
+                &config.cluster.interface,
+                config.cluster.coordinator_address,
+                config.cluster.worker_address,
+            )?
+        } else {
+            LocalRole::Unknown
+        };
+        Ok(Self {
+            admin_token,
+            control_secret,
+            distributed_manifest,
+            role,
+        })
+    }
+}
+
+fn load_persisted_state(
+    state_store: &StateStore,
+) -> anyhow::Result<Option<PersistentClusterState>> {
+    match state_store.load() {
+        Ok(state) => Ok(state),
+        Err(StateStoreError::CorruptPreserved { path, reason }) => {
+            tracing::warn!(preserved = %path.display(), reason, "corrupt cluster state preserved");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn build_standalone_supervisor(
+    config: &ModeAwareConfig,
+) -> anyhow::Result<Arc<StandaloneSupervisor>> {
     let command = build_standalone_command(&config.ds4)?;
     let models_url = url::Url::parse(&format!(
         "http://{}:{}/v1/models",
         config.ds4.http_host, config.ds4.http_port
     ))?;
-    let supervisor = Arc::new(StandaloneSupervisor::new(
+    Ok(Arc::new(StandaloneSupervisor::new(
         command,
         models_url,
         config.cluster.timeouts.standalone_startup,
         std::time::Duration::from_millis(250),
         config.cluster.timeouts.stop,
         config.ds4.allow_sigkill,
-    ));
-    let runtime = Arc::new(match restart {
+    )))
+}
+
+async fn spawn_runtime(
+    config: &ModeAwareConfig,
+    role: LocalRole,
+    state: &Arc<AppState>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    restart: RestartDecision,
+) -> anyhow::Result<Arc<ModeRuntime>> {
+    Ok(Arc::new(match restart {
         RestartDecision::StartSolo {
             baseline_generation,
         } => {
@@ -330,23 +413,34 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             )
             .await?
         }
-    });
+    }))
+}
+
+fn attach_control_plane(
+    config: &ModeAwareConfig,
+    boot: BootInputs,
+    state: &Arc<AppState>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+) -> anyhow::Result<Option<ProductionClusterRuntime>> {
     let production = if config.cluster.enabled {
         Some(ProductionClusterRuntime::new(
             config.clone(),
-            role,
+            boot.role,
             runtime.clone(),
             state.proxy.clone(),
             supervisor.clone(),
-            distributed_manifest.context("distributed manifest is unavailable")?,
-            control_secret.context("control secret is unavailable")?,
+            boot.distributed_manifest
+                .context("distributed manifest is unavailable")?,
+            boot.control_secret
+                .context("control secret is unavailable")?,
         )?)
     } else {
         None
     };
     state.attach_cluster(runtime.cluster_handle());
     state.attach_admin(AdminController::new(
-        admin_token,
+        boot.admin_token,
         Arc::new(RuntimeAdminExecutor {
             runtime: runtime.clone(),
             supervisor: supervisor.clone(),
@@ -355,14 +449,25 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             production: production.clone(),
         }),
     )?);
+    Ok(production)
+}
+
+fn spawn_transition_monitor(
+    state: &Arc<AppState>,
+    state_store: &Arc<StateStore>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    production: Option<&ProductionClusterRuntime>,
+    profile: &str,
+) -> tokio::task::JoinHandle<()> {
     let mut transition_snapshots = runtime.cluster_handle().subscribe();
     let transition_metrics = state.metrics.clone();
     let transition_store = state_store.clone();
     let transition_runtime = runtime.clone();
     let transition_supervisor = supervisor.clone();
-    let transition_production = production.clone();
-    let transition_profile = config.ds4.standalone.profile_id.clone();
-    let transition_monitor = tokio::spawn(async move {
+    let transition_production = production.cloned();
+    let transition_profile = profile.to_string();
+    tokio::spawn(async move {
         let mut previous = *transition_snapshots.borrow_and_update();
         let mut transition_started = std::time::Instant::now();
         while transition_snapshots.changed().await.is_ok() {
@@ -388,21 +493,22 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
                 tracing::error!(error = %error, "persistent cluster transition write failed");
             }
         }
-    });
-    persist_runtime_state(
-        &state_store,
-        &runtime,
-        &supervisor,
-        production.as_ref(),
-        &config.ds4.standalone.profile_id,
-    )
-    .await?;
+    })
+}
+
+fn spawn_local_monitor(
+    state: &Arc<AppState>,
+    state_store: &Arc<StateStore>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    profile: &str,
+) -> tokio::task::JoinHandle<()> {
     let local_monitor_runtime = runtime.clone();
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
-    let local_monitor_profile = config.ds4.standalone.profile_id.clone();
+    let local_monitor_profile = profile.to_string();
     let local_monitor_metrics = state.metrics.clone();
-    let local_monitor = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -429,7 +535,20 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
                 }
             }
         }
-    });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_servers(
+    config: &ModeAwareConfig,
+    state: Arc<AppState>,
+    production: Option<ProductionClusterRuntime>,
+    role: LocalRole,
+    supervisor: Arc<StandaloneSupervisor>,
+    runtime: Arc<ModeRuntime>,
+    transition_monitor: tokio::task::JoinHandle<()>,
+    local_monitor: tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
     let public_addr = state.config.public_listen;
     let admin_addr = state.config.admin_listen;
     let public = public_router(state.clone());
