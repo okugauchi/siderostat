@@ -336,6 +336,19 @@ pub fn spawn_state_machine(
     )
 }
 
+pub(crate) fn transition_name(from: ClusterState, to: ClusterState) -> &'static str {
+    match (from, to) {
+        (ClusterState::SoloStandaloneReady, ClusterState::Pairing) => "pair",
+        (ClusterState::PairedStandaloneReady, ClusterState::AwaitingWorkerHello)
+        | (ClusterState::AwaitingWorkerHello, ClusterState::Promoting)
+        | (ClusterState::Promoting, ClusterState::DistributedStarting)
+        | (ClusterState::DistributedStarting, ClusterState::DistributedReady) => "promote",
+        (ClusterState::DistributedReady, ClusterState::Demoting)
+        | (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => "demote",
+        _ => "reconcile",
+    }
+}
+
 fn cluster_event_name(event: ClusterEventKind, state: ClusterState) -> &'static str {
     match (event, state) {
         (_, ClusterState::SoloStandaloneReady) => "solo_standalone_ready",
@@ -553,5 +566,47 @@ mod tests {
             ClusterState::SoloStandaloneStarting
         );
         task.abort();
+    }
+
+    #[test]
+    fn transition_name_classifies_promotion_and_demotion_paths() {
+        assert_eq!(
+            transition_name(ClusterState::SoloStandaloneReady, ClusterState::Pairing),
+            "pair"
+        );
+        assert_eq!(
+            transition_name(
+                ClusterState::PairedStandaloneReady,
+                ClusterState::AwaitingWorkerHello
+            ),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::AwaitingWorkerHello, ClusterState::Promoting),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Promoting, ClusterState::DistributedStarting),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(
+                ClusterState::DistributedStarting,
+                ClusterState::DistributedReady
+            ),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::DistributedReady, ClusterState::Demoting),
+            "demote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Demoting, ClusterState::PairedStandaloneReady),
+            "demote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Booting, ClusterState::SoloStandaloneStarting),
+            "reconcile"
+        );
     }
 }

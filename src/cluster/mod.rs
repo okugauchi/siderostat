@@ -88,6 +88,7 @@ pub use restart::{
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};
+pub(crate) use state::transition_name;
 pub use state::{
     ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot, FailureAction,
     PromotionFailureStatus, PromotionFailureTracker, PromotionRetryDecision, PromotionTrackerError,

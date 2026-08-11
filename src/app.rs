@@ -368,8 +368,8 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         while transition_snapshots.changed().await.is_ok() {
             let current = *transition_snapshots.borrow_and_update();
             transition_metrics.transition(
-                previous.state.name(),
-                current.state.name(),
+                previous.state,
+                current.state,
                 "success",
                 "state-change",
                 transition_started.elapsed().as_secs_f64(),

@@ -1,9 +1,10 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     app::target_name,
-    cluster::ClusterSnapshot,
+    cluster::{ClusterSnapshot, transition_name},
     config::{ModelVariant, Residency},
     proxy::ModeAwareTargetSnapshot,
+    target::ClusterState,
 };
 use std::{
     collections::HashMap,
@@ -73,8 +74,8 @@ impl Metrics {
 
     pub fn transition(
         &self,
-        from: &'static str,
-        to: &'static str,
+        from: ClusterState,
+        to: ClusterState,
         result: &'static str,
         reason: &'static str,
         seconds: f64,
@@ -82,8 +83,8 @@ impl Metrics {
         self.increment(
             "ds4_proxy_cluster_transitions_total",
             &[
-                ("from", from),
-                ("to", to),
+                ("from", from.name()),
+                ("to", to.name()),
                 ("result", result),
                 ("reason", reason),
             ],
@@ -399,18 +400,6 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn transition_name(from: &str, to: &str) -> &'static str {
-    match (from, to) {
-        ("solo-standalone-ready", "pairing") => "pair",
-        ("paired-standalone-ready", "awaiting-worker-hello")
-        | ("awaiting-worker-hello", "promoting")
-        | ("promoting", "distributed-starting")
-        | ("distributed-starting", "distributed-ready") => "promote",
-        ("distributed-ready", "demoting") | ("demoting", "paired-standalone-ready") => "demote",
-        _ => "reconcile",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,8 +566,8 @@ mod tests {
     fn cluster_event_counters_use_only_finite_diagnostic_labels() {
         let metrics = Metrics::default();
         metrics.transition(
-            "paired-standalone-ready",
-            "awaiting-worker-hello",
+            ClusterState::PairedStandaloneReady,
+            ClusterState::AwaitingWorkerHello,
             "success",
             "state-change",
             0.25,
