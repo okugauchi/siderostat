@@ -1,4 +1,7 @@
-use super::{ChildLogForwarders, ChildLogRecord, Ds4Command, spawn_child_log_forwarders};
+use super::{
+    ChildLogForwarders, ChildLogRecord, Ds4Command, Ds4LogEvent, spawn_child_log_forwarders,
+    spawn_child_log_forwarders_with_events,
+};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
@@ -239,6 +242,66 @@ struct SupervisedChild {
     log_task: tokio::task::JoinHandle<()>,
 }
 
+/// Shared slot management for a single supervised child. All supervisors use the same
+/// child_identity / is_running / stop / begin_start lifecycle so that the per-supervisor code
+/// only differs where the startup conditions actually differ (readiness waits, dspark activation,
+/// route observation).
+struct SupervisedSlot {
+    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+}
+
+impl SupervisedSlot {
+    fn new() -> Self {
+        Self {
+            child: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn child_identity(&self) -> Option<ChildIdentity> {
+        self.child
+            .lock()
+            .await
+            .as_ref()
+            .map(|current| current.child.identity().clone())
+    }
+
+    async fn is_running(&self) -> anyhow::Result<bool> {
+        let mut slot = self.child.lock().await;
+        let Some(current) = slot.as_mut() else {
+            return Ok(false);
+        };
+        Ok(current.child.try_wait()?.is_none())
+    }
+
+    async fn stop(&self, stop_timeout: Duration, allow_sigkill: bool) -> anyhow::Result<()> {
+        let mut slot = self.child.lock().await;
+        let Some(mut current) = slot.take() else {
+            return Ok(());
+        };
+        let result = current.child.stop(stop_timeout, allow_sigkill).await;
+        current.log_task.abort();
+        result?;
+        Ok(())
+    }
+
+    /// Locks the slot and clears any stale child so a replacement can be placed. Returns `None`
+    /// when a child is already running; callers treat that as a no-op start.
+    async fn begin_start(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::MutexGuard<'_, Option<SupervisedChild>>>> {
+        let mut slot = self.child.lock().await;
+        if let Some(current) = slot.as_mut()
+            && current.child.try_wait()?.is_none()
+        {
+            return Ok(None);
+        }
+        if let Some(stale) = slot.take() {
+            stale.log_task.abort();
+        }
+        Ok(Some(slot))
+    }
+}
+
 impl ManagedChild {
     #[cfg(target_os = "macos")]
     pub async fn spawn(command: &Ds4Command, generation: u64) -> Result<Self, ProcessControlError> {
@@ -321,6 +384,35 @@ impl ManagedChild {
         let stdout = self.take_stdout().expect("stdout presence checked above");
         let stderr = self.take_stderr().expect("stderr presence checked above");
         Ok(spawn_child_log_forwarders(
+            stdout,
+            stderr,
+            Arc::from(self.identity.profile_id.as_str()),
+            self.identity.generation,
+            self.identity.pid,
+            capacity,
+        ))
+    }
+
+    pub fn start_log_forwarding_with_events(
+        &mut self,
+        capacity: usize,
+    ) -> Result<
+        (
+            mpsc::Receiver<ChildLogRecord>,
+            mpsc::UnboundedReceiver<Ds4LogEvent>,
+            ChildLogForwarders,
+        ),
+        ProcessControlError,
+    > {
+        if capacity == 0 {
+            return Err(ProcessControlError::InvalidLogCapacity);
+        }
+        if self.child.stdout.is_none() || self.child.stderr.is_none() {
+            return Err(ProcessControlError::MissingLogPipe);
+        }
+        let stdout = self.take_stdout().expect("stdout presence checked above");
+        let stderr = self.take_stderr().expect("stderr presence checked above");
+        Ok(spawn_child_log_forwarders_with_events(
             stdout,
             stderr,
             Arc::from(self.identity.profile_id.as_str()),

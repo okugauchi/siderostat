@@ -1,8 +1,5 @@
-use super::{ChildIdentity, ManagedChild, ProcessControlError, SupervisedChild};
-use crate::cluster::{
-    DistributedCoordinatorLifecycle, Ds4Command, Ds4LogEvent,
-    spawn_child_log_forwarders_with_events,
-};
+use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
+use crate::cluster::{DistributedCoordinatorLifecycle, Ds4Command, Ds4LogEvent};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
 use url::Url;
@@ -20,7 +17,7 @@ struct DistributedCoordinatorSupervisorInner {
     poll_interval: Duration,
     stop_timeout: Duration,
     allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+    child: SupervisedSlot,
     route: tokio::sync::watch::Sender<CoordinatorRouteState>,
 }
 
@@ -50,50 +47,26 @@ impl DistributedCoordinatorSupervisor {
                 poll_interval,
                 stop_timeout,
                 allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
+                child: SupervisedSlot::new(),
                 route,
             }),
         }
     }
 
     pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .map(|current| current.child.identity().clone())
+        self.inner.child.child_identity().await
     }
 
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        if let Some(current) = slot.as_mut()
-            && current.child.try_wait()?.is_none()
-        {
+        let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
-        }
-        if let Some(stale) = slot.take() {
-            stale.log_task.abort();
-        }
+        };
         self.inner
             .route
             .send_replace(CoordinatorRouteState::default());
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let stdout = child
-            .take_stdout()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let stderr = child
-            .take_stderr()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let (mut logs, mut events, forwarders) = spawn_child_log_forwarders_with_events(
-            stdout,
-            stderr,
-            Arc::from(child.identity().profile_id.as_str()),
-            child.identity().generation,
-            child.identity().pid,
-            256,
-        );
+        let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let route = self.inner.route.clone();
         let log_task = tokio::spawn(async move {
             loop {
@@ -160,31 +133,19 @@ impl DistributedCoordinatorSupervisor {
     }
 
     async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            self.inner
-                .route
-                .send_replace(CoordinatorRouteState::default());
-            return Ok(());
-        };
-        let result = current
+        let result = self
+            .inner
             .child
             .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
             .await;
-        current.log_task.abort();
         self.inner
             .route
             .send_replace(CoordinatorRouteState::default());
-        result?;
-        Ok(())
+        result
     }
 
     async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(current) = slot.as_mut() else {
-            return Ok(false);
-        };
-        Ok(current.child.try_wait()?.is_none())
+        self.inner.child.is_running().await
     }
 
     async fn wait_ready_inner(&self) -> anyhow::Result<()> {

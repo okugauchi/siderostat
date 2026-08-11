@@ -1,4 +1,4 @@
-use super::{ChildIdentity, ManagedChild, SupervisedChild};
+use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
 use crate::cluster::{DistributedWorkerLifecycle, Ds4Command};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
@@ -12,7 +12,7 @@ struct DistributedWorkerSupervisorInner {
     command: Ds4Command,
     stop_timeout: Duration,
     allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+    child: SupervisedSlot,
 }
 
 impl DistributedWorkerSupervisor {
@@ -22,31 +22,20 @@ impl DistributedWorkerSupervisor {
                 command,
                 stop_timeout,
                 allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
+                child: SupervisedSlot::new(),
             }),
         }
     }
 
     pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .map(|current| current.child.identity().clone())
+        self.inner.child.child_identity().await
     }
 
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        if let Some(current) = slot.as_mut()
-            && current.child.try_wait()?.is_none()
-        {
+        let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
-        }
-        if let Some(stale) = slot.take() {
-            stale.log_task.abort();
-        }
+        };
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let (mut logs, forwarders) = child.start_log_forwarding(256)?;
         let log_task = tokio::spawn(async move {
@@ -77,25 +66,14 @@ impl DistributedWorkerSupervisor {
     }
 
     async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            return Ok(());
-        };
-        let result = current
+        self.inner
             .child
             .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-            .await;
-        current.log_task.abort();
-        result?;
-        Ok(())
+            .await
     }
 
     async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(current) = slot.as_mut() else {
-            return Ok(false);
-        };
-        Ok(current.child.try_wait()?.is_none())
+        self.inner.child.is_running().await
     }
 }
 

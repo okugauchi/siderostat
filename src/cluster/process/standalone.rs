@@ -1,7 +1,5 @@
-use super::{ChildIdentity, ManagedChild, ProcessControlError, SupervisedChild};
-use crate::cluster::{
-    Ds4Command, Ds4LogEvent, LocalStandaloneLifecycle, spawn_child_log_forwarders_with_events,
-};
+use super::{ChildIdentity, ManagedChild, ProcessControlError, SupervisedChild, SupervisedSlot};
+use crate::cluster::{Ds4Command, Ds4LogEvent, LocalStandaloneLifecycle};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -20,7 +18,7 @@ struct StandaloneSupervisorInner {
     poll_interval: Duration,
     stop_timeout: Duration,
     allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+    child: SupervisedSlot,
 }
 
 impl StandaloneSupervisor {
@@ -41,45 +39,23 @@ impl StandaloneSupervisor {
                 poll_interval,
                 stop_timeout,
                 allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
+                child: SupervisedSlot::new(),
             }),
         }
     }
 
     pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .map(|current| current.child.identity().clone())
+        self.inner.child.child_identity().await
     }
 
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        if let Some(current) = slot.as_mut()
-            && current.child.try_wait()?.is_none()
-        {
+        let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
-        }
-        *slot = None;
+        };
         let startup_deadline = Instant::now() + self.inner.startup_timeout;
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let stdout = child
-            .take_stdout()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let stderr = child
-            .take_stderr()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let (mut logs, mut events, forwarders) = spawn_child_log_forwarders_with_events(
-            stdout,
-            stderr,
-            Arc::from(child.identity().profile_id.as_str()),
-            child.identity().generation,
-            child.identity().pid,
-            256,
-        );
+        let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let (dspark_activation, mut dspark_activation_rx) = tokio::sync::watch::channel(false);
         let activation_profile = self.inner.command.profile.profile_id.clone();
         let log_task = tokio::spawn(async move {
@@ -160,25 +136,14 @@ impl StandaloneSupervisor {
     }
 
     async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            return Ok(());
-        };
-        let result = current
+        self.inner
             .child
             .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-            .await;
-        current.log_task.abort();
-        result?;
-        Ok(())
+            .await
     }
 
     async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(current) = slot.as_mut() else {
-            return Ok(false);
-        };
-        Ok(current.child.try_wait()?.is_none())
+        self.inner.child.is_running().await
     }
 }
 
