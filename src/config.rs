@@ -418,87 +418,47 @@ fn validate_dns_sd_name(service_type: &str, domain: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// 各durationを非ゼロ検証する。名前はフィールドパスから生成するため、duration追加時に
+/// 検証名とフィールド参照が二重管理になることはない。
+macro_rules! require_positive_duration {
+    ($config:expr, $($group:ident.$field:ident.$leaf:ident),+ $(,)?) => {
+        $(
+            anyhow::ensure!(
+                !$config.$group.$field.$leaf.is_zero(),
+                concat!(
+                    stringify!($group), ".", stringify!($field), ".", stringify!($leaf),
+                    " must be greater than zero"
+                )
+            );
+        )+
+    };
+}
+
 fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
-    let durations = [
-        ("proxy.timeouts.connect", config.proxy.timeouts.connect),
-        (
-            "proxy.timeouts.response_headers",
-            config.proxy.timeouts.response_headers,
-        ),
-        (
-            "proxy.timeouts.first_body_byte",
-            config.proxy.timeouts.first_body_byte,
-        ),
-        (
-            "proxy.timeouts.stream_idle",
-            config.proxy.timeouts.stream_idle,
-        ),
-        (
-            "cluster.discovery.event_debounce",
-            config.cluster.discovery.event_debounce,
-        ),
-        (
-            "cluster.discovery.reconcile_interval",
-            config.cluster.discovery.reconcile_interval,
-        ),
-        (
-            "cluster.security.max_clock_skew",
-            config.cluster.security.max_clock_skew,
-        ),
-        (
-            "cluster.security.nonce_ttl",
-            config.cluster.security.nonce_ttl,
-        ),
-        (
-            "cluster.policy.required_peer_stability",
-            config.cluster.policy.required_peer_stability,
-        ),
-        (
-            "cluster.policy.route_loss_grace",
-            config.cluster.policy.route_loss_grace,
-        ),
-        (
-            "cluster.policy.promotion_backoff",
-            config.cluster.policy.promotion_backoff,
-        ),
-        (
-            "cluster.timeouts.peer_connect",
-            config.cluster.timeouts.peer_connect,
-        ),
-        (
-            "cluster.timeouts.peer_request",
-            config.cluster.timeouts.peer_request,
-        ),
-        (
-            "cluster.timeouts.control_lease",
-            config.cluster.timeouts.control_lease,
-        ),
-        ("cluster.timeouts.drain", config.cluster.timeouts.drain),
-        ("cluster.timeouts.stop", config.cluster.timeouts.stop),
-        (
-            "cluster.timeouts.rendezvous_hello",
-            config.cluster.timeouts.rendezvous_hello,
-        ),
-        (
-            "cluster.timeouts.worker_startup",
-            config.cluster.timeouts.worker_startup,
-        ),
-        (
-            "cluster.timeouts.coordinator_startup",
-            config.cluster.timeouts.coordinator_startup,
-        ),
-        (
-            "cluster.timeouts.complete_route",
-            config.cluster.timeouts.complete_route,
-        ),
-        (
-            "cluster.timeouts.standalone_startup",
-            config.cluster.timeouts.standalone_startup,
-        ),
-    ];
-    for (name, duration) in durations {
-        anyhow::ensure!(!duration.is_zero(), "{name} must be greater than zero");
-    }
+    require_positive_duration!(
+        config,
+        proxy.timeouts.connect,
+        proxy.timeouts.response_headers,
+        proxy.timeouts.first_body_byte,
+        proxy.timeouts.stream_idle,
+        cluster.discovery.event_debounce,
+        cluster.discovery.reconcile_interval,
+        cluster.security.max_clock_skew,
+        cluster.security.nonce_ttl,
+        cluster.policy.required_peer_stability,
+        cluster.policy.route_loss_grace,
+        cluster.policy.promotion_backoff,
+        cluster.timeouts.peer_connect,
+        cluster.timeouts.peer_request,
+        cluster.timeouts.control_lease,
+        cluster.timeouts.drain,
+        cluster.timeouts.stop,
+        cluster.timeouts.rendezvous_hello,
+        cluster.timeouts.worker_startup,
+        cluster.timeouts.coordinator_startup,
+        cluster.timeouts.complete_route,
+        cluster.timeouts.standalone_startup,
+    );
     anyhow::ensure!(
         config.cluster.timeouts.rendezvous_hello >= config.cluster.timeouts.worker_startup,
         "cluster.timeouts.rendezvous_hello must not be shorter than worker_startup"
@@ -878,6 +838,38 @@ fn parse_duration(value: &str) -> Option<Duration> {
         .ok()
         .and_then(|n| n.checked_mul(multiplier))
         .map(Duration::from_millis)
+}
+
+/// 検証テスト用: 指定したドット区切りパスのdurationをゼロにする。
+#[cfg(test)]
+fn zero_duration_at(config: &mut ModeAwareConfig, path: &str) {
+    let duration = match path {
+        "proxy.timeouts.connect" => &mut config.proxy.timeouts.connect,
+        "proxy.timeouts.response_headers" => &mut config.proxy.timeouts.response_headers,
+        "proxy.timeouts.first_body_byte" => &mut config.proxy.timeouts.first_body_byte,
+        "proxy.timeouts.stream_idle" => &mut config.proxy.timeouts.stream_idle,
+        "cluster.discovery.event_debounce" => &mut config.cluster.discovery.event_debounce,
+        "cluster.discovery.reconcile_interval" => &mut config.cluster.discovery.reconcile_interval,
+        "cluster.security.max_clock_skew" => &mut config.cluster.security.max_clock_skew,
+        "cluster.security.nonce_ttl" => &mut config.cluster.security.nonce_ttl,
+        "cluster.policy.required_peer_stability" => {
+            &mut config.cluster.policy.required_peer_stability
+        }
+        "cluster.policy.route_loss_grace" => &mut config.cluster.policy.route_loss_grace,
+        "cluster.policy.promotion_backoff" => &mut config.cluster.policy.promotion_backoff,
+        "cluster.timeouts.peer_connect" => &mut config.cluster.timeouts.peer_connect,
+        "cluster.timeouts.peer_request" => &mut config.cluster.timeouts.peer_request,
+        "cluster.timeouts.control_lease" => &mut config.cluster.timeouts.control_lease,
+        "cluster.timeouts.drain" => &mut config.cluster.timeouts.drain,
+        "cluster.timeouts.stop" => &mut config.cluster.timeouts.stop,
+        "cluster.timeouts.rendezvous_hello" => &mut config.cluster.timeouts.rendezvous_hello,
+        "cluster.timeouts.worker_startup" => &mut config.cluster.timeouts.worker_startup,
+        "cluster.timeouts.coordinator_startup" => &mut config.cluster.timeouts.coordinator_startup,
+        "cluster.timeouts.complete_route" => &mut config.cluster.timeouts.complete_route,
+        "cluster.timeouts.standalone_startup" => &mut config.cluster.timeouts.standalone_startup,
+        _ => unreachable!("unknown duration path {path}"),
+    };
+    *duration = Duration::ZERO;
 }
 
 #[cfg(test)]
@@ -1292,10 +1284,6 @@ level = "info"
     #[test]
     fn rejects_zero_or_inconsistent_timeouts() {
         let files = ConfigTestFiles::new();
-        let mut zero = files.config();
-        zero.proxy.timeouts.connect = Duration::ZERO;
-        assert!(zero.validate().unwrap_err().to_string().contains("connect"));
-
         let mut inconsistent = files.config();
         inconsistent.cluster.timeouts.rendezvous_hello = Duration::from_secs(1);
         assert!(
@@ -1305,6 +1293,43 @@ level = "info"
                 .to_string()
                 .contains("rendezvous_hello")
         );
+    }
+
+    #[test]
+    fn rejects_every_duration_at_zero_with_dotted_path() {
+        let files = ConfigTestFiles::new();
+        let paths = [
+            "proxy.timeouts.connect",
+            "proxy.timeouts.response_headers",
+            "proxy.timeouts.first_body_byte",
+            "proxy.timeouts.stream_idle",
+            "cluster.discovery.event_debounce",
+            "cluster.discovery.reconcile_interval",
+            "cluster.security.max_clock_skew",
+            "cluster.security.nonce_ttl",
+            "cluster.policy.required_peer_stability",
+            "cluster.policy.route_loss_grace",
+            "cluster.policy.promotion_backoff",
+            "cluster.timeouts.peer_connect",
+            "cluster.timeouts.peer_request",
+            "cluster.timeouts.control_lease",
+            "cluster.timeouts.drain",
+            "cluster.timeouts.stop",
+            "cluster.timeouts.rendezvous_hello",
+            "cluster.timeouts.worker_startup",
+            "cluster.timeouts.coordinator_startup",
+            "cluster.timeouts.complete_route",
+            "cluster.timeouts.standalone_startup",
+        ];
+        for path in paths {
+            let mut config = files.config();
+            zero_duration_at(&mut config, path);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{path} must be greater than zero")),
+                "expected {path} to be validated, got: {error}"
+            );
+        }
     }
 
     #[test]
