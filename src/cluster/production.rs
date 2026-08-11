@@ -27,7 +27,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -936,6 +936,7 @@ impl ProductionClusterRuntime {
     pub fn start_reconcile_task(&self) -> tokio::task::JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
+            let promotion_running = Arc::new(AtomicBool::new(false));
             let lease_refresh = runtime.inner.config.cluster.timeouts.control_lease / 3;
             let period = runtime
                 .inner
@@ -961,9 +962,18 @@ impl ProductionClusterRuntime {
                 } else if snapshot.state == ClusterState::PairedStandaloneReady
                     && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_promote
-                    && let Err(error) = runtime.promote().await
+                    && promotion_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
                 {
-                    tracing::error!(error = %error, "automatic promotion failed");
+                    let promotion_runtime = runtime.clone();
+                    let promotion_running = promotion_running.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = promotion_runtime.promote().await {
+                            tracing::error!(error = %error, "automatic promotion failed");
+                        }
+                        promotion_running.store(false, Ordering::Release);
+                    });
                 }
             }
         })
