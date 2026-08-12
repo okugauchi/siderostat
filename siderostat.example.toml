@@ -110,3 +110,7 @@ extra_args = ["--debug"]
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true

@@ -45,6 +45,22 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub sound: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: cfg!(target_os = "macos"),
+            sound: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeAwareConfig {
     pub schema_version: u32,
@@ -52,6 +68,8 @@ pub struct ModeAwareConfig {
     pub cluster: ClusterConfig,
     pub ds4: Ds4Config,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -979,6 +997,10 @@ extra_args = ["--debug"]
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true
 "#
     }
 
@@ -1058,6 +1080,17 @@ level = "info"
             config.cluster.timeouts.rendezvous_hello,
             Duration::from_secs(900)
         );
+        assert!(config.notifications.enabled);
+        assert!(config.notifications.sound);
+    }
+
+    #[test]
+    fn notifications_section_defaults_are_backward_compatible() {
+        let input =
+            mode_aware_config().replace("[notifications]\nenabled = true\nsound = true\n", "");
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert_eq!(config.notifications.enabled, cfg!(target_os = "macos"));
+        assert!(config.notifications.sound);
     }
 
     #[test]
