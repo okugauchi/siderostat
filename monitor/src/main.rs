@@ -1,8 +1,9 @@
 //! siderostat-monitor: macOS menu bar monitor for siderostat.
 //!
 //! Polls the siderostat `/metrics` endpoint and renders the state through a
-//! tray-icon menu bar item. The tray icon is created and updated on the main
-//! thread (macOS AppKit requirement); polling runs on a separate thread.
+//! tray-icon menu bar item. Polling runs on a separate thread; the AppKit
+//! event loop runs on the main thread (tray-icon macOS requirement) and a
+//! CFRunLoop timer refreshes the tray from the shared state.
 
 mod client;
 mod config;
@@ -12,12 +13,32 @@ mod tray;
 
 use crate::{client::MetricsClient, config::MonitorConfig, state::DisplayState, tray::MonitorTray};
 use anyhow::Result;
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_core_foundation::{
+    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
+};
 use std::{
-    sync::{Arc, Mutex},
+    ffi::c_void,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicPtr, Ordering},
+    },
     thread,
-    time::Duration,
 };
 use tray_icon::menu::MenuEvent;
+
+/// Raw pointer to the shared NSApplication, so the Send+Sync menu event handler
+/// can terminate the app without capturing the non-Sync object.
+static APP_PTR: AtomicPtr<NSApplication> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Main-thread refresh context for the CFRunLoop timer. The tray pointer stays
+/// valid because the tray is created on the main thread and lives until the
+/// process exits (`app.run()` blocks on the same thread).
+struct UpdateContext {
+    shared: Arc<Mutex<DisplayState>>,
+    tray: *const MonitorTray,
+}
 
 fn main() -> Result<()> {
     initialize_logging();
@@ -32,7 +53,7 @@ fn main() -> Result<()> {
     let shared = Arc::new(Mutex::new(DisplayState::default()));
 
     // Polling runs on a separate thread with its own Tokio runtime so the
-    // main thread stays free for AppKit menu bar event processing.
+    // main thread stays free for the AppKit menu bar event loop.
     let poll_client = client;
     let poll_state = shared.clone();
     thread::Builder::new()
@@ -45,29 +66,84 @@ fn main() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         })?;
 
-    // Build the tray on the main thread and keep it alive for the process
-    // lifetime. The returned guard is intentionally held until exit.
-    let tray = MonitorTray::new()?;
+    // AppKit setup on the main thread (tray-icon macOS requirement): create the
+    // NSApplication, run as a background menu-bar (accessory) app, then create
+    // the tray. Without the AppKit event loop below, the status item is created
+    // (and appears in System Settings) but never drawn in the menu bar.
+    let mtm = MainThreadMarker::new().expect("tray creation requires the main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    tracing::info!("NSApplication ready (accessory policy)");
 
-    // Main-thread event loop: refresh the menu from shared state and process
-    // menu events (quit).
-    loop {
-        {
-            let display = shared
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tray.update(&display);
-        }
-        if let Ok(event) = MenuEvent::receiver().try_recv()
-            && MonitorTray::is_quit_event(&event)
-        {
-            tracing::info!("quit requested from menu");
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
+    let tray = MonitorTray::new()?;
+    {
+        let display = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tray.update(&display);
     }
 
+    // Quit from the menu terminates the app. The Send+Sync event-handler
+    // closure cannot capture `Retained<NSApplication>` (not Send), so reach it
+    // through an AtomicPtr global; the app lives for the process lifetime.
+    APP_PTR.store(
+        (&*app as *const NSApplication).cast_mut(),
+        Ordering::Relaxed,
+    );
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if MonitorTray::is_quit_event(&event) {
+            tracing::info!("quit requested from menu");
+            let ptr = APP_PTR.load(Ordering::Relaxed);
+            // SAFETY: APP_PTR is set before the handler can fire and the app
+            // object outlives the process (main blocks in `app.run()`).
+            unsafe { (*ptr).terminate(None) };
+        }
+    }));
+
+    // Periodic tray refresh on the main run loop via a CFRunLoop timer.
+    let update = Box::new(UpdateContext {
+        shared: shared.clone(),
+        tray: &tray as *const MonitorTray,
+    });
+    let update_ptr: *mut UpdateContext = Box::into_raw(update);
+    let mut context = CFRunLoopTimerContext {
+        version: 0,
+        info: update_ptr.cast::<c_void>(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    let timer =
+        unsafe { CFRunLoopTimer::new(None, 0.0, 0.5, 0, 0, Some(refresh_callback), &mut context) }
+            .expect("create tray refresh timer");
+    if let Some(run_loop) = CFRunLoop::main() {
+        unsafe {
+            run_loop.add_timer(Some(&*timer), kCFRunLoopCommonModes);
+        }
+    }
+
+    // Run the AppKit main event loop. This is what actually draws the menu bar
+    // item and processes menu clicks. It returns only after the quit menu item
+    // terminates the app.
+    tracing::info!("running AppKit main loop");
+    app.run();
+
+    tracing::info!("monitor exiting");
     Ok(())
+}
+
+/// CFRunLoop timer callback: refresh the tray from shared state on the main thread.
+unsafe extern "C-unwind" fn refresh_callback(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+    // SAFETY: `info` points to the leaked UpdateContext, valid for the timer lifetime.
+    let context = unsafe { &*info.cast::<UpdateContext>() };
+    let display = context
+        .shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: `context.tray` points to the tray created on the main thread,
+    // alive until the process exits.
+    let tray = unsafe { &*context.tray };
+    tray.update(&display);
 }
 
 /// Poll the metrics endpoint and update the shared display state.
