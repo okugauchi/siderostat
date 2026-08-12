@@ -1,5 +1,8 @@
 use super::{ChildIdentity, ManagedChild, ProcessControlError, SupervisedChild, SupervisedSlot};
-use crate::cluster::{Ds4Command, Ds4LogEvent, LocalStandaloneLifecycle};
+use crate::{
+    cluster::{Ds4Command, Ds4LogEvent, LocalStandaloneLifecycle},
+    metrics::Metrics,
+};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -18,6 +21,7 @@ struct StandaloneSupervisorInner {
     poll_interval: Duration,
     stop_timeout: Duration,
     allow_sigkill: bool,
+    metrics: Arc<Metrics>,
     child: SupervisedSlot,
 }
 
@@ -29,6 +33,7 @@ impl StandaloneSupervisor {
         poll_interval: Duration,
         stop_timeout: Duration,
         allow_sigkill: bool,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             inner: Arc::new(StandaloneSupervisorInner {
@@ -39,6 +44,7 @@ impl StandaloneSupervisor {
                 poll_interval,
                 stop_timeout,
                 allow_sigkill,
+                metrics,
                 child: SupervisedSlot::new(),
             }),
         }
@@ -58,18 +64,38 @@ impl StandaloneSupervisor {
         let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let (dspark_activation, mut dspark_activation_rx) = tokio::sync::watch::channel(false);
         let activation_profile = self.inner.command.profile.profile_id.clone();
+        let metrics = self.inner.metrics.clone();
         let log_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(event) = events.recv() => {
-                        if event == Ds4LogEvent::DsparkActivated {
-                            dspark_activation.send_replace(true);
-                            tracing::info!(
-                                event = "dspark-activated",
-                                profile = %activation_profile,
-                                generation,
-                                "DS4 standalone feature activated"
-                            );
+                        match event {
+                            Ds4LogEvent::DsparkActivated => {
+                                dspark_activation.send_replace(true);
+                                tracing::info!(
+                                    event = "dspark-activated",
+                                    profile = %activation_profile,
+                                    generation,
+                                    "DS4 standalone feature activated"
+                                );
+                            }
+                            Ds4LogEvent::PrefillProgress {
+                                current,
+                                total,
+                                percent,
+                                cached,
+                            } => {
+                                metrics.prefill_progress(current, total, percent, cached);
+                            }
+                            Ds4LogEvent::KvCacheHit { tokens, load_ms } => {
+                                metrics.kv_cache_hit(tokens, load_ms);
+                            }
+                            Ds4LogEvent::HttpListening { .. }
+                            | Ds4LogEvent::WorkerRegistered { .. }
+                            | Ds4LogEvent::CompleteRouteReady { .. }
+                            | Ds4LogEvent::WorkerRemoved { .. }
+                            | Ds4LogEvent::RouteIncomplete { .. }
+                            | Ds4LogEvent::GenerationProgress { .. } => {}
                         }
                     }
                     Some(record) = logs.recv() => {

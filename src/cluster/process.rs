@@ -775,7 +775,12 @@ mod tests {
                 dspark_required: false,
             },
         };
-        let supervisor = DistributedWorkerSupervisor::new(command, Duration::from_secs(2), false);
+        let supervisor = DistributedWorkerSupervisor::new(
+            command,
+            Duration::from_secs(2),
+            false,
+            Arc::new(crate::metrics::Metrics::default()),
+        );
         supervisor.start(13).await.unwrap();
         assert!(supervisor.is_running().await.unwrap());
         assert_eq!(supervisor.child_identity().await.unwrap().generation, 13);

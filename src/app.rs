@@ -248,7 +248,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         },
         false,
     );
-    let supervisor = build_standalone_supervisor(&config)?;
+    let supervisor = build_standalone_supervisor(&config, &state)?;
     let role = boot.role;
     let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
     let production = attach_control_plane(&config, boot, &state, &runtime, &supervisor)?;
@@ -377,6 +377,7 @@ fn load_persisted_state(
 
 fn build_standalone_supervisor(
     config: &ModeAwareConfig,
+    state: &Arc<AppState>,
 ) -> anyhow::Result<Arc<StandaloneSupervisor>> {
     let command = build_standalone_command(&config.ds4)?;
     let models_url = url::Url::parse(&format!(
@@ -390,6 +391,7 @@ fn build_standalone_supervisor(
         std::time::Duration::from_millis(250),
         config.cluster.timeouts.stop,
         config.ds4.allow_sigkill,
+        state.metrics.clone(),
     )))
 }
 
@@ -444,6 +446,7 @@ fn attach_control_plane(
             runtime.clone(),
             state.proxy.clone(),
             supervisor.clone(),
+            state.metrics.clone(),
             boot.distributed_manifest
                 .context("distributed manifest is unavailable")?,
             boot.control_secret

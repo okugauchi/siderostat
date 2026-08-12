@@ -4,7 +4,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 mod error;
-mod metrics;
+pub mod metrics;
 pub mod notify;
 pub mod proxy;
 pub mod target;

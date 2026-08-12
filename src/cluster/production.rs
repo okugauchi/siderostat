@@ -6,7 +6,9 @@ use super::{
     HEADER_TIMESTAMP, ModeRuntime, NodeDescriptor, PromotionRetryPolicy, StandaloneSupervisor,
     WorkerControl, WorkerDistributedRuntime,
 };
-use crate::{config::ModeAwareConfig, proxy::ModeAwareProxyState, target::LocalRole};
+use crate::{
+    config::ModeAwareConfig, metrics::Metrics, proxy::ModeAwareProxyState, target::LocalRole,
+};
 use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
@@ -198,12 +200,14 @@ struct ProductionInner {
 }
 
 impl ProductionClusterRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ModeAwareConfig,
         role: LocalRole,
         mode: Arc<ModeRuntime>,
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<StandaloneSupervisor>,
+        metrics: Arc<Metrics>,
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
     ) -> anyhow::Result<Self> {
@@ -273,6 +277,7 @@ impl ProductionClusterRuntime {
                 )?,
                 config.cluster.timeouts.stop,
                 config.ds4.allow_sigkill,
+                metrics.clone(),
             ));
             (
                 Some(WorkerDistributedRuntime::new(
@@ -325,6 +330,7 @@ impl ProductionClusterRuntime {
                 Duration::from_secs(1),
                 inner.config.cluster.timeouts.stop,
                 inner.config.ds4.allow_sigkill,
+                metrics.clone(),
             )));
         }
         let runtime = Self {

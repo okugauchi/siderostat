@@ -19,11 +19,24 @@ struct Summary {
     count: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct Ds4MetricsState {
+    prefill_active: bool,
+    prefill_current: u64,
+    prefill_total: u64,
+    prefill_percent: f64,
+    prefill_cached: u64,
+    kv_cache_hits: u64,
+    kv_cache_hit_tokens: u64,
+    kv_cache_load_ms: f64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     counters: Mutex<HashMap<String, u64>>,
     summaries: Mutex<HashMap<String, Summary>>,
     in_flight: Mutex<HashMap<(String, String), u64>>,
+    ds4: Mutex<Ds4MetricsState>,
 }
 
 pub struct RequestMetricGuard {
@@ -124,6 +137,31 @@ impl Metrics {
         );
     }
 
+    /// Record DS4 prefill progress. When `current >= total` the prefill is
+    /// considered finished and the active flag is cleared.
+    pub fn prefill_progress(&self, current: u64, total: u64, percent: f64, cached: u64) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.prefill_active = current < total;
+        ds4.prefill_current = current;
+        ds4.prefill_total = total;
+        ds4.prefill_percent = percent;
+        ds4.prefill_cached = cached;
+    }
+
+    /// Record a DS4 KV cache hit.
+    pub fn kv_cache_hit(&self, tokens: u64, load_ms: f64) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.kv_cache_hits = ds4.kv_cache_hits.saturating_add(1);
+        ds4.kv_cache_hit_tokens = tokens;
+        ds4.kv_cache_load_ms = load_ms;
+    }
+
     pub fn render_mode_aware(&self, snapshot: MetricSnapshot<'_>) -> String {
         let mut output = String::new();
         render_counters(&mut output, &self.counters);
@@ -216,6 +254,55 @@ impl Metrics {
             snapshot.model_variant.name(),
             snapshot.residency.name(),
         );
+        let ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_active gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_active {}",
+            u8::from(ds4.prefill_active)
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_current gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_current {}",
+            ds4.prefill_current
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_total gauge\n");
+        let _ = writeln!(output, "ds4_proxy_ds4_prefill_total {}", ds4.prefill_total);
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_percent gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_percent {}",
+            ds4.prefill_percent
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_cached gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_cached {}",
+            ds4.prefill_cached
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hits_total counter\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_hits_total {}",
+            ds4.kv_cache_hits
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hit_tokens gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_hit_tokens {}",
+            ds4.kv_cache_hit_tokens
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_load_ms gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_load_ms {}",
+            ds4.kv_cache_load_ms
+        );
+        drop(ds4);
         output
     }
 
@@ -587,5 +674,30 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn renders_ds4_prefill_and_kv_cache_gauges() {
+        let metrics = Metrics::default();
+        metrics.prefill_progress(4096, 9005, 45.5, 0);
+        metrics.kv_cache_hit(9005, 12.3);
+        metrics.kv_cache_hit(1024, 3.1);
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_active 1"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_current 4096"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_total 9005"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_percent 45.5"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_cached 0"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hits_total 2"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hit_tokens 1024"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_load_ms 3.1"));
+    }
+
+    #[test]
+    fn prefill_completion_clears_active_flag() {
+        let metrics = Metrics::default();
+        metrics.prefill_progress(9005, 9005, 100.0, 0);
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_active 0"));
     }
 }

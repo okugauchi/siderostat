@@ -14,17 +14,42 @@ pub enum ChildLogStream {
     Stderr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Ds4LogEvent {
-    HttpListening { url: Url },
+    HttpListening {
+        url: Url,
+    },
     DsparkActivated,
-    WorkerRegistered { detail: String },
-    CompleteRouteReady { detail: String },
-    WorkerRemoved { detail: String },
-    RouteIncomplete { detail: String },
+    WorkerRegistered {
+        detail: String,
+    },
+    CompleteRouteReady {
+        detail: String,
+    },
+    WorkerRemoved {
+        detail: String,
+    },
+    RouteIncomplete {
+        detail: String,
+    },
+    PrefillProgress {
+        current: u64,
+        total: u64,
+        percent: f64,
+        cached: u64,
+    },
+    KvCacheHit {
+        tokens: u64,
+        load_ms: f64,
+    },
+    GenerationProgress {
+        completion: u64,
+        chunk_tps: f64,
+        avg_tps: f64,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChildLogRecord {
     pub profile_id: Arc<str>,
     pub generation: u64,
@@ -143,6 +168,7 @@ where
 }
 
 pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
+    let line = strip_timestamp(line);
     const LISTENING: &str = "ds4-server: listening on ";
     const REGISTERED: &str = "ds4: distributed coordinator: registered worker ";
     const COMPLETE: &str = "ds4: distributed coordinator: complete route ready: ";
@@ -150,6 +176,15 @@ pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
     const INCOMPLETE: &str = "ds4: distributed coordinator: route incomplete; ";
     const DSPARK_ACTIVATED: &str = "ds4: DSpark target-hidden capture enabled: layers=";
 
+    if let Some(event) = parse_prefill_progress(line) {
+        return Some(event);
+    }
+    if let Some(event) = parse_kv_cache_hit(line) {
+        return Some(event);
+    }
+    if let Some(event) = parse_generation_progress(line) {
+        return Some(event);
+    }
     if let Some(value) = line.strip_prefix(LISTENING) {
         let url = Url::parse(value.trim()).ok()?;
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
@@ -179,6 +214,103 @@ pub fn parse_ds4_log_event(line: &str) -> Option<Ds4LogEvent> {
         (1, detail) => Ds4LogEvent::CompleteRouteReady { detail },
         (2, detail) => Ds4LogEvent::WorkerRemoved { detail },
         (_, detail) => Ds4LogEvent::RouteIncomplete { detail },
+    })
+}
+
+/// Remove a `MMDD HH:MM:SS ` log prefix emitted by `server_log`.
+fn strip_timestamp(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    if bytes.len() >= 15
+        && bytes[4] == b' '
+        && bytes[7] == b':'
+        && bytes[10] == b':'
+        && bytes[13] == b' '
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        && bytes[11..13].iter().all(|b| b.is_ascii_digit())
+    {
+        &line[14..]
+    } else {
+        line
+    }
+}
+
+/// Parse `ds4-server: chat ctx=0..9005:0 prefill chunk 4096/9005 (45.5%) ...`.
+fn parse_prefill_progress(line: &str) -> Option<Ds4LogEvent> {
+    let marker = " prefill chunk ";
+    let idx = line.find(marker)?;
+    let before = &line[..idx];
+    let after = &line[idx + marker.len()..];
+    let (current_str, rest) = after.split_once('/')?;
+    let current = current_str.trim().parse().ok()?;
+    let (total_str, rest) = rest.split_once(' ')?;
+    let total = total_str.trim().parse().ok()?;
+    let percent_str = rest.trim_start().trim_start_matches('(').split_once('%')?.0;
+    let percent = percent_str.trim().parse().ok()?;
+    let cached = before
+        .rsplit("ctx=")
+        .next()?
+        .split("..")
+        .next()?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    Some(Ds4LogEvent::PrefillProgress {
+        current,
+        total,
+        percent,
+        cached,
+    })
+}
+
+/// Parse `ds4: kv cache hit text tokens=9005 ... load=12.3 ms file=...`.
+fn parse_kv_cache_hit(line: &str) -> Option<Ds4LogEvent> {
+    let rest = line.strip_prefix("ds4: kv cache hit text ")?;
+    let tokens = rest
+        .strip_prefix("tokens=")?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    let load_ms = rest
+        .split(" load=")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    Some(Ds4LogEvent::KvCacheHit { tokens, load_ms })
+}
+
+/// Parse `ds4-server: chat ctx=... gen=42 ... decoding chunk=32.1 t/s avg=28.5 t/s ...`.
+fn parse_generation_progress(line: &str) -> Option<Ds4LogEvent> {
+    let rest = line.strip_prefix("ds4-server: ")?;
+    let completion = rest
+        .split(" gen=")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    let chunk_tps = rest
+        .split(" decoding chunk=")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    let avg_tps = rest
+        .split(" avg=")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    Some(Ds4LogEvent::GenerationProgress {
+        completion,
+        chunk_tps,
+        avg_tps,
     })
 }
 
@@ -298,6 +430,67 @@ mod tests {
             parse_ds4_log_event("ds4: distributed coordinator: registered worker "),
             None
         );
+    }
+
+    #[test]
+    fn parses_prefill_progress_with_and_without_timestamp() {
+        assert_eq!(
+            parse_ds4_log_event(
+                "0812 14:30:45 ds4-server: chat ctx=0..9005:0 prefill chunk 4096/9005 (45.5%) chunk=123.4 t/s avg=100.0 t/s 10.000s",
+            ),
+            Some(Ds4LogEvent::PrefillProgress {
+                current: 4096,
+                total: 9005,
+                percent: 45.5,
+                cached: 0,
+            })
+        );
+        assert_eq!(
+            parse_ds4_log_event(
+                "ds4-server: completion ctx=2048..9005:6957 prefill chunk 8192/9005 (91.0%) chunk=200.0 t/s avg=180.0 t/s 20.000s",
+            ),
+            Some(Ds4LogEvent::PrefillProgress {
+                current: 8192,
+                total: 9005,
+                percent: 91.0,
+                cached: 2048,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_kv_cache_hit() {
+        assert_eq!(
+            parse_ds4_log_event(
+                "ds4: kv cache hit text tokens=9005 text=hello quant=8 key=prefix load=12.3 ms file=/tmp/cache.bin",
+            ),
+            Some(Ds4LogEvent::KvCacheHit {
+                tokens: 9005,
+                load_ms: 12.3,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_generation_progress() {
+        assert_eq!(
+            parse_ds4_log_event(
+                "0812 14:31:00 ds4-server: chat ctx=0..9005:0 gen=42 decoding chunk=32.1 t/s avg=28.5 t/s 1.500s",
+            ),
+            Some(Ds4LogEvent::GenerationProgress {
+                completion: 42,
+                chunk_tps: 32.1,
+                avg_tps: 28.5,
+            })
+        );
+    }
+
+    #[test]
+    fn timestamped_listening_line_is_recognized() {
+        assert!(matches!(
+            parse_ds4_log_event("0812 14:29:00 ds4-server: listening on http://127.0.0.1:8000"),
+            Some(Ds4LogEvent::HttpListening { .. })
+        ));
     }
 
     #[tokio::test]

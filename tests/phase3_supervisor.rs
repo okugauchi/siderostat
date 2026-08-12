@@ -7,6 +7,7 @@ use siderostat::{
         NodeDescriptor, StandaloneSupervisor, WorkerControl,
     },
     config::{ModelVariant, Residency},
+    metrics::Metrics,
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{LocalRole, StableMode},
 };
@@ -81,6 +82,7 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
         Duration::from_millis(20),
         Duration::from_secs(1),
         false,
+        Arc::new(Metrics::default()),
     ));
     let proxy = Arc::new(
         ModeAwareProxyState::new(
@@ -195,6 +197,7 @@ async fn dspark_profile_without_activation_event_fails_readiness_and_reaps_child
         Duration::from_millis(20),
         Duration::from_secs(1),
         false,
+        Arc::new(Metrics::default()),
     );
     let error = supervisor.start(1).await.unwrap_err();
     assert!(format!("{error:#}").contains("DSpark activation"));

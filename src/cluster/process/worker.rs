@@ -1,5 +1,8 @@
 use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
-use crate::cluster::{DistributedWorkerLifecycle, Ds4Command};
+use crate::{
+    cluster::{DistributedWorkerLifecycle, Ds4Command, Ds4LogEvent},
+    metrics::Metrics,
+};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
 
@@ -12,16 +15,23 @@ struct DistributedWorkerSupervisorInner {
     command: Ds4Command,
     stop_timeout: Duration,
     allow_sigkill: bool,
+    metrics: Arc<Metrics>,
     child: SupervisedSlot,
 }
 
 impl DistributedWorkerSupervisor {
-    pub fn new(command: Ds4Command, stop_timeout: Duration, allow_sigkill: bool) -> Self {
+    pub fn new(
+        command: Ds4Command,
+        stop_timeout: Duration,
+        allow_sigkill: bool,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             inner: Arc::new(DistributedWorkerSupervisorInner {
                 command,
                 stop_timeout,
                 allow_sigkill,
+                metrics,
                 child: SupervisedSlot::new(),
             }),
         }
@@ -38,8 +48,31 @@ impl DistributedWorkerSupervisor {
         };
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let (mut logs, forwarders) = child.start_log_forwarding(256)?;
+        let metrics = self.inner.metrics.clone();
         let log_task = tokio::spawn(async move {
             while let Some(record) = logs.recv().await {
+                if let Some(event) = &record.event {
+                    match event {
+                        Ds4LogEvent::PrefillProgress {
+                            current,
+                            total,
+                            percent,
+                            cached,
+                        } => {
+                            metrics.prefill_progress(*current, *total, *percent, *cached);
+                        }
+                        Ds4LogEvent::KvCacheHit { tokens, load_ms } => {
+                            metrics.kv_cache_hit(*tokens, *load_ms);
+                        }
+                        Ds4LogEvent::HttpListening { .. }
+                        | Ds4LogEvent::DsparkActivated
+                        | Ds4LogEvent::WorkerRegistered { .. }
+                        | Ds4LogEvent::CompleteRouteReady { .. }
+                        | Ds4LogEvent::WorkerRemoved { .. }
+                        | Ds4LogEvent::RouteIncomplete { .. }
+                        | Ds4LogEvent::GenerationProgress { .. } => {}
+                    }
+                }
                 tracing::info!(
                     profile = %record.profile_id,
                     generation = record.generation,

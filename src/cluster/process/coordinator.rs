@@ -1,5 +1,6 @@
 use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
 use crate::cluster::{DistributedCoordinatorLifecycle, Ds4Command, Ds4LogEvent};
+use crate::metrics::Metrics;
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Duration};
 use url::Url;
@@ -17,6 +18,7 @@ struct DistributedCoordinatorSupervisorInner {
     poll_interval: Duration,
     stop_timeout: Duration,
     allow_sigkill: bool,
+    metrics: Arc<Metrics>,
     child: SupervisedSlot,
     route: tokio::sync::watch::Sender<CoordinatorRouteState>,
 }
@@ -36,6 +38,7 @@ impl DistributedCoordinatorSupervisor {
         poll_interval: Duration,
         stop_timeout: Duration,
         allow_sigkill: bool,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let (route, _) = tokio::sync::watch::channel(CoordinatorRouteState::default());
         Self {
@@ -47,6 +50,7 @@ impl DistributedCoordinatorSupervisor {
                 poll_interval,
                 stop_timeout,
                 allow_sigkill,
+                metrics,
                 child: SupervisedSlot::new(),
                 route,
             }),
@@ -68,6 +72,7 @@ impl DistributedCoordinatorSupervisor {
         let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let route = self.inner.route.clone();
+        let metrics = self.inner.metrics.clone();
         let log_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -81,7 +86,20 @@ impl DistributedCoordinatorSupervisor {
                                 state.complete_route = false;
                             }
                             Ds4LogEvent::RouteIncomplete { .. } => state.complete_route = false,
-                            Ds4LogEvent::HttpListening { .. } | Ds4LogEvent::DsparkActivated => {}
+                            Ds4LogEvent::PrefillProgress {
+                                current,
+                                total,
+                                percent,
+                                cached,
+                            } => {
+                                metrics.prefill_progress(current, total, percent, cached);
+                            }
+                            Ds4LogEvent::KvCacheHit { tokens, load_ms } => {
+                                metrics.kv_cache_hit(tokens, load_ms);
+                            }
+                            Ds4LogEvent::HttpListening { .. }
+                            | Ds4LogEvent::DsparkActivated
+                            | Ds4LogEvent::GenerationProgress { .. } => {}
                         }
                         route.send_replace(state);
                     }
