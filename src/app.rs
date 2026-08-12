@@ -11,6 +11,7 @@ use crate::{
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
+    notify::{DesktopNotificationService, NotifyPlatform, build_notifier},
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
@@ -251,6 +252,14 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let role = boot.role;
     let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
     let production = attach_control_plane(&config, boot, &state, &runtime, &supervisor)?;
+    let notifier = build_notifier(
+        config.notifications.enabled,
+        config.notifications.sound,
+        NotifyPlatform::detect(),
+    );
+    let notification_service = Arc::new(std::sync::Mutex::new(DesktopNotificationService::new(
+        notifier,
+    )));
     let transition_monitor = spawn_transition_monitor(
         &state,
         &state_store,
@@ -267,12 +276,14 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         &config.ds4.standalone.profile_id,
     )
     .await?;
+    let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
     let local_monitor = spawn_local_monitor(
         &state,
         &state_store,
         &runtime,
         &supervisor,
         &config.ds4.standalone.profile_id,
+        notification_service.clone(),
     );
     run_servers(
         &config,
@@ -283,6 +294,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         runtime,
         transition_monitor,
         local_monitor,
+        desktop_notifier,
     )
     .await
 }
@@ -496,18 +508,49 @@ fn spawn_transition_monitor(
     })
 }
 
+/// Subscribe to the cluster state watch channel and forward important
+/// transitions to the desktop notification service. Runs until the channel
+/// closes; failures are non-fatal and never affect the cluster.
+fn spawn_desktop_notifier(
+    runtime: &Arc<ModeRuntime>,
+    service: Arc<std::sync::Mutex<DesktopNotificationService>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut snapshots = runtime.cluster_handle().subscribe();
+    let startup_state = runtime.snapshot().state;
+    {
+        let mut service = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        service.observe_startup(startup_state);
+    }
+    tokio::spawn(async move {
+        let mut previous = *snapshots.borrow_and_update();
+        while snapshots.changed().await.is_ok() {
+            let current = *snapshots.borrow_and_update();
+            let mut service = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            service.observe_transition(previous.state, current.state);
+            drop(service);
+            previous = current;
+        }
+    })
+}
+
 fn spawn_local_monitor(
     state: &Arc<AppState>,
     state_store: &Arc<StateStore>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     profile: &str,
+    notifier: Arc<std::sync::Mutex<DesktopNotificationService>>,
 ) -> tokio::task::JoinHandle<()> {
     let local_monitor_runtime = runtime.clone();
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
     let local_monitor_profile = profile.to_string();
     let local_monitor_metrics = state.metrics.clone();
+    let local_monitor_notifier = notifier;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -517,6 +560,10 @@ fn spawn_local_monitor(
             match local_monitor_runtime.reconcile_local().await {
                 Ok(snapshot) if snapshot.generation != before => {
                     local_monitor_metrics.child_restart("standalone", "unexpected-exit");
+                    local_monitor_notifier
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .observe_child_restart();
                     if let Err(error) = persist_runtime_state(
                         &local_monitor_store,
                         &local_monitor_runtime,
@@ -548,6 +595,7 @@ async fn run_servers(
     runtime: Arc<ModeRuntime>,
     transition_monitor: tokio::task::JoinHandle<()>,
     local_monitor: tokio::task::JoinHandle<()>,
+    desktop_notifier: tokio::task::JoinHandle<()>,
 ) -> anyhow::Result<()> {
     let public_addr = state.config.public_listen;
     let admin_addr = state.config.admin_listen;
@@ -627,6 +675,7 @@ async fn run_servers(
     shutdown_sender.send_replace(true);
     local_monitor.abort();
     transition_monitor.abort();
+    desktop_notifier.abort();
     if let Some(task) = reconcile_task {
         task.abort();
     }
