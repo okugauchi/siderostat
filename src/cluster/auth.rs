@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, net::IpAddr, sync::Mutex};
 use thiserror::Error;
