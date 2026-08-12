@@ -1,6 +1,6 @@
 # siderostat メニューバーモニター 仕様
 
-- 文書状態: 設計 / 実装未着手
+- 文書状態: 実装済み (Phase 1〜4) / Phase 5 は実機確認待ち
 - 作成日: 2026-08-12
 - 対象baseline: `develop` (`4faf6d5` / デスクトップ通知実装後)
 - 前提: 本仕様は siderostat 本体の `docs/spec.md` で定義する target behavior を変更しない付加レイヤである。
@@ -247,4 +247,11 @@ siderostat/
 | 4 | 本体側の prefill / KV cache メトリクス追加 | `parse_ds4_log_event` 拡張、`metrics.rs` |
 | 5 | 統合・動作確認（実 DS4 で prefill 中の表示確認） | 受け入れ証跡 |
 
-Phase 1 は本仕様書と同時に完了済みとする。
+Phase 1〜4 は 2026-08-12 に実装済みとする。
+- Phase 1: workspace 化 + monitor crate skeleton（完了）
+- Phase 2: `monitor/src/config.rs`、`metrics.rs`、`client.rs`、`state.rs`（完了）
+- Phase 3: `monitor/src/tray.rs`、`main.rs`（完了）
+- Phase 4: 本体 `parse_ds4_log_event` 拡張（prefill / kv cache / generation、タイムスタンプ除去）と
+  `Metrics` の DS4 gauge 公開（完了）
+- Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
+  テストとコンパイルを検証済み（本体 170 tests、monitor 13 tests、Required CI 成功）
