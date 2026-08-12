@@ -257,9 +257,11 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         config.notifications.sound,
         NotifyPlatform::detect(),
     );
-    let notification_service = Arc::new(std::sync::Mutex::new(DesktopNotificationService::new(
-        notifier,
-    )));
+    let notification_service = DesktopNotificationService::new(notifier);
+    if config.notifications.enabled {
+        notification_service.log_session_status().await;
+    }
+    let notification_service = Arc::new(std::sync::Mutex::new(notification_service));
     let transition_monitor = spawn_transition_monitor(
         &state,
         &state_store,

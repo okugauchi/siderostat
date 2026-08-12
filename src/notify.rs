@@ -150,7 +150,9 @@ impl NotifyPlatform {
 }
 
 /// Whether the current process runs in a GUI (Aqua) session that can show
-/// notifications. On non-macOS platforms this is always false.
+/// notifications. On non-macOS platforms this is always true so that a
+/// no-op notifier is not repeatedly warned about a missing session; the
+/// platform check is applied when the notifier implementation is chosen.
 pub async fn gui_session_available() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -168,8 +170,7 @@ pub async fn gui_session_available() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = ();
-        false
+        true
     }
 }
 
@@ -188,6 +189,22 @@ impl DesktopNotificationService {
             notifier,
             last_sent_at: None,
             session_check: Box::new(|| Box::pin(gui_session_available())),
+        }
+    }
+
+    /// Log whether desktop notifications can reach the user's GUI session.
+    /// Called once at startup so an operator notices a deployment outside the
+    /// `gui/<uid>` Aqua domain (for example a LaunchDaemon or `user/<uid>`
+    /// agent) instead of silently dropping notifications.
+    pub async fn log_session_status(&self) {
+        let available = (self.session_check)().await;
+        if available {
+            tracing::info!("desktop notifications available in this Aqua GUI session");
+        } else {
+            tracing::warn!(
+                "desktop notifications unavailable: not running in an Aqua GUI session; \
+                 deploy as a LaunchAgent under gui/<uid> to receive notifications"
+            );
         }
     }
 
@@ -468,6 +485,64 @@ mod tests {
         assert_eq!(notifier.calls.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn session_status_logs_warning_outside_aqua_session() {
+        let service = DesktopNotificationService::with_session_check(
+            Arc::new(NoopNotifier),
+            Box::new(|| Box::pin(async { false })),
+        );
+        let log = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(service.log_session_status());
+        });
+        let output = String::from_utf8(log.lines.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("desktop notifications unavailable"),
+            "expected unavailable warning, got: {output}"
+        );
+        assert!(
+            output.contains("gui/<uid>"),
+            "expected deployment hint, got: {output}"
+        );
+    }
+
+    #[test]
+    fn session_status_logs_available_in_aqua_session() {
+        let service = DesktopNotificationService::with_session_check(
+            Arc::new(NoopNotifier),
+            Box::new(|| Box::pin(async { true })),
+        );
+        let log = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(service.log_session_status());
+        });
+        let output = String::from_utf8(log.lines.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("desktop notifications available"),
+            "expected availability info, got: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn gui_session_posts_notification() {
         let notifier = Arc::new(RecordingNotifier::default());
@@ -528,5 +603,21 @@ mod tests {
         assert_eq!(StableMode::SoloStandalone.name(), "solo-standalone");
         assert_eq!(StableMode::PairedStandalone.name(), "paired-standalone");
         assert_eq!(StableMode::DistributedMxfp4.name(), "distributed-mxfp4");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLog {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.lines.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
