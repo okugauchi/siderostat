@@ -28,6 +28,24 @@ launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 
 `ProgramArguments`の各要素がabsolute pathまたは固定subcommandであり、placeholderが残っていないことを登録前に確認します。
 
+## GUIドメイン必須
+
+このplistには `LimitLoadToSessionType = Aqua` を指定しています。デスクトップ通知
+(`osascript display notification`) はユーザーのAquaセッション内のNotification Centerで
+表示されるため、LaunchAgentを `gui/<uid>` ドメインに載せる必要があります。
+
+- `system/` (LaunchDaemon) や `user/<uid>` ドメインへ誤ってロードすると、ロード自体が
+  失敗するか、通知が黙って表示されません。
+- 登録後、次のコマンドで `gui/<uid>` ドメインに載っていることを確認します。
+
+```sh
+launchctl print "gui/$(id -u)/local.siderostat.runtime"
+```
+
+`state` が `running` であることと、`LimitLoadToSessionType` が `Aqua` として適用されて
+いることを確認してください。ログアウト時は `gui/<uid>` ドメインごとagentが停止するため、
+通知は出ません (想定どおりです)。
+
 ## Verification
 
 ```sh
