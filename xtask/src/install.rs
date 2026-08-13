@@ -159,27 +159,45 @@ fn sign_and_install(bin: &Path, dest: &Path) -> Result<()> {
         ],
     )?;
 
-    util::tracing_log(&format!("sudo install to {}", dest.display()));
-    util::run_live(
-        "sudo",
-        &[
-            OsStr::new("install"),
-            OsStr::new("-d"),
-            OsStr::new("-m"),
-            OsStr::new("0755"),
-            OsStr::new("/usr/local/bin"),
-        ],
-    )?;
-    util::run_live(
-        "sudo",
-        &[
-            OsStr::new("install"),
-            OsStr::new("-m"),
-            OsStr::new("0755"),
-            OsStr::new(bin),
-            OsStr::new(dest),
-        ],
-    )?;
+    // Idempotent install: if /usr/local/bin already holds the same bytes as the
+    // freshly signed build, do not replace it (no sudo install needed).
+    let unchanged = if dest.is_file() {
+        let installed = util::sha256_hex(dest)?;
+        let built = util::sha256_hex(bin)?;
+        installed == built
+    } else {
+        false
+    };
+
+    if unchanged {
+        util::tracing_log(&format!(
+            "{} unchanged; keeping existing install",
+            dest.display()
+        ));
+    } else {
+        util::tracing_log(&format!("sudo install to {}", dest.display()));
+        util::run_live(
+            "sudo",
+            &[
+                OsStr::new("install"),
+                OsStr::new("-d"),
+                OsStr::new("-m"),
+                OsStr::new("0755"),
+                OsStr::new("/usr/local/bin"),
+            ],
+        )?;
+        util::run_live(
+            "sudo",
+            &[
+                OsStr::new("install"),
+                OsStr::new("-m"),
+                OsStr::new("0755"),
+                OsStr::new(bin),
+                OsStr::new(dest),
+            ],
+        )?;
+    }
+
     util::run(
         "codesign",
         &[
@@ -459,9 +477,9 @@ fn write_config(
     }
 
     let config_path = home.join("Library/Application Support/siderostat/config.toml");
-    util::backup_and_write(&example, &config_path)?;
-    // Write the substituted content (not the raw example) to the config path.
-    util::write(&config_path, out.as_bytes())?;
+    // Idempotent: write the substituted content only when the deployed config
+    // differs; otherwise leave it (and its backup) untouched.
+    util::backup_and_write_if_changed(&config_path, out.as_bytes())?;
     util::tracing_log(&format!("wrote config -> {}", config_path.display()));
 
     let mut config = ModeAwareConfig::parse(&out).context("parse generated config.toml")?;
@@ -515,8 +533,8 @@ fn install_launch_agent(home: &Path, start: bool) -> Result<()> {
 
     let agent_dir = home.join("Library/LaunchAgents");
     let plist = agent_dir.join("local.siderostat.runtime.plist");
-    util::backup_and_write(&repo_plist, &plist)?;
-    util::write(&plist, content.as_bytes())?;
+    // Idempotent: keep the deployed plist (and its backup) when unchanged.
+    util::backup_and_write_if_changed(&plist, content.as_bytes())?;
 
     let config_path = home.join("Library/Application Support/siderostat/config.toml");
     util::run(
@@ -554,24 +572,7 @@ fn install_launch_agent(home: &Path, start: bool) -> Result<()> {
     util::tracing_log(&format!("plist installed -> {}", plist.display()));
 
     if start {
-        let uid = current_uid()?;
-        let domain = format!("gui/{uid}");
-        let job = format!("gui/{uid}/local.siderostat.runtime");
-        // Ensure the job is enabled before bootstrap.
-        let _ = util::run("launchctl", &[OsStr::new("enable"), OsStr::new(&job)]);
-        util::run_live(
-            "launchctl",
-            &[
-                OsStr::new("bootstrap"),
-                OsStr::new(&domain),
-                OsStr::new(&plist),
-            ],
-        )?;
-        util::run_live(
-            "launchctl",
-            &[OsStr::new("kickstart"), OsStr::new("-k"), OsStr::new(&job)],
-        )?;
-        util::tracing_log(&format!("LaunchAgent started: {job}"));
+        start_launch_agent(&plist, "local.siderostat.runtime")?;
     } else {
         util::tracing_log(
             "LaunchAgent plist installed but NOT started (avoid restarting ds4-server). \
@@ -596,8 +597,8 @@ fn install_monitor_launch_agent(home: &Path, start: bool) -> Result<()> {
 
     let agent_dir = home.join("Library/LaunchAgents");
     let plist = agent_dir.join("local.siderostat.monitor.plist");
-    util::backup_and_write(&repo_plist, &plist)?;
-    util::write(&plist, content.as_bytes())?;
+    // Idempotent: keep the deployed plist (and its backup) when unchanged.
+    util::backup_and_write_if_changed(&plist, content.as_bytes())?;
 
     let log_dir = home.join("Library/Logs/local.siderostat.monitor");
     std::fs::create_dir_all(&log_dir).with_context(|| format!("mkdir {}", log_dir.display()))?;
@@ -605,23 +606,7 @@ fn install_monitor_launch_agent(home: &Path, start: bool) -> Result<()> {
     util::tracing_log(&format!("monitor plist installed -> {}", plist.display()));
 
     if start {
-        let uid = current_uid()?;
-        let domain = format!("gui/{uid}");
-        let job = format!("gui/{uid}/local.siderostat.monitor");
-        let _ = util::run("launchctl", &[OsStr::new("enable"), OsStr::new(&job)]);
-        util::run_live(
-            "launchctl",
-            &[
-                OsStr::new("bootstrap"),
-                OsStr::new(&domain),
-                OsStr::new(&plist),
-            ],
-        )?;
-        util::run_live(
-            "launchctl",
-            &[OsStr::new("kickstart"), OsStr::new("-k"), OsStr::new(&job)],
-        )?;
-        util::tracing_log(&format!("monitor LaunchAgent started: {job}"));
+        start_launch_agent(&plist, "local.siderostat.monitor")?;
     } else {
         util::tracing_log(
             "monitor LaunchAgent plist installed but NOT started. It will auto-start at the \
@@ -629,6 +614,39 @@ fn install_monitor_launch_agent(home: &Path, start: bool) -> Result<()> {
              launchctl kickstart -k \"gui/$(id -u)/local.siderostat.monitor\"",
         );
     }
+    Ok(())
+}
+
+/// Start a LaunchAgent job. If launchd already has the job loaded (for example a
+/// process running via the LaunchAgent from an earlier install), bootout it
+/// first so `install --start` can re-bootstrap and restart cleanly. This keeps
+/// repeated installs idempotent instead of failing on a second bootstrap.
+fn start_launch_agent(plist: &Path, label: &str) -> Result<()> {
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let job = format!("gui/{uid}/{label}");
+    // Ensure the job is enabled before bootstrap.
+    let _ = util::run("launchctl", &[OsStr::new("enable"), OsStr::new(&job)]);
+    // Detect whether launchd already owns the job. `launchctl print` succeeds
+    // when the job is loaded into the gui domain.
+    let loaded = util::run("launchctl", &[OsStr::new("print"), OsStr::new(&job)]).is_ok();
+    if loaded {
+        util::tracing_log(&format!("{job} already loaded; bootout before restart"));
+        let _ = util::run("launchctl", &[OsStr::new("bootout"), OsStr::new(&job)]);
+    }
+    util::run_live(
+        "launchctl",
+        &[
+            OsStr::new("bootstrap"),
+            OsStr::new(&domain),
+            OsStr::new(plist),
+        ],
+    )?;
+    util::run_live(
+        "launchctl",
+        &[OsStr::new("kickstart"), OsStr::new("-k"), OsStr::new(&job)],
+    )?;
+    util::tracing_log(&format!("LaunchAgent started: {job}"));
     Ok(())
 }
 

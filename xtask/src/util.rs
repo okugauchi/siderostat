@@ -200,11 +200,24 @@ pub fn sha256_cached(
     );
     Ok((digest, false))
 }
-/// Copy `src` to `dst`, creating the parent directory. If `dst` already exists it
-/// is first moved to a timestamped `.bak-<ts>` sibling.
-pub fn backup_and_write(src: &Path, dst: &Path) -> Result<()> {
+/// If `dst` already holds exactly `content`, leave it untouched and return
+/// false (idempotent install). Otherwise move an existing `dst` to a
+/// timestamped `.bak-<ts>` sibling and write `content`. Creates parents.
+pub fn backup_and_write_if_changed(dst: &Path, content: &[u8]) -> Result<bool> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let same = if dst.exists() {
+        match std::fs::read(dst) {
+            Ok(bytes) => bytes == content,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    if same {
+        tracing_log(&format!("unchanged, keeping {}", dst.display()));
+        return Ok(false);
     }
     if dst.exists() {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -217,9 +230,8 @@ pub fn backup_and_write(src: &Path, dst: &Path) -> Result<()> {
             backup.display()
         ));
     }
-    std::fs::copy(src, dst)
-        .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-    Ok(())
+    std::fs::write(dst, content).with_context(|| format!("write {}", dst.display()))?;
+    Ok(true)
 }
 
 /// Write bytes to a path, creating parents.
