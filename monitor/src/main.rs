@@ -53,7 +53,9 @@ fn main() -> Result<()> {
     let shared = Arc::new(Mutex::new(DisplayState::default()));
 
     // Polling runs on a separate thread with its own Tokio runtime so the
-    // main thread stays free for the AppKit menu bar event loop.
+    // main thread stays free for the AppKit menu bar event loop. The restart
+    // menu handler shares a clone of the client with the polling task.
+    let restart_client = Arc::new(client.clone());
     let poll_client = client;
     let poll_state = shared.clone();
     thread::Builder::new()
@@ -86,6 +88,8 @@ fn main() -> Result<()> {
     // Quit from the menu terminates the app. The Send+Sync event-handler
     // closure cannot capture `Retained<NSApplication>` (not Send), so reach it
     // through an AtomicPtr global; the app lives for the process lifetime.
+    // Restart from the menu posts to the authenticated admin API on a
+    // dedicated thread so the AppKit main loop is never blocked.
     APP_PTR.store(
         (&*app as *const NSApplication).cast_mut(),
         Ordering::Relaxed,
@@ -97,6 +101,35 @@ fn main() -> Result<()> {
             // SAFETY: APP_PTR is set before the handler can fire and the app
             // object outlives the process (main blocks in `app.run()`).
             unsafe { (*ptr).terminate(None) };
+        } else if MonitorTray::is_restart_event(&event) {
+            tracing::info!("restart requested from menu");
+            let client = restart_client.clone();
+            let _ = thread::Builder::new()
+                .name("siderostat-monitor-restart".into())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(async move {
+                        match client.request_restart().await {
+                            Ok(job) => {
+                                let job_id = job
+                                    .get("job_id")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("?");
+                                tracing::info!(
+                                    job_id = job_id,
+                                    "siderostat runtime restart accepted"
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                error = %error,
+                                "siderostat runtime restart failed"
+                            ),
+                        }
+                    });
+                    Ok::<(), anyhow::Error>(())
+                });
         }
     }));
 

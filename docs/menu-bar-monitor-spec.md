@@ -64,6 +64,9 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
   ポーリング間隔を 5 秒へバックオフする。本体復帰を自動検出する。
 - 現状の `/metrics` は認証なしで公開されているため、モニターはトークンなしで取得する。
   将来 `/metrics` に認証が付く場合は、admin token を Bearer で送る設定を追加する。
+- メニュー「siderostat(runtime) の再起動」は `POST {admin_listen}/cluster/restart` を
+  Bearer（hex 形式の admin token）で呼ぶ。このエンドポイントは認証必須のため `admin_token`
+  設定が必要。失敗時もモニターは継続し、結果をログに記録する。
 
 ## 4. データソース
 
@@ -127,11 +130,21 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
 ### 5.1 メニューバーアイコン
 
 - 常駐アイコンとして表示する。
+- アイコンは cluster mode を「2つの円 + 任意の接続線」の描画で表現する。テキストの
+  `solo` / `paired` / `dist` は表示しない。
+  - 緑の円: 有効稼働状態（operating）
+  - 赤の円: 非稼働状態（non-operating）
+  - 常に2つの円を表示する。
+  - mode → 描画の対応:
+    - `solo`（solo-standalone）: 左が緑・右が赤、2つの円は直線で接続されていない
+    - `paired`（paired-standalone）: 2つとも緑、2つの円は直線で接続されていない
+    - `dist`（distributed-mxfp4）: 2つとも緑、2つの円を接続する1本の直線を描画
+    - offline / 不明: 2つとも赤、接続線なし
 - アイコンのタイトル（または代替テキスト）に状態を要約表示する:
-  - 通常時: mode 短縮名（例 `solo` / `paired` / `dist`）
+  - 通常時: 空（mode はアイコン描画のみで表現）
   - prefill 進行中: `prefill 45%` のように % を優先表示
   - offline: `offline`
-- ツールチップに詳細（node_id、state、generation）を表示する。
+- ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
 ### 5.2 メニュー構成
 
@@ -149,13 +162,17 @@ Prefill: 4096/9005 (45.5%)   ← 進行中のみ
 KV cache: hit tokens=9005 load=12.3ms
   total hits: 7
 ────────────────────────
-Decode:  32.1 t/s (直近)
+Decode:  32.1 t/s (直近)   ← TPS 実装後
 ────────────────────────
-終了
+siderostat(runtime) の再起動
+Monitor を終了
 ```
 
 - セクションは状態に応じて動的に表示する（prefill 非進行中は prefill 行を出さない）。
-- 「終了」はモニター自身だけを終了する。siderostat 本体には影響しない。
+- 「Monitor を終了」はモニター自身だけを終了する。siderostat 本体には影響しない。
+- 「siderostat(runtime) の再起動」は認証付き admin API `POST /cluster/restart` を呼び、
+  本体の current profile child を再起動する。モニター自身は終了しない。
+  `admin_token` 未設定・不正の場合は失敗し、メニュー表示には影響しない（ログに記録）。
 
 ### 5.3 offline 表示
 
@@ -172,7 +189,12 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
+admin_token = ""                           # hex 形式の admin token（再起動メニューで必須）
 ```
+
+- `admin_token` は本体の `admin.key`（生 bytes）を hex エンコードした値で、
+  `siderostat cluster restart` が送る Bearer と同一。未設定だと「siderostat(runtime) の
+  再起動」は 401 で失敗する。
 
 - 設定が存在しない場合は既定値で動作する。
 - 未知フィールドは拒否する（本体 config と同じ `deny_unknown_fields` 方針）。

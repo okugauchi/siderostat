@@ -64,22 +64,6 @@ impl DisplayState {
     pub fn mark_offline(&mut self) {
         self.status = MonitorStatus::Offline;
     }
-
-    /// Short status text shown in the menu bar title.
-    pub fn status_abbreviation(&self) -> String {
-        if self.status == MonitorStatus::Offline {
-            return "offline".to_string();
-        }
-        if self.prefill_active {
-            return format!("prefill {:.0}%", self.prefill_percent);
-        }
-        match self.cluster_mode.as_deref() {
-            Some("solo-standalone") => "solo".to_string(),
-            Some("paired-standalone") => "paired".to_string(),
-            Some("distributed-mxfp4") => "dist".to_string(),
-            _ => "siderostat".to_string(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -109,30 +93,14 @@ mod tests {
     }
 
     #[test]
-    fn applies_metrics_and_derives_abbreviation() {
+    fn applies_metrics() {
         let mut state = DisplayState::default();
         state.apply_metrics(&snapshot());
         assert_eq!(state.status, MonitorStatus::Online);
         assert_eq!(state.cluster_mode.as_deref(), Some("distributed-mxfp4"));
         assert_eq!(state.generation, Some(7));
         assert!(state.prefill_active);
-        assert_eq!(state.status_abbreviation(), "prefill 46%");
-    }
-
-    #[test]
-    fn mode_abbreviations_are_stable() {
-        for (mode, expected) in [
-            ("solo-standalone", "solo"),
-            ("paired-standalone", "paired"),
-            ("distributed-mxfp4", "dist"),
-        ] {
-            let mut state = DisplayState::default();
-            let mut snapshot = snapshot();
-            snapshot.prefill.active = false;
-            snapshot.cluster_mode = Some(mode.into());
-            state.apply_metrics(&snapshot);
-            assert_eq!(state.status_abbreviation(), expected);
-        }
+        assert_eq!(state.prefill_percent, 45.5);
     }
 
     #[test]
@@ -141,6 +109,5 @@ mod tests {
         state.apply_metrics(&snapshot());
         state.mark_offline();
         assert_eq!(state.status, MonitorStatus::Offline);
-        assert_eq!(state.status_abbreviation(), "offline");
     }
 }
