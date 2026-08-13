@@ -5,7 +5,7 @@
 # - Every secret/token file must contain 32+ bytes with mode 0600; the three files and values differ.
 # - The control secret and peer proxy token values are each shared between the two nodes. The admin
 #   token is node-local.
-# Replace every PLACEHOLDER and fill the secret files before running `siderostat serve --config ...`.
+# Replace every placeholder and fill the secret files before running `siderostat serve --config ...`.
 # On a worker node, change only cluster.node_id and the node-specific paths; role is derived from the
 # interface address, never set directly.
 schema_version = 2

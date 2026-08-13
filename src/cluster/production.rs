@@ -610,7 +610,10 @@ pub fn detect_cluster_role(
     match matches.as_slice() {
         [address] if *address == coordinator => Ok(LocalRole::Coordinator),
         [address] if *address == worker => Ok(LocalRole::Worker),
-        [] => anyhow::bail!("cluster interface {interface} has no IPv4 address"),
+        // Thunderboltケーブル未接続などでIPv4アドレスが未設定の場合、クラスタ判定は
+        // 保留(Unknown)として扱う。siderostatはstandaloneで動作できる設計であり、起動を失敗させてはならない。
+        // アドレスが複数ある場合のみ設定矛盾としてbailする。
+        [] => Ok(LocalRole::Unknown),
         _ => anyhow::bail!(
             "cluster interface {interface} has conflicting IPv4 addresses: {matches:?}"
         ),
