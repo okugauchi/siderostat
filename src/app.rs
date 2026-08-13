@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::cluster::MacOsDynamicStoreWatcher;
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
@@ -7,7 +9,7 @@ use crate::{
         PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
         StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
         detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
-        required_port_available,
+        required_port_available, spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
@@ -18,6 +20,7 @@ use crate::{
     },
     target::{ClusterState, LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
+
 use anyhow::Context;
 use axum::{
     Json, Router,
@@ -29,7 +32,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -147,6 +150,9 @@ struct RuntimeAdminExecutor {
     standalone_model: PathBuf,
     distributed_model: PathBuf,
     production: Option<ProductionClusterRuntime>,
+    interface: String,
+    coordinator_address: IpAddr,
+    worker_address: IpAddr,
 }
 
 impl AdminExecutor for RuntimeAdminExecutor {
@@ -156,6 +162,9 @@ impl AdminExecutor for RuntimeAdminExecutor {
         let standalone_model = self.standalone_model.clone();
         let distributed_model = self.distributed_model.clone();
         let production = self.production.clone();
+        let interface = self.interface.clone();
+        let coordinator_address = self.coordinator_address;
+        let worker_address = self.worker_address;
         Box::pin(async move {
             match action {
                 AdminAction::Reconcile => {
@@ -177,6 +186,21 @@ impl AdminExecutor for RuntimeAdminExecutor {
                     Ok(snapshot_json(snapshot))
                 }
                 AdminAction::Restart => {
+                    let new_role =
+                        detect_cluster_role(&interface, coordinator_address, worker_address)?;
+                    let current_role = production
+                        .as_ref()
+                        .map(ProductionClusterRuntime::role)
+                        .unwrap_or(LocalRole::Unknown);
+                    if new_role != current_role {
+                        tracing::warn!(from = ?current_role, to = ?new_role, "cluster role changed on restart; restarting process to apply new role");
+                        spawn_process_restart();
+                        return Ok(json!({
+                            "restart": "process",
+                            "role": new_role.name(),
+                            "reason": "role-change",
+                        }));
+                    }
                     anyhow::ensure!(
                         runtime.snapshot().stable_mode == StableMode::SoloStandalone,
                         "restart of a distributed profile requires its active lifecycle owner"
@@ -214,6 +238,83 @@ impl AdminExecutor for RuntimeAdminExecutor {
             }
         })
     }
+}
+
+fn spawn_process_restart() {
+    // LaunchAgent の KeepAlive に依存して siderostat プロセス全体を再起動する。
+    // role は起動時に一度だけ判定されるため、role 変更を適用するにはプロセスごと
+    // 再起動して起動時判定をやり直す必要がある。
+    // HTTP 応答を返す猶予を確保してから exit する。
+    tokio::task::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(0);
+    });
+}
+
+/// macOS のネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
+/// role が初期値から変化したらプロセス全体を再起動する。起動時に一度だけ判定される
+/// role を、ケーブル抜き差し後も LaunchAgent 再起動を介して更新するための配線。
+#[cfg(target_os = "macos")]
+fn spawn_role_change_monitor(
+    config: &ModeAwareConfig,
+    initial_role: LocalRole,
+) -> (
+    Option<tokio::task::JoinHandle<()>>,
+    Option<MacOsDynamicStoreWatcher>,
+) {
+    let (rescans, mut rescan_receiver) = tokio::sync::mpsc::channel(16);
+    let (handle, monitor_task) = match spawn_network_event_monitor(
+        0,
+        config.cluster.discovery.event_debounce,
+        config.cluster.discovery.reconcile_interval,
+        64,
+        rescans,
+    ) {
+        Ok(pair) => pair,
+        Err(error) => {
+            tracing::warn!(error = %error, "network event monitor unavailable");
+            return (None, None);
+        }
+    };
+    let watcher = match MacOsDynamicStoreWatcher::start(&config.cluster.interface, handle) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::warn!(error = %error, "dynamic store watcher unavailable");
+            return (Some(monitor_task), None);
+        }
+    };
+    let interface = config.cluster.interface.clone();
+    let coordinator = config.cluster.coordinator_address;
+    let worker = config.cluster.worker_address;
+    let task = tokio::spawn(async move {
+        while let Some(request) = rescan_receiver.recv().await {
+            match detect_cluster_role(&interface, coordinator, worker) {
+                Ok(new_role) if new_role != initial_role => {
+                    tracing::warn!(
+                        from = ?initial_role,
+                        to = ?new_role,
+                        reason = ?request.reason,
+                        "cluster role changed; restarting process to apply new role"
+                    );
+                    spawn_process_restart();
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "cluster role re-detection failed");
+                }
+            }
+        }
+    });
+    (Some(task), Some(watcher))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_role_change_monitor(
+    _config: &ModeAwareConfig,
+    _initial_role: LocalRole,
+) -> (Option<tokio::task::JoinHandle<()>>, Option<()>) {
+    (None, None)
 }
 
 fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
@@ -287,6 +388,9 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         &config.ds4.standalone.profile_id,
         notification_service.clone(),
     );
+    // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
+    // role が起動時の初期値から変化したらプロセス全体を再起動する。
+    let (_role_change_task, _role_change_watcher) = spawn_role_change_monitor(&config, role);
     run_servers(
         &config,
         state,
@@ -467,6 +571,9 @@ fn attach_control_plane(
             standalone_model: config.ds4.standalone.model.clone(),
             distributed_model: config.ds4.mxfp4.model.clone(),
             production: production.clone(),
+            interface: config.cluster.interface.clone(),
+            coordinator_address: config.cluster.coordinator_address,
+            worker_address: config.cluster.worker_address,
         }),
     )?);
     Ok(production)
