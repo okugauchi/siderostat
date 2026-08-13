@@ -64,6 +64,19 @@ pub fn sha256_hex(path: &Path) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// Compute a SHA-256 with a progress log line before and after, so long hashing
+/// of large model files doesn't look like a hang.
+pub fn sha256_hex_logged(path: &Path, label: &str) -> Result<String> {
+    let size_mib = file_size(path)? / (1024 * 1024);
+    tracing_log(&format!(
+        "hashing {label} ({size_mib} MiB) -> {}",
+        path.display()
+    ));
+    let digest = sha256_hex(path)?;
+    tracing_log(&format!("{label} hash complete -> {digest}"));
+    Ok(digest)
+}
+
 /// Byte length of a file.
 pub fn file_size(path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)

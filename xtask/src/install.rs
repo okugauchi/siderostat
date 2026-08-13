@@ -119,7 +119,7 @@ fn run_ci_gates() -> Result<()> {
 
 fn build_release() -> Result<()> {
     util::tracing_log("cargo build --release");
-    util::run("cargo", &[OsStr::new("build"), OsStr::new("--release")])?;
+    util::run_live("cargo", &[OsStr::new("build"), OsStr::new("--release")])?;
     Ok(())
 }
 
@@ -452,7 +452,7 @@ fn resolve_manifest_inputs(
     config: &ModeAwareConfig,
     args: &InstallArgs,
 ) -> Result<(Option<String>, Vec<String>)> {
-    let local_digest = util::sha256_hex(&config.ds4.binary)?;
+    let local_digest = util::sha256_hex_logged(&config.ds4.binary, "ds4 binary")?;
     let prior = manifest::read_existing_distributed(&config.ds4.mxfp4.model_manifest)?;
 
     let source_commit = match args.ds4_source_commit.as_deref() {

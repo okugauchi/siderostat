@@ -20,11 +20,11 @@ pub fn generate(
     ds4_source_commit: Option<&str>,
     approved: &[String],
 ) -> Result<()> {
-    let ds4_digest = util::sha256_hex(&config.ds4.binary)
-        .with_context(|| format!("sha256 of {}", config.ds4.binary.display()))?;
+    let ds4_digest = util::sha256_hex_logged(&config.ds4.binary, "ds4 binary")?;
 
     // Standalone manifest.
-    let standalone_model_digest = util::sha256_hex(&config.ds4.standalone.model)?;
+    let standalone_model_digest =
+        util::sha256_hex_logged(&config.ds4.standalone.model, "standalone model")?;
     let standalone_command = build_standalone_command(&config.ds4)
         .map_err(|error| anyhow::anyhow!("build standalone command: {error}"))?;
     let standalone_argv_profile = util::hex(&argv_sha256(
@@ -40,7 +40,10 @@ pub fn generate(
             .support_model
             .as_ref()
             .context("DSpark enabled but no support model in config")?;
-        (util::sha256_hex(support)?, util::file_size(support)?)
+        (
+            util::sha256_hex_logged(support, "dspark support model")?,
+            util::file_size(support)?,
+        )
     } else {
         (String::new(), 0)
     };
@@ -87,7 +90,7 @@ pub fn generate(
     // Distributed manifest (MXFP4). The worker command argv is used for the
     // recorded argv profile; both nodes must generate from the same ds4.mxfp4
     // config so the values agree (spec: MXFP4 config is shared).
-    let mxfp4_digest = util::sha256_hex(&config.ds4.mxfp4.model)?;
+    let mxfp4_digest = util::sha256_hex_logged(&config.ds4.mxfp4.model, "mxfp4 model")?;
     let mxfp4_size = util::file_size(&config.ds4.mxfp4.model)?;
     let worker_command = build_distributed_worker_command(
         &config.ds4,
