@@ -82,6 +82,7 @@ pub fn install(args: &InstallArgs) -> Result<()> {
     util::tracing_log("config.toml validation passed");
 
     install_launch_agent(&home, args.start)?;
+    install_monitor_launch_agent(&home, args.start)?;
 
     util::tracing_log("install complete");
     Ok(())
@@ -120,21 +121,33 @@ fn run_ci_gates() -> Result<()> {
 fn build_release() -> Result<()> {
     util::tracing_log("cargo build --release");
     util::run_live("cargo", &[OsStr::new("build"), OsStr::new("--release")])?;
+    // Explicitly build the monitor binary too. It is a workspace member, so the
+    // full release build already covers it; this guarantees it exists before we
+    // sign and install it.
+    util::tracing_log("cargo build --release -p siderostat-monitor");
+    util::run_live(
+        "cargo",
+        &[
+            OsStr::new("build"),
+            OsStr::new("--release"),
+            OsStr::new("-p"),
+            OsStr::new("siderostat-monitor"),
+        ],
+    )?;
     Ok(())
 }
 
-/// Sign the release proxy (ad-hoc, not linker-signed) so launchd's launch
+/// Sign a release binary (ad-hoc, not linker-signed) so launchd's launch
 /// constraints accept it, then install it to /usr/local/bin.
-fn sign_and_install_proxy() -> Result<()> {
-    let bin = PathBuf::from("target/release/siderostat");
-    util::tracing_log("codesign --force --sign - target/release/siderostat");
+fn sign_and_install(bin: &Path, dest: &Path) -> Result<()> {
+    util::tracing_log(&format!("codesign --force --sign - {}", bin.display()));
     util::run(
         "codesign",
         &[
             OsStr::new("--force"),
             OsStr::new("--sign"),
             OsStr::new("-"),
-            OsStr::new(&bin),
+            OsStr::new(bin),
         ],
     )?;
     util::run(
@@ -142,11 +155,11 @@ fn sign_and_install_proxy() -> Result<()> {
         &[
             OsStr::new("--verify"),
             OsStr::new("--verbose=4"),
-            OsStr::new(&bin),
+            OsStr::new(bin),
         ],
     )?;
 
-    util::tracing_log("sudo install to /usr/local/bin/siderostat");
+    util::tracing_log(&format!("sudo install to {}", dest.display()));
     util::run_live(
         "sudo",
         &[
@@ -163,8 +176,8 @@ fn sign_and_install_proxy() -> Result<()> {
             OsStr::new("install"),
             OsStr::new("-m"),
             OsStr::new("0755"),
-            OsStr::new(&bin),
-            OsStr::new("/usr/local/bin/siderostat"),
+            OsStr::new(bin),
+            OsStr::new(dest),
         ],
     )?;
     util::run(
@@ -172,10 +185,23 @@ fn sign_and_install_proxy() -> Result<()> {
         &[
             OsStr::new("--verify"),
             OsStr::new("--verbose=4"),
-            OsStr::new("/usr/local/bin/siderostat"),
+            OsStr::new(dest),
         ],
     )?;
-    util::tracing_log("installed and verified /usr/local/bin/siderostat");
+    util::tracing_log(&format!("installed and verified {}", dest.display()));
+    Ok(())
+}
+
+/// Sign and install the proxy binary, then the monitor binary.
+fn sign_and_install_proxy() -> Result<()> {
+    sign_and_install(
+        &PathBuf::from("target/release/siderostat"),
+        &PathBuf::from("/usr/local/bin/siderostat"),
+    )?;
+    sign_and_install(
+        &PathBuf::from("target/release/siderostat-monitor"),
+        &PathBuf::from("/usr/local/bin/siderostat-monitor"),
+    )?;
     Ok(())
 }
 
@@ -550,6 +576,57 @@ fn install_launch_agent(home: &Path, start: bool) -> Result<()> {
         util::tracing_log(
             "LaunchAgent plist installed but NOT started (avoid restarting ds4-server). \
              Start it later with:\n  launchctl bootstrap \"gui/$(id -u)\" <plist>\n  launchctl kickstart -k \"gui/$(id -u)/local.siderostat.runtime\"",
+        );
+    }
+    Ok(())
+}
+
+/// Install the monitor LaunchAgent plist. The monitor is a menu-bar GUI app
+/// (gui/<uid> Aqua session), so RunAtLoad + KeepAlive(SuccessfulExit=false)
+/// auto-start it at login and restart it on crash, but a manual quit from the
+/// menu is honored. `start` bootstraps/kickstarts the job now.
+fn install_monitor_launch_agent(home: &Path, start: bool) -> Result<()> {
+    let user = util::current_user()?;
+    let repo_plist = PathBuf::from("contrib/launchd/local.siderostat.monitor.plist");
+    let content = std::fs::read_to_string(&repo_plist)?;
+    let content = content.replace("USERNAME", &user);
+    if content.contains("USERNAME") || content.contains("PLACEHOLDER") {
+        anyhow::bail!("monitor LaunchAgent plist still contains an unresolved placeholder");
+    }
+
+    let agent_dir = home.join("Library/LaunchAgents");
+    let plist = agent_dir.join("local.siderostat.monitor.plist");
+    util::backup_and_write(&repo_plist, &plist)?;
+    util::write(&plist, content.as_bytes())?;
+
+    let log_dir = home.join("Library/Logs/local.siderostat.monitor");
+    std::fs::create_dir_all(&log_dir).with_context(|| format!("mkdir {}", log_dir.display()))?;
+    util::run("plutil", &[OsStr::new("-lint"), OsStr::new(&plist)])?;
+    util::tracing_log(&format!("monitor plist installed -> {}", plist.display()));
+
+    if start {
+        let uid = current_uid()?;
+        let domain = format!("gui/{uid}");
+        let job = format!("gui/{uid}/local.siderostat.monitor");
+        let _ = util::run("launchctl", &[OsStr::new("enable"), OsStr::new(&job)]);
+        util::run_live(
+            "launchctl",
+            &[
+                OsStr::new("bootstrap"),
+                OsStr::new(&domain),
+                OsStr::new(&plist),
+            ],
+        )?;
+        util::run_live(
+            "launchctl",
+            &[OsStr::new("kickstart"), OsStr::new("-k"), OsStr::new(&job)],
+        )?;
+        util::tracing_log(&format!("monitor LaunchAgent started: {job}"));
+    } else {
+        util::tracing_log(
+            "monitor LaunchAgent plist installed but NOT started. It will auto-start at the \
+             next login; start it now with:\n  launchctl bootstrap \"gui/$(id -u)\" <plist>\n  \
+             launchctl kickstart -k \"gui/$(id -u)/local.siderostat.monitor\"",
         );
     }
     Ok(())
