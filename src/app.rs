@@ -439,7 +439,10 @@ fn attach_control_plane(
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
 ) -> anyhow::Result<Option<ProductionClusterRuntime>> {
-    let production = if config.cluster.enabled {
+    // detect_cluster_role は対象 interface に IPv4 が無い場合などに
+    // LocalRole::Unknown を返す。Unknown は standalone 運用として想定済み
+    // なので、production を生成せず起動を継続する。
+    let production = if config.cluster.enabled && boot.role != LocalRole::Unknown {
         Some(ProductionClusterRuntime::new(
             config.clone(),
             boot.role,
