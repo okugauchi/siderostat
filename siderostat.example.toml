@@ -18,9 +18,9 @@ max_in_flight = 1
 
 [proxy.timeouts]
 connect = "5s"
-response_headers = "60s"
-first_body_byte = "300s"
-stream_idle = "300s"
+response_headers = "120s"
+first_body_byte = "1200s"
+stream_idle = "1200s"
 
 [cluster]
 enabled = true
@@ -91,20 +91,20 @@ model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standal
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
 residency = "resident"
-context_size = 1000000
+context_size = 384000
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
-kv_disk_space_mb = 262144
+kv_disk_space_mb = 131072
 extra_args = []
 
 [ds4.mxfp4]
 model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
-context_size = 1000000
+context_size = 384000
 coordinator_layers = "0:19"
 worker_layers = "20:output"
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/distributed/mxfp4-0731"
-kv_disk_space_mb = 262144
+kv_disk_space_mb = 131072
 extra_args = ["--debug"]
 
 [logging]
