@@ -175,14 +175,14 @@ pub fn sha256_cached(
     cache: &mut DigestCache,
 ) -> Result<(String, bool)> {
     let meta = file_meta(path)?;
-    if let Some(cached) = cache.entries.get(key) {
-        if cached.meta == meta {
-            tracing_log(&format!(
-                "{label} unchanged ({size_mib} MiB) -> reusing cached digest",
-                size_mib = meta.size / (1024 * 1024)
-            ));
-            return Ok((cached.digest.clone(), true));
-        }
+    if let Some(cached) = cache.entries.get(key)
+        && cached.meta == meta
+    {
+        tracing_log(&format!(
+            "{label} unchanged ({size_mib} MiB) -> reusing cached digest",
+            size_mib = meta.size / (1024 * 1024)
+        ));
+        return Ok((cached.digest.clone(), true));
     }
     let size_mib = meta.size / (1024 * 1024);
     tracing_log(&format!(
