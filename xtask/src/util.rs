@@ -93,6 +93,113 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Filesystem metadata that identifies whether a previously recorded digest can
+/// be reused without re-reading the file. Mirrors the application's
+/// `FileFingerprint` staleness check (device_id + inode + size + modified_nanos).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileMeta {
+    pub device_id: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub modified_nanos: u128,
+}
+
+/// A cached digest plus the metadata of the file it was computed from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CachedDigest {
+    pub meta: FileMeta,
+    pub digest: String,
+}
+
+/// On-disk digest cache keyed by a stable profile name, so a re-install can
+/// reuse previously computed model digests when file metadata is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DigestCache {
+    pub entries: std::collections::HashMap<String, CachedDigest>,
+}
+
+/// Stat a file and record the metadata used for digest-cache staleness checks.
+pub fn file_meta(path: &Path) -> Result<FileMeta> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let modified_nanos = (metadata.mtime() as i128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(metadata.mtime_nsec() as i128)
+            .try_into()
+            .unwrap_or_default();
+        Ok(FileMeta {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_nanos,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(FileMeta {
+            device_id: 0,
+            inode: 0,
+            size: metadata.len(),
+            modified_nanos: 0,
+        })
+    }
+}
+
+/// Load a digest cache file if present and parseable. Returns an empty cache
+/// when absent or unreadable, so a fresh install still computes digests.
+pub fn load_digest_cache(path: &Path) -> DigestCache {
+    if !path.is_file() {
+        return DigestCache::default();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => DigestCache::default(),
+    }
+}
+
+/// Save a digest cache file, creating parent directories.
+pub fn save_digest_cache(path: &Path, cache: &DigestCache) -> Result<()> {
+    let json = serde_json::to_string_pretty(cache)?;
+    write(path, json.as_bytes())
+}
+
+/// Compute a SHA-256 for `path`, reusing `cache[key]` when the current file
+/// metadata matches the cached record. Otherwise computes and records it.
+/// Returns the digest and whether it was reused (no re-read).
+pub fn sha256_cached(
+    path: &Path,
+    label: &str,
+    key: &str,
+    cache: &mut DigestCache,
+) -> Result<(String, bool)> {
+    let meta = file_meta(path)?;
+    if let Some(cached) = cache.entries.get(key) {
+        if cached.meta == meta {
+            tracing_log(&format!(
+                "{label} unchanged ({size_mib} MiB) -> reusing cached digest",
+                size_mib = meta.size / (1024 * 1024)
+            ));
+            return Ok((cached.digest.clone(), true));
+        }
+    }
+    let size_mib = meta.size / (1024 * 1024);
+    tracing_log(&format!(
+        "hashing {label} ({size_mib} MiB) -> {}",
+        path.display()
+    ));
+    let digest = sha256_hex(path)?;
+    tracing_log(&format!("{label} hash complete -> {digest}"));
+    cache.entries.insert(
+        key.to_string(),
+        CachedDigest {
+            meta,
+            digest: digest.clone(),
+        },
+    );
+    Ok((digest, false))
+}
 /// Copy `src` to `dst`, creating the parent directory. If `dst` already exists it
 /// is first moved to a timestamped `.bak-<ts>` sibling.
 pub fn backup_and_write(src: &Path, dst: &Path) -> Result<()> {

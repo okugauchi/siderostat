@@ -8,6 +8,7 @@ description = "siderostat install/verify automation via cargo xtask"
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 siderostat = { path = ".." }
 toml = "1.1.4"

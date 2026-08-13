@@ -20,11 +20,33 @@ pub fn generate(
     ds4_source_commit: Option<&str>,
     approved: &[String],
 ) -> Result<()> {
-    let ds4_digest = util::sha256_hex_logged(&config.ds4.binary, "ds4 binary")?;
+    // Digest cache lives beside the MXFP4 manifest so re-installs skip re-reading
+    // the (multi-GB) model files when their metadata is unchanged.
+    let cache_path = config
+        .ds4
+        .mxfp4
+        .model_manifest
+        .parent()
+        .context("mxfp4 model_manifest has no parent directory")?
+        .join("digest-cache.json");
+    let mut digest_cache = util::load_digest_cache(&cache_path);
+
+    let ds4_digest = util::sha256_cached(
+        &config.ds4.binary,
+        "ds4 binary",
+        "ds4-binary",
+        &mut digest_cache,
+    )?
+    .0;
 
     // Standalone manifest.
-    let standalone_model_digest =
-        util::sha256_hex_logged(&config.ds4.standalone.model, "standalone model")?;
+    let standalone_model_digest = util::sha256_cached(
+        &config.ds4.standalone.model,
+        "standalone model",
+        "standalone-model",
+        &mut digest_cache,
+    )?
+    .0;
     let standalone_command = build_standalone_command(&config.ds4)
         .map_err(|error| anyhow::anyhow!("build standalone command: {error}"))?;
     let standalone_argv_profile = util::hex(&argv_sha256(
@@ -41,7 +63,13 @@ pub fn generate(
             .as_ref()
             .context("DSpark enabled but no support model in config")?;
         (
-            util::sha256_hex_logged(support, "dspark support model")?,
+            util::sha256_cached(
+                support,
+                "dspark support model",
+                "dspark-support",
+                &mut digest_cache,
+            )?
+            .0,
             util::file_size(support)?,
         )
     } else {
@@ -90,7 +118,13 @@ pub fn generate(
     // Distributed manifest (MXFP4). The worker command argv is used for the
     // recorded argv profile; both nodes must generate from the same ds4.mxfp4
     // config so the values agree (spec: MXFP4 config is shared).
-    let mxfp4_digest = util::sha256_hex_logged(&config.ds4.mxfp4.model, "mxfp4 model")?;
+    let mxfp4_digest = util::sha256_cached(
+        &config.ds4.mxfp4.model,
+        "mxfp4 model",
+        "mxfp4-model",
+        &mut digest_cache,
+    )?
+    .0;
     let mxfp4_size = util::file_size(&config.ds4.mxfp4.model)?;
     let worker_command = build_distributed_worker_command(
         &config.ds4,
@@ -136,6 +170,8 @@ pub fn generate(
         "wrote distributed manifest -> {}",
         config.ds4.mxfp4.model_manifest.display()
     ));
+
+    util::save_digest_cache(&cache_path, &digest_cache)?;
 
     Ok(())
 }
