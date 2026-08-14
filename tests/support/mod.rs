@@ -345,6 +345,47 @@ impl DistributedCoordinatorLifecycle for FakeCoordinatorChild {
     }
 }
 
+/// Synthetic DS4D HELLO frame bytes used to satisfy the coordinator rendezvous listener during
+/// promotion. Matches the WorkerHelloExpectation in `test_config` (layer_start 20, output
+/// layer, context 262144, model deepseek-v4-flash) per docs/spec.md section 17.2.
+pub fn fake_worker_hello_bytes() -> Vec<u8> {
+    include_str!("../fixtures/ds4/hello40-schema-v1.hex")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(|line| line.split_ascii_whitespace())
+        .map(|value| u8::from_str_radix(value, 16).unwrap())
+        .collect()
+}
+
+/// Spawn a task that repeatedly connects to the coordinator DS4 rendezvous port and writes a
+/// fake worker HELLO, so `promote()` can complete its `accept_one`. Returns when the hello is
+/// accepted (or panics if the listener never becomes reachable).
+pub fn inject_fake_worker_hello(ds4_distributed_port: u16) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let bytes = fake_worker_hello_bytes();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", ds4_distributed_port)).await {
+                Ok(mut stream) => {
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    return;
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!(
+                            "coordinator DS4 rendezvous listener on port {ds4_distributed_port} \
+                             never became reachable"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    })
+}
+
 fn proxy_state() -> anyhow::Result<Arc<ModeAwareProxyState>> {
     Ok(Arc::new(ModeAwareProxyState::new(
         url::Url::parse("http://127.0.0.1:8000")?,
@@ -515,6 +556,7 @@ pub struct Node {
     pub standalone: Arc<FakeStandalone>,
     pub worker_child: Option<Arc<FakeWorkerChild>>,
     pub coordinator_child: Option<Arc<FakeCoordinatorChild>>,
+    pub ds4_distributed_port: u16,
     pub mode: Arc<ModeRuntime>,
     pub production: Arc<ProductionClusterRuntime>,
     pub serve: JoinHandle<()>,
@@ -609,6 +651,7 @@ impl Node {
             standalone,
             worker_child,
             coordinator_child,
+            ds4_distributed_port,
             mode,
             production,
             serve,
@@ -683,6 +726,29 @@ impl TwoNode {
     /// Coordinator-initiated normal first pair over real control HTTP.
     pub async fn pair(&self) -> anyhow::Result<()> {
         self.coordinator.production.pair().await?;
+        Ok(())
+    }
+
+    /// Drive promotion to DistributedReady over real control HTTP. The coordinator's
+    /// `promote()` blocks on its rendezvous listener waiting for a DS4 worker HELLO, which the
+    /// fake worker child never sends, so we inject a synthetic HELLO frame in a background task
+    /// while `promote()` runs. Both nodes then converge on DistributedReady.
+    pub async fn promote_to_distributed(&self) -> anyhow::Result<()> {
+        let hello = inject_fake_worker_hello(self.coordinator.ds4_distributed_port);
+        self.coordinator.production.promote().await?;
+        hello.await?;
+        let converged = self
+            .wait_until_both(
+                siderostat::target::ClusterState::DistributedReady,
+                Duration::from_secs(10),
+            )
+            .await;
+        anyhow::ensure!(
+            converged,
+            "nodes did not converge to DistributedReady; coordinator={:?} worker={:?}",
+            self.coordinator.mode.snapshot().state,
+            self.worker.mode.snapshot().state,
+        );
         Ok(())
     }
 

@@ -186,3 +186,88 @@ async fn wait_until_reports_last_snapshot_on_timeout() {
     let reached = wait_until(Duration::from_millis(80), || async { probe }).await;
     assert!(!reached);
 }
+
+#[tokio::test]
+#[ignore = "RED for P0-A; resolve in A-03 coordinator PeerLost recovery (see reconnect plan R0-05)"]
+async fn peer_lost_from_distributed_ready_orphans_distributed_children() {
+    // RED for P0-A: reaching DistributedReady, then losing the peer, must fully recover to a
+    // solo standalone with no distributed child left behind. Today `fallback_to_solo` never
+    // stops the distributed children, so the coordinator orphans its distributed coordinator
+    // child and the worker runs standalone and distributed simultaneously.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+
+    harness.pair().await.expect("coordinator-initiated pair");
+    let paired = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(paired, "nodes did not pair");
+
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+
+    let coordinator_child = harness
+        .coordinator
+        .coordinator_child
+        .as_ref()
+        .expect("coordinator child");
+    let worker_child = harness.worker.worker_child.as_ref().expect("worker child");
+    assert!(
+        coordinator_child.child().is_running(),
+        "coordinator distributed child should be running in DistributedReady"
+    );
+    assert!(
+        worker_child.child().is_running(),
+        "worker distributed child should be running in DistributedReady"
+    );
+
+    // Expire control/route on both nodes by taking the peer control HTTP servers down.
+    harness.coordinator.serve.abort();
+    harness.worker.serve.abort();
+
+    // Each node observes the peer is unreachable and falls back to a solo standalone.
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker PeerLost reconcile");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator PeerLost reconcile");
+
+    let recovered = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        recovered,
+        "nodes did not return to solo; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+
+    // P0-A lifecycle consistency: after PeerLost no distributed child may remain, and the
+    // worker must never run standalone and distributed at the same time.
+    assert!(
+        !coordinator_child.child().is_running(),
+        "coordinator distributed child must be stopped after PeerLost (P0-A: orphaned)"
+    );
+    assert!(
+        !worker_child.child().is_running(),
+        "worker distributed child must be stopped after PeerLost (P0-A: orphaned)"
+    );
+    assert!(
+        harness.worker.standalone.child().is_running(),
+        "worker standalone must be running after PeerLost recovery"
+    );
+    assert!(
+        !(worker_child.child().is_running() && harness.worker.standalone.child().is_running()),
+        "worker must not run standalone and distributed simultaneously (P0-A: coexistence)"
+    );
+
+    harness.shutdown().await;
+}
