@@ -473,7 +473,8 @@ fn transition(
             | ClusterState::Promoting
             | ClusterState::DistributedStarting
             | ClusterState::DistributedReady
-            | ClusterState::Demoting,
+            | ClusterState::Demoting
+            | ClusterState::Backoff,
             ClusterEventKind::PeerLost,
         ) => (
             StableMode::SoloStandalone,

@@ -1650,3 +1650,101 @@ async fn pair_response_delay_and_duplicate_converge_idempotently() {
     }
     harness.shutdown().await;
 }
+
+#[tokio::test]
+async fn coordinator_backoff_reconcile_recovers_to_paired_after_deadline() {
+    // B-02: the coordinator's periodic reconcile drives backoff recovery. Before the deadline
+    // reconcile keeps Backoff (and never starts pair/promote concurrently); after the deadline
+    // it recovers exactly once to the stable paired state.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before backoff test");
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    // Drive the coordinator into Backoff. Record with a future timestamp so the retry deadline
+    // (now + promotion_backoff = 50ms) sits comfortably ahead of the real clock, giving a
+    // robust before/after split even on a slow CI host.
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    coordinator
+        .production
+        .record_promotion_failure(
+            siderostat::cluster::ClusterFailure::HelloTimeout,
+            real_now + 400,
+        )
+        .await
+        .expect("record promotion failure");
+    assert_eq!(coordinator.mode.snapshot().state, ClusterState::Backoff);
+
+    // Before the deadline: reconcile keeps Backoff and does not move to pair/promote.
+    let before = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile before deadline");
+    assert_eq!(before.state, ClusterState::Backoff);
+
+    // After the deadline: reconcile recovers exactly once to PairedStandaloneReady.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile after deadline");
+    assert_eq!(after.state, ClusterState::PairedStandaloneReady);
+
+    // Recovery is one-shot: a further reconcile is a no-op, staying Paired Standalone.
+    let again = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile after recovery");
+    assert_eq!(again.state, ClusterState::PairedStandaloneReady);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_loss_during_backoff_recovers_to_solo_first() {
+    // B-02: peer loss is prioritized over the backoff deadline. Even though the coordinator is
+    // in Backoff, losing the peer routes through the shared recovery owner to Solo Standalone
+    // instead of waiting out the deadline.
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before backoff test");
+
+    {
+        let coordinator = harness.node(LocalRole::Coordinator);
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        coordinator
+            .production
+            .record_promotion_failure(siderostat::cluster::ClusterFailure::HelloTimeout, real_now)
+            .await
+            .expect("record promotion failure");
+        assert_eq!(coordinator.mode.snapshot().state, ClusterState::Backoff);
+    }
+
+    // Stop the worker's control server so the coordinator's reconcile sees the peer as gone
+    // and invalidates the route, then recovers to Solo rather than honoring the backoff.
+    harness.worker.stop_serve().await;
+    let recovered = harness
+        .node(LocalRole::Coordinator)
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile during backoff with peer loss");
+    assert_eq!(recovered.state, ClusterState::SoloStandaloneReady);
+
+    harness.shutdown().await;
+}

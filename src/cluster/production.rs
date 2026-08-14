@@ -8,7 +8,11 @@ use super::{
     PromotionRetryPolicy, StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
 };
 use crate::{
-    config::ModeAwareConfig, metrics::Metrics, proxy::ModeAwareProxyState, target::LocalRole,
+    cluster::{ClusterFailure, ClusterSnapshot},
+    config::ModeAwareConfig,
+    metrics::Metrics,
+    proxy::ModeAwareProxyState,
+    target::LocalRole,
 };
 use anyhow::{Context, ensure};
 use axum::{
@@ -461,6 +465,26 @@ impl ProductionClusterRuntime {
             .coordinator_runtime
             .set(runtime)
             .map_err(|_| anyhow::anyhow!("coordinator runtime initialized twice"))
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Record a promotion failure on the coordinator's promotion tracker (test-support only).
+    /// Used to drive a production runtime into Backoff so the periodic-reconcile recovery path
+    /// (B-02) can be exercised without waiting on a real promotion timeout.
+    pub async fn record_promotion_failure(
+        &self,
+        failure: ClusterFailure,
+        now_millis: u64,
+    ) -> anyhow::Result<ClusterSnapshot> {
+        let runtime = self
+            .inner
+            .coordinator_runtime
+            .get()
+            .context("coordinator runtime unavailable")?;
+        runtime
+            .record_promotion_failure(failure, now_millis)
+            .await
+            .map_err(Into::into)
     }
 
     pub fn role(&self) -> LocalRole {
