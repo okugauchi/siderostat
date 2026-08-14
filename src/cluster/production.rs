@@ -34,6 +34,7 @@ use tokio::sync::Mutex;
 mod effects;
 mod pairing;
 mod reconcile;
+mod recovery;
 mod worker;
 
 /// The production control transport. Requests are pinned to the cluster address and authenticated
@@ -198,6 +199,7 @@ struct ProductionInner {
     distributed_worker: Option<Arc<dyn DistributedWorkerLifecycle>>,
     config: ModeAwareConfig,
     manifest: DistributedManifest,
+    recovery: Arc<recovery::PeerLossRecovery>,
 }
 
 impl ProductionClusterRuntime {
@@ -372,6 +374,7 @@ impl ProductionClusterRuntime {
             distributed_worker,
             config,
             manifest,
+            recovery: Arc::new(recovery::PeerLossRecovery::default()),
         };
         let runtime = Self {
             inner: Arc::new(inner),

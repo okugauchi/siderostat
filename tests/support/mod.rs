@@ -66,6 +66,16 @@ impl FakeDs4Process {
     }
 }
 
+pub async fn free_loopback_port() -> anyhow::Result<u16> {
+    // Bind an ephemeral loopback port and release it so the runtime can bind it. The small
+    // reallocation race is acceptable for tests; it keeps concurrent harness instances from
+    // colliding on the fixed DS4 rendezvous / peer ingress ports.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
 pub fn temporary_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("siderostat-{name}-{}", uuid::Uuid::new_v4()))
 }
@@ -185,6 +195,7 @@ pub struct FakeStandalone {
     child: RecordedChild,
     profile: &'static str,
     pid: u32,
+    start_fails: Arc<AtomicBool>,
 }
 
 impl FakeStandalone {
@@ -193,11 +204,17 @@ impl FakeStandalone {
             child: RecordedChild::default(),
             profile,
             pid,
+            start_fails: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn child(&self) -> &RecordedChild {
         &self.child
+    }
+
+    /// Inject a standalone-start failure (A-04 failure table: SoloStandaloneStarting retry).
+    pub fn set_start_fails(&self, fails: bool) {
+        self.start_fails.store(fails, Ordering::SeqCst);
     }
 }
 
@@ -206,7 +223,11 @@ impl LocalStandaloneLifecycle for FakeStandalone {
         let child = self.child.clone();
         let profile = self.profile;
         let pid = self.pid;
+        let start_fails = self.start_fails.clone();
         Box::pin(async move {
+            if start_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("injected standalone start failure");
+            }
             child.start(generation, pid, profile);
             Ok(())
         })
@@ -236,6 +257,7 @@ pub struct FakeWorkerChild {
     child: RecordedChild,
     profile: &'static str,
     pid: u32,
+    stop_fails: Arc<AtomicBool>,
 }
 
 impl FakeWorkerChild {
@@ -244,11 +266,17 @@ impl FakeWorkerChild {
             child: RecordedChild::default(),
             profile,
             pid,
+            stop_fails: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn child(&self) -> &RecordedChild {
         &self.child
+    }
+
+    /// Inject a distributed-worker stop failure (A-04 failure table).
+    pub fn set_stop_fails(&self, fails: bool) {
+        self.stop_fails.store(fails, Ordering::SeqCst);
     }
 }
 
@@ -265,7 +293,11 @@ impl DistributedWorkerLifecycle for FakeWorkerChild {
 
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
         let child = self.child.clone();
+        let stop_fails = self.stop_fails.clone();
         Box::pin(async move {
+            if stop_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("injected distributed worker stop failure");
+            }
             child.stop();
             Ok(())
         })
@@ -287,6 +319,10 @@ pub struct FakeCoordinatorChild {
     child: RecordedChild,
     profile: &'static str,
     pid: u32,
+    route_ready: Arc<AtomicBool>,
+    route_lost: Arc<AtomicBool>,
+    route_changed: Arc<tokio::sync::Notify>,
+    stop_fails: Arc<AtomicBool>,
 }
 
 impl FakeCoordinatorChild {
@@ -295,11 +331,34 @@ impl FakeCoordinatorChild {
             child: RecordedChild::default(),
             profile,
             pid,
+            route_ready: Arc::new(AtomicBool::new(false)),
+            route_lost: Arc::new(AtomicBool::new(false)),
+            route_changed: Arc::new(tokio::sync::Notify::new()),
+            stop_fails: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn child(&self) -> &RecordedChild {
         &self.child
+    }
+
+    /// Inject a distributed-coordinator stop failure (A-04 failure table).
+    pub fn set_stop_fails(&self, fails: bool) {
+        self.stop_fails.store(fails, Ordering::SeqCst);
+    }
+
+    /// Drop the DS4 route, waking the route-loss monitor (A-04 route-loss race).
+    pub fn lose_route(&self) {
+        self.route_ready.store(false, Ordering::SeqCst);
+        self.route_lost.store(true, Ordering::SeqCst);
+        self.route_changed.notify_waiters();
+    }
+
+    /// Restore the DS4 route (blip recovery).
+    pub fn restore_route(&self) {
+        self.route_ready.store(true, Ordering::SeqCst);
+        self.route_lost.store(false, Ordering::SeqCst);
+        self.route_changed.notify_waiters();
     }
 }
 
@@ -308,30 +367,66 @@ impl DistributedCoordinatorLifecycle for FakeCoordinatorChild {
         let child = self.child.clone();
         let profile = self.profile;
         let pid = self.pid;
+        let route_ready = self.route_ready.clone();
+        let route_lost = self.route_lost.clone();
+        let route_changed = self.route_changed.clone();
         Box::pin(async move {
             child.start(generation, pid, profile);
+            route_ready.store(true, Ordering::SeqCst);
+            route_lost.store(false, Ordering::SeqCst);
+            route_changed.notify_waiters();
             Ok(())
         })
     }
 
     fn wait_ready(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let child = self.child.clone();
+        let route_ready = self.route_ready.clone();
+        let route_lost = self.route_lost.clone();
+        let route_changed = self.route_changed.clone();
         Box::pin(async move {
-            anyhow::ensure!(child.is_running(), "coordinator child not running");
-            Ok(())
+            loop {
+                if route_ready.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if route_lost.load(Ordering::SeqCst) {
+                    anyhow::bail!("coordinator route lost");
+                }
+                route_changed.notified().await;
+            }
         })
     }
 
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
         let child = self.child.clone();
+        let stop_fails = self.stop_fails.clone();
+        let route_ready = self.route_ready.clone();
+        let route_changed = self.route_changed.clone();
         Box::pin(async move {
+            if stop_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("injected distributed coordinator stop failure");
+            }
             child.stop();
+            route_ready.store(false, Ordering::SeqCst);
+            route_changed.notify_waiters();
             Ok(())
         })
     }
 
     fn wait_route_loss(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(std::future::pending())
+        let route_lost = self.route_lost.clone();
+        let route_ready = self.route_ready.clone();
+        let route_changed = self.route_changed.clone();
+        Box::pin(async move {
+            loop {
+                if route_lost.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if !route_ready.load(Ordering::SeqCst) {
+                    anyhow::bail!("coordinator route never ready");
+                }
+                route_changed.notified().await;
+            }
+        })
     }
 
     fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
@@ -575,11 +670,8 @@ impl Node {
         listener: tokio::net::TcpListener,
         baseline_generation: u64,
     ) -> anyhow::Result<Self> {
-        let (ds4_distributed_port, peer_ingress_port) = match role {
-            LocalRole::Coordinator => (19911, 19082),
-            LocalRole::Worker => (19912, 19083),
-            LocalRole::Unknown => anyhow::bail!("unknown role"),
-        };
+        let ds4_distributed_port = free_loopback_port().await?;
+        let peer_ingress_port = free_loopback_port().await?;
         let config = test_config(
             node_id,
             coordinator_address,
@@ -609,6 +701,7 @@ impl Node {
             .await?,
         );
         let (worker_child, coordinator_child) = match role {
+            LocalRole::Unknown => anyhow::bail!("unknown role"),
             LocalRole::Worker => (
                 Some(Arc::new(FakeWorkerChild::new("flash-worker", 9202))),
                 None,
@@ -620,7 +713,6 @@ impl Node {
                     9201,
                 ))),
             ),
-            LocalRole::Unknown => anyhow::bail!("unknown role"),
         };
         let worker_trait: Option<Arc<dyn DistributedWorkerLifecycle>> = worker_child
             .clone()

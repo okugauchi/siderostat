@@ -22,6 +22,29 @@ impl super::ProductionClusterRuntime {
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         let now = now_millis();
+        // Detect peer loss before delegating to the pure state machine so the production
+        // recovery owner stops the distributed child and restarts the standalone. The pure
+        // `ModeRuntime::fallback_to_solo` cannot touch distributed children, so it is only used
+        // by unit tests.
+        let (state, peer_present) = match &self.inner.control {
+            RoleControl::Coordinator(control) => {
+                let control = control.lock().await;
+                (
+                    self.inner.mode.snapshot().state,
+                    control.peer_lease().peer_present(now),
+                )
+            }
+            RoleControl::Worker(control) => {
+                let control = control.lock().await;
+                (
+                    self.inner.mode.snapshot().state,
+                    control.peer_lease().peer_present(now),
+                )
+            }
+        };
+        if !peer_present && self.requires_solo_fallback(state) {
+            return self.recover_from_peer_loss(owner).await;
+        }
         Ok(match &self.inner.control {
             RoleControl::Coordinator(control) => {
                 self.inner
@@ -36,6 +59,22 @@ impl super::ProductionClusterRuntime {
                     .await?
             }
         })
+    }
+
+    /// Whether a cluster state must fall back to a solo standalone when the peer is gone.
+    fn requires_solo_fallback(&self, state: crate::target::ClusterState) -> bool {
+        use crate::target::ClusterState;
+        matches!(
+            state,
+            ClusterState::Pairing
+                | ClusterState::PairedStandaloneReady
+                | ClusterState::AwaitingWorkerHello
+                | ClusterState::Promoting
+                | ClusterState::DistributedStarting
+                | ClusterState::DistributedReady
+                | ClusterState::Demoting
+                | ClusterState::SoloStandaloneStarting
+        )
     }
 
     async fn invalidate_route(&self) {

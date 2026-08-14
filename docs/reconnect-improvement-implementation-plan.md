@@ -279,7 +279,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 7. Phase A: P0-A PeerLost lifecycle
 
-### [ ] A-01 PeerLost recovery の所有権と失敗規則を設計固定する
+### [x] A-01 PeerLost recovery の所有権と失敗規則を設計固定する
 
 - Actor: agent + operator review
 - Depends on: R0-05
@@ -297,8 +297,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: coordinator/worker/競合/途中失敗の sequence diagram と状態表
 - 完了条件: 実装者が lock 範囲、event 順、failure state を推測せず実装できる
 - 停止条件: `spec.md` 第 18.4 節と 18.5 節の変更が必要
+- Evidence: `docs/reconnect-peer-loss-design.md` を新規作成 (commit は本 Phase A 実装と一体で記録)。単一の `PeerLossRecovery` owner (lock + `completed_generation`) を定義し、control reconcile と route-loss demotion monitor が共有する。世代保護は owner の lock と state machine の `expected_generation` 照合の二重で担保。role 別順序を `admission block -> distributed stop -> standalone start -> publish SoloReady` に固定。stop は `ChildIdentity` 検証必須。failure mapping 表を固定: stop/start/readiness 失敗は `SoloStandaloneStarting + Unavailable` で retry、同一 generation 重複は冪等 no-op、古い generation は no-op、永続回復不能は `ManualInterventionRequired` (Phase B で接続)。coordinator も standalone を再起動する (R0-05 action 4 の不整合 4 を解消)。`spec.md` 18.4/18.5 は変更不要と判断。; 2026-08-14
 
-### [ ] A-02 worker の PeerLost recovery を実装する
+### [x] A-02 worker の PeerLost recovery を実装する
 
 - Actor: agent
 - Depends on: A-01
@@ -314,8 +315,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: R0-05 の worker assertion、stop/start failure unit test、共通 local gate
 - 完了条件: worker で standalone と distributed child が同時に生存しない
 - 停止条件: identity mismatch を無視または強制 kill しないと test が通らない
+- Evidence: `src/cluster/production/recovery.rs` に共通 owner を実装。worker 側は `recover_from_peer_loss(owner)` が `admission.block()` + `proxy target=Unavailable(Transition)` -> `stop_distributed_child()` (worker distributed child のみ) -> `PeerLost` 適用で `SoloStandaloneStarting` -> `standalone.start(generation)` -> `LocalStandaloneReady` で `SoloStandaloneReady` -> `proxy target=LocalStandalone, ready=true` publish + `admission.start_serving()`。`reconcile_peer` は peer_present=false かつ fallback 対象 state なら recovery owner 経由に変更 (純粋 `fallback_to_solo` は distributed child を触れないため production では使用しない)。`requires_solo_fallback` に `SoloStandaloneStarting` を含め、途中失敗からの retry が再び recovery に入って先へ進む (A-04 で確認)。stop/start 失敗時は state を偽 Ready にせず `SoloStandaloneStarting + Unavailable` を維持して error を返し、owner の lock を解放して次回 reconcile に委ねる。共通 local gate 全項目成功 (後述 A-03/A-04 Evidence 参照); 2026-08-14
 
-### [ ] A-03 coordinator の PeerLost recovery を実装する
+### [x] A-03 coordinator の PeerLost recovery を実装する
 
 - Actor: agent
 - Depends on: A-02
@@ -332,8 +334,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: R0-05 の coordinator assertion、stale demotion test、共通 local gate
 - 完了条件: coordinator の SoloReady が実 standalone readiness と一致する
 - 停止条件: cleanup 前に state だけを Ready へ進める必要がある
+- Evidence: 共通 recovery owner を coordinator 側にも適用。`stop_distributed_child()` は coordinator なら distributed coordinator child のみ停止。`pairing.rs` の route-loss task を `CoordinatorDistributedRuntime::wait_route_loss_and_demote()` から `runtime.handle_route_loss()` に変更し、route-loss monitor も peer present なら graceful demote、peer loss なら `recover_from_peer_loss(RouteLossMonitor)` で同じ owner へ収束させる。`R0-05` で付けた `peer_lost_from_distributed_ready_orphans_distributed_children` の一時 `ignore` を解除し GREEN 確認。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets / cargo test --all-targets --features test-support / git diff --check clean); 2026-08-14
 
-### [ ] A-04 PeerLost recovery の race と failure test を完成する
+### [x] A-04 PeerLost recovery の race と failure test を完成する
 
 - Actor: agent
 - Depends on: A-03
@@ -348,6 +351,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: 対象 race test を 10 回反復、共通 local gate
 - 完了条件: lifecycle の RED test と競合 test がすべて GREEN
 - 停止条件: test の成功に scheduler timing や長い固定 sleep が必要
+- Evidence: `tests/reconnect_production.rs` に race/failure 5 test を追加。`peer_loss_recovery_is_idempotent_on_duplicate_reconcile` (重複 recovery で standalone が再起動されない)、`recovery_then_repromotion_uses_new_child_generation` (recovery 後の再 promotion で新旧 generation が再利用されない)、`route_loss_monitor_and_peer_loss_reconcile_race_converge_to_solo` (route-loss と reconcile の同時発火が単一 Solo recovery へ収束し orphan child なし)、`worker_stop_failure_keeps_recovery_from_faking_ready` (stop 失敗で `SoloStandaloneStarting + Unavailable` 維持、retry で回復)、`standalone_start_failure_keeps_recovery_from_faking_ready` (standalone start 失敗でも同様)。harness 側は `FakeStandalone.set_start_fails`、`FakeWorkerChild.set_stop_fails`、`FakeCoordinatorChild` に route_ready/route_lost/route_changed Notify + `lose_route`/`restore_route`/`set_stop_fails` を追加、`Node::build` の control/peer 各 port を `free_loopback_port()` で動的確保し並行実行の衝突を回避。A-04 Verification として `cargo test --test reconnect_production --features test-support` を 10 回反復し全回 GREEN (10 passed + 1 ignored、flaky なし、固定 sleep 不使用)。共通 local gate 全項目成功; 2026-08-14
 
 ## 8. Phase G: P0-B control session generation
 

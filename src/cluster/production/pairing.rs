@@ -96,15 +96,10 @@ impl super::ProductionClusterRuntime {
         };
         self.inner.client.send(&ready).await?;
         if self.inner.config.cluster.policy.auto_demote {
-            let coordinator = self
-                .inner
-                .coordinator_runtime
-                .get()
-                .context("coordinator runtime unavailable")?
-                .clone();
+            let runtime = self.clone();
             tokio::spawn(async move {
-                if let Err(error) = coordinator.wait_route_loss_and_demote().await {
-                    tracing::error!(error = %error, "automatic distributed demotion failed");
+                if let Err(error) = runtime.handle_route_loss().await {
+                    tracing::error!(error = %error, "automatic distributed route-loss demotion failed");
                 }
             });
         }

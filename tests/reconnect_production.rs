@@ -6,7 +6,7 @@
 mod support;
 
 use siderostat::{
-    cluster::DistributedControlPhase,
+    cluster::{DistributedControlPhase, EventOwner},
     target::{ClusterState, LocalRole},
 };
 use std::time::Duration;
@@ -188,12 +188,10 @@ async fn wait_until_reports_last_snapshot_on_timeout() {
 }
 
 #[tokio::test]
-#[ignore = "RED for P0-A; resolve in A-03 coordinator PeerLost recovery (see reconnect plan R0-05)"]
 async fn peer_lost_from_distributed_ready_orphans_distributed_children() {
-    // RED for P0-A: reaching DistributedReady, then losing the peer, must fully recover to a
-    // solo standalone with no distributed child left behind. Today `fallback_to_solo` never
-    // stops the distributed children, so the coordinator orphans its distributed coordinator
-    // child and the worker runs standalone and distributed simultaneously.
+    // P0-A: reaching DistributedReady, then losing the peer, must fully recover to a
+    // solo standalone with no distributed child left behind. The single recovery owner stops
+    // both the coordinator and worker distributed children and restarts each local standalone.
     let harness = TwoNode::boot().await.expect("boot two-node harness");
 
     harness.pair().await.expect("coordinator-initiated pair");
@@ -326,5 +324,327 @@ async fn higher_coordinator_baseline_generation_is_followed_by_worker() {
         harness.worker.mode.snapshot().state,
     );
 
+    harness.shutdown().await;
+}
+
+// ---- A-04 PeerLost recovery races and failures --------------------------------
+
+/// Duplicate PeerLost reconcile after a completed recovery is a no-op: state stays Solo and
+/// the standalone is not started again.
+#[tokio::test]
+async fn peer_loss_recovery_is_idempotent_on_duplicate_reconcile() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    harness.coordinator.serve.abort();
+    harness.worker.serve.abort();
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker PeerLost reconcile");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator PeerLost reconcile");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(solo, "nodes did not recover to solo");
+
+    let coordinator_starts = harness.coordinator.standalone.child().starts();
+    let worker_starts = harness.worker.standalone.child().starts();
+
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("duplicate worker reconcile is a no-op");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("duplicate coordinator reconcile is a no-op");
+
+    assert_eq!(
+        harness.coordinator.mode.snapshot().state,
+        ClusterState::SoloStandaloneReady
+    );
+    assert_eq!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::SoloStandaloneReady
+    );
+    assert_eq!(
+        harness.coordinator.standalone.child().starts(),
+        coordinator_starts,
+        "duplicate recovery must not restart the coordinator standalone"
+    );
+    assert_eq!(
+        harness.worker.standalone.child().starts(),
+        worker_starts,
+        "duplicate recovery must not restart the worker standalone"
+    );
+    harness.shutdown().await;
+}
+
+/// Recovery then re-promotion must start fresh distributed children with new identities; the
+/// old child generation is never reused.
+#[tokio::test]
+async fn recovery_then_repromotion_uses_new_child_generation() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    let coordinator_child = harness
+        .coordinator
+        .coordinator_child
+        .as_ref()
+        .expect("coordinator child");
+    let worker_child = harness.worker.worker_child.as_ref().expect("worker child");
+    let first_coordinator_gen = coordinator_child
+        .child()
+        .identity()
+        .expect("coordinator identity")
+        .generation;
+    let first_worker_gen = worker_child
+        .child()
+        .identity()
+        .expect("worker identity")
+        .generation;
+
+    // Recover both nodes to Solo through the single recovery owner while control HTTP stays up.
+    harness
+        .coordinator
+        .production
+        .recover_from_peer_loss(EventOwner::Control)
+        .await
+        .expect("coordinator recovery");
+    harness
+        .worker
+        .production
+        .recover_from_peer_loss(EventOwner::Control)
+        .await
+        .expect("worker recovery");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(solo, "nodes did not recover to solo");
+    assert!(
+        !coordinator_child.child().is_running(),
+        "coordinator distributed child stopped after recovery"
+    );
+    assert!(
+        !worker_child.child().is_running(),
+        "worker distributed child stopped after recovery"
+    );
+
+    // Re-pair and re-promote; the new children carry new generations.
+    harness.pair().await.expect("re-pair after recovery");
+    let paired = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(paired, "nodes did not re-pair after recovery");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("re-promote to DistributedReady");
+    let second_coordinator_gen = coordinator_child
+        .child()
+        .identity()
+        .expect("coordinator identity")
+        .generation;
+    let second_worker_gen = worker_child
+        .child()
+        .identity()
+        .expect("worker identity")
+        .generation;
+    assert_ne!(
+        second_coordinator_gen, first_coordinator_gen,
+        "coordinator child generation must not be reused after recovery"
+    );
+    assert_ne!(
+        second_worker_gen, first_worker_gen,
+        "worker child generation must not be reused after recovery"
+    );
+    // Stop the fresh distributed children explicitly; the harness ends in DistributedReady.
+    coordinator_child.child().stop();
+    worker_child.child().stop();
+    harness.shutdown().await;
+}
+
+/// Control lease loss and the route-loss monitor firing together must converge to a single
+/// Solo recovery with no orphaned distributed child.
+#[tokio::test]
+async fn route_loss_monitor_and_peer_loss_reconcile_race_converge_to_solo() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    let coordinator_child = harness
+        .coordinator
+        .coordinator_child
+        .as_ref()
+        .expect("coordinator child");
+    let worker_child = harness.worker.worker_child.as_ref().expect("worker child");
+    assert!(coordinator_child.child().is_running());
+    assert!(worker_child.child().is_running());
+
+    // Peer unreachable and the coordinator DS4 route drops at the same time.
+    harness.coordinator.serve.abort();
+    harness.worker.serve.abort();
+    coordinator_child.lose_route();
+
+    let coordinator = harness.coordinator.production.clone();
+    let worker = harness.worker.production.clone();
+    let coordinator_reconcile = tokio::spawn(async move {
+        let _ = coordinator.reconcile().await;
+    });
+    let worker_reconcile = tokio::spawn(async move {
+        let _ = worker.reconcile().await;
+    });
+    coordinator_reconcile
+        .await
+        .expect("coordinator reconcile task");
+    worker_reconcile.await.expect("worker reconcile task");
+
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        solo,
+        "nodes did not converge to solo after route-loss + reconcile race"
+    );
+    assert!(
+        !coordinator_child.child().is_running(),
+        "coordinator distributed child must not be orphaned by the race"
+    );
+    assert!(
+        !worker_child.child().is_running(),
+        "worker distributed child must not be orphaned by the race"
+    );
+
+    // Give the route-loss monitor time to run; it must be a stale no-op against the already
+    // recovered solo state.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        harness.coordinator.mode.snapshot().state,
+        ClusterState::SoloStandaloneReady
+    );
+    assert!(!coordinator_child.child().is_running());
+    harness.shutdown().await;
+}
+
+/// A distributed-worker stop failure must keep the node in SoloStandaloneStarting + Unavailable
+/// (never faking Ready) and retry on the next reconcile.
+#[tokio::test]
+async fn worker_stop_failure_keeps_recovery_from_faking_ready() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    let worker_child = harness.worker.worker_child.as_ref().expect("worker child");
+    worker_child.set_stop_fails(true);
+    harness.coordinator.serve.abort();
+    harness.worker.serve.abort();
+
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect_err("worker recovery must fail while distributed stop fails");
+    assert_ne!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::SoloStandaloneReady,
+        "stop failure must not fake SoloReady"
+    );
+    assert!(
+        worker_child.child().is_running(),
+        "distributed worker child stays running while stop fails"
+    );
+
+    // Lift the failure; the next reconcile retries to a clean Solo recovery.
+    worker_child.set_stop_fails(false);
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker recovery retry");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator recovery");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(solo, "nodes did not recover after stop-failure retry");
+    assert!(!worker_child.child().is_running());
+    harness.shutdown().await;
+}
+
+/// A standalone-start failure during recovery must keep the node from faking Ready and retry.
+#[tokio::test]
+async fn standalone_start_failure_keeps_recovery_from_faking_ready() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    let worker_child = harness.worker.worker_child.as_ref().expect("worker child");
+    harness.coordinator.serve.abort();
+    harness.worker.serve.abort();
+    harness.worker.standalone.set_start_fails(true);
+
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect_err("worker recovery must fail while standalone start fails");
+    assert_ne!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::SoloStandaloneReady,
+        "standalone-start failure must not fake SoloReady"
+    );
+    assert!(
+        !worker_child.child().is_running(),
+        "distributed worker child was stopped even though standalone start failed"
+    );
+
+    harness.worker.standalone.set_start_fails(false);
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker recovery retry");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator recovery");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(solo, "nodes did not recover after standalone-start retry");
     harness.shutdown().await;
 }
