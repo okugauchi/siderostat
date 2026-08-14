@@ -241,7 +241,7 @@ Evidence: branch=feature/reconnect-recovery; 前半の read-only 診断 snapshot
 
 Evidence: branch=feature/reconnect-recovery; 実装を commit 96d5459 で追加; `ProductionInner` の child を trait object 化し、lifecycle に `child_identity`/`is_running` を追加、`new_with_lifecycles` で fake child と peer control port を注入可能にした (production `new` は従来通り `config.cluster.control_port` を peer へ渡すため挙動不変); `tests/support/mod.rs` に fake standalone/worker/coordinator child (start/stop、PID 相当 identity、profile、generation を記録) と TwoNode fixture (別 runtime、別 control port、別永続 state path、loopback は同一 127.0.0.1 に別 port で分離) を追加。このホストは bind 可能な loopback address が 127.0.0.1 と ::1 のみ (127.0.0.2/::2 は alias なし、IPv4/IPv6 の混在接続は非対応) のため、計画の「別 loopback address」は満たせず、同一 loopback 上で別 port による完全分離に変更して harness に制約を明記。`ProductionControlClient` が peer 接続に local node の control_port を用いる設計のため、test-support 専用に peer control port 注入を追加した (production-only code の test 専用分岐への置換は行っていない)。`tests/reconnect_production.rs` に Solo 起動と正常な初回 pair の smoke test を追加し、2 node の状態と child identity を一つの assertion helper (assert_paired_consistent) で比較、wait_until は deadline + 最終 snapshot 方式、shutdown で serve task を回収し orphan distributed child を検出。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 173 + integration GREEN / cargo test --all-targets --features test-support: unit 173 + integration GREEN (reconnect_production 3 tests 含む) / git diff --check clean); 2026-08-14
 
-### [ ] R0-05 PeerLost lifecycle の RED test を追加する
+### [x] R0-05 PeerLost lifecycle の RED test を追加する
 
 - Actor: agent
 - Depends on: R0-04
@@ -256,6 +256,8 @@ Evidence: branch=feature/reconnect-recovery; 実装を commit 96d5459 で追加;
 - Verification: 対象 test が既知の lifecycle assertion で再現性をもって失敗する
 - 完了条件: P0-A の修正がなければ通らない test と failure evidence があり、残りの suite は GREEN
 - 停止条件: failure が generation mismatch に先に遮られる。この場合は fixture の同一 generation を明示する
+
+Evidence: branch=feature/reconnect-recovery; 実装を追加。`tests/support/mod.rs` に `fake_worker_hello_bytes` / `inject_fake_worker_hello` / `TwoNode::promote_to_distributed` (coordinator の DS4 rendezvous listener へ合成 HELLO を注入して `promote()` を DistributedReady まで完走させる) と `Node.ds4_distributed_port` を追加。`tests/reconnect_production.rs` に `peer_lost_from_distributed_ready_orphans_distributed_children` を追加し、pair -> promote -> DistributedReady で両 distributed child の稼働を確認した後、両 node の control HTTP server を abort して `reconcile()` を呼び PeerLost を発火。P0-A の lifecycle 不整合を検出: coordinator の distributed child が PeerLost 後に残存 (fallback_to_solo が distributed child を停止しない)、worker が standalone と distributed を同時稼働させる (fallback_to_solo が worker standalone を起動しても distributed worker child を停止しない)。RED 確認: 両 assertion とも再現性をもって失敗 (coordinator orphan / worker coexistence)。failure evidence 採取後、解除 task A-03 を明記した `#[ignore = "RED for P0-A; resolve in A-03 coordinator PeerLost recovery (see reconnect plan R0-05)"]` を付与し、残り suite を GREEN に維持。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 173 + integration GREEN / cargo test --all-targets --features test-support: unit 173 + integration GREEN (reconnect_production 3 passed + 1 ignored) / git diff --check clean); 2026-08-14
 
 ### [ ] R0-06 control generation mismatch の RED test を追加する
 
