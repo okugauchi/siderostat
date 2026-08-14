@@ -573,6 +573,7 @@ impl Node {
         state_path: PathBuf,
         manifest_cache: PathBuf,
         listener: tokio::net::TcpListener,
+        baseline_generation: u64,
     ) -> anyhow::Result<Self> {
         let (ds4_distributed_port, peer_ingress_port) = match role {
             LocalRole::Coordinator => (19911, 19082),
@@ -598,11 +599,12 @@ impl Node {
             },
         ));
         let mode = Arc::new(
-            ModeRuntime::spawn_ready(
+            ModeRuntime::spawn_ready_at(
                 role,
                 proxy.clone(),
                 standalone.clone(),
                 Duration::from_secs(1),
+                baseline_generation,
             )
             .await?,
         );
@@ -667,6 +669,17 @@ pub struct TwoNode {
 
 impl TwoNode {
     pub async fn boot() -> anyhow::Result<Self> {
+        Self::boot_with_baseline(0, 0).await
+    }
+
+    /// Boot both nodes with explicit state-machine baseline generations. A higher baseline
+    /// models a node whose persistent control session generation is ahead of its peer (for
+    /// example after it alone was restarted with newer state), which drives the R0-06
+    /// direction-dependent generation-mismatch cases.
+    pub async fn boot_with_baseline(
+        coordinator_baseline: u64,
+        worker_baseline: u64,
+    ) -> anyhow::Result<Self> {
         // This host binds only one IPv4 loopback (127.0.0.1) and one IPv6 loopback (::1);
         // 127.0.0.2 and ::2 are not aliased, and cross-family (IPv4 vs IPv6) control
         // connections are unsupported. The two nodes are therefore isolated on the same
@@ -695,6 +708,7 @@ impl TwoNode {
             coordinator_state,
             coordinator_cache,
             coordinator_listener,
+            coordinator_baseline,
         )
         .await?;
         let worker = Node::build(
@@ -707,6 +721,7 @@ impl TwoNode {
             worker_state,
             worker_cache,
             worker_listener,
+            worker_baseline,
         )
         .await?;
         Ok(Self {

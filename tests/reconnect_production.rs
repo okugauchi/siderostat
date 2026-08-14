@@ -271,3 +271,60 @@ async fn peer_lost_from_distributed_ready_orphans_distributed_children() {
 
     harness.shutdown().await;
 }
+
+#[tokio::test]
+#[ignore = "RED for P0-B; resolve in G-05 control session generation negotiation (see reconnect plan R0-06)"]
+async fn coordinator_adopts_higher_worker_generation_on_pair() {
+    // RED for P0-B: when only the worker carries a higher persistent control session
+    // generation, the coordinator must adopt that higher generation so the pair converges.
+    // Today the worker rejects the coordinator's lower-generation Pair with 409
+    // GenerationMismatch and periodic reconcile never converges, so this assertion fails.
+    let worker_baseline = 100;
+    let coordinator_baseline = 0;
+    let harness = TwoNode::boot_with_baseline(coordinator_baseline, worker_baseline)
+        .await
+        .expect("boot two-node harness");
+
+    harness.coordinator.production.pair().await.expect(
+        "coordinator Pair should adopt the worker's higher control generation and succeed \
+             (P0-B: rejected with 409 GenerationMismatch instead)",
+    );
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        converged,
+        "nodes did not converge to PairedStandaloneReady; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn higher_coordinator_baseline_generation_is_followed_by_worker() {
+    // Reverse direction, fixing the direction-dependence: when the coordinator carries the
+    // higher control session generation, the worker follows it and the pair converges.
+    let harness = TwoNode::boot_with_baseline(100, 0)
+        .await
+        .expect("boot two-node harness");
+
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("coordinator Pair must succeed when the coordinator generation is higher");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        converged,
+        "nodes did not converge; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+
+    harness.shutdown().await;
+}
