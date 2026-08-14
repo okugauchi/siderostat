@@ -447,7 +447,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 9. Phase E: P0-C 再接続 E2E
 
-### [ ] E-01 P0 reconnect matrix を一つの acceptance suite にする
+### [x] E-01 P0 reconnect matrix を一つの acceptance suite にする
 
 - Actor: agent
 - Depends on: A-04、G-05
@@ -464,6 +464,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: `cargo test --test reconnect_production --features test-support` を単独実行後、共通 local gate
 - 完了条件: proposal P0-C の全行が test 名へ一対一で対応する
 - 停止条件: flaky 回避のため cycle 数削減や timeout 延長が必要
+- Evidence: `tests/reconnect_production.rs` と `tests/support/mod.rs` を commit 8798b1a で追加。P0-C の各行を test 名へ一対一対応させた: `paired_cable_blip_repairs_to_paired_over_10_cycles` / `distributed_cable_blip_rebuilds_new_generation_over_10_cycles` (各 10 cycle) / `coordinator_only_restart_converges_generation_without_orphan` / `worker_only_restart_converges_including_coordinator_low_generation` (coordinator 低世代の worker 高世代採用を含む) / `both_process_restart_converges_from_persisted_generation` / `pair_response_delay_and_duplicate_converge_idempotently`。harness 側は cable blip 相当を `Node::stop_serve`/`restart_serve` (非 blocking std listener clone で同一 control port を再 serve)、process 再起動相当を `Node::restart_control_process(persisted_generation)` (serve/child 終了後、fresh mode + `new_with_lifecycles(.., Some(generation), ..)` で永続 control session generation から再起動) として実装。共通 helper (`assert_solo_serving` / `assert_paired_consistent` / `assert_paired_serving` / `assert_distributed_consistent`) で state、stable mode、cluster/control generation、phase、lease、proxy target、admission、standalone/distributed child identity を両 node 検証し、Solo serving と Paired serving を途中 checkpoint として必須化 (最終 checkpoint のみでなく)。設計判断の根拠は R0-04/05/06 Evidence から参照: 同一 loopback 127.0.0.1 を別 port で分離、test-support 専用 peer control port 注入、`inject_fake_worker_hello` による promotion 用 fake HELLO、`boot_with_baseline`/`spawn_ready_at` による baseline generation 注入。Verification は `cargo test --test reconnect_production --features test-support` 単独 (19 passed / 0 ignored) と共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 176 + integration GREEN / cargo test --all-targets --features test-support: unit 176 + integration + reconnect_production 19 GREEN / git diff --check clean)。cable blip 2 test を別途 2 回反復し flaky なし (固定 sleep 不使用、`required_peer_stability` と lease 期限を利用)。; 2026-08-15
 
 ## 10. Phase B: P1 Backoff と operator reconcile
 
