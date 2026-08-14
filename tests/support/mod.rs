@@ -654,7 +654,15 @@ pub struct Node {
     pub ds4_distributed_port: u16,
     pub mode: Arc<ModeRuntime>,
     pub production: Arc<ProductionClusterRuntime>,
-    pub serve: JoinHandle<()>,
+    /// The peer's control port, so a process-restart rebuild can recreate the control client
+    /// with the same peer endpoint.
+    pub peer_control_port: u16,
+    /// The bound control listener for this node. Kept owned here (never moved into the serve
+    /// task) so a cable-blip or process-restart can re-spawn serve on the same control port.
+    /// A `std` listener is used so it can be cheaply cloned via `try_clone` for each serve task.
+    pub listener: std::net::TcpListener,
+    /// The live control HTTP serve task, or `None` while the node is stopped/restarting.
+    pub serve: Option<JoinHandle<()>>,
 }
 
 impl Node {
@@ -733,11 +741,17 @@ impl Node {
             worker_trait,
             coordinator_trait,
         )?);
+        // Keep a non-blocking std clone of the listener owned by the node so cable-blip and
+        // process-restart can re-spawn serve on the same control port. The tokio listener is
+        // already non-blocking, so `into_std`/`try_clone`/`from_std` stay non-blocking and
+        // `from_std` accepts them without the `tokio_allow_from_blocking_fd` cfg.
+        let listener_std = listener.into_std()?;
+        let serve_listener = tokio::net::TcpListener::from_std(listener_std.try_clone()?)?;
         let app = production
             .router()
             .into_make_service_with_connect_info::<SocketAddr>();
         let serve = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(serve_listener, app).await.unwrap();
         });
         Ok(Self {
             role,
@@ -749,8 +763,97 @@ impl Node {
             ds4_distributed_port,
             mode,
             production,
-            serve,
+            peer_control_port,
+            listener: listener_std,
+            serve: Some(serve),
         })
+    }
+
+    /// Abort the control HTTP serve task and await its exit (the peer becomes unreachable).
+    pub async fn stop_serve(&mut self) {
+        if let Some(serve) = self.serve.take() {
+            serve.abort();
+            let _ = serve.await;
+        }
+    }
+
+    /// Re-spawn the control HTTP serve task on the same listener after a stop (cable blip
+    /// restore). The production runtime is unchanged, so state survives the blip.
+    pub async fn restart_serve(&mut self) -> anyhow::Result<()> {
+        self.stop_serve().await;
+        let serve_listener = tokio::net::TcpListener::from_std(self.listener.try_clone()?)?;
+        let app = self
+            .production
+            .router()
+            .into_make_service_with_connect_info::<SocketAddr>();
+        self.serve = Some(tokio::spawn(async move {
+            axum::serve(serve_listener, app).await.unwrap();
+        }));
+        Ok(())
+    }
+
+    /// Simulate a full control-process restart on the same control port and persistent state
+    /// path: the serve task and every child terminate, then a fresh mode runtime and a fresh
+    /// production runtime boot carrying `persisted_generation` (the node's persisted control
+    /// session generation, as if reloaded from state).
+    pub async fn restart_control_process(
+        &mut self,
+        persisted_generation: u64,
+    ) -> anyhow::Result<()> {
+        self.stop_serve().await;
+        // Process exit terminates any children it owned.
+        if let Some(child) = &self.coordinator_child {
+            child.child().stop();
+        }
+        if let Some(child) = &self.worker_child {
+            child.child().stop();
+        }
+        self.standalone.child().stop();
+
+        // Fresh state machine boots to SoloStandaloneReady at the persisted generation, and a
+        // fresh production runtime resumes the control session at that generation.
+        let mode = Arc::new(
+            ModeRuntime::spawn_ready_at(
+                self.role,
+                self.proxy.clone(),
+                self.standalone.clone(),
+                Duration::from_secs(1),
+                persisted_generation,
+            )
+            .await?,
+        );
+        let worker_trait: Option<Arc<dyn DistributedWorkerLifecycle>> = self
+            .worker_child
+            .clone()
+            .map(|child| child as Arc<dyn DistributedWorkerLifecycle>);
+        let coordinator_trait: Option<Arc<dyn DistributedCoordinatorLifecycle>> = self
+            .coordinator_child
+            .clone()
+            .map(|child| child as Arc<dyn DistributedCoordinatorLifecycle>);
+        let production = Arc::new(ProductionClusterRuntime::new_with_lifecycles(
+            self.config.clone(),
+            self.role,
+            mode.clone(),
+            self.proxy.clone(),
+            self.standalone.clone(),
+            manifest(),
+            vec![0x42; 32],
+            self.peer_control_port,
+            Some(persisted_generation),
+            worker_trait,
+            coordinator_trait,
+        )?);
+        let serve_listener = tokio::net::TcpListener::from_std(self.listener.try_clone()?)?;
+        let app = production
+            .router()
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let serve = tokio::spawn(async move {
+            axum::serve(serve_listener, app).await.unwrap();
+        });
+        self.mode = mode;
+        self.production = production;
+        self.serve = Some(serve);
+        Ok(())
     }
 }
 
@@ -874,11 +977,9 @@ impl TwoNode {
     }
 
     /// Abort serve tasks and fail the test if any distributed child was left running.
-    pub async fn shutdown(self) {
-        self.coordinator.serve.abort();
-        self.worker.serve.abort();
-        let _ = self.coordinator.serve.await;
-        let _ = self.worker.serve.await;
+    pub async fn shutdown(mut self) {
+        self.coordinator.stop_serve().await;
+        self.worker.stop_serve().await;
         if let Some(child) = &self.coordinator.coordinator_child
             && child.child().is_running()
         {
