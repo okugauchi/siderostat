@@ -252,6 +252,10 @@ impl PeerLease {
         self.descriptor.as_ref()
     }
 
+    pub fn route_scoped(&self) -> bool {
+        self.route_scoped
+    }
+
     pub fn invalidate_route(&mut self) {
         self.route_scoped = false;
     }

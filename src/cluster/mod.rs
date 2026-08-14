@@ -81,7 +81,11 @@ pub use process::{
     ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
     ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
 };
-pub use production::{ProductionClusterRuntime, ProductionControlClient, detect_cluster_role};
+pub use production::{
+    ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
+    PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient, ProductionDiagnostics,
+    detect_cluster_role,
+};
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
     required_port_available,

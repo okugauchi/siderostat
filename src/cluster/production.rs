@@ -1,10 +1,11 @@
 use super::{
-    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage,
+    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
     ControlResponse, ControlRole, ControlSecret, CoordinatorControl, CoordinatorDistributedRuntime,
-    CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedCoordinatorSupervisor,
-    DistributedManifest, DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE,
-    HEADER_TIMESTAMP, ModeRuntime, NodeDescriptor, PromotionRetryPolicy, StandaloneSupervisor,
-    WorkerControl, WorkerDistributedRuntime,
+    CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedControlPhase,
+    DistributedCoordinatorSupervisor, DistributedManifest, DistributedWorkerLifecycle,
+    DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP,
+    LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor, PromotionRetryPolicy,
+    StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
 };
 use crate::{
     config::ModeAwareConfig, metrics::Metrics, proxy::ModeAwareProxyState, target::LocalRole,
@@ -406,6 +407,150 @@ impl ProductionClusterRuntime {
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self.clone())
     }
+
+    /// Read-only diagnostics snapshot for the reconnect diagnostics contract
+    /// (`docs/reconnect-diagnostics-contract.md`). Never mutates the runtime and never exposes
+    /// secrets, signatures, nonces, or full deployment IDs.
+    pub async fn diagnostics(&self) -> ProductionDiagnostics {
+        let inner = &self.inner;
+        let now = now_millis();
+        let (generation, phase, role, lease) = match &inner.control {
+            RoleControl::Coordinator(control) => {
+                let control = control.lock().await;
+                (
+                    control.generation(),
+                    control.phase(),
+                    ControlRole::Coordinator,
+                    lease_diagnostics(control.peer_lease(), now),
+                )
+            }
+            RoleControl::Worker(control) => {
+                let control = control.lock().await;
+                (
+                    control.generation(),
+                    control.phase(),
+                    ControlRole::Worker,
+                    lease_diagnostics(control.peer_lease(), now),
+                )
+            }
+        };
+        let standalone_ready = inner.mode.snapshot().local_standalone_ready;
+        let children = ChildrenDiagnostics {
+            standalone: Some(child_diagnostics(
+                inner.standalone.child_identity().await,
+                inner.standalone.is_running().await.ok(),
+                Some(standalone_ready),
+            )),
+            distributed_coordinator: match &inner.distributed_coordinator {
+                Some(supervisor) => Some(child_diagnostics(
+                    supervisor.child_identity().await,
+                    supervisor.is_running().await.ok(),
+                    None,
+                )),
+                None => None,
+            },
+            distributed_worker: match &inner.distributed_worker {
+                Some(supervisor) => Some(child_diagnostics(
+                    supervisor.child_identity().await,
+                    supervisor.is_running().await.ok(),
+                    None,
+                )),
+                None => None,
+            },
+        };
+        ProductionDiagnostics {
+            control_session: ControlSessionDiagnostics {
+                generation,
+                phase,
+                role,
+                lease,
+            },
+            children,
+        }
+    }
+}
+
+fn lease_diagnostics(lease: &super::PeerLease, now: u64) -> LeaseDiagnostics {
+    let expires_at = lease.expires_at_millis();
+    let valid = expires_at.is_some_and(|expires| now < expires);
+    LeaseDiagnostics {
+        valid,
+        expires_at_millis: expires_at,
+        route_scoped: lease.route_scoped(),
+        peer_present: lease.peer_present(now),
+        peer: lease.descriptor().map(|descriptor| PeerDiagnostics {
+            node_id: descriptor.node_id.clone(),
+            role: descriptor.role,
+            generation: descriptor.generation,
+            mode: descriptor.mode,
+        }),
+    }
+}
+
+fn child_diagnostics(
+    identity: Option<crate::cluster::ChildIdentity>,
+    running: Option<bool>,
+    ready: Option<bool>,
+) -> ChildDiagnostics {
+    ChildDiagnostics {
+        pid: identity.as_ref().map(|identity| identity.pid),
+        profile: identity
+            .as_ref()
+            .map(|identity| identity.profile_id.clone()),
+        generation: identity.as_ref().map(|identity| identity.generation),
+        running: running.unwrap_or(false),
+        ready,
+    }
+}
+
+/// Read-only reconnect diagnostics. Field semantics are fixed by
+/// `docs/reconnect-diagnostics-contract.md`; only additive changes are allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionDiagnostics {
+    pub control_session: ControlSessionDiagnostics,
+    pub children: ChildrenDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlSessionDiagnostics {
+    pub generation: u64,
+    pub phase: DistributedControlPhase,
+    pub role: ControlRole,
+    pub lease: LeaseDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseDiagnostics {
+    pub valid: bool,
+    pub expires_at_millis: Option<u64>,
+    pub route_scoped: bool,
+    pub peer_present: bool,
+    pub peer: Option<PeerDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDiagnostics {
+    pub node_id: String,
+    pub role: ControlRole,
+    pub generation: u64,
+    pub mode: ControlMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChildrenDiagnostics {
+    pub standalone: Option<ChildDiagnostics>,
+    pub distributed_coordinator: Option<ChildDiagnostics>,
+    pub distributed_worker: Option<ChildDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildDiagnostics {
+    pub pid: Option<u32>,
+    pub profile: Option<String>,
+    pub generation: Option<u64>,
+    pub running: bool,
+    /// `Some` for the standalone child (readiness confirmed); `None` for distributed children.
+    pub ready: Option<bool>,
 }
 
 // This type is filled out together with coordinator promotion below; keeping transport lifecycle

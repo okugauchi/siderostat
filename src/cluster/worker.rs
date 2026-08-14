@@ -281,6 +281,10 @@ impl WorkerControl {
         self.processor.lease()
     }
 
+    pub fn generation(&self) -> u64 {
+        self.processor.generation()
+    }
+
     pub fn invalidate_route(&mut self) {
         self.processor.lease_mut().invalidate_route();
     }

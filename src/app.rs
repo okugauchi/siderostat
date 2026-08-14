@@ -3,9 +3,11 @@ use crate::cluster::MacOsDynamicStoreWatcher;
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
-        AdminAction, AdminController, AdminExecutor, AdminFuture, ClusterEvent, ClusterEventKind,
-        ClusterHandle, DistributedManifest, FingerprintProfile, ModeRuntime,
-        PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState, PersistentMode,
+        AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
+        ChildrenDiagnostics, ClusterEvent, ClusterEventKind, ClusterHandle, ControlMode,
+        ControlRole, ControlSessionDiagnostics, DistributedControlPhase, DistributedManifest,
+        FingerprintProfile, LeaseDiagnostics, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION,
+        PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
         PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
         StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
         detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
@@ -56,6 +58,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
+    production: RwLock<Option<ProductionClusterRuntime>>,
 }
 
 impl AppState {
@@ -111,6 +114,7 @@ impl AppState {
             metrics,
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
+            production: RwLock::new(None),
         }))
     }
 
@@ -127,6 +131,25 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(ClusterHandle::snapshot)
+    }
+
+    fn attach_production(&self, production: ProductionClusterRuntime) {
+        *self
+            .production
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(production);
+    }
+
+    async fn production_diagnostics(&self) -> Option<crate::cluster::ProductionDiagnostics> {
+        let production = self
+            .production
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match production {
+            Some(production) => Some(production.diagnostics().await),
+            None => None,
+        }
     }
 
     fn attach_admin(&self, admin: AdminController) {
@@ -563,6 +586,9 @@ fn attach_control_plane(
         None
     };
     state.attach_cluster(runtime.cluster_handle());
+    if let Some(production) = &production {
+        state.attach_production(production.clone());
+    }
     state.attach_admin(AdminController::new(
         boot.admin_token,
         Arc::new(RuntimeAdminExecutor {
@@ -1119,15 +1145,27 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let admission = state.proxy.admission().snapshot();
     let solo = !state.config.cluster_enabled;
     let snapshot = state.cluster_snapshot();
+    let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
+    let diagnostics = state.production_diagnostics().await;
+    let (control_session, children) = match &diagnostics {
+        Some(diagnostics) => (
+            control_session_json(&diagnostics.control_session),
+            children_json(&diagnostics.children),
+        ),
+        None => (Value::Null, Value::Null),
+    };
     Json(json!({
         "node_id": state.config.node_id,
         "role": snapshot.map_or("unknown", |snapshot| snapshot.role.name()),
         "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| snapshot.stable_mode.name()),
         "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| snapshot.state.name()),
-        "generation": snapshot.map_or(0, |snapshot| snapshot.generation),
+        "generation": generation,
+        "cluster_generation": generation,
         "target": target_name(target.target),
         "target_ready": target.ready,
         "admission": admission_json(admission),
+        "control_session": control_session,
+        "children": children,
         "peer_ingress_ready": false,
         "interface": state.config.interface,
         "active_standalone_profile": {
@@ -1183,6 +1221,71 @@ fn admission_state_name(state: AdmissionState) -> &'static str {
         AdmissionState::Serving => "serving",
         AdmissionState::Draining => "draining",
         AdmissionState::Blocked => "blocked",
+    }
+}
+
+fn control_session_json(session: &ControlSessionDiagnostics) -> Value {
+    json!({
+        "generation": session.generation,
+        "phase": distributed_phase_name(session.phase),
+        "role": control_role_json(session.role),
+        "lease": lease_json(&session.lease),
+    })
+}
+
+fn lease_json(lease: &LeaseDiagnostics) -> Value {
+    json!({
+        "valid": lease.valid,
+        "expires-at-millis": lease.expires_at_millis,
+        "route-scoped": lease.route_scoped,
+        "peer-present": lease.peer_present,
+        "peer": lease.peer.as_ref().map(peer_json).unwrap_or(Value::Null),
+    })
+}
+
+fn peer_json(peer: &PeerDiagnostics) -> Value {
+    json!({
+        "node-id": peer.node_id,
+        "role": control_role_json(peer.role),
+        "generation": peer.generation,
+        "mode": control_mode_json(peer.mode),
+    })
+}
+
+fn children_json(children: &ChildrenDiagnostics) -> Value {
+    json!({
+        "standalone": children.standalone.as_ref().map(child_json).unwrap_or(Value::Null),
+        "distributed-coordinator": children.distributed_coordinator.as_ref().map(child_json).unwrap_or(Value::Null),
+        "distributed-worker": children.distributed_worker.as_ref().map(child_json).unwrap_or(Value::Null),
+    })
+}
+
+fn child_json(child: &ChildDiagnostics) -> Value {
+    json!({
+        "pid": child.pid,
+        "profile": child.profile,
+        "generation": child.generation,
+        "running": child.running,
+        "ready": child.ready,
+    })
+}
+
+fn control_role_json(role: ControlRole) -> Value {
+    serde_json::to_value(role).unwrap_or(Value::Null)
+}
+
+fn control_mode_json(mode: ControlMode) -> Value {
+    serde_json::to_value(mode).unwrap_or(Value::Null)
+}
+
+fn distributed_phase_name(phase: DistributedControlPhase) -> &'static str {
+    match phase {
+        DistributedControlPhase::Unpaired => "unpaired",
+        DistributedControlPhase::Paired => "paired",
+        DistributedControlPhase::WorkerPreparing => "worker-preparing",
+        DistributedControlPhase::WorkerReady => "worker-ready",
+        DistributedControlPhase::Draining => "draining",
+        DistributedControlPhase::Drained => "drained",
     }
 }
 
@@ -1275,6 +1378,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
+            production: RwLock::new(None),
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
@@ -1367,6 +1471,81 @@ mod tests {
         assert_eq!(body["state"], "manual-intervention-required");
         assert_eq!(body["generation"], 13);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn cluster_endpoint_exposes_diagnostic_fields_without_production_runtime() {
+        let state = test_state(true);
+        let (_, body) = get(state, "/cluster").await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["generation"], body["cluster_generation"]);
+        assert_eq!(body["control_session"], Value::Null);
+        assert_eq!(body["children"], Value::Null);
+    }
+
+    #[test]
+    fn diagnostics_serialize_to_contract_shape() {
+        let diagnostics = crate::cluster::ProductionDiagnostics {
+            control_session: ControlSessionDiagnostics {
+                generation: 7,
+                phase: DistributedControlPhase::WorkerPreparing,
+                role: ControlRole::Coordinator,
+                lease: LeaseDiagnostics {
+                    valid: true,
+                    expires_at_millis: Some(1_770_000_000_000_u64),
+                    route_scoped: true,
+                    peer_present: true,
+                    peer: Some(PeerDiagnostics {
+                        node_id: "worker-node".into(),
+                        role: ControlRole::Worker,
+                        generation: 7,
+                        mode: ControlMode::DistributedMxfp4,
+                    }),
+                },
+            },
+            children: ChildrenDiagnostics {
+                standalone: Some(ChildDiagnostics {
+                    pid: Some(1234),
+                    profile: Some("standalone".into()),
+                    generation: Some(12),
+                    running: true,
+                    ready: Some(true),
+                }),
+                distributed_coordinator: Some(ChildDiagnostics {
+                    pid: Some(5678),
+                    profile: Some("distributed".into()),
+                    generation: Some(12),
+                    running: true,
+                    ready: None,
+                }),
+                distributed_worker: None,
+            },
+        };
+
+        let session = control_session_json(&diagnostics.control_session);
+        assert_eq!(session["generation"], 7);
+        assert_eq!(session["phase"], "worker-preparing");
+        assert_eq!(session["role"], "coordinator");
+        assert_eq!(session["lease"]["valid"], true);
+        assert_eq!(session["lease"]["expires-at-millis"], 1_770_000_000_000_i64);
+        assert_eq!(session["lease"]["route-scoped"], true);
+        assert_eq!(session["lease"]["peer-present"], true);
+        assert_eq!(session["lease"]["peer"]["node-id"], "worker-node");
+        assert_eq!(session["lease"]["peer"]["role"], "worker");
+        assert_eq!(session["lease"]["peer"]["generation"], 7);
+        assert_eq!(session["lease"]["peer"]["mode"], "distributed-mxfp4");
+
+        let children = children_json(&diagnostics.children);
+        assert_eq!(children["standalone"]["pid"], 1234);
+        assert_eq!(children["standalone"]["profile"], "standalone");
+        assert_eq!(children["standalone"]["generation"], 12);
+        assert_eq!(children["standalone"]["running"], true);
+        assert_eq!(children["standalone"]["ready"], true);
+        assert_eq!(children["distributed-coordinator"]["pid"], 5678);
+        assert_eq!(children["distributed-coordinator"]["running"], true);
+        // Distributed children omit the `ready` field.
+        assert!(children["distributed-coordinator"]["ready"].is_null());
+        assert_eq!(children["distributed-worker"], Value::Null);
     }
 
     #[tokio::test]

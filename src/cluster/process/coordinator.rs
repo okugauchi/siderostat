@@ -61,6 +61,10 @@ impl DistributedCoordinatorSupervisor {
         self.inner.child.child_identity().await
     }
 
+    pub async fn is_running(&self) -> anyhow::Result<bool> {
+        self.is_running_inner().await
+    }
+
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
         let Some(mut slot) = self.inner.child.begin_start().await? else {
