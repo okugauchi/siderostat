@@ -86,7 +86,7 @@ Standalone startup timeout（既定900秒）を超えた場合、standalone prof
 
 ### 3.9 Promotion backoff / manual state
 
-同一原因のpromotion失敗が3回連続したらauto promotionを止める。Standalone upstreamがreadyならproxyはServingを継続し、cluster stateだけ `ManualInterventionRequired` とする。Operator reconcileまで再試行しない（spec第18.6節）。原因を取り除いてから `cluster reconcile` を実行する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
+同一原因のpromotion失敗が3回連続したらauto promotionを止める。Standalone upstreamがreadyならproxyはServingを継続し、cluster stateだけ `ManualInterventionRequired` とする。Operator reconcileまで再試行しない（spec第18.6節）。原因を取り除いてから `cluster reconcile` を実行する。`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱うため、解除後は同一原因の失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する（plan B-03）。解除後に `siderostat cluster status` でstable stateへ戻り、trackerの失敗回数が保持されないことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
 
 ### 3.10 State corrupt
 

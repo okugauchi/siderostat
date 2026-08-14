@@ -103,6 +103,8 @@ siderostat cluster reconcile
 
 `cluster reconcile` はobserved stateをdesired stateへ収束させる。原因を先に特定し、deployment mismatch、manifest stale、Hello timeoutなどの原因を取り除いてから実行する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
 
+`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱う（plan B-03）。そのため、原因除去後のreconcileでtrackerの失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する。解除後に `siderostat cluster status` で `state` が `paired-standalone-ready`（または期待するstable state）へ戻り、同一原因の失敗回数が保持されないことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
+
 ## 6. Safe restart
 
 `cluster restart` はcurrent profileのchildを再起動する。Modeを変えず、admission/drainに連動する。
