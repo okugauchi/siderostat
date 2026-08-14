@@ -168,7 +168,7 @@ R0-01 -> R0-02 -> R0-03 -> R0-04
 
 ## 6. Phase R0: baseline、診断、失敗再現
 
-### [ ] R0-01 現行 baseline を固定する
+### [x] R0-01 現行 baseline を固定する
 
 - Actor: agent
 - Depends on: なし
@@ -183,6 +183,8 @@ R0-01 -> R0-02 -> R0-03 -> R0-04
 - Verification: 共通 local gate
 - 完了条件: 実装前の再現可能な SHA と test 結果が Evidence にある
 - 停止条件: 対象 file に由来不明の未 commit 変更がある、または baseline 自体が compile しない
+
+Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc483cc569419d, 着手時 dirty=なし; 共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 170 + integration 3 GREEN / cargo test --all-targets --features test-support: unit 170 + integration 8 GREEN / git diff --check clean); proposal 記載の関数 (fallback_to_solo, reconcile_backoff, operator_reconcile, control_generation, GenerationMismatch) と test file (tests/phase4_distributed.rs, tests/phase5_security.rs) の存在を確認、baseline failure なし; 2026-08-14
 
 ### [ ] R0-02 reconnect 診断 contract を固定する
 
