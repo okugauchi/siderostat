@@ -582,7 +582,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   得て `[x]` に確定。共通 local gate は文書のみ変更のため `git diff --check` clean
   で確認; 2026-08-15
 
-### [ ] N-02 network evidence を production control へ接続する
+### [x] N-02 network evidence を production control へ接続する
 
 - Actor: agent
 - Depends on: N-01
@@ -598,6 +598,40 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: platform-independent unit test、macOS compile、共通 local gate
 - 完了条件: peer present の各条件が実際の production input に由来する
 - 停止条件: network 設定変更や shell output parsing が必要
+- Evidence: branch=feature/reconnect-recovery; `src/cluster/network_snapshot.rs` の
+  `NetworkObservation` / `NetworkSnapshot` に観測 `epoch` を追加し `from_observation` で
+  伝搬、`stale_relative_to(newer_epoch)` と fail-closed な `Default` (ReadyNoPeer / epoch 0 /
+  peer_present false) を追加。新規 `src/cluster/network_evidence.rs` に共有
+  `NetworkEvidence` (RwLock で最新 `NetworkSnapshot` と `observed_epoch` を保持) を追加し、
+  `update()` は古い epoch の snapshot を拒否 (stale)、`route_scoped()` は
+  `PeerCandidateFound | AuthenticatedPeer` のときだけ true (candidate が期待 peer かつ
+  bridge0 scoped)、`peer_present()` は `snapshot.peer_present`、未観測は fail-closed。
+  `ProductionInner` に `network: Arc<NetworkEvidence>` を追加し、`src/cluster/production/
+  effects.rs` の `handle()` で `route_scoped = self.inner.network.route_scoped()` を一度だけ
+  評価して `/v1/node` (`node_descriptor`) と各 control message (`handle`) の 4 箇所の固定
+  `true` を置換した (plan N-01 完了条件、action 2)。macOS observation provider
+  `observe_network_observation(interface, coordinator, worker, peer)` を `getifaddrs` のみ
+  で実装 (service/interface/address + peer candidate の同 subnet による bridge0 route scoped
+  判定、interface 欠落/down/address なしは fail-closed)。`ProductionClusterRuntime::
+  start_network_evidence_monitor` (macOS) が `spawn_network_event_monitor` +
+  `MacOsDynamicStoreWatcher` を配線し、Initial / debounced event / periodic reconcile の各
+  rescan で単調増加 epoch を付与して共有 evidence を更新 (event loss は reconcile で回復、
+  action 4)、detached task が watcher を保持し process lifetime で稼働。`new` (production
+  経路) でのみ起動し、非 macOS は no-op。test harness (`tests/support/mod.rs`) に
+  `valid_peer_evidence(role)` を追加し、`Node::build` と `restart_control_process` で
+  `AuthenticatedPeer` (epoch 1) を `set_network_evidence` 注入して既存 27 本を GREEN 維持。
+  platform-independent unit test: `network_evidence` (default fail-closed / route_scoped 写像 /
+  stale 拒否) と `network_snapshot::snapshot_carries_observation_epoch_and_rejects_stale_
+  relative_to`。`tests/reconnect_production.rs` に `pairing_is_fail_closed_without_route_
+  scoped_evidence` (両 node を ReadyNoPeer の新 epoch へ置換 → pair が RouteNotScoped で
+  拒否され Solo 維持、完了条件の fail-closed を固定) と `stale_network_evidence_is_rejected_
+  and_pairing_keeps_latest` (stale epoch 0 が拒否され最新 evidence 維持で pair 収束、action 3)
+  を追加。action 5 (route loss が A-01 の単一 recovery owner へ到達) は既存
+  `route_loss_monitor_and_peer_loss_reconcile_race_converge_to_solo` 等が GREEN のままである
+  ことを確認。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets
+  --all-features -- -D warnings / cargo test --all-targets: unit 180 + integration GREEN /
+  cargo test --all-targets --features test-support: unit 180 + integration + reconnect_production
+  29 GREEN / git diff --check clean); 2026-08-15
 
 ### [ ] N-03 route/discovery reconnect matrix を自動化する
 
