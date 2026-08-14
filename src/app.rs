@@ -4,14 +4,14 @@ use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
-        ChildrenDiagnostics, ClusterEvent, ClusterEventKind, ClusterHandle, ControlMode,
-        ControlRole, ControlSessionDiagnostics, DistributedControlPhase, DistributedManifest,
-        FingerprintProfile, LeaseDiagnostics, ModeRuntime, PERSISTENT_STATE_SCHEMA_VERSION,
-        PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
-        PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
-        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
-        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
-        required_port_available, spawn_network_event_monitor,
+        ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
+        DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
+        ModeRuntime, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION, PeerDiagnostics,
+        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
+        ProductionClusterRuntime, RestartDecision, StandaloneManifest, StandaloneSupervisor,
+        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
+        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
+        spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
@@ -20,7 +20,7 @@ use crate::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
     },
-    target::{ClusterState, LocalRole, ProxyTarget, StableMode, UnavailableReason},
+    target::{LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
 
 use anyhow::Context;
@@ -191,22 +191,38 @@ impl AdminExecutor for RuntimeAdminExecutor {
         Box::pin(async move {
             match action {
                 AdminAction::Reconcile => {
-                    let current = runtime.snapshot();
-                    if current.state == ClusterState::ManualInterventionRequired {
-                        runtime
-                            .cluster_handle()
-                            .apply(ClusterEvent {
-                                expected_generation: current.generation,
-                                kind: ClusterEventKind::OperatorReconcile,
-                            })
-                            .await?;
-                    }
+                    // B-03: route through the coordinator runtime so the promotion tracker reset
+                    // and the OperatorReconcile state event are one atomic operation, instead of
+                    // applying the event directly to the state machine. Worker / role-unknown /
+                    // non-manual states are reported explicitly in the response.
+                    let note = if let Some(production) = &production {
+                        match production.operator_reconcile().await? {
+                            OperatorReconcileOutcome::Coordinator { manual_cleared } => {
+                                if manual_cleared {
+                                    "coordinator promotion tracker reset; manual intervention cleared"
+                                } else {
+                                    "coordinator promotion tracker reset"
+                                }
+                            }
+                            OperatorReconcileOutcome::NotCoordinator { manual_cleared } => {
+                                if manual_cleared {
+                                    "no coordinator promotion tracker; local manual state cleared"
+                                } else {
+                                    "no coordinator promotion tracker on this node"
+                                }
+                            }
+                        }
+                    } else {
+                        "cluster disabled; no coordinator promotion tracker"
+                    };
                     let snapshot = if let Some(production) = &production {
                         production.reconcile().await?
                     } else {
                         runtime.reconcile_local().await?
                     };
-                    Ok(snapshot_json(snapshot))
+                    let mut value = snapshot_json(snapshot);
+                    value["reconcile"] = json!(note);
+                    Ok(value)
                 }
                 AdminAction::Restart => {
                     let new_role =
@@ -615,6 +631,87 @@ fn attach_control_plane(
         }),
     )?);
     Ok(production)
+}
+
+#[cfg(feature = "test-support")]
+/// Run one admin `/cluster/reconcile` HTTP request against a production-backed
+/// `RuntimeAdminExecutor` and return the completed job result (test-support only). Builds an
+/// `AppState` from `config` (writing the peer-proxy token file the harness config omits), wires
+/// the same executor construction as `attach_control_plane`, POSTs `/cluster/reconcile` with
+/// `admin_token`, and polls the async admin job to completion. Lets an integration test drive
+/// the real admin HTTP endpoint against an already-built `ProductionClusterRuntime` from the
+/// two-node harness without needing `axum` in the integration crate.
+pub async fn admin_http_reconcile(
+    config: &ModeAwareConfig,
+    runtime: &Arc<ModeRuntime>,
+    production: Option<Arc<ProductionClusterRuntime>>,
+    admin_token: Vec<u8>,
+) -> anyhow::Result<Value> {
+    use axum::{body::to_bytes, http::Request};
+    use tower::ServiceExt;
+
+    std::fs::write(
+        &config.cluster.security.peer_proxy_token_file,
+        vec![0x42; 32],
+    )?;
+    let state = AppState::from_config(config.clone())?;
+    let supervisor = build_standalone_supervisor(config, &state)?;
+    state.attach_cluster(runtime.cluster_handle());
+    if let Some(production) = &production {
+        state.attach_production((**production).clone());
+    }
+    state.attach_admin(AdminController::new(
+        admin_token.clone(),
+        Arc::new(RuntimeAdminExecutor {
+            runtime: runtime.clone(),
+            supervisor,
+            standalone_model: config.ds4.standalone.model.clone(),
+            distributed_model: config.ds4.mxfp4.model.clone(),
+            production: production.as_ref().map(|p| (**p).clone()),
+            interface: config.cluster.interface.clone(),
+            coordinator_address: config.cluster.coordinator_address,
+            worker_address: config.cluster.worker_address,
+        }),
+    )?);
+
+    let bearer = format!("Bearer {}", crate::cluster::encode_token(&admin_token));
+    let request = Request::post("/cluster/reconcile")
+        .header("content-type", "application/json")
+        .header("authorization", bearer)
+        .body(Body::from("{}"))
+        .expect("valid reconcile request");
+    let response = admin_router(state.clone())
+        .oneshot(request)
+        .await
+        .context("admin reconcile HTTP request")?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let job: Value = serde_json::from_slice(&body)?;
+    let job_id = job["job_id"]
+        .as_str()
+        .context("reconcile job id")?
+        .to_string();
+
+    let admin = state.admin_controller().context("admin controller")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let job = admin.job(&job_id).context("admin job lookup")?;
+        match job.state {
+            crate::cluster::AdminJobState::Complete => {
+                return job.result.context("reconcile job result missing");
+            }
+            crate::cluster::AdminJobState::Failed => {
+                anyhow::bail!("admin reconcile failed: {:?}", job.error)
+            }
+            crate::cluster::AdminJobState::Running => {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "admin reconcile timed out"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 fn spawn_transition_monitor(

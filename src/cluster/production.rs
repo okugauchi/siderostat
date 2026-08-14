@@ -8,11 +8,13 @@ use super::{
     PromotionRetryPolicy, StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
 };
 use crate::{
-    cluster::{ClusterFailure, ClusterSnapshot},
+    cluster::{
+        ClusterEvent, ClusterEventKind, ClusterFailure, ClusterSnapshot, PromotionFailureStatus,
+    },
     config::ModeAwareConfig,
     metrics::Metrics,
     proxy::ModeAwareProxyState,
-    target::LocalRole,
+    target::{ClusterState, LocalRole},
 };
 use anyhow::{Context, ensure};
 use axum::{
@@ -54,6 +56,19 @@ struct ControlClientInner {
     local_node_id: String,
     authenticator: ControlAuthenticator,
     lifecycle_timeout: Duration,
+}
+
+/// Outcome of an operator reconcile on the production runtime (B-03). Distinguishes whether a
+/// coordinator promotion tracker was present so the admin response can be explicit for worker /
+/// role-unknown nodes and for non-manual coordinator states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorReconcileOutcome {
+    /// A coordinator runtime existed: the promotion tracker was reset and, if the node was in
+    /// `ManualInterventionRequired`, the state was cleared as one atomic operation.
+    Coordinator { manual_cleared: bool },
+    /// No coordinator promotion tracker on this node (worker or unknown role). The local manual
+    /// state, if any, was cleared through the mode runtime.
+    NotCoordinator { manual_cleared: bool },
 }
 
 impl ProductionControlClient {
@@ -485,6 +500,45 @@ impl ProductionClusterRuntime {
             .record_promotion_failure(failure, now_millis)
             .await
             .map_err(Into::into)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the coordinator's promotion tracker status (test-support only). Used to assert that
+    /// operator reconcile resets the manual failure count (B-03 completion condition).
+    pub async fn promotion_failure_status(&self) -> Option<PromotionFailureStatus> {
+        let runtime = self.inner.coordinator_runtime.get()?;
+        Some(runtime.promotion_failure_status().await)
+    }
+
+    /// Operator reconcile (B-03). On the coordinator the promotion tracker reset and the
+    /// `OperatorReconcile` state event are one atomic operation through
+    /// [`CoordinatorDistributedRuntime::operator_reconcile`], so the manual failure count does
+    /// not carry over after the state is cleared. On a worker / role-unknown node there is no
+    /// coordinator promotion tracker, so the local manual state is cleared through the mode
+    /// runtime instead.
+    pub async fn operator_reconcile(&self) -> anyhow::Result<OperatorReconcileOutcome> {
+        let was_manual =
+            self.inner.mode.snapshot().state == ClusterState::ManualInterventionRequired;
+        if let Some(runtime) = self.inner.coordinator_runtime.get() {
+            runtime.operator_reconcile().await?;
+            return Ok(OperatorReconcileOutcome::Coordinator {
+                manual_cleared: was_manual,
+            });
+        }
+        if was_manual {
+            let current = self.inner.mode.snapshot();
+            self.inner
+                .mode
+                .cluster_handle()
+                .apply(ClusterEvent {
+                    expected_generation: current.generation,
+                    kind: ClusterEventKind::OperatorReconcile,
+                })
+                .await?;
+        }
+        Ok(OperatorReconcileOutcome::NotCoordinator {
+            manual_cleared: was_manual,
+        })
     }
 
     pub fn role(&self) -> LocalRole {

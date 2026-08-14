@@ -1748,3 +1748,213 @@ async fn peer_loss_during_backoff_recovers_to_solo_first() {
 
     harness.shutdown().await;
 }
+
+// ---- B-03: operator reconcile routes through the coordinator runtime ----------------------
+
+#[tokio::test]
+async fn operator_reconcile_resets_coordinator_tracker_and_clears_manual_state() {
+    // B-03: operator reconcile is one atomic operation on the coordinator runtime, so after the
+    // manual state is cleared the same promotion failure count is not carried over.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before reconcile test");
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    // Drive three consecutive promotion failures to reach ManualInterventionRequired.
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for offset in 0_u64..3 {
+        coordinator
+            .production
+            .record_promotion_failure(
+                siderostat::cluster::ClusterFailure::HelloTimeout,
+                real_now + offset * 50,
+            )
+            .await
+            .expect("record promotion failure");
+    }
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::ManualInterventionRequired
+    );
+    let status = coordinator
+        .production
+        .promotion_failure_status()
+        .await
+        .expect("coordinator promotion tracker");
+    assert_eq!(status.consecutive, 3);
+    assert!(status.manual);
+
+    let outcome = coordinator
+        .production
+        .operator_reconcile()
+        .await
+        .expect("operator reconcile");
+    assert_eq!(
+        outcome,
+        siderostat::cluster::OperatorReconcileOutcome::Coordinator {
+            manual_cleared: true
+        }
+    );
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    let status = coordinator
+        .production
+        .promotion_failure_status()
+        .await
+        .expect("coordinator promotion tracker");
+    assert_eq!(status.consecutive, 0);
+    assert!(!status.manual);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn operator_reconcile_on_worker_and_non_manual_coordinator_are_explicit() {
+    // B-03: a worker / role-unknown node has no coordinator promotion tracker, and a non-manual
+    // coordinator reconcile is a no-op; both report the outcome explicitly instead of assuming a
+    // tracker exists.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before reconcile test");
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    let worker = harness.node(LocalRole::Worker);
+
+    let worker_outcome = worker
+        .production
+        .operator_reconcile()
+        .await
+        .expect("worker operator reconcile");
+    assert_eq!(
+        worker_outcome,
+        siderostat::cluster::OperatorReconcileOutcome::NotCoordinator {
+            manual_cleared: false
+        }
+    );
+    assert_eq!(
+        worker.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    let coordinator_outcome = coordinator
+        .production
+        .operator_reconcile()
+        .await
+        .expect("coordinator operator reconcile");
+    assert_eq!(
+        coordinator_outcome,
+        siderostat::cluster::OperatorReconcileOutcome::Coordinator {
+            manual_cleared: false
+        }
+    );
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_http_reconcile_clears_manual_state_and_resets_tracker() {
+    // B-03: the admin /cluster/reconcile HTTP endpoint, wired to a production runtime through the
+    // RuntimeAdminExecutor, routes through the coordinator operator reconcile and reports the
+    // outcome explicitly; the manual failure count is not carried over after the state clears.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before admin reconcile test");
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for offset in 0_u64..3 {
+        coordinator
+            .production
+            .record_promotion_failure(
+                siderostat::cluster::ClusterFailure::HelloTimeout,
+                real_now + offset * 50,
+            )
+            .await
+            .expect("record promotion failure");
+    }
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::ManualInterventionRequired
+    );
+
+    let result = siderostat::app::admin_http_reconcile(
+        &coordinator.config,
+        &coordinator.mode,
+        Some(coordinator.production.clone()),
+        vec![3; 32],
+    )
+    .await
+    .expect("admin HTTP reconcile");
+
+    assert_eq!(
+        result["reconcile"],
+        "coordinator promotion tracker reset; manual intervention cleared"
+    );
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    let status = coordinator
+        .production
+        .promotion_failure_status()
+        .await
+        .expect("coordinator promotion tracker");
+    assert_eq!(status.consecutive, 0);
+    assert!(!status.manual);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_http_reconcile_on_worker_reports_no_coordinator_tracker() {
+    // B-03: on a worker / role-unknown node the admin reconcile response is explicit that no
+    // coordinator promotion tracker exists, and the local state is left unchanged.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not pair before admin reconcile test");
+
+    let worker = harness.node(LocalRole::Worker);
+    let result = siderostat::app::admin_http_reconcile(
+        &worker.config,
+        &worker.mode,
+        Some(worker.production.clone()),
+        vec![3; 32],
+    )
+    .await
+    .expect("admin HTTP reconcile");
+
+    assert_eq!(
+        result["reconcile"],
+        "no coordinator promotion tracker on this node"
+    );
+    assert_eq!(
+        worker.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    harness.shutdown().await;
+}

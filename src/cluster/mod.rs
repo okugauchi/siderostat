@@ -83,8 +83,8 @@ pub use process::{
 };
 pub use production::{
     ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
-    PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient, ProductionDiagnostics,
-    detect_cluster_role,
+    OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
+    ProductionDiagnostics, detect_cluster_role,
 };
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
