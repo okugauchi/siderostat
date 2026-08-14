@@ -204,7 +204,7 @@ Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc48
 - 停止条件: secret または高 cardinality 値を metrics label に入れる必要がある
 Evidence: docs/reconnect-diagnostics-contract.md を新規作成し operator 承認済み (commit 46d1116); proposal P0-0 観測項目との対応表 §8 を作成、field/redaction/導出元を確定; 2026-08-14
 
-### [-] R0-03 reconnect 診断情報を実装する
+### [x] R0-03 reconnect 診断情報を実装する
 
 - Actor: agent
 - Depends on: R0-02
@@ -220,6 +220,8 @@ Evidence: docs/reconnect-diagnostics-contract.md を新規作成し operator 承
 - Verification: admin handler/CLI JSON test、log field test、共通 local gate
 - 完了条件: proposal P0-0 の全項目を外部から read-only で採取できる
 - 停止条件: 診断取得のために mutation endpoint または secret 公開が必要になる
+
+Evidence: branch=feature/reconnect-recovery; 前半の read-only 診断 snapshot を commit 533b46e、後半の構造化 log を commit 0bcf240 で実装; `/cluster` と `cluster status --json` に `cluster_generation`/`control_session`/`children` を kebab-case で追加; EventOwner を導入し peer-lost / recovery-started / recovery-completed / recovery-failed / pairing-started / pairing-ready / promotion-started / promotion-failed / demotion-started / pair-generation-mismatch / cluster-transition-rejected を構造化 log 化; Pair 409 は expected/received/cluster_generation/control_session_generation の generation 値のみ記録 (secret/signature/nonce/deployment_id は除外); child identity なし・lease なし・role unknown は null または明示 enum で扱い偽 0 値なし; ログ捕捉テストを tracing-test の traced_test に移行し 並列実行を安定化; 共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 173 + integration GREEN / cargo test --all-targets --features test-support: unit 173 + integration GREEN / git diff --check clean); 2026-08-14
 
 ### [ ] R0-04 2 node production 相当 test harness を作る
 
