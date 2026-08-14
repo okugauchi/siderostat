@@ -225,4 +225,14 @@ impl DistributedCoordinatorLifecycle for DistributedCoordinatorSupervisor {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.wait_route_loss_inner().await })
     }
+
+    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.is_running().await })
+    }
+
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.child_identity().await })
+    }
 }

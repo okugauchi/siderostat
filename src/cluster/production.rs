@@ -2,10 +2,10 @@ use super::{
     AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
     ControlResponse, ControlRole, ControlSecret, CoordinatorControl, CoordinatorDistributedRuntime,
     CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedControlPhase,
-    DistributedCoordinatorSupervisor, DistributedManifest, DistributedWorkerLifecycle,
-    DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP,
-    LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor, PromotionRetryPolicy,
-    StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
+    DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor, DistributedManifest,
+    DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
+    PromotionRetryPolicy, StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
 };
 use crate::{
     config::ModeAwareConfig, metrics::Metrics, proxy::ModeAwareProxyState, target::LocalRole,
@@ -191,11 +191,11 @@ struct ProductionInner {
     lease: LeaseStatus,
     mode: Arc<ModeRuntime>,
     proxy: Arc<ModeAwareProxyState>,
-    standalone: Arc<StandaloneSupervisor>,
+    standalone: Arc<dyn LocalStandaloneLifecycle>,
     worker_runtime: Option<WorkerDistributedRuntime>,
     coordinator_runtime: OnceLock<CoordinatorDistributedRuntime>,
-    distributed_coordinator: Option<Arc<DistributedCoordinatorSupervisor>>,
-    distributed_worker: Option<Arc<DistributedWorkerSupervisor>>,
+    distributed_coordinator: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+    distributed_worker: Option<Arc<dyn DistributedWorkerLifecycle>>,
     config: ModeAwareConfig,
     manifest: DistributedManifest,
 }
@@ -211,6 +211,72 @@ impl ProductionClusterRuntime {
         metrics: Arc<Metrics>,
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
+        {
+            Some(Arc::new(DistributedWorkerSupervisor::new(
+                super::build_distributed_worker_command(
+                    &config.ds4,
+                    config.cluster.coordinator_address,
+                    config.cluster.ds4_distributed_port,
+                )?,
+                config.cluster.timeouts.stop,
+                config.ds4.allow_sigkill,
+                metrics.clone(),
+            )))
+        } else {
+            None
+        };
+        let coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>> =
+            if role == LocalRole::Coordinator {
+                Some(Arc::new(DistributedCoordinatorSupervisor::new(
+                    super::build_distributed_coordinator_command(
+                        &config.ds4,
+                        config.cluster.coordinator_address,
+                        config.cluster.ds4_distributed_port,
+                    )?,
+                    Url::parse(&format!(
+                        "http://{}:{}/v1/models",
+                        config.ds4.http_host, config.ds4.http_port
+                    ))?,
+                    config.cluster.timeouts.coordinator_startup,
+                    Duration::from_secs(1),
+                    config.cluster.timeouts.stop,
+                    config.ds4.allow_sigkill,
+                    metrics.clone(),
+                )))
+            } else {
+                None
+            };
+        let peer_control_port = config.cluster.control_port;
+        Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            manifest,
+            control_secret,
+            peer_control_port,
+            worker_child,
+            coordinator_child,
+        )
+    }
+
+    /// Shared constructor. Production uses [`Self::new`]; tests inject fake child lifecycles via
+    /// [`Self::new_with_lifecycles`] (test-support only).
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        manifest: DistributedManifest,
+        control_secret: Vec<u8>,
+        peer_control_port: u16,
+        worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
+        coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
     ) -> anyhow::Result<Self> {
         ensure!(role != LocalRole::Unknown, "cluster role is unknown");
         manifest.validate()?;
@@ -256,7 +322,7 @@ impl ProductionClusterRuntime {
             local_control_id,
             local_address,
             peer_address,
-            config.cluster.control_port,
+            peer_control_port,
             control_secret.clone(),
             config.cluster.timeouts.peer_connect,
             config.cluster.timeouts.peer_request,
@@ -270,16 +336,7 @@ impl ProductionClusterRuntime {
         );
         let lease = LeaseStatus::new();
         let (worker_runtime, distributed_worker) = if role == LocalRole::Worker {
-            let child = Arc::new(DistributedWorkerSupervisor::new(
-                super::build_distributed_worker_command(
-                    &config.ds4,
-                    config.cluster.coordinator_address,
-                    config.cluster.ds4_distributed_port,
-                )?,
-                config.cluster.timeouts.stop,
-                config.ds4.allow_sigkill,
-                metrics.clone(),
-            ));
+            let child = worker_child.context("worker child lifecycle missing")?;
             (
                 Some(WorkerDistributedRuntime::new(
                     proxy.admission().clone(),
@@ -294,7 +351,7 @@ impl ProductionClusterRuntime {
         } else {
             (None, None)
         };
-        let mut inner = ProductionInner {
+        let inner = ProductionInner {
             role,
             local_address,
             peer_address,
@@ -311,34 +368,47 @@ impl ProductionClusterRuntime {
             standalone,
             worker_runtime,
             coordinator_runtime: OnceLock::new(),
-            distributed_coordinator: None,
+            distributed_coordinator: coordinator_child,
             distributed_worker,
             config,
             manifest,
         };
-        if role == LocalRole::Coordinator {
-            inner.distributed_coordinator = Some(Arc::new(DistributedCoordinatorSupervisor::new(
-                super::build_distributed_coordinator_command(
-                    &inner.config.ds4,
-                    inner.config.cluster.coordinator_address,
-                    inner.config.cluster.ds4_distributed_port,
-                )?,
-                Url::parse(&format!(
-                    "http://{}:{}/v1/models",
-                    inner.config.ds4.http_host, inner.config.ds4.http_port
-                ))?,
-                inner.config.cluster.timeouts.coordinator_startup,
-                Duration::from_secs(1),
-                inner.config.cluster.timeouts.stop,
-                inner.config.ds4.allow_sigkill,
-                metrics.clone(),
-            )));
-        }
         let runtime = Self {
             inner: Arc::new(inner),
         };
         runtime.finish_coordinator()?;
         Ok(runtime)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    /// Build a production-equivalent runtime for tests with injected fake child lifecycles.
+    /// The control HTTP layer and state machine are identical to production; only the child
+    /// process supervisors are replaced so tests can record start/stop and inject faults.
+    pub fn new_with_lifecycles(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        manifest: DistributedManifest,
+        control_secret: Vec<u8>,
+        peer_control_port: u16,
+        worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
+        coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            manifest,
+            control_secret,
+            peer_control_port,
+            worker_child,
+            coordinator_child,
+        )
     }
 
     fn finish_coordinator(&self) -> anyhow::Result<()> {

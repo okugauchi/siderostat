@@ -1,6 +1,5 @@
 #![cfg(feature = "test-support")]
 
-#[allow(dead_code)]
 mod support;
 
 use anyhow::{Context, Result};

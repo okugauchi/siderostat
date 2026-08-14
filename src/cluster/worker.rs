@@ -1,7 +1,7 @@
 use super::{
-    AuthenticatedPeer, ClusterFailure, ControlCommand, ControlEndpoint, ControlError,
-    ControlMessage, ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase,
-    NodeDescriptor, PeerLease, WorkerEventKind, control::ControlProcessor,
+    AuthenticatedPeer, ChildIdentity, ClusterFailure, ControlCommand, ControlEndpoint,
+    ControlError, ControlMessage, ControlResponse, ControlResponseStatus, ControlRole,
+    DistributedControlPhase, NodeDescriptor, PeerLease, WorkerEventKind, control::ControlProcessor,
     runtime::LocalStandaloneLifecycle,
 };
 use crate::admission::{AdmissionGate, DrainError};
@@ -13,6 +13,10 @@ pub trait DistributedWorkerLifecycle: Send + Sync + 'static {
     fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
     fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>>;
+    /// Optional child identity for diagnostics. Defaults to `None`.
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        Box::pin(async { None })
+    }
 }
 
 pub trait WorkerLeaseStatus: Send + Sync + 'static {

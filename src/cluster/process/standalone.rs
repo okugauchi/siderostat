@@ -188,4 +188,9 @@ impl LocalStandaloneLifecycle for StandaloneSupervisor {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.is_running_inner().await })
     }
+
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        let supervisor = self.clone();
+        Box::pin(async move { supervisor.child_identity().await })
+    }
 }

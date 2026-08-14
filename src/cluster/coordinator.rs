@@ -1,5 +1,5 @@
 use super::{
-    ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot,
+    ChildIdentity, ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot,
     DistributedControlPhase, Ds4Hello, LocalStandaloneLifecycle, PromotionFailureStatus,
     PromotionFailureTracker, PromotionRetryDecision, PromotionTrackerError, TransitionError,
 };
@@ -17,6 +17,15 @@ pub trait DistributedCoordinatorLifecycle: Send + Sync + 'static {
     fn wait_ready(&self) -> BoxFuture<'static, anyhow::Result<()>>;
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
     fn wait_route_loss(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    /// Whether the child process is currently running. Defaults to `false`.
+    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Optional child identity for diagnostics. Defaults to `None`.
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        Box::pin(async { None })
+    }
 }
 
 pub trait CoordinatorPeerLifecycle: Send + Sync + 'static {

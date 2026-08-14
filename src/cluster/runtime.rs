@@ -1,6 +1,6 @@
 use super::{
-    ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, CoordinatorControl, EventOwner,
-    PeerLease, TransitionError, WorkerControl, spawn_state_machine,
+    ChildIdentity, ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot,
+    CoordinatorControl, EventOwner, PeerLease, TransitionError, WorkerControl, spawn_state_machine,
 };
 use crate::{
     admission::DrainError,
@@ -15,6 +15,10 @@ pub trait LocalStandaloneLifecycle: Send + Sync + 'static {
     fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
     fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>>;
+    /// Optional child identity for diagnostics. Defaults to `None`.
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        Box::pin(async { None })
+    }
 }
 
 pub trait RuntimePeerControl {
