@@ -186,7 +186,7 @@ R0-01 -> R0-02 -> R0-03 -> R0-04
 
 Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc483cc569419d, 着手時 dirty=なし; 共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 170 + integration 3 GREEN / cargo test --all-targets --features test-support: unit 170 + integration 8 GREEN / git diff --check clean); proposal 記載の関数 (fallback_to_solo, reconcile_backoff, operator_reconcile, control_generation, GenerationMismatch) と test file (tests/phase4_distributed.rs, tests/phase5_security.rs) の存在を確認、baseline failure なし; 2026-08-14
 
-### [-] R0-02 reconnect 診断 contract を固定する
+### [x] R0-02 reconnect 診断 contract を固定する
 
 - Actor: agent + operator review
 - Depends on: R0-01
@@ -202,8 +202,9 @@ Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc48
 - Verification: proposal 第 4 節 P0-0 の観測項目との対応表を作る
 - 完了条件: operator が field と redaction を承認し、実装者に追加判断が残っていない
 - 停止条件: secret または高 cardinality 値を metrics label に入れる必要がある
+Evidence: docs/reconnect-diagnostics-contract.md を新規作成し operator 承認済み (commit 46d1116); proposal P0-0 観測項目との対応表 §8 を作成、field/redaction/導出元を確定; 2026-08-14
 
-### [ ] R0-03 reconnect 診断情報を実装する
+### [-] R0-03 reconnect 診断情報を実装する
 
 - Actor: agent
 - Depends on: R0-02
