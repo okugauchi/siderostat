@@ -468,7 +468,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 10. Phase B: P1 Backoff と operator reconcile
 
-### [ ] B-01 promotion failure の分類と tracker 接続を統一する
+### [x] B-01 promotion failure の分類と tracker 接続を統一する
 
 - Actor: agent
 - Depends on: E-01
@@ -483,6 +483,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: table-driven failure action/tracker test、共通 local gate
 - 完了条件: 対象 failure が漏れなく backoff または明示した別 action へ入る
 - 停止条件: unknown schema の製品方針を operator が判断していない
+- Evidence: branch=feature/reconnect-recovery; spec.md §31 と計画書 P1 冒頭の方針差を解消し、`src/cluster/state.rs` の `failure_action()` で `UnknownDs4Schema` を `PromotionBackoff` から `PairedStandalone` へ変更 (unknown HELLO/log schema は promotion 拒否・Paired Standalone 維持、backoff しない)。`HelloTimeout` と `CoordinatorStartupTimeout` は `PromotionBackoff` を維持し、同一 `PromotionFailureTracker` へ記録する配線を統一: `src/cluster/production/pairing.rs` に `PromotionHelloError` (Rendezvous/Control/Preflight/WorkerStartupTimeout) を追加して `prepare_and_accept_hello` のエラーを型付けし、`promote()` の preflight 失敗で `Rendezvous(Ds4HelloError::Timeout)` または `WorkerStartupTimeout` のときだけ `record_promotion_failure(HelloTimeout, now)` で tracker へ接続、それ以外 (deployment mismatch / unknown schema 等) は Paired Standalone のまま tracker へ入れない。coordinator startup timeout は既存の `promotion_failure_for_error` (StartupTimeout → CoordinatorStartupTimeout) で tracker へ接続済みであることを確認。reconnect 成功後の promotion failure を reconnect failure として記録しない方針は、tracker が `note_success` で consecutive を reset し、`PeerAbsent` 等の reconnect failure は `PromotionBackoff` でないため tracker が `NotPromotionFailure` で拒否することに固定。`tests/phase5_failure.rs` を更新: `UnknownDs4Schema` 行を `PairedStandalone` に変更して table-driven failure_action を spec §31 と一致させ、tracker が HelloTimeout/CoordinatorStartupTimeout を Backoff として記録、UnknownDs4Schema と PeerAbsent を NotPromotionFailure で拒否、note_success 後の consecutive reset を検証。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 176 + integration GREEN / cargo test --all-targets --features test-support: unit 176 + integration + reconnect_production 19 GREEN / git diff --check clean); 2026-08-15
 
 ### [ ] B-02 periodic reconcile に Backoff 復帰を接続する
 

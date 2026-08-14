@@ -1,5 +1,6 @@
 use siderostat::cluster::{
-    ClusterFailure, FailureAction, PromotionFailureTracker, PromotionRetryDecision, failure_action,
+    ClusterFailure, FailureAction, PromotionFailureTracker, PromotionRetryDecision,
+    PromotionTrackerError, failure_action,
 };
 use std::time::Duration;
 
@@ -51,9 +52,11 @@ fn failure_table_and_finite_promotion_retry_match_policy() {
             ClusterFailure::HelloTimeout,
             FailureAction::PromotionBackoff,
         ),
+        // spec.md §31: an unknown HELLO/log schema refuses promotion but stays Paired
+        // Standalone. It is not a backoff target.
         (
             ClusterFailure::UnknownDs4Schema,
-            FailureAction::PromotionBackoff,
+            FailureAction::PairedStandalone,
         ),
         (
             ClusterFailure::CoordinatorStartupTimeout,
@@ -123,9 +126,46 @@ fn failure_table_and_finite_promotion_retry_match_policy() {
     tracker.operator_reconcile();
     assert!(tracker.can_retry(0));
     assert_eq!(tracker.status().consecutive, 0);
-    tracker.record(ClusterFailure::HelloTimeout, 2_000).unwrap();
-    tracker
-        .record(ClusterFailure::UnknownDs4Schema, 2_300)
-        .unwrap();
+
+    // All PromotionBackoff targets are recorded in the same tracker.
+    assert_eq!(
+        tracker.record(ClusterFailure::HelloTimeout, 2_000).unwrap(),
+        PromotionRetryDecision::Backoff {
+            retry_at_millis: 2_300
+        }
+    );
+    assert_eq!(
+        tracker
+            .record(ClusterFailure::CoordinatorStartupTimeout, 2_300)
+            .unwrap(),
+        PromotionRetryDecision::Backoff {
+            retry_at_millis: 2_600
+        }
+    );
+    // Consecutive counts the same failure kind; a different PromotionBackoff kind is also
+    // accepted but restarts the consecutive window.
+    assert_eq!(tracker.status().consecutive, 1);
+
+    // spec.md §31: unknown schema is Paired Standalone, so the tracker must refuse it rather
+    // than counting it as a promotion backoff.
+    assert_eq!(
+        tracker.record(ClusterFailure::UnknownDs4Schema, 2_600),
+        Err(PromotionTrackerError::NotPromotionFailure)
+    );
+    assert_eq!(tracker.status().consecutive, 1);
+
+    // A successful promotion (or a successful reconnect) resets the consecutive count, so a
+    // later promotion failure starts fresh instead of accumulating across reconnects.
+    tracker.note_success();
+    assert_eq!(tracker.status().consecutive, 0);
+    tracker.record(ClusterFailure::HelloTimeout, 3_000).unwrap();
+    assert_eq!(tracker.status().consecutive, 1);
+
+    // Reconnect (peer loss) failures are classified Solo Standalone, never recorded as a
+    // promotion failure, and promotion failures never enter the reconnect path.
+    assert_eq!(
+        tracker.record(ClusterFailure::PeerAbsent, 3_000),
+        Err(PromotionTrackerError::NotPromotionFailure)
+    );
     assert_eq!(tracker.status().consecutive, 1);
 }

@@ -142,9 +142,13 @@ pub fn failure_action(failure: ClusterFailure) -> FailureAction {
         ClusterFailure::DeploymentMismatch | ClusterFailure::ManifestStale => {
             FailureAction::PairedStandalone
         }
-        ClusterFailure::HelloTimeout
-        | ClusterFailure::UnknownDs4Schema
-        | ClusterFailure::CoordinatorStartupTimeout => FailureAction::PromotionBackoff,
+        // spec.md §31: HELLO timeout and coordinator startup timeout back off and retry
+        // promotion; an unknown HELLO/log schema is refused promotion but stays Paired
+        // Standalone (no backoff) so an operator can correct the peer.
+        ClusterFailure::HelloTimeout | ClusterFailure::CoordinatorStartupTimeout => {
+            FailureAction::PromotionBackoff
+        }
+        ClusterFailure::UnknownDs4Schema => FailureAction::PairedStandalone,
         ClusterFailure::RouteIncomplete => FailureAction::PairedStandalone,
         ClusterFailure::ChildIdentityUnknown => FailureAction::ManualIntervention,
         ClusterFailure::StandaloneStartFailed => FailureAction::Unavailable,

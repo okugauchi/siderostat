@@ -1,14 +1,36 @@
 use super::{RoleControl, now_millis};
 use crate::{
     cluster::{
-        ClusterEvent, ClusterEventKind, ControlCommand, ControlMessage, ControlMode,
-        DistributedControlPhase, Ds4Hello, EventOwner, NodeDescriptor, RendezvousControlSnapshot,
-        RendezvousListener, WorkerHelloExpectation,
+        ClusterEvent, ClusterEventKind, ClusterFailure, ControlCommand, ControlError,
+        ControlMessage, ControlMode, DistributedControlPhase, Ds4Hello, Ds4HelloError, EventOwner,
+        NodeDescriptor, RendezvousControlSnapshot, RendezvousListener, WorkerHelloExpectation,
     },
     target::{ClusterState, LocalRole, StableMode},
 };
 use anyhow::{Context, ensure};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
+use thiserror::Error;
+
+/// Errors raised while accepting the worker HELLO and waiting for the worker control plane
+/// to become Ready. Only the timeout variants are retried with backoff; all other preflight
+/// rejections stay Paired Standalone (spec.md §31).
+#[derive(Debug, Error)]
+enum PromotionHelloError {
+    #[error(transparent)]
+    Rendezvous(#[from] Ds4HelloError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
+    #[error("promotion preflight control failed: {0}")]
+    Preflight(#[source] anyhow::Error),
+    #[error("worker did not become Ready before the startup deadline")]
+    WorkerStartupTimeout,
+}
+
+impl From<anyhow::Error> for PromotionHelloError {
+    fn from(error: anyhow::Error) -> Self {
+        PromotionHelloError::Preflight(error)
+    }
+}
 
 impl super::ProductionClusterRuntime {
     pub async fn pair(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
@@ -74,8 +96,27 @@ impl super::ProductionClusterRuntime {
         let hello = match self.prepare_and_accept_hello(awaiting).await {
             Ok(hello) => hello,
             Err(error) => {
+                let retry_with_backoff = matches!(
+                    error,
+                    PromotionHelloError::Rendezvous(Ds4HelloError::Timeout)
+                        | PromotionHelloError::WorkerStartupTimeout
+                );
                 self.recover_preflight_promotion().await;
-                return Err(error);
+                // spec.md §31: HELLO timeout backs off and retries promotion. Record it in the
+                // same coordinator promotion tracker as the other backoff targets so the
+                // reconnect is not misreported as a reconnect (peer loss) failure.
+                if retry_with_backoff
+                    && let Some(runtime) = self.inner.coordinator_runtime.get()
+                    && let Err(record_error) = runtime
+                        .record_promotion_failure(ClusterFailure::HelloTimeout, now_millis())
+                        .await
+                {
+                    tracing::warn!(
+                        error = %record_error,
+                        "failed to record promotion HELLO timeout"
+                    );
+                }
+                return Err(error.into());
             }
         };
         let prerequisites = {
@@ -137,7 +178,7 @@ impl super::ProductionClusterRuntime {
     async fn prepare_and_accept_hello(
         &self,
         awaiting: crate::cluster::ClusterSnapshot,
-    ) -> anyhow::Result<Ds4Hello> {
+    ) -> Result<Ds4Hello, PromotionHelloError> {
         let control_snapshot = RendezvousControlSnapshot {
             state: awaiting.state,
             generation: awaiting.generation,
@@ -153,7 +194,8 @@ impl super::ProductionClusterRuntime {
             .split_once(':')
             .context("invalid worker layer range")?
             .0
-            .parse::<u32>()?;
+            .parse::<u32>()
+            .map_err(anyhow::Error::from)?;
         let listener = RendezvousListener::bind(
             SocketAddr::new(
                 self.inner.local_address,
@@ -206,10 +248,9 @@ impl super::ProductionClusterRuntime {
             if ready {
                 break;
             }
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "worker Ready timed out"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                return Err(PromotionHelloError::WorkerStartupTimeout);
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(hello)
