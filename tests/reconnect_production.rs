@@ -1958,3 +1958,266 @@ async fn admin_http_reconcile_on_worker_reports_no_coordinator_tracker() {
 
     harness.shutdown().await;
 }
+
+// ---- B-04: reconnect E2E with promotion failure -------------------------------------------
+
+#[tokio::test]
+async fn reconnect_then_promotion_failure_cycle_converges_via_backoff_and_operator_reconcile() {
+    // B-04: a full reconnect E2E that includes promotion failure. After a cable blip (Distributed
+    // -> Solo -> re-pair -> Paired), an intentional promotion failure drives Backoff, the deadline
+    // recovers to Paired Standalone, a recurring failure reaches ManualInterventionRequired (which
+    // reconcile cannot auto-clear), and a real operator reconcile resets the tracker and lets
+    // promotion resume. Recovery goes through the real operator reconcile, never a direct tracker
+    // reset from the test (B-04 stop condition).
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("initial pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    assert_distributed_consistent(&harness.coordinator, &harness.worker).await;
+
+    // --- Reconnect: cable blip drops both nodes to Solo serving, then re-pair to Paired. ---
+    harness.coordinator.stop_serve().await;
+    harness.worker.stop_serve().await;
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker PeerLost reconcile after blip");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator PeerLost reconcile after blip");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        solo,
+        "nodes did not recover to solo after blip; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+    assert_solo_serving(&harness.coordinator).await;
+    assert_solo_serving(&harness.worker).await;
+    harness
+        .coordinator
+        .restart_serve()
+        .await
+        .expect("coordinator serve restart");
+    harness
+        .worker
+        .restart_serve()
+        .await
+        .expect("worker serve restart");
+    harness.pair().await.expect("re-pair after blip");
+    let paired = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        paired,
+        "nodes did not re-pair after blip; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+    assert_paired_consistent(&harness.coordinator, &harness.worker).await;
+    assert_paired_serving(&harness.coordinator).await;
+    assert_paired_serving(&harness.worker).await;
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    // Record with a future timestamp so the retry deadline sits ahead of the real clock, giving a
+    // robust before/after split even on a slow CI host.
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    // --- Intentionally fail promotion in the reconnected state -> Backoff. ---
+    coordinator
+        .production
+        .record_promotion_failure(
+            siderostat::cluster::ClusterFailure::HelloTimeout,
+            real_now + 400,
+        )
+        .await
+        .expect("record promotion failure");
+    assert_eq!(coordinator.mode.snapshot().state, ClusterState::Backoff);
+    // Before the deadline: reconcile keeps Backoff.
+    let before = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile before deadline");
+    assert_eq!(before.state, ClusterState::Backoff);
+    // After the deadline: reconcile recovers exactly once to PairedStandaloneReady.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile after deadline");
+    assert_eq!(after.state, ClusterState::PairedStandaloneReady);
+
+    // --- Recurring failures reach the limit -> ManualInterventionRequired. ---
+    // The tracker is still at consecutive 1 after the deadline recovery (recovery does not reset
+    // it); two more failures reach the 3-failure limit.
+    for offset in 1_u64..3 {
+        coordinator
+            .production
+            .record_promotion_failure(
+                siderostat::cluster::ClusterFailure::HelloTimeout,
+                real_now + 400 + offset * 50,
+            )
+            .await
+            .expect("record promotion failure");
+    }
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::ManualInterventionRequired
+    );
+    // Reconcile cannot auto-clear the manual state.
+    let stuck = coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile in manual state");
+    assert_eq!(stuck.state, ClusterState::ManualInterventionRequired);
+    let status = coordinator
+        .production
+        .promotion_failure_status()
+        .await
+        .expect("coordinator promotion tracker");
+    assert_eq!(status.consecutive, 3);
+    assert!(status.manual);
+
+    // --- Operator reconcile resets the tracker and lets promotion resume. ---
+    let outcome = coordinator
+        .production
+        .operator_reconcile()
+        .await
+        .expect("operator reconcile");
+    assert_eq!(
+        outcome,
+        siderostat::cluster::OperatorReconcileOutcome::Coordinator {
+            manual_cleared: true
+        }
+    );
+    assert_eq!(
+        coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    let status = coordinator
+        .production
+        .promotion_failure_status()
+        .await
+        .expect("coordinator promotion tracker");
+    assert_eq!(status.consecutive, 0);
+    assert!(!status.manual);
+
+    // Promotion resumes and the reconnect fully converges to DistributedReady.
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("re-promote after operator reconcile");
+    assert_distributed_consistent(&harness.coordinator, &harness.worker).await;
+
+    // Stop the freshly started distributed children explicitly; the harness ends in
+    // DistributedReady.
+    harness
+        .coordinator
+        .coordinator_child
+        .as_ref()
+        .expect("coordinator child")
+        .child()
+        .stop();
+    harness
+        .worker
+        .worker_child
+        .as_ref()
+        .expect("worker child")
+        .child()
+        .stop();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_then_peer_loss_during_backoff_recovers_to_solo_first() {
+    // B-04: in the reconnect context, peer loss during Backoff is prioritized over the backoff
+    // deadline, so a cable drop recovers to Solo serving instead of waiting out the deadline.
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("initial pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+    assert_distributed_consistent(&harness.coordinator, &harness.worker).await;
+
+    // --- Reconnect: cable blip to Solo, then re-pair to Paired. ---
+    harness.coordinator.stop_serve().await;
+    harness.worker.stop_serve().await;
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker PeerLost reconcile after blip");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator PeerLost reconcile after blip");
+    let solo = harness
+        .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(solo, "nodes did not recover to solo after blip");
+    harness
+        .coordinator
+        .restart_serve()
+        .await
+        .expect("coordinator serve restart");
+    harness
+        .worker
+        .restart_serve()
+        .await
+        .expect("worker serve restart");
+    harness.pair().await.expect("re-pair after blip");
+    let paired = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(paired, "nodes did not re-pair after blip");
+    assert_paired_consistent(&harness.coordinator, &harness.worker).await;
+
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    {
+        let coordinator = harness.node(LocalRole::Coordinator);
+        coordinator
+            .production
+            .record_promotion_failure(
+                siderostat::cluster::ClusterFailure::HelloTimeout,
+                real_now + 400,
+            )
+            .await
+            .expect("record promotion failure");
+        assert_eq!(coordinator.mode.snapshot().state, ClusterState::Backoff);
+    }
+
+    // Peer loss during Backoff: reconcile routes to Solo recovery instead of honoring the deadline.
+    harness.worker.stop_serve().await;
+    let recovered = harness
+        .node(LocalRole::Coordinator)
+        .production
+        .reconcile()
+        .await
+        .expect("reconcile during backoff with peer loss");
+    assert_eq!(recovered.state, ClusterState::SoloStandaloneReady);
+    assert_solo_serving(&harness.coordinator).await;
+
+    harness.shutdown().await;
+}
