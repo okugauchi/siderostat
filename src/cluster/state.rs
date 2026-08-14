@@ -89,6 +89,29 @@ pub enum ClusterFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOwner {
+    PeriodicReconcile,
+    RouteLossMonitor,
+    Admin,
+    Control,
+    Promotion,
+    Recovery,
+}
+
+impl EventOwner {
+    pub fn name(self) -> &'static str {
+        match self {
+            EventOwner::PeriodicReconcile => "periodic-reconcile",
+            EventOwner::RouteLossMonitor => "route-loss-monitor",
+            EventOwner::Admin => "admin",
+            EventOwner::Control => "control",
+            EventOwner::Promotion => "promotion",
+            EventOwner::Recovery => "recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAction {
     MaintainCurrent,
     RejectRequest,
@@ -314,7 +337,7 @@ pub fn spawn_state_machine(
                 publisher.send_replace(next);
             } else if let Err(error) = &result {
                 tracing::warn!(
-                    event = "cluster_transition",
+                    event = "cluster-transition-rejected",
                     from = ?current.state,
                     to = ?current.state,
                     reason = ?command.event.kind,

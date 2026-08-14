@@ -2,7 +2,7 @@ use super::{RoleControl, now_millis};
 use crate::{
     cluster::{
         ClusterEvent, ClusterEventKind, ControlCommand, ControlMessage, ControlMode,
-        DistributedControlPhase, Ds4Hello, NodeDescriptor, RendezvousControlSnapshot,
+        DistributedControlPhase, Ds4Hello, EventOwner, NodeDescriptor, RendezvousControlSnapshot,
         RendezvousListener, WorkerHelloExpectation,
     },
     target::{ClusterState, LocalRole, StableMode},
@@ -27,7 +27,7 @@ impl super::ProductionClusterRuntime {
         let response = self.inner.client.send(&message).await?;
         self.inner.lease.update(&response);
         tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-        self.reconcile_peer().await
+        self.reconcile_peer(EventOwner::Control).await
     }
 
     pub async fn promote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
@@ -39,6 +39,14 @@ impl super::ProductionClusterRuntime {
         ensure!(
             current.state == ClusterState::PairedStandaloneReady,
             "cluster is not paired standalone"
+        );
+        tracing::info!(
+            event = "promotion-started",
+            owner = EventOwner::Admin.name(),
+            from = ?current.state,
+            result = "success",
+            cluster_generation = current.generation,
+            "reconnect cluster event"
         );
         let awaiting = self
             .inner
@@ -213,6 +221,22 @@ impl super::ProductionClusterRuntime {
             tracing::warn!(error = %error, "worker promotion cancellation failed");
         }
         let current = self.inner.mode.snapshot();
+        if matches!(
+            current.state,
+            ClusterState::AwaitingWorkerHello
+                | ClusterState::Promoting
+                | ClusterState::DistributedStarting
+        ) {
+            tracing::warn!(
+                event = "promotion-failed",
+                owner = EventOwner::Promotion.name(),
+                from = ?current.state,
+                result = "failed",
+                cluster_generation = current.generation,
+                reason = "PromotionFailed",
+                "reconnect cluster event"
+            );
+        }
         if matches!(
             current.state,
             ClusterState::AwaitingWorkerHello

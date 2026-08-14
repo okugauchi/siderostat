@@ -1,34 +1,38 @@
 use super::{RoleControl, now_millis};
+use crate::cluster::EventOwner;
 
 impl super::ProductionClusterRuntime {
     pub async fn reconcile(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         match self.inner.client.node().await {
             Ok(response) => {
                 self.inner.lease.update(&response);
-                self.reconcile_peer().await
+                self.reconcile_peer(EventOwner::PeriodicReconcile).await
             }
             Err(error) => {
                 self.invalidate_route().await;
-                let snapshot = self.reconcile_peer().await?;
+                let snapshot = self.reconcile_peer(EventOwner::PeriodicReconcile).await?;
                 tracing::warn!(error = %error, "peer control reconciliation failed");
                 Ok(snapshot)
             }
         }
     }
 
-    pub(super) async fn reconcile_peer(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+    pub(super) async fn reconcile_peer(
+        &self,
+        owner: EventOwner,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         let now = now_millis();
         Ok(match &self.inner.control {
             RoleControl::Coordinator(control) => {
                 self.inner
                     .mode
-                    .reconcile_peer(&mut *control.lock().await, now)
+                    .reconcile_peer(owner, &mut *control.lock().await, now)
                     .await?
             }
             RoleControl::Worker(control) => {
                 self.inner
                     .mode
-                    .reconcile_peer(&mut *control.lock().await, now)
+                    .reconcile_peer(owner, &mut *control.lock().await, now)
                     .await?
             }
         })

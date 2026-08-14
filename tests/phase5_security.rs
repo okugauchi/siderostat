@@ -3,8 +3,8 @@ use futures::future::BoxFuture;
 use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
-        ControlRole, ControlSecret, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
-        WorkerControl,
+        ControlRole, ControlSecret, EventOwner, LocalStandaloneLifecycle, ModeRuntime,
+        NodeDescriptor, WorkerControl,
     },
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{ClusterState, LocalRole, ProxyTarget},
@@ -144,13 +144,22 @@ async fn ten_route_detach_attach_cycles_converge_without_orphan_state() {
                 now,
             )
             .unwrap();
-        runtime.reconcile_peer(&mut control, now).await.unwrap();
-        let paired = runtime.reconcile_peer(&mut control, now + 5).await.unwrap();
+        runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, now)
+            .await
+            .unwrap();
+        let paired = runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, now + 5)
+            .await
+            .unwrap();
         assert_eq!(paired.state, ClusterState::PairedStandaloneReady);
         assert_eq!(paired.target, ProxyTarget::Coordinator);
 
         control.invalidate_route();
-        let solo = runtime.reconcile_peer(&mut control, now + 6).await.unwrap();
+        let solo = runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, now + 6)
+            .await
+            .unwrap();
         assert_eq!(solo.state, ClusterState::SoloStandaloneReady);
         assert_eq!(solo.target, ProxyTarget::LocalStandalone);
     }

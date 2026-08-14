@@ -3,8 +3,8 @@
 use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
-        ControlRole, ControlSecret, Ds4Command, Ds4Profile, LocalStandaloneLifecycle, ModeRuntime,
-        NodeDescriptor, StandaloneSupervisor, WorkerControl,
+        ControlRole, ControlSecret, Ds4Command, Ds4Profile, EventOwner, LocalStandaloneLifecycle,
+        ModeRuntime, NodeDescriptor, StandaloneSupervisor, WorkerControl,
     },
     config::{ModelVariant, Residency},
     metrics::Metrics,
@@ -140,7 +140,7 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
         .unwrap();
     assert_eq!(
         runtime
-            .reconcile_peer(&mut control, 1_000)
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_000)
             .await
             .unwrap()
             .stable_mode,
@@ -150,7 +150,7 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
 
     assert_eq!(
         runtime
-            .reconcile_peer(&mut control, 1_100)
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_100)
             .await
             .unwrap()
             .stable_mode,

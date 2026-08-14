@@ -3,9 +3,9 @@ use super::{
 };
 use crate::{
     cluster::{
-        AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlMessage, ControlRequest,
-        ControlResponse, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP,
-        SignedControlHeaders,
+        AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
+        ControlRequest, ControlResponse, EventOwner, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE,
+        HEADER_TIMESTAMP, SignedControlHeaders,
     },
     target::LocalRole,
 };
@@ -70,18 +70,35 @@ impl super::ProductionClusterRuntime {
         let message: ControlMessage = serde_json::from_slice(&body)
             .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
         let command = message.command.clone();
+        let cluster_generation = self.inner.mode.snapshot().generation;
         let response = match &self.inner.control {
             RoleControl::Coordinator(control) => {
-                control
+                match control
                     .lock()
                     .await
-                    .handle(endpoint, message, &authenticated, true, now)?
+                    .handle(endpoint, message, &authenticated, true, now)
+                {
+                    Ok(response) => response,
+                    Err(ControlError::GenerationMismatch { expected, received }) => {
+                        log_pair_generation_mismatch(expected, received, cluster_generation);
+                        return Err(ControlError::GenerationMismatch { expected, received }.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             RoleControl::Worker(control) => {
-                control
+                match control
                     .lock()
                     .await
-                    .handle(endpoint, message, &authenticated, true, now)?
+                    .handle(endpoint, message, &authenticated, true, now)
+                {
+                    Ok(response) => response,
+                    Err(ControlError::GenerationMismatch { expected, received }) => {
+                        log_pair_generation_mismatch(expected, received, cluster_generation);
+                        return Err(ControlError::GenerationMismatch { expected, received }.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         };
         self.inner.lease.update(&response);
@@ -122,7 +139,7 @@ impl super::ProductionClusterRuntime {
                     self.inner.lease.update(&response);
                 }
                 tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-                self.reconcile_peer().await?;
+                self.reconcile_peer(EventOwner::Control).await?;
             }
             ControlCommand::PrepareWorker => self.prepare_worker().await?,
             ControlCommand::BeginDrain => self.worker_drained().await?,
@@ -134,4 +151,19 @@ impl super::ProductionClusterRuntime {
         }
         Ok(())
     }
+}
+
+/// Emit the contract's `pair-generation-mismatch` structured log for a Pair 409.
+/// Records only the expected/received generations (never secrets or signatures).
+fn log_pair_generation_mismatch(expected: u64, received: u64, cluster_generation: u64) {
+    tracing::warn!(
+        event = "pair-generation-mismatch",
+        owner = EventOwner::Control.name(),
+        result = "rejected",
+        expected = expected,
+        received = received,
+        cluster_generation = cluster_generation,
+        control_session_generation = expected,
+        "reconnect cluster event"
+    );
 }

@@ -2,7 +2,7 @@ use super::RoleControl;
 use crate::{
     cluster::{
         ChildIdentity, ClusterEvent, ClusterEventKind, DistributedCoordinatorLifecycle,
-        DistributedWorkerLifecycle,
+        DistributedWorkerLifecycle, EventOwner,
     },
     target::{ClusterState, LocalRole},
 };
@@ -23,6 +23,14 @@ impl super::ProductionClusterRuntime {
             .as_ref()
             .context("worker lifecycle unavailable")?;
         let current = self.inner.mode.snapshot();
+        tracing::info!(
+            event = "promotion-started",
+            owner = EventOwner::Control.name(),
+            from = ?current.state,
+            result = "success",
+            cluster_generation = current.generation,
+            "reconnect cluster event"
+        );
         let awaiting = self
             .inner
             .mode
@@ -97,6 +105,14 @@ impl super::ProductionClusterRuntime {
             worker.cancel().await?;
             let paired = match current.state {
                 ClusterState::DistributedReady => {
+                    tracing::info!(
+                        event = "demotion-started",
+                        owner = EventOwner::Control.name(),
+                        from = ?current.state,
+                        result = "success",
+                        cluster_generation = current.generation,
+                        "reconnect cluster event"
+                    );
                     let demoting = self
                         .inner
                         .mode
@@ -118,6 +134,15 @@ impl super::ProductionClusterRuntime {
                 ClusterState::AwaitingWorkerHello
                 | ClusterState::Promoting
                 | ClusterState::DistributedStarting => {
+                    tracing::warn!(
+                        event = "promotion-failed",
+                        owner = EventOwner::Promotion.name(),
+                        from = ?current.state,
+                        result = "failed",
+                        cluster_generation = current.generation,
+                        reason = "PromotionFailed",
+                        "reconnect cluster event"
+                    );
                     self.inner
                         .mode
                         .cluster_handle()
