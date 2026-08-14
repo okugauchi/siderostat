@@ -259,7 +259,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を commit 96d5459 で追加;
 
 Evidence: branch=feature/reconnect-recovery; 実装を追加。`tests/support/mod.rs` に `fake_worker_hello_bytes` / `inject_fake_worker_hello` / `TwoNode::promote_to_distributed` (coordinator の DS4 rendezvous listener へ合成 HELLO を注入して `promote()` を DistributedReady まで完走させる) と `Node.ds4_distributed_port` を追加。`tests/reconnect_production.rs` に `peer_lost_from_distributed_ready_orphans_distributed_children` を追加し、pair -> promote -> DistributedReady で両 distributed child の稼働を確認した後、両 node の control HTTP server を abort して `reconcile()` を呼び PeerLost を発火。P0-A の lifecycle 不整合を検出: coordinator の distributed child が PeerLost 後に残存 (fallback_to_solo が distributed child を停止しない)、worker が standalone と distributed を同時稼働させる (fallback_to_solo が worker standalone を起動しても distributed worker child を停止しない)。RED 確認: 両 assertion とも再現性をもって失敗 (coordinator orphan / worker coexistence)。failure evidence 採取後、解除 task A-03 を明記した `#[ignore = "RED for P0-A; resolve in A-03 coordinator PeerLost recovery (see reconnect plan R0-05)"]` を付与し、残り suite を GREEN に維持。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 173 + integration GREEN / cargo test --all-targets --features test-support: unit 173 + integration GREEN (reconnect_production 3 passed + 1 ignored) / git diff --check clean); 2026-08-14
 
-### [ ] R0-06 control generation mismatch の RED test を追加する
+### [x] R0-06 control generation mismatch の RED test を追加する
 
 - Actor: agent
 - Depends on: R0-04
@@ -274,6 +274,8 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`tests/support/mo
 - Verification: 失敗理由が expected/received generation と一致する
 - 完了条件: P0-B の修正がなければ通らない方向別 test と evidence があり、残りの suite は GREEN
 - 停止条件: lifecycle failure と同じ test に混ざり、原因を一意に判定できない
+
+Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に baseline generation を渡せるよう `spawn_ready_at` を利用し、`TwoNode::boot_with_baseline(coordinator_baseline, worker_baseline)` を追加 (spawn_ready_at により各 node の control session generation は baseline+2)。`tests/reconnect_production.rs` に方向別 2 test を追加。(1) `coordinator_adopts_higher_worker_generation_on_pair` (RED, worker baseline 100 / coordinator 0): worker の高 generation を coordinator が採用して pair が収束すべき、を assert。現行は worker が coordinator の低 generation Pair を 409 GenerationMismatch で拒否するため失敗 (evidence: `peer control /v1/pair returned 409 Conflict: {"error":"control generation mismatch: expected 102, received 2"}`、expected=worker baseline+2、received=coordinator baseline+2)。periodic reconcile を複数回実行しても coordinator は SoloStandaloneReady のまま収束しない現行 behavior を確認済み (coordinator の lease が未確立のため peer_present=false で reconcile が no-op)。(2) `higher_coordinator_baseline_generation_is_followed_by_worker` (GREEN, coordinator baseline 100 / worker 0): 逆方向では worker が coordinator の高 generation を advance_generation で追従し pair が収束する方向依存を固定。failure evidence 採取後、解除 task G-05 を明記した `#[ignore = "RED for P0-B; resolve in G-05 control session generation negotiation (see reconnect plan R0-06)"]` を付与し、残り suite を GREEN に維持。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets: unit 173 + integration GREEN / cargo test --all-targets --features test-support: unit 173 + integration GREEN (reconnect_production 4 passed + 2 ignored) / git diff --check clean); 2026-08-14
 
 ## 7. Phase A: P0-A PeerLost lifecycle
 
