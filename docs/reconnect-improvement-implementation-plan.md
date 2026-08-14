@@ -536,7 +536,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 11. Phase N: P2 route / discovery pairing gate
 
-### [-] N-01 pairing gate の network evidence contract を固定する
+### [x] N-01 pairing gate の network evidence contract を固定する
 
 - Actor: agent + operator review
 - Depends on: B-04
@@ -578,8 +578,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   wrong interface/subnet、stale candidate、Bonjour failure、macOS API 失敗の真理値表を作成。
   完了条件として N-02 で 4 箇所の固定 `true` を最新 epoch の `NetworkSnapshot` 由来の実測
   `route_scoped` へ置換する設計を示した。**Actor: agent + operator review** のため、本 Evidence は
-  operator review 待ち (`[x]` 未確定)。共通 local gate は文書のみ変更のため
-  `git diff --check` clean で確認; 2026-08-15
+  operator review 待ち (`[x]` 未確定) としていたが、2026-08-15 に operator 承認を
+  得て `[x]` に確定。共通 local gate は文書のみ変更のため `git diff --check` clean
+  で確認; 2026-08-15
 
 ### [ ] N-02 network evidence を production control へ接続する
 
