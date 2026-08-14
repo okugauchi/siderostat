@@ -2,7 +2,8 @@
 
 > 本稿は `docs/spec.md` の target behavior と、現行実装（`src/cluster/state.rs`、
 > `src/cluster/runtime.rs`、`src/cluster/control.rs`、`src/cluster/production/*`）を突き合わせて、
-> **実装が実際に行っている** cluster / peer 接続状態を状態機械として記述する。
+> cluster / peer 接続状態を記述する。純粋な状態遷移だけでなく、その遷移を起こす
+> production orchestration と child lifecycle の配線も区別して扱う。
 > 文書の位置づけは「現状把握用の正本」であり、`docs/spec.md`（target）や
 > `docs/archive/implementation-plan-v0.1.0.md`（完了済み刷新計画の履歴）を置き換えるものではない。
 > 最終更新日: 2026-08-14
@@ -18,13 +19,24 @@
 HTTP reverse proxy の詳細（header、retry、admission、drain）は `docs/spec.md` を参照し、
 ここでは cluster 状態遷移に必要な範囲だけを扱う。
 
+本稿では次の 3 層を区別する。
+
+1. **transition reducer**：`state.rs::transition()` が許可する状態とイベントの組。
+2. **mode / child lifecycle**：`ModeRuntime`、`CoordinatorDistributedRuntime`、
+   `WorkerDistributedRuntime` が admission と child process を操作する経路。
+3. **production wiring**：control HTTP、periodic reconcile、永続 state、network event が
+   上記を実際に呼び出す配線。
+
+遷移が reducer 上で許可されることは、必要な child 操作や timer が production に配線済みで
+あることを意味しない。
+
 ## 2. 用語（本稿限定）
 
 | 用語 | 意味 |
 |---|---|
 | cluster 世代 (generation) | `ClusterSnapshot.generation`。状態機械の遷移ごとに +1 される単調増加整数。イベントの `expected_generation` 照合に使う |
 | control 世代 | `ControlProcessor.local.generation`。control メッセージの `generation` 欄。cluster 世代とは**別カウンタ** |
-| 自ノード descriptor | `ProductionInner.descriptor`。起動時に一度だけ構築され、`generation` は以後更新されない（0 相当の初期値） |
+| 自ノード descriptor | `ProductionInner.descriptor`。起動時に `mode.snapshot().generation` から一度だけ構築され、以後更新されない。再起動時は永続 generation を継承した起動遷移後の値であり、通常 0 ではない |
 | peer lease | `PeerLease`。相手から受信した認証済み descriptor と期限付き有効性（route_scoped / stability / expires_at） |
 | required_peer_stability | 既定 5 秒。認証開始から peer present と判定するまでに必要な継続時間 |
 | control lease | 既定 15 秒。renew なしで peer present を維持できる上限 |
@@ -123,11 +135,15 @@ stateDiagram-v2
     Backoff --> PairedStandaloneReady: BackoffElapsed (stable_mode=Paired)
     Backoff --> DistributedReady: BackoffElapsed (stable_mode=Distributed)
 
-    [*] --> ManualInterventionRequired: RequireManualIntervention
+    Booting --> ManualInterventionRequired: RequireManualIntervention
     ManualInterventionRequired --> SoloStandaloneReady: OperatorReconcile (Solo)
     ManualInterventionRequired --> PairedStandaloneReady: OperatorReconcile (Paired)
     ManualInterventionRequired --> DistributedReady: OperatorReconcile (Distributed)
 ```
+
+図の可読性のため、`EnterBackoff` と `RequireManualIntervention` の全辺は省略している。
+reducer 上はいずれも**任意状態**から適用できる。`BeginSoloStandalone` は Booting に加えて
+Backoff からも適用できる。正確な許可組は次の遷移一覧を正とする。
 
 ### 4.2 遷移一覧（state.rs `transition()` の実装通り）
 
@@ -191,6 +207,11 @@ enum ClusterEventKind {
 
 `invalidate_route()` は `route_scoped` だけを false にする（descriptor と generation は保持）。
 
+ただし production control handler は、HMAC と固定 peer source address の検証後、
+`descriptor_response()` / `handle()` へ `route_scoped=true` を固定で渡している。
+現状の `route_scoped` は control request ごとの実 route/interface 再検証結果ではない。
+Bonjour / `DiscoveryTracker` も production pairing の必須 gate には配線されていない。
+
 ### 6.2 establish / renew
 
 - `establish`：`Pair` を受信したときに呼ばれる。`same_membership`（同一 generation・同一
@@ -219,7 +240,7 @@ coordinator                      worker
     |                               |    lease.establish (worker側)
     |                               |    apply_effect(Pair):
     |                               |      POST /v1/pair を返信
-    |  <-----------------------------|      (worker も lease.establish)
+    |  <-----------------------------|      coordinatorへ Pairを送信
     |  CoordinatorControl::handle    |
     |    lease.establish (coord側)   |
     |  apply_effect(Pair):           |
@@ -229,6 +250,10 @@ coordinator                      worker
     |    peer_present -> BeginPairing
     |    -> Pairing -> PairingReady
 ```
+
+worker 側も返信送信後に stability を待って `reconcile_peer()` を行う。また coordinator が
+返信 Pair を受信した際にも別の `apply_effect(Pair)` が起動される。このため最初の
+`pair()` 内の sleep が早く満了しても、それだけで再pair 試行全体が終了するわけではない。
 
 - 送信側の `pair()` が使う generation は `control_generation()`：
   `peer_lease().descriptor().map_or(inner.descriptor.generation, |d| d.generation)`。
@@ -254,6 +279,19 @@ coordinator                      worker
 - worker：local standalone child を **start**。
 - `LocalStandaloneReady` で SoloStandaloneReady に戻り serving。
 
+これは reducer と `ModeRuntime` が**実際に行う処理**だが、DistributedReady からの
+peer loss には lifecycle 上の欠落がある。
+
+- coordinator / worker の distributed child を停止しない。
+- coordinator では停止済み standalone child を起動しない。
+- それでも `LocalStandaloneReady` を適用し、`local_standalone_ready=true` とする。
+- coordinator の route-loss demotion task は state が先に DistributedReady 以外へ進むと
+  cleanup せず終了する。
+
+したがって state / proxy target / 実 child が不整合になり得る。これは
+`docs/spec.md` 18.5 の target behavior との差分であり、再pair後の再昇格を評価する際に
+単なる control handshake 問題と分離して扱う必要がある。
+
 ### 8.3 promotion（coordinator）
 
 `promote()`：`BeginPromotion` → AwaitingWorkerHello → `prepare_and_accept_hello`
@@ -276,11 +314,19 @@ standalone start → `PairingReady` → PairedStandaloneReady。
 
 ## 9. Backoff / ManualIntervention
 
-- Promotion 失敗（同一 `ClusterFailure` で連続）は `PromotionFailureTracker` が集計する。
+- `PromotionFailureTracker` は、呼び出された対象 failure を同一 `ClusterFailure` ごとに集計する。
 - 連続回数 < `max_consecutive_promotion_failures`（既定 3）なら `EnterBackoff` → Backoff へ。
 - 連続回数 >= 上限なら `RequireManualIntervention` → ManualInterventionRequired へ。
-- Backoff は `reconcile_backoff`（既定 300s 後）で `BackoffElapsed` → 現行 stable_mode の ready 状態へ。
-- ManualInterventionRequired は `OperatorReconcile` でのみ復帰。
+- `CoordinatorDistributedRuntime::reconcile_backoff` は、既定 300s 後に `BackoffElapsed` を
+  適用する実装を持つ。
+- ただし production の `start_reconcile_task` は `reconcile_backoff` を呼んでいないため、
+  現状は Backoff からの自動復帰が配線されていない。
+- production の admin reconcile は `OperatorReconcile` を直接適用し、
+  `CoordinatorDistributedRuntime::operator_reconcile` を経由しない。この経路では
+  failure tracker が reset されない。
+- promotion preflight の全失敗が tracker に接続されているわけではない。
+  現行 `promotion_failure_for_error()` が明示的に backoff 対象へ写像するのは
+  `CoordinatorStartupTimeout` に限られる。
 - 注意: promotion 失敗から `PromotionFailed` で PairedStandaloneReady へ戻す recovery と、
   backoff/manual への遷移は別系統。
 
@@ -290,15 +336,23 @@ standalone start → `PairingReady` → PairedStandaloneReady。
 `cluster_state` / `proxy_target` / child identity / generation）。atomic rename、file lock、
 corrupt 時は保全。Secret/token は保存しない。
 
+起動時は保存済み `generation` を baseline として Booting を作り、
+`BeginSoloStandalone` と `LocalStandaloneReady` の 2 遷移で generation を進める。
+その後 `ProductionInner.descriptor` が作られるため、process 再起動は control generation を
+0へ戻す操作ではなく、通常は以前より大きい初期 control generation を作る。
+
 ## 11. 実装と仕様の対応（既知の差分）
 
 | 観点 | spec の記述 | 実装の状況 |
 |---|---|---|
 | 状態集合 | `Booting`〜`ManualInterventionRequired` | state.rs の `ClusterState` と一致 |
-| Peer present 条件 | 5 条件（route/HMAC/lease/stability 等） | `PeerLease::peer_present` で 4 条件を判定（Bonjour 発見は discovery 層で別扱い） |
+| Peer present 条件 | 5 条件（route/HMAC/lease/stability 等） | `PeerLease::peer_present` は4条件を判定するが、production は route_scoped を true 固定で渡す。Bonjour/discovery は pairing gate に未配線 |
 | Pairing | coordinator 起点 | `pair()` は coordinator のみ（worker は bail） |
-| 世代 | transition の idempotency | cluster 世代は遷移ごとに +1。control 世代は別管理 |
-| 再pair | 「reconnect/backoff 後 Paired Standalone、次いで MXFP4 再昇格」（spec 32.5） | 統合テストは promote/demote の往復のみ。peer 喪失→solo→再pair の自動経路はテストされていない |
+| 世代 | transition の idempotency | cluster 世代は遷移ごとに +1。control 世代は別管理。再起動時だけ cluster generation から初期化され、その後は同期しない |
+| Peer loss cleanup | distributed child 停止後に各 node の standalone へ復帰 | 汎用 `fallback_to_solo` は distributed child を停止せず、coordinator standalone も起動しないまま SoloReady へ進み得る |
+| Backoff | timeout 後に自動再試行 | `reconcile_backoff` は実装済みだが production periodic task に未配線 |
+| Manual reconcile | failure count を reset して再試行 | admin 経路は state event を直接適用し、tracker reset を迂回する |
+| 再pair test | reconnect/backoff 後 Paired、次いで再昇格 | route detach/attach の低レベル反復と promote/demote 反復は別々に存在するが、production transport・永続 state・片側再起動・distributed peer loss を連結した E2E はない |
 
 ## 12. 付録: 主要ソース位置
 

@@ -2,168 +2,266 @@
 
 > 対象: peer 接続断 → Solo Standalone → 再pair → Distributed 復帰の自動経路。
 > 本稿は現行実装の調査結果（[`connection-state-machine.md`](connection-state-machine.md)）に基づく
-> 根本原因の仮説と、優先度付きの改善案である。実装変更の可否は別途判断する。
+> 原因候補と、優先度付きの改善案である。ユーザー報告とコード上の欠陥候補を区別し、
+> 再現テストで確認できていないものは仮説として扱う。
 > 最終更新日: 2026-08-14
 
-## 1. 症状の要約
+## 1. 症状と目標
 
 ユーザー報告:
 
-- 一度確立した pair のどちらかの peer が接続断になった後、**再pair に一度も成功していない**。
-- **2 台とも macOS を再起動したときだけ**理想的な pair（Distributed）に復帰できる。
+- 一度確立した pair の peer が接続断になった後、Distributed へ自動復帰した実績がない。
+- 2 台とも macOS を再起動したときは Distributed へ復帰できる。
 - 片側だけの再起動では復帰できない。
 
-## 2. 現状の再pair 自動経路
+本提案の完了条件は、単に control の `/v1/pair` が 200 を返すことではない。次を一連の
+reconnect として検証する。
 
-再pair は次の「coordinator 起点」の周期的試行だけで駆動される。
+1. peer loss 後、両 node が実際に Solo Standalone を serving する。
+2. stale distributed child や orphan transition が残らない。
+3. 再接続後、Paired Standalone へ収束する。
+4. auto promotion により新しい有効な generation で DistributedReady へ戻る。
+5. state、proxy target、admission、child identity が一致する。
+
+## 2. 現行の自動経路
+
+### 2.1 control と pairing
 
 ```text
-coordinator (SoloStandaloneReady) の reconcile タスク
-  -> auto_pair が true
+各 node の periodic reconcile（既定 5 秒）
+  -> GET /v1/node
+  -> 失敗時は PeerLease.route_scoped=false
+  -> reconcile_peer()
+
+coordinator が SoloStandaloneReady かつ auto_pair=true
   -> pair()
       -> POST /v1/pair (generation = control_generation())
-      -> worker が受信
-      -> worker が Pair を返信
-      -> coordinator の lease が再確立
-      -> 両者 reconcile_peer() -> form_pair -> PairedStandaloneReady
-      -> auto_promote -> promote() -> Distributed
+      -> worker が受信して Pair を返信
+      -> 双方の PeerLease を establish
+      -> stability 待ち後に双方が reconcile_peer()
+      -> PairedStandaloneReady
+  -> auto_promote=true なら promote()
+  -> DistributedReady
 ```
 
-この経路は、両 node の「control 世代」が一致していることを前提にしている。
+`pair()` 自体は coordinator 起点に限定される。worker の periodic task も SoloReady で
+`pair()` を呼ぶが、role check で失敗する。
 
-## 3. 根本原因の仮説
+### 2.2 process 再起動時の generation
 
-### 3.1 【主因】control 世代が peer 断後も再同期されず、世代差で Pair が永久に拒否される
+再起動時は永続 state の `generation` を baseline とし、Booting から SoloReady までの
+2 遷移を行う。その後 `ProductionInner.descriptor` と `ControlProcessor.local` が作られる。
+したがって process 再起動は control generation を 0 へ戻さず、通常は再起動前より大きい
+初期値を作る。
 
-`pair()` が送る generation は `control_generation()` で決まる。
+起動後の control generation は cluster generation と独立しており、より大きい Pair を
+受信した場合にだけ更新される。通常の cluster transition や Pair の成功回数ごとに
+control generation が増えるわけではない。
 
-```rust
-// src/cluster/production/pairing.rs (control_generation)
-RoleControl::Coordinator(control) => control.lock().await
-    .peer_lease()
-    .descriptor()
-    .map_or(self.inner.descriptor.generation, |d| d.generation),
-```
+### 2.3 DistributedReady での peer loss
 
-つまり送信 generation は「相手から最後に受け取った descriptor の世代」または
-「起動時に固定された自ノード初期値」に依存する。一方、受信側 `handle_validated` は：
+periodic control reconcile が peer loss を検出すると、`ModeRuntime::fallback_to_solo()` が
+直接呼ばれる。この経路は state を SoloReady へ進めるが、distributed lifecycle の cleanup を
+行わない。
 
-```rust
-// src/cluster/control.rs (ControlProcessor::handle_validated)
-if matches!(message.command, ControlCommand::Pair { .. })
-    && message.generation > self.local.generation {
-    self.advance_generation(message.generation);   // 大きいときだけ上書き
-}
-if message.generation != self.local.generation {
-    return Err(ControlError::GenerationMismatch { .. });  // 一致しないと拒否
-}
-```
+- coordinator / worker の distributed child を停止しない。
+- coordinator standalone を起動しない。
+- worker は standalone を起動するが、distributed worker child が残り得る。
+- coordinator route-loss demotion task は、state が先に DistributedReady 以外へ進むと
+  cleanup せず終了する。
 
-- `advance_generation` は「受信 Pair が自 local generation より**大きい**ときだけ」世代を上げる。
-  世代は下がる方向には動かない。
-- peer 喪失時、`invalidate_route()` は `route_scoped` を false にするだけで
-  descriptor / generation を**クリアしない**。control 世代は peer 断をまたいで保持される。
-- したがって、両 node の control 世代が何らかの理由でずれると（片側の process 再起動、
-  再pair の繰り返しで世代がラチェット的に上昇する等）、**低い世代を持つ側が送る Pair は
-  高い世代の側で GenerationMismatch により恒久的に拒否される**。
-- 世代を 0 相当へ戻す唯一の手段が「両 process を起動し直す（= 両機の macOS 再起動）」であり、
-  ユーザー症状と符合する。
+このため、再pair handshake が成功しても、その後の serving や再promotionが正しく完了するとは
+限らない。
 
-### 3.2 【副因】pairing が coordinator 起点のみで、失敗時の世代再同期手段がない
+## 3. 原因候補の評価
 
-- `pair()` 冒頭の `ensure!(role == Coordinator)` により worker は Pair を自発的に送れない。
-- もし coordinator 側の control 世代が worker より低い場合、coordinator は毎周期
-  「拒否される Pair」を送り続け、回復経路が存在しない。
-- worker 起点の再pair、あるいは世代を再同期するハンドシェイクが実装されていない。
+### 3.1 【P0候補】PeerLost recovery の lifecycle 不整合
 
-### 3.3 【副因】「世代」が 2 系統あり、意味が曖昧
+コード上で確認済みの欠落であり、最優先で再現テストを作る。
 
-- `ClusterSnapshot.generation`（状態機械の世代）と
-  `ControlProcessor.local.generation`（control メッセージの世代）は別カウンタ。
-- `pair()` は control 世代を送り、`ClusterEvent.expected_generation` は状態機械世代を使う。
-- この 2 系統が同期されるタイミングが不明確で、世代差が発生しやすい。
+state は SoloStandaloneReady でも、実 child は次のいずれかになり得る。
 
-### 3.4 【副因】再pair 経路がテストで検証されていない
+- coordinator: standalone 停止、distributed coordinator 残存。
+- worker: standalone と distributed worker が併存。
 
-- 統合テスト（`tests/phase4_distributed.rs`）は「確立済み pair からの promote/demote 往復」だけを
-  検証しており、**peer 喪失 → Solo → 再pair → Distributed の自動経路はカバーしていない**。
-- spec 32.5 の「cable 再接続後に自動 pairing へ収束」は acceptance criteria にあるが、
-  自動テストの対象外で、実機でも一度も成功していない。
+この不整合は、ユーザーが観測する「pair に戻らない」に次の形で寄与し得る。
 
-### 3.5 【副因（race）】coordinator の `pair()` と非同期の worker 返信の間の競合
+- SoloReady と表示されても local standalone service が成立していない。
+- 再promotion時に以前の distributed child が no-op start で再利用される。
+- child generation と新しい cluster transition generation が一致しない。
+- route/admission の古い状態が次の promotion に持ち越される。
 
-- coordinator の `pair()` は `sleep(required_peer_stability)` 後に `reconcile_peer()` を呼ぶが、
-  coordinator 側の lease 再確立は worker の返信 Pair が**非同期に**処理されたときに起きる。
-- タイミング次第で `reconcile_peer()` が peer_present=false のまま走り、即座に
-  `fallback_to_solo` へ戻る churn が起きる可能性がある（収束はする想定だが不安定要因）。
+これは有力原因だが、実機症状との因果関係は child PID、profile、generation、route log を
+採取して確定する。
 
-## 4. 提案する改善（優先度順）
+### 3.2 【P0候補】control generation の方向依存 mismatch
 
-### P0: control 世代の再同期 / 世代差耐性
+低い generation の Pair が高い generation の受信側へ送られると、受信側は
+`GenerationMismatch` を返す。Pair は大きい generation への追従だけを許し、下げる方向の
+同期手段はない。
 
-Peer 断や再起動をまたいで世代差が残らないようにする。選択肢：
+`control_generation()` は active な自ノード世代ではなく、既存 PeerLease に descriptor が
+あれば最後に受信した peer descriptor の generation を優先する。このため coordinator が
+古い peer descriptor を保持したまま worker だけが再起動すると、次の形になり得る。
 
-1. **再pair 時に世代を再同期する**
-   - `Pair` を受けた側が、世代差があっても「自分が持つ最新世代を返信」する。
-   - あるいは `Pair` を世代非依存の「再確立」コマンドとして扱い、establish 時に
-     双方の世代を一致させてから以降の control を続行する。
-2. **`control_generation()` を自ノード所有の単調世代へ変更**
-   - 相手 descriptor 由来でなく、自ノードの cluster 世代（または専用の control 世代）を送る。
-   - peer 断時に世代を「次の再pair 用にリセット / 再同期」する明示的遷移を状態機械へ追加する。
-3. **世代不一致を致命的にせず、再同期を誘導する**
-   - `GenerationMismatch` を返す代わりに、返信側が自分の世代を伝え、送信側が追従する
-     ハンドシェイク（例: `Pair` に対して「現在世代 + 再同期要求」を返す）。
+| 条件 | 予想される動作 |
+|---|---|
+| worker だけ再起動し `worker_generation > coordinator_generation` | coordinator の低い Pair が worker で拒否され、周期試行だけでは回復不能になり得る |
+| coordinator だけ再起動し `coordinator_generation > worker_generation` | worker は高い Pair を受けて generation を進められるため、この要因だけなら回復可能 |
+| cable blip、process 再起動なし、双方同一 generation | generation mismatch は通常発生しない |
+| 両 node 再起動 | 永続 generation と各 node の遷移回数次第。0 への reset ではない |
 
-### P1: 再pair 経路の統合テスト追加
+したがって generation mismatch は実在する設計欠陥だが、「片側再起動はすべて失敗する」ことや
+「両側再起動だけが generation を reset する」ことの説明にはならない。再起動方向別テストと
+409 応答の `expected` / `received` 採取が必要である。
 
-- peer 断 → Solo Standalone → 再pair → Paired Standalone → promote → Distributed を
-  自動テストで回す。
-- 特に「coordinator だけ再起動」「worker だけ再起動」「両方再起動」「ケーブル blip」の
-  4 パターンで世代差が残らないことを確認する。
-- このテストが先に落ちることで、P0 の妥当性を検証できる。
+### 3.3 【P1候補】Backoff / operator reconcile の production 未配線
 
-### P2: pairing 起点の非対称性を解消（または世代再同期を coordinator 側に集約）
+`CoordinatorDistributedRuntime::reconcile_backoff()` は実装されているが、production periodic
+task から呼ばれない。このため Backoff は timeout 後も自動復帰しない可能性がある。
 
-- 現状は coordinator 起点固定のため、coordinator 側が低世代のときに回復不能になる。
-- worker 起点の再pair、または世代再同期を coordinator 側の失敗時に worker が誘導する仕組みを検討する。
+また admin reconcile は state machine へ `OperatorReconcile` を直接適用し、failure tracker の
+reset を行う `CoordinatorDistributedRuntime::operator_reconcile()` を迂回する。
 
-### P3: race の解消
+promotion failure のうち tracker に接続されている種類も限定的である。再pair後に promotion が
+一度失敗したケースを「reconnect失敗」として観測している可能性があるため、state と failure
+status を分けて記録する。
 
-- `pair()` 内の `sleep → reconcile_peer()` を、lease 再確立の完了を待ってから実行するようにする。
-- coordinator 側 lease の再確立を `pair()` 自身が確認できるようにする（返信 Pair の処理完了を await）。
+### 3.4 【P1候補】production 境界を覆うテスト不足
 
-### P4: 世代の意味を明確化
+既存テストには次がある。
 
-- control 世代と cluster 世代の関係を仕様へ明記する。
-- 可能なら 1 系統に統合するか、少なくとも「どちらをいつ使うか」をコメント/仕様で固定する。
+- `phase5_security`: route detach/attach と Solo ↔ Paired の10回反復。
+- `phase4_distributed`: Paired ↔ Distributed の10回反復と failure recovery。
+- control unit test: stale generation の拒否。
 
-## 5. 各案のトレードオフ
+ただし、これらは次を一つのシナリオとして連結していない。
+
+- production control HTTP と Pair 返信 side effect。
+- 永続 generation を使った片側 process 再生成。
+- DistributedReady 中の peer loss。
+- distributed child cleanup と standalone readiness。
+- 再pair後の auto promotion。
+
+低レベルテストは存在するが、今回の故障境界を検証する E2E がない、というのが正確な評価である。
+
+### 3.5 【低優先度仮説】Pair 返信 timing
+
+coordinator の最初の `pair()` 内の stability sleep が、worker からの返信 Pair 処理より先に
+満了する可能性はある。しかし SoloReady で `peer_present=false` の reconcile は
+`fallback_to_solo` を起こさない。また返信 Pair の受信 side effect も別途 sleep 後に
+reconcile を行う。
+
+したがって一時的に pairing が遅れる可能性はあるが、現時点で恒久的な reconnect failure の
+主因とする根拠はない。計測で未収束が再現された場合にのみ改善対象とする。
+
+## 4. 提案する改善
+
+### P0-0: 失敗する production 相当テストと診断情報を先に作る
+
+修正前に、少なくとも次を観測できるテストまたは実機記録を作る。
+
+- 両 node の cluster generation / control generation。
+- Pair 409 の expected / received generation。
+- state、stable mode、proxy target、admission。
+- standalone / distributed child の PID、profile、generation、生存状態。
+- PeerLost、route-loss demotion、Pair、promotion の開始・完了順序。
+
+テストは「最終 state だけ」でなく、不要 child が停止され、必要 child が readiness を満たしたことを
+assert する。
+
+### P0-A: peer loss recovery を role 別 lifecycle として実装する
+
+DistributedReady または promotion 中の PeerLost を、汎用 `ModeRuntime::fallback_to_solo` だけで
+処理しない。
+
+1. future admission を block する。
+2. coordinator / worker の distributed child を identity 確認付きで停止する。
+3. local standalone を起動し readiness を待つ。
+4. readiness 成功後にだけ SoloStandaloneReady と target=LocalStandalone を publish する。
+5. 途中失敗時は ready state を偽装せず、Unavailable または ManualInterventionRequired とする。
+
+control reconcile と route-loss demotion が同じ child を並行操作しないよう、単一の recovery owner、
+または transition generation による排他を設ける。
+
+### P0-B: Pair 用 session generation を明示的に再ネゴシエーションする
+
+cluster generation と control session generation は用途が異なるため、単純な1系統統合や
+peer loss 時の 0 reset は行わない。次の性質を持つ handshake を設計する。
+
+- coordinator が pairing session の authority である。
+- `/v1/node` 応答ですでに得られる peer generation を negotiation の入力にできる。
+- 新 session generation は双方の既知値より古くならない。必要なら checked `max + 1` を使う。
+- generation 確定前の Pair offer と、確定後の Pair confirm を区別する。
+- session 確定時に lease、control phase、idempotency map を一貫して更新する。
+- 古い non-Pair command / ack は引き続き拒否する。
+- process crash 後も authority と session の意味が失われないよう、必要な値を永続化する。
+
+最小変更として coordinator が `/v1/node` の peer generation を読んで追従する案は有力だが、
+Pair 適用前に local generation だけを変更すると古い lease/phase と混在するため、session reset を
+一つの原子的操作として定義する。
+
+worker 起点 Pair を許可するだけでも高い worker generation を coordinator へ伝えられるが、
+pairing authority の二重化と同時開始 race が増える。この案は第一選択にしない。
+
+### P0-C: 再接続シナリオを自動テストする
+
+| 開始状態 | 障害 | 必須確認 |
+|---|---|---|
+| PairedStandaloneReady | cable blip | 両 node Solo → 再pair → Paired |
+| DistributedReady | cable blip | distributed child 停止 → 両 node local standalone → 再pair →新規 Distributed |
+| Paired / Distributed | coordinator process のみ再起動 | generation 収束、orphan なし、自動復帰 |
+| Paired / Distributed | worker process のみ再起動 | coordinator 低世代の場合を含め generation 収束 |
+| Paired / Distributed | 両 process 再起動 | 永続 generation から収束 |
+| 任意 | Pair 応答遅延・重複 | 同一 session へ冪等に収束 |
+
+各ケースで cluster state だけでなく、child identity、generation、target、admission、lease、
+control phase を両 node について検証する。
+
+### P1: Backoff と manual reconcile を production に接続する
+
+- periodic task から coordinator の `reconcile_backoff(now)` を呼ぶ。
+- admin reconcile は coordinator runtime の `operator_reconcile()` を経由し、tracker を reset する。
+- `failure_action()` が `PromotionBackoff` とする Hello timeout、unknown DS4 schema、
+  coordinator startup timeout を tracker へ一貫して接続する。unknown schema を
+  Paired 維持とする `docs/spec.md` 31節との方針差も同時に解消する。
+- Backoff 中に peer loss が起きた場合の優先順位を定義する。
+
+### P2: route / discovery の実測を pairing gate へ接続する
+
+production handler が `route_scoped=true` を固定で渡す状態を解消し、network snapshot または
+検証済み discovery candidate の世代と紐付ける。Bonjour の存在だけを trust せず、固定 source、
+HMAC、bridge0 scoped route、lease、stability の全条件を満たした場合だけ peer present とする。
+
+### P3: Pair timing の明示的完了通知
+
+P0〜P2 後も timing 起因の遅延が再現する場合、sleep ベースではなく lease establishment の
+watch/notify または Pair confirm 完了を await する。単なる sleep 延長は採用しない。
+
+## 5. 実装順序
+
+1. P0-0 の失敗テストを作り、generation mismatch と child lifecycle を別々に再現する。
+2. P0-A で peer loss 後の child/state/target 整合を直す。
+3. P0-B で片側再起動後の control session negotiation を直す。
+4. P0-C の全シナリオと既存の10回反復テストを通す。
+5. P1 の backoff/manual 配線を直し、promotion failure 後の自動復帰を検証する。
+6. P2/P3 を network correctness と安定化として実施する。
+7. Thunderbolt 直結2 nodeで spec 32.5 の実 cable 着脱と片側再起動を確認する。
+
+## 6. トレードオフ
 
 | 案 | 利点 | コスト / リスク |
 |---|---|---|
-| P0-1 再pair 時に世代再同期 | 最小変更で症状を解消できる可能性が高い。既存 handshake を拡張 | control プロトコルの変更。冪等性（processed map）との整合を慎重に設計する必要 |
-| P0-2 control 世代を自ノード単調世代へ | 世代の意味が明確になり、再発しにくい | 変更範囲が広い。peer 断時の世代リセット方針の設計が必要 |
-| P0-3 世代不一致を再同期で解決 | 恒久的拒否を構造的に排除 | 世代の「真実の源」を決める必要があり設計判断が要る |
-| P1 テスト追加 | 回帰防止の土台。コスト低 | テストの設計（fake peer / fake DS4）に時間がかかる |
-| P3 race 解消 | 安定性向上 | 小さめの変更 |
+| PeerLost lifecycle の専用化 | state と実 child の不整合を解消し、再promotionの前提を回復 | cleanup失敗、route-loss demotionとの競合を設計する必要 |
+| coordinator-authoritative session negotiation | 片側再起動と世代差を方向非依存で解決 | control protocol変更。lease/phase/idempotencyの原子的更新が必要 |
+| `/v1/node` generation の利用 | 既存応答を使え、追加 discovery が不要 | responseを読むだけではsession確定にならない |
+| worker 起点 Pair | worker高世代を伝えやすい | authority二重化、同時Pair race、role設計変更 |
+| cluster/control generation 統合 | 表面的にはカウンタが減る | nodeごとの遷移回数が異なるため、独立したcontrol session用途には不適切 |
+| generation reset | 実装は単純 | stale command/ackの再受理リスクがあり採用不可 |
 
-## 6. 推奨アプローチ
+## 7. 文書・仕様との関係
 
-1. まず **P1 の再pair 統合テスト**を追加し、現状が「coordinator 再起動 / 世代差」で
-   落ちることを確認する（再現性の確保）。
-2. その上で **P0-1（Pair 再同期）または P0-3（世代差の再同期誘導）** で最小変更の修正を行う。
-3. 修正後、P1 の全パターンと、既存の promote/demote 10 往復テストが通ることを確認する。
-4. P2/P3/P4 は安定化・明確化として後続対応に回す。
-
-## 7. 検証計画
-
-- ユニット: `ControlProcessor` の世代再同期ロジック（世代差・冪等性）。
-- 統合: 上記 4 パターンの再pair 自動経路。
-- 実機: Thunderbolt 直結 2 node で、片側再起動・ケーブル着脱を想定した再pair を確認。
-  spec 32.5 の「2 回連続の実 cable 着脱」と「10 回 promotion/demotion」も合わせて回す。
-
-## 8. 現状の文書・コードとの関係
-
-- 本提案は `docs/connection-state-machine.md`（現状把握）と対をなす。
-- 実装を変更する場合は `docs/spec.md` の該当節（13, 18, 32.5）と整合を取り、
-  CONTRIBUTING.md の Git 運用方針（branch、review、release gate）に従う。
+- 現行実装の詳細と既知差分は [`connection-state-machine.md`](connection-state-machine.md) を参照する。
+- target behavior は `docs/spec.md` 13、16、18、31、32.5節を正とする。
+- 実装時は PeerLost recovery、control session generation、Backoff wiring を別の責務として扱う。
+- 実装変更後は、両文書の「現行実装」部分を新しい配線に合わせて更新する。
