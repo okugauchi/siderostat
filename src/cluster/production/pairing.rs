@@ -16,9 +16,23 @@ impl super::ProductionClusterRuntime {
             self.inner.role == LocalRole::Coordinator,
             "pairing must be initiated by the coordinator"
         );
+        // Offer/confirm negotiation (design §4): the coordinator, as session authority, first
+        // learns the worker's control session generation from /v1/node, computes a candidate
+        // that is no lower than either side, and advances its own generation before offering so
+        // a higher worker generation converges direction-independently.
+        let peer = self.inner.client.node().await?;
+        let candidate = match &self.inner.control {
+            RoleControl::Coordinator(control) => {
+                let mut control = control.lock().await;
+                control.propose_candidate(peer.generation)?
+            }
+            RoleControl::Worker(_) => {
+                unreachable!("pairing must be initiated by the coordinator")
+            }
+        };
         let message = ControlMessage {
             request_id: uuid::Uuid::new_v4().to_string(),
-            generation: self.control_generation().await,
+            generation: candidate,
             deployment_id: self.inner.descriptor.deployment_id.clone(),
             command: ControlCommand::Pair {
                 descriptor: self.local_descriptor().await,
@@ -252,20 +266,31 @@ impl super::ProductionClusterRuntime {
         }
     }
 
+    /// The current control session generation (P0-B). Persisted separately from the cluster
+    /// generation so a negotiated session survives restart (design §7).
+    pub async fn control_session_generation(&self) -> u64 {
+        self.control_generation().await
+    }
+
     pub(super) async fn control_generation(&self) -> u64 {
         match &self.inner.control {
-            RoleControl::Coordinator(control) => control
-                .lock()
-                .await
-                .peer_lease()
-                .descriptor()
-                .map_or(self.inner.descriptor.generation, |d| d.generation),
-            RoleControl::Worker(control) => control
-                .lock()
-                .await
-                .peer_lease()
-                .descriptor()
-                .map_or(self.inner.descriptor.generation, |d| d.generation),
+            // Prefer the processor's live control session generation; the peer lease descriptor
+            // fallback preserves the paired session's generation even before it is reflected in
+            // the local descriptor.
+            RoleControl::Coordinator(control) => {
+                let control = control.lock().await;
+                control
+                    .peer_lease()
+                    .descriptor()
+                    .map_or(control.generation(), |d| d.generation)
+            }
+            RoleControl::Worker(control) => {
+                let control = control.lock().await;
+                control
+                    .peer_lease()
+                    .descriptor()
+                    .map_or(control.generation(), |d| d.generation)
+            }
         }
     }
 

@@ -420,6 +420,18 @@ impl ControlProcessor {
     pub(crate) fn local_descriptor(&self) -> &NodeDescriptor {
         &self.local
     }
+
+    /// Compute the session candidate generation for a Pair offer/confirm: the larger of the
+    /// local control session generation and the peer's reported generation. Never lower than
+    /// either side's known value (design §4). The result cannot exceed `u64::MAX`, but the
+    /// computation is explicit so `u64::MAX` is never treated as an overflow.
+    pub(crate) fn candidate_generation(&self, peer_generation: u64) -> Result<u64, ControlError> {
+        Ok(if peer_generation > self.local.generation {
+            peer_generation
+        } else {
+            self.local.generation
+        })
+    }
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -512,6 +524,50 @@ impl ControlRequest<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_generation_never_lowers_the_known_control_session_generation() {
+        // Table-driven (G-02, design §4): the candidate for a Pair offer/confirm is the larger
+        // of the local control session generation and the peer's reported generation, so a
+        // higher worker generation is adopted direction-independently and the candidate never
+        // overflows.
+        fn processor_at(generation: u64) -> ControlProcessor {
+            ControlProcessor::new(
+                NodeDescriptor {
+                    protocol_version: 1,
+                    node_id: "coordinator".into(),
+                    role: ControlRole::Coordinator,
+                    generation,
+                    mode: ControlMode::SoloStandalone,
+                    deployment_id: Some("deployment-a".into()),
+                },
+                ControlRole::Worker,
+                Duration::from_secs(15),
+                Duration::from_secs(5),
+            )
+        }
+        let cases: [(u64, u64, u64, &str); 5] = [
+            (7u64, 7u64, 7, "equal generations keep the local value"),
+            (7, 102, 102, "higher peer generation is adopted"),
+            (102, 7, 102, "higher local generation is kept"),
+            (
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                "u64::MAX is preserved without overflow",
+            ),
+            (0, u64::MAX, u64::MAX, "peer at u64::MAX is adopted"),
+        ];
+        for (local, peer, expected, label) in cases {
+            let processor = processor_at(local);
+            let candidate = processor.candidate_generation(peer).expect(label);
+            assert_eq!(candidate, expected, "{label}");
+            assert!(
+                candidate >= local && candidate >= peer,
+                "{label}: candidate must not be lower than either known generation"
+            );
+        }
+    }
 
     #[test]
     fn recognizes_only_the_control_protocol_method_and_path_pairs() {

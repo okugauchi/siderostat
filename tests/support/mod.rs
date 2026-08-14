@@ -729,6 +729,7 @@ impl Node {
             manifest(),
             vec![0x42; 32],
             peer_control_port,
+            None,
             worker_trait,
             coordinator_trait,
         )?);

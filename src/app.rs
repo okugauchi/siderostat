@@ -375,7 +375,17 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     let supervisor = build_standalone_supervisor(&config, &state)?;
     let role = boot.role;
     let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
-    let production = attach_control_plane(&config, boot, &state, &runtime, &supervisor)?;
+    let control_session_generation = persisted
+        .as_ref()
+        .map(|persisted| persisted.control_session_generation);
+    let production = attach_control_plane(
+        &config,
+        boot,
+        &state,
+        &runtime,
+        &supervisor,
+        control_session_generation,
+    )?;
     let notifier = build_notifier(
         config.notifications.enabled,
         config.notifications.sound,
@@ -565,6 +575,7 @@ fn attach_control_plane(
     state: &Arc<AppState>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
+    control_session_generation: Option<u64>,
 ) -> anyhow::Result<Option<ProductionClusterRuntime>> {
     // detect_cluster_role は対象 interface に IPv4 が無い場合などに
     // LocalRole::Unknown を返す。Unknown は standalone 運用として想定済み
@@ -581,6 +592,7 @@ fn attach_control_plane(
                 .context("distributed manifest is unavailable")?,
             boot.control_secret
                 .context("control secret is unavailable")?,
+            control_session_generation,
         )?)
     } else {
         None
@@ -893,9 +905,14 @@ async fn persist_runtime_state(
         spawned_at_millis: identity.spawned_at_millis,
         process_start_micros: identity.process_start_micros,
     });
+    let control_session_generation = match production {
+        Some(production) => production.control_session_generation().await,
+        None => snapshot.generation,
+    };
     store.save(&PersistentClusterState {
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
+        control_session_generation,
         desired_mode: persistent_mode(snapshot.stable_mode),
         last_stable_mode: persistent_mode(snapshot.stable_mode),
         cluster_state: snapshot.state.name().into(),

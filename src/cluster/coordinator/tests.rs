@@ -307,6 +307,30 @@ async fn promotion_runtime(
 }
 
 #[test]
+fn propose_candidate_adopts_a_higher_worker_generation_and_keeps_local_otherwise() {
+    // G-02 / design §4: the coordinator is the session authority and proposes a candidate that
+    // is no lower than either side. A higher worker generation is adopted; a lower one is
+    // ignored. The generation never goes backwards.
+    let mut control = coordinator();
+    assert_eq!(control.generation(), 7);
+
+    let candidate = control.propose_candidate(102).unwrap();
+    assert_eq!(candidate, 102);
+    assert_eq!(
+        control.generation(),
+        102,
+        "higher worker generation is adopted"
+    );
+
+    let candidate = control.propose_candidate(50).unwrap();
+    assert_eq!(
+        candidate, 102,
+        "lower peer generation never lowers the session"
+    );
+    assert_eq!(control.generation(), 102);
+}
+
+#[test]
 fn authenticated_scoped_pair_becomes_present_only_after_stability() {
     let mut control = coordinator();
     let response = control

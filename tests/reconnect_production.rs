@@ -271,12 +271,10 @@ async fn peer_lost_from_distributed_ready_orphans_distributed_children() {
 }
 
 #[tokio::test]
-#[ignore = "RED for P0-B; resolve in G-05 control session generation negotiation (see reconnect plan R0-06)"]
 async fn coordinator_adopts_higher_worker_generation_on_pair() {
-    // RED for P0-B: when only the worker carries a higher persistent control session
-    // generation, the coordinator must adopt that higher generation so the pair converges.
-    // Today the worker rejects the coordinator's lower-generation Pair with 409
-    // GenerationMismatch and periodic reconcile never converges, so this assertion fails.
+    // P0-B: when only the worker carries a higher persistent control session generation, the
+    // coordinator (session authority) adopts that higher generation via the /v1/node candidate
+    // and the pair converges direction-independently.
     let worker_baseline = 100;
     let coordinator_baseline = 0;
     let harness = TwoNode::boot_with_baseline(coordinator_baseline, worker_baseline)
@@ -324,6 +322,134 @@ async fn higher_coordinator_baseline_generation_is_followed_by_worker() {
         harness.worker.mode.snapshot().state,
     );
 
+    harness.shutdown().await;
+}
+
+// ---- G-05 control session generation negotiation -----------------------------
+
+/// After a worker-higher pair, both nodes converge on the worker's control session
+/// generation: the coordinator (session authority) adopts it via the /v1/node candidate, and
+/// a subsequent duplicate pair stays on the same generation without lowering it.
+#[tokio::test]
+async fn worker_higher_pair_converges_on_the_worker_control_session_generation() {
+    let harness = TwoNode::boot_with_baseline(0, 100)
+        .await
+        .expect("boot two-node harness");
+
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("coordinator Pair adopts the worker's higher control session generation");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        converged,
+        "nodes did not converge; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+
+    let worker_session = harness.worker.production.control_session_generation().await;
+    assert!(
+        worker_session >= 100,
+        "worker control session generation must not drop below its persistent value; got {worker_session}"
+    );
+    let coordinator_session = harness
+        .coordinator
+        .production
+        .control_session_generation()
+        .await;
+    assert_eq!(
+        coordinator_session, worker_session,
+        "coordinator must adopt the worker's higher control session generation"
+    );
+
+    // A duplicate pair after convergence must not lower either node's session generation.
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("duplicate pair stays on the same session generation");
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .control_session_generation()
+            .await,
+        coordinator_session,
+        "duplicate pair must not lower the coordinator session generation"
+    );
+    assert_eq!(
+        harness.worker.production.control_session_generation().await,
+        worker_session,
+        "duplicate pair must not lower the worker session generation"
+    );
+    harness.shutdown().await;
+}
+
+/// A coordinator-higher pair keeps the coordinator's higher control session generation, and a
+/// repeated pair stays on it (direction matrix, design §8).
+#[tokio::test]
+async fn coordinator_higher_pair_keeps_the_coordinator_control_session_generation() {
+    let harness = TwoNode::boot_with_baseline(100, 0)
+        .await
+        .expect("boot two-node harness");
+
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("coordinator Pair with the higher generation succeeds");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(
+        converged,
+        "nodes did not converge; coordinator={:?} worker={:?}",
+        harness.coordinator.mode.snapshot().state,
+        harness.worker.mode.snapshot().state,
+    );
+
+    let coordinator_session = harness
+        .coordinator
+        .production
+        .control_session_generation()
+        .await;
+    assert!(
+        coordinator_session >= 100,
+        "coordinator session generation must not drop below its persistent value"
+    );
+    let worker_session = harness.worker.production.control_session_generation().await;
+    assert_eq!(
+        worker_session, coordinator_session,
+        "worker follows the coordinator's higher control session generation"
+    );
+
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("duplicate pair stays on the coordinator-higher session generation");
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .control_session_generation()
+            .await,
+        coordinator_session,
+        "duplicate pair must not lower the coordinator session generation"
+    );
+    assert_eq!(
+        harness.worker.production.control_session_generation().await,
+        worker_session,
+        "duplicate pair must not lower the worker session generation"
+    );
     harness.shutdown().await;
 }
 

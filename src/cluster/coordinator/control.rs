@@ -115,6 +115,23 @@ impl CoordinatorControl {
         };
     }
 
+    /// Session-authority hook: compute the candidate generation from the peer's reported
+    /// generation and, if it is higher than the local control session generation, advance the
+    /// local generation before sending the Pair offer (design §4). This makes the negotiated
+    /// session generation direction-independent. Returns the candidate actually used.
+    pub fn propose_candidate(&mut self, peer_generation: u64) -> Result<u64, ControlError> {
+        let candidate = self.processor.candidate_generation(peer_generation)?;
+        if candidate > self.processor.generation() {
+            self.processor.advance_generation(candidate);
+            self.phase = if self.processor.lease().descriptor().is_some() {
+                DistributedControlPhase::Paired
+            } else {
+                DistributedControlPhase::Unpaired
+            };
+        }
+        Ok(candidate)
+    }
+
     pub fn note_prepare_sent(&mut self, generation: u64) -> Result<(), ControlError> {
         self.require_generation(generation)?;
         if self.phase != DistributedControlPhase::Paired {

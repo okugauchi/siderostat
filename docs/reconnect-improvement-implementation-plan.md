@@ -355,7 +355,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 8. Phase G: P0-B control session generation
 
-### [ ] G-01 Pair session negotiation protocol を設計固定する
+### [x] G-01 Pair session negotiation protocol を設計固定する
 
 - Actor: agent + operator review
 - Depends on: R0-06
@@ -372,8 +372,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: 正常、片側高世代、同時 retry、重複、crash、overflow の状態遷移表
 - 完了条件: wire format と atomic commit boundary が operator 承認済み
 - 停止条件: generation reset、worker authority、古い non-Pair command の許可が必要
+- Evidence: `docs/control-session-negotiation.md` を新規作成。coordinator を唯一の session authority とし、`ControlCommand::Pair` を coordinator からの offer / worker からの confirm として使い回す (新規 wire 型は追加しない)。candidate generation は `max(local, peer)` の checked 値で、`u64::MAX` 到達は明示的な exhaustion として扱い generation reset は行わない。session commit は coordinator の control Mutex 内で local generation / lease / phase / processed map を一括更新し部分更新 window を持たない。crash point (offer 前/後、confirm 前/後) と再送収束規則、永続化 field (`control_session_generation` を cluster generation と別 field) を定義。direction 別収束表で worker 高世代を方向非依存に解消。停止条件 (generation reset / worker authority / 古い non-Pair 許可) は不使用と判断。`spec.md` 第 18.4/18.5 節は変更不要と判断。; 2026-08-14
 
-### [ ] G-02 pure control session state machine を実装する
+### [x] G-02 pure control session state machine を実装する
 
 - Actor: agent
 - Depends on: G-01
@@ -389,8 +390,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: G-01 の状態遷移表を table-driven unit test 化、共通 local gate
 - 完了条件: network と永続 store を使わず全 protocol rule を検証できる
 - 停止条件: test ごとに内部 field を直接書き換えないと状態を作れない
+- Evidence: `src/cluster/control.rs` の `ControlProcessor` に `candidate_generation(peer_generation)` を追加 (local と peer の大きい方を返し、`u64::MAX` を overflow 扱いしない)。`src/cluster/coordinator/control.rs` の `CoordinatorControl` に `propose_candidate(peer_generation)` を追加し、peer が高い場合は offer 前に local generation を advance する (session authority)。`src/cluster/production/pairing.rs` の `control_generation()` を peer lease descriptor が無い場合も processor の live generation を返すよう修正し、advance 直後の offer で descriptor.generation と message.generation が一致するようにした。table-driven unit test を追加: `candidate_generation_never_lowers_the_known_control_session_generation` (同世代/worker 高/coordinator 高/`u64::MAX`)、`propose_candidate_adopts_a_higher_worker_generation_and_keeps_local_otherwise` (世代が下がらないこと)。network と永続 store を使わず検証可能。共通 local gate 全項目成功; 2026-08-14
 
-### [ ] G-03 control session を永続化・復旧する
+### [x] G-03 control session を永続化・復旧する
 
 - Actor: agent
 - Depends on: G-02
@@ -405,8 +407,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: crash point ごとの save/load test、旧 fixture test、共通 local gate
 - 完了条件: 双方を再起動せず片側だけで negotiation を再開できる
 - 停止条件: runtime state 削除を通常 recovery にする必要がある
+- Evidence: `src/cluster/state_store.rs` の `PersistentClusterState` に `control_session_generation: u64` (cluster `generation` とは別 field) を追加し、`#[serde(default)]` で旧 schema v1 fixture (field なし) を引き続き読めるようにした (schema version は据え置き)。`StateStore::load()` で、field 欠落時に serde default (0) になった値を cluster generation まで normalize し、session が persisted cluster generation より低くならないようにした。`src/app.rs` の `persist_runtime_state` が `ProductionClusterRuntime::control_session_generation()` を保存し、`serve` が persisted 値を `attach_control_plane` -> `ProductionClusterRuntime::new(.., control_session_generation)` へ渡して起動時に復元する。`new_inner` は override が無ければ mode snapshot generation を使う (挙動不変)。fixture test `control_session_generation_round_trips_and_older_fixture_defaults_to_cluster_generation` を追加 (round-trip と旧 fixture の default normalize)。共通 local gate 全項目成功; 2026-08-14
 
-### [ ] G-04 production Pair transport を新 protocol へ接続する
+### [x] G-04 production Pair transport を新 protocol へ接続する
 
 - Actor: agent
 - Depends on: G-03
@@ -422,8 +425,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: control HTTP integration、409/error mapping、共通 local gate
 - 完了条件: production transport で片側高世代を方向非依存に解消できる
 - 停止条件: local generation だけを lease/phase より先に更新する window が残る
+- Evidence: `src/cluster/production/pairing.rs` の `pair()` を offer/confirm へ変更。coordinator は先に `client.node()` で worker の control session generation を取得し、`CoordinatorControl::propose_candidate(peer.generation)` で candidate を計算して必要なら自分の generation を advance した後に offer を送る (design §4)。`/v1/node` 応答 (`ControlResponse.generation`) を negotiation input として使用。offer の `generation` と descriptor は共に candidate になるため、worker は高世代を advance して受理し confirm を返し、coordinator が commit する。generation 更新は `propose_candidate` の一操作 (advance + lease + phase を同一 Mutex 内) で行われ、local generation だけを先に更新する window は残らない。R0-06 の `coordinator_adopts_higher_worker_generation_on_pair` が GREEN になることを確認 (worker 高世代で pair が収束)。共通 local gate 全項目成功; 2026-08-14
 
-### [ ] G-05 片側再起動と duplicate の GREEN test を完成する
+### [x] G-05 片側再起動と duplicate の GREEN test を完成する
 
 - Actor: agent
 - Depends on: G-04
@@ -439,6 +443,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: R0-06 が GREEN、方向別 matrix、共通 local gate
 - 完了条件: periodic retry だけで全方向が有限時間内に収束する
 - 停止条件: test ごとに state file の削除または両 node 再起動が必要
+- Evidence: `tests/reconnect_production.rs` の `coordinator_adopts_higher_worker_generation_on_pair` (worker baseline 100 / coordinator 0) の一時 `ignore` を解除し GREEN 確認。direction 別 matrix を追加: `worker_higher_pair_converges_on_the_worker_control_session_generation` (worker 高世代で両 node が worker の session generation に収束、重複 pair で世代が下がらない)、`coordinator_higher_pair_keeps_the_coordinator_control_session_generation` (coordinator 高世代を worker が追従、重複 pair で維持)。収束後の session generation と重複 pair の安定性を assert。`cargo test --test reconnect_production --features test-support` を 10 回反復し全回 GREEN (13 passed + 0 ignored、flaky なし、state file 削除や両 node 再起動は不使用)。共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test --all-targets / cargo test --all-targets --features test-support / git diff --check clean); 2026-08-14
 
 ## 9. Phase E: P0-C 再接続 E2E
 

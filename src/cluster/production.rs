@@ -213,6 +213,7 @@ impl ProductionClusterRuntime {
         metrics: Arc<Metrics>,
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
+        control_session_generation: Option<u64>,
     ) -> anyhow::Result<Self> {
         let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
         {
@@ -260,6 +261,7 @@ impl ProductionClusterRuntime {
             manifest,
             control_secret,
             peer_control_port,
+            control_session_generation,
             worker_child,
             coordinator_child,
         )
@@ -277,6 +279,7 @@ impl ProductionClusterRuntime {
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
         peer_control_port: u16,
+        control_session_generation: Option<u64>,
         worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
         coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
     ) -> anyhow::Result<Self> {
@@ -297,11 +300,13 @@ impl ProductionClusterRuntime {
             LocalRole::Unknown => unreachable!(),
         };
         let local_control_id = config.cluster.node_id.clone();
+        let control_session_generation =
+            control_session_generation.unwrap_or_else(|| mode.snapshot().generation);
         let descriptor = NodeDescriptor {
             protocol_version: 1,
             node_id: local_control_id.clone(),
             role: control_role,
-            generation: mode.snapshot().generation,
+            generation: control_session_generation,
             mode: super::ControlMode::SoloStandalone,
             deployment_id: Some(deployment_id),
         };
@@ -388,6 +393,7 @@ impl ProductionClusterRuntime {
     /// Build a production-equivalent runtime for tests with injected fake child lifecycles.
     /// The control HTTP layer and state machine are identical to production; only the child
     /// process supervisors are replaced so tests can record start/stop and inject faults.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_lifecycles(
         config: ModeAwareConfig,
         role: LocalRole,
@@ -397,6 +403,7 @@ impl ProductionClusterRuntime {
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
         peer_control_port: u16,
+        control_session_generation: Option<u64>,
         worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
         coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
     ) -> anyhow::Result<Self> {
@@ -409,6 +416,7 @@ impl ProductionClusterRuntime {
             manifest,
             control_secret,
             peer_control_port,
+            control_session_generation,
             worker_child,
             coordinator_child,
         )
