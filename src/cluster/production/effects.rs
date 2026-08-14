@@ -51,19 +51,24 @@ impl super::ProductionClusterRuntime {
             .authenticate(method, path, &body, source, &headers)
             .await?;
         let now = now_millis();
+        // N-02: derive `route_scoped` from the latest verified network evidence instead of a
+        // hard-coded `true`. Fail-closed until a fresh observation is applied, so the control
+        // plane rejects establish/renew with `RouteNotScoped` when no valid bridge0-scoped
+        // peer candidate is measured.
+        let route_scoped = self.inner.network.route_scoped();
         if endpoint == ControlEndpoint::Node {
             return match &self.inner.control {
                 RoleControl::Coordinator(control) => {
                     Ok(control
                         .lock()
                         .await
-                        .node_descriptor(&authenticated, true, now)?)
+                        .node_descriptor(&authenticated, route_scoped, now)?)
                 }
                 RoleControl::Worker(control) => {
                     Ok(control
                         .lock()
                         .await
-                        .node_descriptor(&authenticated, true, now)?)
+                        .node_descriptor(&authenticated, route_scoped, now)?)
                 }
             };
         }
@@ -73,11 +78,13 @@ impl super::ProductionClusterRuntime {
         let cluster_generation = self.inner.mode.snapshot().generation;
         let response = match &self.inner.control {
             RoleControl::Coordinator(control) => {
-                match control
-                    .lock()
-                    .await
-                    .handle(endpoint, message, &authenticated, true, now)
-                {
+                match control.lock().await.handle(
+                    endpoint,
+                    message,
+                    &authenticated,
+                    route_scoped,
+                    now,
+                ) {
                     Ok(response) => response,
                     Err(ControlError::GenerationMismatch { expected, received }) => {
                         log_pair_generation_mismatch(expected, received, cluster_generation);
@@ -87,11 +94,13 @@ impl super::ProductionClusterRuntime {
                 }
             }
             RoleControl::Worker(control) => {
-                match control
-                    .lock()
-                    .await
-                    .handle(endpoint, message, &authenticated, true, now)
-                {
+                match control.lock().await.handle(
+                    endpoint,
+                    message,
+                    &authenticated,
+                    route_scoped,
+                    now,
+                ) {
                     Ok(response) => response,
                     Err(ControlError::GenerationMismatch { expected, received }) => {
                         log_pair_generation_mismatch(expected, received, cluster_generation);

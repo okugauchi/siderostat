@@ -7,7 +7,7 @@ mod support;
 
 use siderostat::{
     admission::AdmissionState,
-    cluster::{DistributedControlPhase, EventOwner},
+    cluster::{DistributedControlPhase, EventOwner, NetworkSnapshot, ThunderboltIpState},
     target::{ClusterState, LocalRole, ProxyTarget, StableMode},
 };
 use std::time::Duration;
@@ -2219,5 +2219,79 @@ async fn reconnect_then_peer_loss_during_backoff_recovers_to_solo_first() {
     assert_eq!(recovered.state, ClusterState::SoloStandaloneReady);
     assert_solo_serving(&harness.coordinator).await;
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn pairing_is_fail_closed_without_route_scoped_evidence() {
+    // N-02: the production control plane derives `route_scoped` from the shared network
+    // evidence, fail-closed until a valid bridge0-scoped peer candidate is observed. Replacing
+    // the harness-injected valid evidence with a fail-closed snapshot (ReadyNoPeer, newer
+    // epoch) must make pairing reject with RouteNotScoped on both nodes.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+
+    for role in [LocalRole::Coordinator, LocalRole::Worker] {
+        let node = harness.node(role);
+        let fail_closed = NetworkSnapshot {
+            epoch: 10,
+            state: ThunderboltIpState::ReadyNoPeer,
+            role: node.role,
+            local_address: None,
+            expected_peer_address: None,
+            peer_present: false,
+        };
+        assert!(
+            node.production.set_network_evidence(fail_closed),
+            "fail-closed snapshot must replace the injected evidence"
+        );
+    }
+
+    let error = harness
+        .pair()
+        .await
+        .expect_err("pairing must be rejected when route is not scoped");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("not scoped"),
+        "expected a RouteNotScoped error, got: {message}"
+    );
+
+    // No pairing happened; both nodes remain solo serving.
+    assert_solo_serving(harness.node(LocalRole::Coordinator)).await;
+    assert_solo_serving(harness.node(LocalRole::Worker)).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_network_evidence_is_rejected_and_pairing_keeps_latest() {
+    // N-02 action 3: an observation with an older epoch must not overwrite the current verified
+    // evidence, so pairing continues to derive `route_scoped` from the latest snapshot.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+
+    let coordinator = harness.node(LocalRole::Coordinator);
+    let stale = NetworkSnapshot {
+        epoch: 0, // harness injected the valid evidence at epoch 1
+        state: ThunderboltIpState::ReadyNoPeer,
+        role: coordinator.role,
+        local_address: None,
+        expected_peer_address: None,
+        peer_present: false,
+    };
+    assert!(
+        !coordinator.production.set_network_evidence(stale),
+        "stale evidence must be rejected"
+    );
+
+    // The valid evidence remains in place, so pairing still converges.
+    harness.pair().await.expect("coordinator-initiated pair");
+    let converged = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(converged, "nodes did not converge to PairedStandaloneReady");
+    assert_paired_consistent(
+        harness.node(LocalRole::Coordinator),
+        harness.node(LocalRole::Worker),
+    )
+    .await;
     harness.shutdown().await;
 }

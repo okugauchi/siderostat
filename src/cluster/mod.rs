@@ -9,6 +9,7 @@ mod ds4_hello;
 mod ds4_log;
 mod manifest;
 mod network_events;
+mod network_evidence;
 mod network_snapshot;
 mod platform;
 mod process;
@@ -65,6 +66,7 @@ pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,
     SpawnNetworkMonitorError, spawn_network_event_monitor,
 };
+pub use network_evidence::NetworkEvidence;
 pub use network_snapshot::{
     InterfaceObservation, Ipv4Assignment, NetworkObservation, NetworkServiceObservation,
     NetworkSnapshot, PeerObservation, ThunderboltIpState,

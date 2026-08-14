@@ -4,8 +4,11 @@ use super::{
     CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedControlPhase,
     DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor, DistributedManifest,
     DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE,
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
-    PromotionRetryPolicy, StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
+    LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
+    NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
+    PeerObservation, PromotionRetryPolicy, StandaloneSupervisor, WorkerControl,
+    WorkerDistributedRuntime, spawn_network_event_monitor,
 };
 use crate::{
     cluster::{
@@ -219,6 +222,10 @@ struct ProductionInner {
     config: ModeAwareConfig,
     manifest: DistributedManifest,
     recovery: Arc<recovery::PeerLossRecovery>,
+    /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
+    /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
+    /// actual production input. Fail-closed until a fresh observation is applied.
+    network: Arc<NetworkEvidence>,
 }
 
 impl ProductionClusterRuntime {
@@ -271,7 +278,7 @@ impl ProductionClusterRuntime {
                 None
             };
         let peer_control_port = config.cluster.control_port;
-        Self::new_inner(
+        let runtime = Self::new_inner(
             config,
             role,
             mode,
@@ -283,7 +290,12 @@ impl ProductionClusterRuntime {
             control_session_generation,
             worker_child,
             coordinator_child,
-        )
+        )?;
+        // N-02: share verified network observations into the control plane so `route_scoped` is
+        // measured, not hard-coded. The monitor runs only for production (`new`); tests inject
+        // evidence directly via `new_with_lifecycles`.
+        runtime.start_network_evidence_monitor();
+        Ok(runtime)
     }
 
     /// Shared constructor. Production uses [`Self::new`]; tests inject fake child lifecycles via
@@ -399,6 +411,7 @@ impl ProductionClusterRuntime {
             config,
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
+            network: Arc::new(NetworkEvidence::new()),
         };
         let runtime = Self {
             inner: Arc::new(inner),
@@ -508,6 +521,16 @@ impl ProductionClusterRuntime {
     pub async fn promotion_failure_status(&self) -> Option<PromotionFailureStatus> {
         let runtime = self.inner.coordinator_runtime.get()?;
         Some(runtime.promotion_failure_status().await)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Inject a verified network snapshot into the shared network evidence (test-support only).
+    /// Used by the reconnect harness to give each node a valid, bridge0-scoped, authenticated
+    /// peer candidate so the production control plane derives `route_scoped` from production
+    /// input rather than a hard-coded constant (N-02). Returns `false` when the injected
+    /// snapshot is stale relative to the latest applied epoch.
+    pub fn set_network_evidence(&self, snapshot: NetworkSnapshot) -> bool {
+        self.inner.network.update(snapshot)
     }
 
     /// Operator reconcile (B-03). On the coordinator the promotion tracker reset and the
@@ -931,6 +954,204 @@ pub fn detect_cluster_role(
     _worker: IpAddr,
 ) -> anyhow::Result<LocalRole> {
     anyhow::bail!("production cluster role detection requires macOS")
+}
+
+/// IPv4 addresses and link state observed on an interface via `getifaddrs`.
+#[cfg(target_os = "macos")]
+struct ObservedInterfaceIpv4 {
+    addresses: Vec<Ipv4Assignment>,
+    up: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn collect_interface_ipv4(interface: &str) -> anyhow::Result<ObservedInterfaceIpv4> {
+    use std::ffi::CStr;
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes a linked list owned until freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut raw) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut up = false;
+    let mut addresses = Vec::new();
+    let mut current = raw;
+    while !current.is_null() {
+        // SAFETY: current belongs to the live getifaddrs list.
+        let entry = unsafe { &*current };
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+        if name == interface {
+            if entry.ifa_flags & libc::IFF_UP as u32 != 0 {
+                up = true;
+            }
+            if !entry.ifa_addr.is_null()
+                && unsafe { (*entry.ifa_addr).sa_family } as i32 == libc::AF_INET
+            {
+                let socket = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
+                let address = Ipv4Addr::from(u32::from_be(socket.sin_addr.s_addr));
+                let prefix = if entry.ifa_netmask.is_null() {
+                    0
+                } else {
+                    let mask = unsafe { &*(entry.ifa_netmask.cast::<libc::sockaddr_in>()) };
+                    u32::from_be(mask.sin_addr.s_addr).count_ones() as u8
+                };
+                addresses.push(Ipv4Assignment { address, prefix });
+            }
+        }
+        current = entry.ifa_next;
+    }
+    // SAFETY: raw is the head returned by getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(raw) };
+    addresses.sort_by_key(|a| a.address);
+    addresses.dedup_by_key(|a| a.address);
+    Ok(ObservedInterfaceIpv4 { addresses, up })
+}
+
+/// Build a [`NetworkObservation`] from the live interface state (N-02). Uses only `getifaddrs`
+/// (spec §13.1), never shell output parsing or network configuration changes (N-02 停止条件).
+/// The peer candidate is the configured counterpart; its route is treated as `bridge0`-scoped
+/// when the peer shares a subnet with a local `bridge0` address (fixed topology, spec §13.1
+/// item 6). Fail-closed: if the interface is missing, down, or has no IPv4 address, the service
+/// observation is `None`, which maps to `ServiceMissing`/`InterfaceUnavailable` and never to a
+/// peer-present state.
+#[cfg(target_os = "macos")]
+pub fn observe_network_observation(
+    interface: &str,
+    coordinator: IpAddr,
+    worker: IpAddr,
+    peer_address: IpAddr,
+) -> anyhow::Result<NetworkObservation> {
+    let IpAddr::V4(coordinator) = coordinator else {
+        anyhow::bail!("cluster coordinator address must be IPv4");
+    };
+    let IpAddr::V4(worker) = worker else {
+        anyhow::bail!("cluster worker address must be IPv4");
+    };
+    let IpAddr::V4(peer) = peer_address else {
+        anyhow::bail!("cluster peer address must be IPv4");
+    };
+    let observed = collect_interface_ipv4(interface)?;
+    let service = if !observed.up || observed.addresses.is_empty() {
+        None
+    } else {
+        Some(NetworkServiceObservation {
+            enabled: true,
+            ipv4_enabled: true,
+            configured_addresses: observed.addresses.clone(),
+        })
+    };
+    let interface_observation = InterfaceObservation {
+        name: interface.to_string(),
+        up: observed.up,
+        ipv4_addresses: observed.addresses.clone(),
+    };
+    let route_scoped = observed.addresses.iter().any(|assignment| {
+        let mask = if assignment.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - assignment.prefix)
+        };
+        u32::from(assignment.address) & mask == u32::from(peer) & mask
+    });
+    let peer_observation = PeerObservation {
+        candidate_address: Some(peer),
+        route_scoped_to_interface: route_scoped,
+        authenticated: false,
+    };
+    Ok(NetworkObservation {
+        // The caller (monitor) fills the monotonic epoch per rescan.
+        epoch: 0,
+        expected_interface: interface.to_string(),
+        coordinator_address: coordinator,
+        worker_address: worker,
+        // The initial topology fixes the peer pair on a /30 (spec §13.1). The interface
+        // observation carries the actual netmask-derived prefix for role assessment.
+        expected_prefix: 30,
+        service,
+        interface: Some(interface_observation),
+        peer: peer_observation,
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl ProductionClusterRuntime {
+    /// Start the production network-evidence monitor (N-02 action 1 & 4). Reuses
+    /// `spawn_network_event_monitor` + `MacOsDynamicStoreWatcher` so a fresh observation is
+    /// produced on the initial rescan, after debounced link/ipv4/setup events, and on the
+    /// periodic reconcile interval (recovering lost events). Each rescan assigns a strictly
+    /// increasing epoch; the shared [`NetworkEvidence`] rejects stale observations. The task is
+    /// detached and owns the dynamic-store watcher, living for the process lifetime.
+    fn start_network_evidence_monitor(&self) {
+        let config = &self.inner.config;
+        let evidence = self.inner.network.clone();
+        let interface = config.cluster.interface.clone();
+        let coordinator = config.cluster.coordinator_address;
+        let worker = config.cluster.worker_address;
+        let peer = match self.inner.role {
+            LocalRole::Coordinator => worker,
+            LocalRole::Worker => coordinator,
+            LocalRole::Unknown => return,
+        };
+        let (rescans, mut rescan_receiver) = tokio::sync::mpsc::channel(16);
+        let (handle, monitor_task) = match spawn_network_event_monitor(
+            0,
+            config.cluster.discovery.event_debounce,
+            config.cluster.discovery.reconcile_interval,
+            64,
+            rescans,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(error = %error, "network evidence monitor unavailable");
+                return;
+            }
+        };
+        let watcher = match MacOsDynamicStoreWatcher::start(&interface, handle) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "dynamic store watcher unavailable; network evidence stays fail-closed until reconcile"
+                );
+                None
+            }
+        };
+        // monitor_task (debounce + reconcile) runs independently once started.
+        std::mem::drop(monitor_task);
+        tokio::spawn(async move {
+            // Keep the dynamic-store watcher alive for the lifetime of the monitor task.
+            let _watcher = watcher;
+            let mut epoch: u64 = 0;
+            while let Some(request) = rescan_receiver.recv().await {
+                epoch = epoch.saturating_add(1);
+                match observe_network_observation(&interface, coordinator, worker, peer) {
+                    Ok(mut observation) => {
+                        observation.epoch = epoch;
+                        let snapshot = NetworkSnapshot::from_observation(&observation);
+                        if evidence.update(snapshot) {
+                            tracing::debug!(
+                                reason = ?request.reason,
+                                epoch,
+                                state = ?snapshot.state,
+                                "network evidence updated"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "network observation failed; evidence stays fail-closed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ProductionClusterRuntime {
+    /// Non-macOS has no network evidence provider; the shared evidence stays fail-closed, which
+    /// is safe (no peer is ever considered route-scoped).
+    fn start_network_evidence_monitor(&self) {}
 }
 
 #[cfg(test)]

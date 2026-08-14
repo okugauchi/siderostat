@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsString,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::Path,
     process::Stdio,
     time::{Duration, Instant},
@@ -120,8 +120,8 @@ use futures::future::BoxFuture;
 use siderostat::{
     cluster::{
         ChildIdentity, DistributedCoordinatorLifecycle, DistributedManifest,
-        DistributedWorkerLifecycle, LocalStandaloneLifecycle, ModeRuntime,
-        ProductionClusterRuntime,
+        DistributedWorkerLifecycle, LocalStandaloneLifecycle, ModeRuntime, NetworkSnapshot,
+        ProductionClusterRuntime, ThunderboltIpState,
     },
     config::ModeAwareConfig,
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
@@ -642,6 +642,22 @@ sound = false
     config
 }
 
+/// Build the network-evidence snapshot that models this node as having a valid,
+/// bridge0-scoped, HMAC-authenticated peer candidate (N-02). The reconnect harness isolates
+/// both nodes on the same loopback (127.0.0.1) with distinct control ports, so local and peer
+/// addresses are both the loopback address; what matters for the production gate is that the
+/// snapshot reports `AuthenticatedPeer` (peer_present) with a positive epoch.
+fn valid_peer_evidence(role: LocalRole) -> NetworkSnapshot {
+    NetworkSnapshot {
+        epoch: 1,
+        state: ThunderboltIpState::AuthenticatedPeer,
+        role,
+        local_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        expected_peer_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        peer_present: true,
+    }
+}
+
 /// One production-equivalent node: separate runtime, separate loopback listener, separate
 /// persistent state path, and fake child lifecycles.
 pub struct Node {
@@ -741,6 +757,10 @@ impl Node {
             worker_trait,
             coordinator_trait,
         )?);
+        // N-02: give this node a valid, bridge0-scoped, authenticated peer candidate so the
+        // production control plane derives `route_scoped` from shared evidence. Without it the
+        // gate is fail-closed and pairing would be rejected with `RouteNotScoped`.
+        production.set_network_evidence(valid_peer_evidence(role));
         // Keep a non-blocking std clone of the listener owned by the node so cable-blip and
         // process-restart can re-spawn serve on the same control port. The tokio listener is
         // already non-blocking, so `into_std`/`try_clone`/`from_std` stay non-blocking and
@@ -843,6 +863,8 @@ impl Node {
             worker_trait,
             coordinator_trait,
         )?);
+        // Re-establish the valid network evidence for the fresh runtime (N-02).
+        production.set_network_evidence(valid_peer_evidence(self.role));
         let serve_listener = tokio::net::TcpListener::from_std(self.listener.try_clone()?)?;
         let app = production
             .router()
