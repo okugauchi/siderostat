@@ -536,7 +536,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 11. Phase N: P2 route / discovery pairing gate
 
-### [ ] N-01 pairing gate の network evidence contract を固定する
+### [-] N-01 pairing gate の network evidence contract を固定する
 
 - Actor: agent + operator review
 - Depends on: B-04
@@ -551,6 +551,35 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: attach/detach、wrong interface/subnet、stale candidate、Bonjour failure の真理値表
 - 完了条件: production handler が `route_scoped=true` を固定値で渡す必要がなくなる設計が承認済み
 - 停止条件: ICMP や Bonjour presence だけを trust する必要がある
+
+- Evidence: branch=feature/reconnect-recovery; `docs/pairing-network-gate.md` を新規作成。
+  現行 `src/cluster/production/effects.rs` の `ProductionClusterRuntime::handle()` が
+  `RoleControl::Coordinator` / `RoleControl::Worker` へ `.node_descriptor(&authenticated, true, now)` /
+  `.handle(endpoint, message, &authenticated, true, now)` で **固定値 `route_scoped=true`** を
+  渡している 4 箇所 (60, 66, 79, 93 行目) を明記し、production 経路で `bridge0` scoped route の
+  実測が control lease / pairing 判定へ効いていない問題を固定した。peer present の必須条件
+  (spec §9.3/§13.1/§13.3) を表にし、`bridge0` local address、期待 peer address と subnet、
+  bridge0 scoped route、HMAC 認証済み node descriptor、control lease、`required_peer_stability`
+  の 6 条件を列挙。discovery candidate の必須条件は `DiscoveryTracker::accept_bonjour` の
+  検査順序 (`OldGeneration` / `SelfResult` / `WrongInterface` / `WrongProtocol` / `InvalidPort` /
+  `WrongSubnet` / `UnexpectedAddress` / `RouteNotScoped`) に固定し、static fallback は
+  `BonjourFailure::allows_static_fallback()` かつ route scoped / port 非 0 のみ許可した。
+  snapshot / candidate に観測 epoch を付与して古い観測を拒否する設計を定義
+  (`network_events.rs` の generation フィルタ、`BonjourLifecycle::accepts`、
+  `DiscoveryTracker::OldGeneration` を参照)。Bonjour 単独では peer present にしない
+  (`NetworkSnapshot::from_observation` は `AuthenticatedPeer` のときだけ true、
+  `PeerCandidateFound` / `ReadyNoPeer` は false、`wrong_route_or_candidate_never_becomes_peer_present`
+  test で route 非 scoped の candidate が `authenticated=true` でも peer present にならないことを
+  固定)。network event と periodic snapshot の競合は `spawn_network_event_monitor` を正とし、
+  Initial / debounce (500ms) / reconcile (30s) の優先順位と失効条件を定義。macOS API 失敗は
+  fail closed (新 lease 不確立・promotion 不開始・`ServiceMissing` 等で peer present にしない) とし、
+  既存 lease は失効 (15s) まで current mode を維持、address/route 消失または lease 失効で
+  future admission を閉じ single recovery owner で Solo へ収束する時系列を定義。attach/detach、
+  wrong interface/subnet、stale candidate、Bonjour failure、macOS API 失敗の真理値表を作成。
+  完了条件として N-02 で 4 箇所の固定 `true` を最新 epoch の `NetworkSnapshot` 由来の実測
+  `route_scoped` へ置換する設計を示した。**Actor: agent + operator review** のため、本 Evidence は
+  operator review 待ち (`[x]` 未確定)。共通 local gate は文書のみ変更のため
+  `git diff --check` clean で確認; 2026-08-15
 
 ### [ ] N-02 network evidence を production control へ接続する
 
