@@ -369,6 +369,22 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     validate_dspark_binding(&config).await?;
     let boot = BootInputs::load(&config).await?;
+    match crate::startup_cleanup::cleanup_startup_processes(
+        std::process::id(),
+        &config.ds4.binary,
+        &platform_process_controller(),
+        config.cluster.timeouts.stop,
+    )
+    .await?
+    {
+        crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
+        | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
+        crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
+            anyhow::bail!(
+                "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
+            );
+        }
+    }
     let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
     let persisted = load_persisted_state(&state_store)?;
     let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);

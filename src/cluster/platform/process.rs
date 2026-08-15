@@ -36,18 +36,62 @@ pub struct MacOsProcessSignaler;
 
 impl ProcessSignaler for MacOsProcessSignaler {
     fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
-        let pid = c_int::try_from(pid)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds c_int"))?;
-        let signal = match signal {
-            ProcessSignal::Terminate => libc::SIGTERM,
-            ProcessSignal::Kill => libc::SIGKILL,
-        };
-        // SAFETY: a negative owned child PID addresses only that child's process group.
-        if unsafe { libc::kill(-pid, signal) } == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        signal_pid(pid, signal, true)
+    }
+
+    fn signal_process(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
+        signal_pid(pid, signal, false)
+    }
+}
+
+fn signal_pid(pid: u32, signal: ProcessSignal, process_group: bool) -> io::Result<()> {
+    let pid = c_int::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds c_int"))?;
+    let signal = match signal {
+        ProcessSignal::Terminate => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    let target = if process_group { -pid } else { pid };
+    // SAFETY: the caller has verified the process identity immediately before signaling.
+    if unsafe { libc::kill(target, signal) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Enumerate process identities visible to the current macOS user.
+pub(crate) fn list_processes() -> io::Result<Vec<ObservedProcess>> {
+    let mut pids = vec![0_i32; 1024];
+    loop {
+        let capacity = i32::try_from(pids.len().saturating_mul(size_of::<i32>()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process list too large"))?;
+        // SAFETY: the buffer is writable for `capacity` bytes and contains i32 PID slots.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), capacity) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
         }
+        let count = count as usize;
+        if count >= pids.len() {
+            pids.resize(pids.len().saturating_mul(2).max(count + 1), 0);
+            continue;
+        }
+        pids.truncate(count);
+        let inspector = MacOsProcessInspector;
+        let mut processes = Vec::with_capacity(pids.len());
+        for pid in pids.into_iter().filter(|pid| *pid > 0) {
+            match inspector.observe(pid as u32) {
+                Ok(Some(process)) => processes.push(process),
+                Ok(None) => {}
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(code) if matches!(code, libc::ESRCH | libc::EPERM | libc::EACCES)
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(processes);
     }
 }
 

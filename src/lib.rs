@@ -7,4 +7,5 @@ mod error;
 pub mod metrics;
 pub mod notify;
 pub mod proxy;
+mod startup_cleanup;
 pub mod target;

@@ -37,6 +37,78 @@ pub struct ObservedProcess {
     pub start_time_micros: u64,
 }
 
+/// Process identity used for an operator-approved startup cleanup.
+///
+/// This deliberately omits the logical child metadata (profile/generation). A process that was
+/// started by an older siderostat, or by another launcher, cannot have that metadata, but it can
+/// still be safely targeted when the operator has explicitly approved the cleanup and the OS-level
+/// identity is re-verified immediately before every signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub executable: PathBuf,
+    pub argv_sha256: [u8; 32],
+    pub process_start_micros: u64,
+}
+
+impl ProcessIdentity {
+    pub fn from_observed(observed: &ObservedProcess) -> Self {
+        Self {
+            pid: observed.pid,
+            executable: observed.executable.clone(),
+            argv_sha256: argv_sha256(observed.executable.as_os_str(), &observed.argv),
+            process_start_micros: observed.start_time_micros,
+        }
+    }
+
+    fn matches(&self, observed: &ObservedProcess) -> bool {
+        self.pid == observed.pid
+            && self.executable == observed.executable
+            && self.argv_sha256 == argv_sha256(observed.executable.as_os_str(), &observed.argv)
+            && self.process_start_micros == observed.start_time_micros
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupProcessKind {
+    Siderostat,
+    Ds4,
+}
+
+impl StartupProcessKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Siderostat => "siderostat",
+            Self::Ds4 => "ds4-server",
+        }
+    }
+}
+
+/// A locally running process that can conflict with this siderostat instance at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupProcessCandidate {
+    pub kind: StartupProcessKind,
+    pub observed: ObservedProcess,
+}
+
+impl StartupProcessCandidate {
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity::from_observed(&self.observed)
+    }
+
+    pub fn command_line(&self) -> String {
+        let mut values = Vec::with_capacity(self.observed.argv.len() + 1);
+        values.push(self.observed.executable.display().to_string());
+        values.extend(
+            self.observed
+                .argv
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned()),
+        );
+        values.join(" ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildIdentity {
     pub pid: u32,
@@ -50,10 +122,13 @@ pub struct ChildIdentity {
 
 impl ChildIdentity {
     fn matches(&self, observed: &ObservedProcess) -> bool {
-        self.pid == observed.pid
-            && self.executable == observed.executable
-            && self.argv_sha256 == argv_sha256(observed.executable.as_os_str(), &observed.argv)
-            && self.process_start_micros == observed.start_time_micros
+        ProcessIdentity {
+            pid: self.pid,
+            executable: self.executable.clone(),
+            argv_sha256: self.argv_sha256,
+            process_start_micros: self.process_start_micros,
+        }
+        .matches(observed)
     }
 }
 
@@ -79,6 +154,12 @@ pub trait ProcessInspector: Send + Sync + 'static {
 
 pub trait ProcessSignaler: Send + Sync + 'static {
     fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()>;
+
+    /// Signal only the process itself. This is used for operator-approved adoption/cleanup of
+    /// processes that were not spawned into siderostat's process group.
+    fn signal_process(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
+        self.signal_process_group(pid, signal)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +234,23 @@ impl ProcessController {
         Ok(())
     }
 
+    pub fn signal_approved_process(
+        &self,
+        identity: &ProcessIdentity,
+        signal: ProcessSignal,
+    ) -> Result<(), ProcessControlError> {
+        let observed = self
+            .inspector
+            .observe(identity.pid)?
+            .ok_or(ProcessControlError::NotRunning)?;
+        if !identity.matches(&observed) {
+            return Err(ProcessControlError::IdentityMismatch);
+        }
+        self.signaler
+            .signal_process(identity.pid, signal)
+            .map_err(ProcessControlError::Io)
+    }
+
     pub async fn stop_recovered_owned(
         &self,
         identity: &ChildIdentity,
@@ -197,6 +295,68 @@ impl ProcessController {
             }
         }
     }
+
+    /// Stop a process only after an operator has approved it for cleanup.
+    ///
+    /// Unlike normal supervision this method intentionally permits SIGKILL after the grace
+    /// period. The permission comes from the explicit startup confirmation, while every signal is
+    /// still preceded by a complete identity check.
+    pub async fn force_stop_approved(
+        &self,
+        identity: &ProcessIdentity,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<(), ProcessControlError> {
+        if timeout.is_zero() || poll_interval.is_zero() {
+            return Err(ProcessControlError::InvalidReadinessTiming);
+        }
+        match self.signal_approved_process(identity, ProcessSignal::Terminate) {
+            Ok(()) => {}
+            Err(ProcessControlError::NotRunning) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify_process(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < deadline => continue,
+                Ok(_) => break,
+            }
+        }
+        self.signal_approved_process(identity, ProcessSignal::Kill)?;
+        let kill_deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(kill_deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify_process(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < kill_deadline => {}
+                Ok(_) => return Err(ProcessControlError::StopTimeout),
+            }
+        }
+    }
+
+    fn verify_process(
+        &self,
+        identity: &ProcessIdentity,
+    ) -> Result<ProcessIdentity, ProcessControlError> {
+        let observed = self
+            .inspector
+            .observe(identity.pid)?
+            .ok_or(ProcessControlError::NotRunning)?;
+        if !identity.matches(&observed) {
+            return Err(ProcessControlError::IdentityMismatch);
+        }
+        Ok(identity.clone())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -206,6 +366,42 @@ pub fn platform_process_controller() -> ProcessController {
         Arc::new(MacOsProcessInspector),
         Arc::new(MacOsProcessSignaler),
     )
+}
+
+/// Discover likely stale siderostat/DS4 processes before the new supervisor acquires its state
+/// lock or binds its listeners. The non-macOS implementation is intentionally empty because the
+/// supported production process-identity API is macOS-specific.
+pub fn discover_startup_processes(
+    current_pid: u32,
+    configured_ds4_binary: &std::path::Path,
+) -> io::Result<Vec<StartupProcessCandidate>> {
+    #[cfg(target_os = "macos")]
+    {
+        let configured_name = configured_ds4_binary.file_name();
+        let processes = crate::cluster::platform::process::list_processes()?;
+        Ok(processes
+            .into_iter()
+            .filter(|observed| observed.pid != current_pid)
+            .filter_map(|observed| {
+                let executable_name = observed.executable.file_name();
+                let kind = if executable_name.is_some_and(|name| name == "siderostat") {
+                    Some(StartupProcessKind::Siderostat)
+                } else if executable_name.is_some_and(|name| name == "ds4-server")
+                    || configured_name.is_some() && executable_name == configured_name
+                {
+                    Some(StartupProcessKind::Ds4)
+                } else {
+                    None
+                }?;
+                Some(StartupProcessCandidate { kind, observed })
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (current_pid, configured_ds4_binary);
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -662,6 +858,45 @@ mod tests {
             Err(ProcessControlError::NotRunning)
         ));
         assert!(signaler.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_external_process_is_terminated_after_identity_recheck() {
+        let observed = observed();
+        let slot = Arc::new(Mutex::new(Some(observed.clone())));
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let signaler = Arc::new(ApprovedSignaler {
+            observed: slot.clone(),
+            signals: signals.clone(),
+        });
+        let controller = ProcessController::new(Arc::new(Inspector(slot)), signaler);
+        controller
+            .force_stop_approved(
+                &ProcessIdentity::from_observed(&observed),
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signals.lock().unwrap().as_slice(),
+            &[(42, ProcessSignal::Terminate)]
+        );
+    }
+
+    struct ApprovedSignaler {
+        observed: Arc<Mutex<Option<ObservedProcess>>>,
+        signals: Arc<Mutex<Vec<(u32, ProcessSignal)>>>,
+    }
+
+    impl ProcessSignaler for ApprovedSignaler {
+        fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
+            self.signals.lock().unwrap().push((pid, signal));
+            if signal == ProcessSignal::Terminate {
+                *self.observed.lock().unwrap() = None;
+            }
+            Ok(())
+        }
     }
 
     #[test]

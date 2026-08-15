@@ -111,10 +111,10 @@ config を使う場合はその config を別途記録する。commit SHA は ag
 
 | 項目 | 記録内容 | coordinator candidate | worker candidate |
 |---|---|---|---|
-| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） |  `400e492106de28e4296faf863c4b44369762119c` | `400e492106de28e4296faf863c4b44369762119c` |
-| candidate binary パス | 導入予定ファイルの実パス（例 `/tmp/siderostat-candidate`） |  | |
-| candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | | |
-| config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | | |
+| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | `6d6164922ca90aac2372a4407b77b659f19059b1` | `6d6164922ca90aac2372a4407b77b659f19059b1` |
+| candidate binary パス | 実際に LaunchAgent が起動する candidate の実パス | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat`（build source: `/Users/o/LLM/siderostat/target/release/siderostat`） | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） |
+| candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | `fd07857125e1ae6f3849c21cd7bd807c66c9c1baa8e2066c5a0f9a662546e133` | `6798f005fc39413988b2c762fc676f625107279d491eaf690ab818dfc2b47037` |
+| config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` | `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
 
 ```sh
 # candidate binary の SHA-256 を導入前に取得（例）
@@ -128,6 +128,39 @@ shasum -a 256 "$HOME/Library/Application Support/siderostat/config.toml"
 > 2. operator が現行 binary / config / state / log を backup する（§6 step 3）。
 > 3. operator の承認後にのみ、candidate binary を `/usr/local/bin/siderostat` へ配置する。
 > 4. 問題が起きたら backup した現行 binary へ戻す（rollback）。
+
+**2026-08-15 read-only 再確認**: `launchctl print` の実際の stdout/stderr は両 node とも
+`/Users/o/Library/Logs/local.siderostat.runtime/ds4-server_siderostat.log` へ統合されていた。
+3.1 表に記録された旧 worker の `ds4-siderostat.log` および coordinator の分割ログとは異なるため、
+導入前 baseline の log artifact には `launchctl` の実測値を使用する。coordinator は
+`solo-standalone-ready`（generation 330、admission serving）だったが、worker は admin API が
+接続拒否で、LaunchAgent の再起動後も standalone DS4 child が HTTP readiness 前に exit status 2 で終了していた。
+この状態では DistributedReady を baseline とみなさない。
+
+**2026-08-15 candidate 配置結果**: `/usr/local/bin/siderostat` は root 所有で非対話 sudo が利用できなかったため、
+現行 binary は上書きせず、保全済み plist の `ProgramArguments[0]` を上記 user-owned candidate path に変更した。
+両 node とも plist lint と candidate SHA-256 は PASS。coordinator は candidate で
+`solo-standalone-ready`（generation 332、health/ready PASS）へ復帰したが、worker は DS4 child が
+HTTP readiness 前に exit status 2 で終了し続けたため LaunchAgent を bootout して再試行を停止した。
+worker の plist は保全 backup と SHA-256 が一致する `/usr/local/bin/siderostat` 指定へ戻し、candidate は staged path に保持している。
+現行 binary/config/state/plist/log の rollback backup は worker の
+`/private/tmp/siderostat-reconnect-evidence-20260815/rollback/` と coordinator の
+`/Users/o/siderostat-reconnect-evidence-20260815/rollback/` に保持している。
+
+**2026-08-16 worker 起動失敗の原因調査**: worker の exit status 2 は DS4 instance lock 競合と判定した。
+保存ログでは、distributed worker PID 1482 が `2026-08-15T09:46:39Z` まで稼働ログを出した後も残留し、
+`2026-08-15T13:03:03Z` に restart reconcile が `PersistedChildStopFailed` で
+`ManualInterventionRequired` へ遷移している。その後 `2026-08-15T14:15:38Z` からの standalone child は、
+全て HTTP readiness 前に exit status 2 で終了した。DS4 source の `ds4_acquire_instance_lock()` は
+`/tmp/ds4.lock` 競合時に exit 2 を返す。coordinator の controlled probe では実際に
+`another ds4 process is already running (pid 98130); refusing to start` を再現し、worker の同一 standalone argv を
+モデル `/dev/null` に置換した probe は CLI parse を通過してモデル形式エラー exit 1 になったため、argv 不整合ではない。
+`allow_sigkill = false` と DS4 worker の SIGTERM 停止制約の組合せにより、残留 distributed child が lock を保持したまま
+standalone 起動を妨げた。これは service の修正や live process の強制終了をまだ行わない調査結果である。
+
+**互換性上の別問題**: 現在の DS4 checkout は `84cc882...` で、互換性記録 `docs/compatibility/ds4-b030961.md` の承認済み
+`b030961...` と異なる。binary digest も worker `344006...` / coordinator `982011...` で、承認済み
+worker `33f504...` / coordinator `a5b2e9...` と一致しない。lock 解消後の再検証では、承認済み DS4 artifact への復帰を先行する。
 
 ## 4. 証跡ディレクトリと記録方法
 
@@ -235,7 +268,7 @@ launchctl print-disabled "gui/$(id -u)" | grep -i siderostat || true
 
 - 完了条件: candidate / rollback の checksum が記録され、両 node が Solo または Distributed の
   健全な baseline である。
-- 停止条件: active workload、unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ。
+- 停止条件: active workload、確認ダイアログで承認されていない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ。
 
 ## 7. H-02 cable detach/reconnect（operator の作業）
 

@@ -755,7 +755,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 操作、macOS 再起動、candidate binary の配置承認を担当する。agent はユーザーの明示的依頼なしに
 実機 service の停止、再起動、binary 上書きを行わない。
 
-### [ ] H-01 実機検証の change window と rollback を準備する
+### [!] H-01 実機検証の change window と rollback を準備する
 
 - Actor: operator + agent
 - Depends on: N-03、Q-02 の判定完了
@@ -775,7 +775,53 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   用いない。
 - Verification: candidate/rollback の checksum、両 node Solo または Distributed の健全な baseline
 - 完了条件: 各操作を中止して旧 binary へ戻せることを operator が確認済み
-- 停止条件: active workload、unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
+- 停止条件: active workload、確認ダイアログで承認されていない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
+
+Progress evidence: candidate commit `6d6164922ca90aac2372a4407b77b659f19059b1` を固定し、worker candidate
+`/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat` の SHA-256 は
+`6798f005fc39413988b2c762fc676f625107279d491eaf690ab818dfc2b47037`、coordinator candidate
+`/Users/o/LLM/siderostat/target/release/siderostat` の SHA-256 は
+`fd07857125e1ae6f3849c21cd7bd807c66c9c1baa8e2066c5a0f9a662546e133`; `cargo fmt --check`、
+`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`（181 passed）、
+`cargo test --all-targets --features test-support`（181 unit + integration、reconnect production 33 passed）、
+`cargo build --release` を実行。baseline artifact は
+`/private/tmp/siderostat-reconnect-evidence-20260815/baseline/`（SHA256SUMS.txt の SHA-256:
+`e6851ffa79d02577195e9f06dcbed1bd7e35917dee5faa901bc96aa5a8a0bd7a`）。read-only baseline は coordinator が
+SoloStandaloneReady、worker が admin API 接続拒否かつ standalone DS4 child の readiness 前 exit status 2
+であり、operator の backup / candidate 配置承認後も worker の健全な baseline が得られないため H-01 は継続中;
+2026-08-15
+
+Blocked evidence: operator 承認後、現行 binary/config/state/plist/log を rollback backup へ保全し、candidate を両 node の
+user-owned path `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat` へ配置した。
+`/usr/local/bin` は root 所有で非対話 sudo が使えないため上書きしていない。両 plist の lint と candidate SHA-256 は一致し、
+coordinator は candidate で `SoloStandaloneReady`（generation 332、health/ready PASS）へ復帰した。一方 worker は candidate 起動後も
+standalone DS4 child が HTTP readiness 前に exit status 2 で終了し、LaunchAgent を bootout して再試行ループを停止した。
+worker の plist は保全 backup と SHA-256 が一致する元の `/usr/local/bin/siderostat` 指定へ戻し、LaunchAgent は unloaded のままにした。
+worker の 2026-08-15 crash report には、直前の `/usr/local/bin/siderostat` に対する
+`SIGKILL (Code Signature Invalid)` / `Launch Constraint Violation` が記録されている。candidate と DS4 binary の
+`codesign --verify` は両 node で PASS だった。
+
+原因調査結果 (2026-08-16): worker の今回の standalone exit status 2 は、DS4 の同一ノード instance lock 競合と判定した。
+保存ログでは、worker は `DistributedReady` の distributed worker PID 1482 が動作中のまま `PeerLost` 後に
+`SoloStandaloneStarting` へ入り、その後の standalone child が同じ世代で繰り返し exit status 2 になっている。
+PID 1482 のログは `2026-08-15T09:46:39Z` まで続き、`2026-08-15T13:03:03Z` には restart reconcile が
+`PersistedChildStopFailed` で `ManualInterventionRequired` へ遷移した。`2026-08-15T14:15:38Z` 以降の
+standalone child は全て HTTP readiness 前に exit status 2 で終了した。DS4 source の
+`ds4_acquire_instance_lock()` は `/tmp/ds4.lock` の競合時に「another ds4 process is already running」を出して exit 2
+する。coordinator 上の同じ DS4 実体への controlled probe はこの stderr と exit 2 を再現し、worker 上で同じ standalone argv
+をモデル `/dev/null` に置換した probe は CLI parse を通過して「model file is too small to be GGUF」exit 1 となったため、
+worker の exit 2 は `--mtp` / `--dspark` などの argv 不整合ではない。
+
+根本の lifecycle 問題は、DS4 worker が SIGTERM だけでは停止しない既知制約と、worker config の `allow_sigkill = false` により、
+persisted distributed child の停止失敗が手動介入状態に固定され、後続の standalone 起動をロック競合へ導いたこと。なお、現在の
+DS4 checkout `84cc882...` と binary digest（worker `344006...`、coordinator `982011...`）は互換性記録の承認 baseline
+`b030961...` / worker `33f504...` / coordinator `a5b2e9...` とも一致しないため、lock 解消後も承認済み DS4 artifact へ戻す必要がある。
+再開条件は、operator が live/orphan DS4 child を identity 確認付きで停止して lock 解放を確認し、承認済み DS4 artifact を
+配置したうえで、worker の admin/health/ready と `SoloStandaloneReady` を確認してから両 node を同一 candidate で再起動すること。
+証跡: `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/`（SHA256SUMS.txt SHA-256:
+`df089fca33b826c56b1b228f9507575dbddd98f1a55c32dc788ab4699c2a2191`）、worker rollback manifest SHA-256
+`be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator rollback manifest SHA-256
+`7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977`; 2026-08-15
 
 ### [ ] H-02 DistributedReady から cable detach/reconnect を検証する
 

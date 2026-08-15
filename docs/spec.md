@@ -904,17 +904,25 @@ MXFP4 model mapは遅いためstartupより短いHELLO timeoutを設定しない
 - PID、canonical executable、argv hash、profile、generation、spawn timestampを保存する。
 - Process一覧のsubstring検索でidentityを決めない。
 - PIDだけを信用しない。
-- Unknown processへsignalしない。
+- Unknown processへ自動ではsignalしない。起動時に `siderostat` / `ds4-server` の既存processを
+  検出した場合は、PID、実行ファイル、argv、起動時刻をoperatorへ提示し、明示承認がある場合だけ
+  operator-approved cleanupの対象にできる。
 
 ### 20.2 Recovery
 
-Proxy再起動時、macOS process APIでexecutable、argv、start timeを照合する。完全一致したowned childだけを再所有または停止対象にする。Unknown processが必要portを占有する場合はManualInterventionRequired。
+Proxy再起動時、macOS process APIでexecutable、argv、start timeを照合する。完全一致したowned childだけを
+自動で再所有または停止対象にする。起動直前には同一ホストの `siderostat` / `ds4-server` を列挙し、
+既存versionや外部launcher由来のprocessも候補として提示する。operatorが承認しない、確認UIを表示できない、
+または承認後のidentity再照合に失敗した場合は起動せず、ManualInterventionRequired相当で停止する。
+必要portを未知processが占有していても、承認なしにsignalしない。
 
 ### 20.3 Signal
 
 - 通常停止はSIGTERM。
 - Drain完了後にsignalする。
 - Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。
+- 起動時のoperator-approved cleanupは、承認をSIGKILL許可として扱う。ただしSIGTERM/SIGKILLの各直前に
+  PID、executable、argv hash、start timeを再確認し、通常のprocess groupではなく候補process自身へsignalする。
 - Exit statusを必ず回収する。
 
 ### 20.4 Log event
@@ -1308,7 +1316,7 @@ ds4_proxy_cluster_deployment_mismatch_total{field}
 - DS4 HTTPはloopbackだけ。
 - Shellを介してchildをspawnしない。
 - Config argvを1要素ずつ `Command::arg` へ渡す。
-- Unknown processをkillしない。
+- Unknown processを無承認ではkillしない。起動時の候補提示、operator明示承認、signal直前のidentity再確認を必須とする。
 - Model fingerprint時にregular file/canonical pathを確認。
 - Admin mutationはtoken必須。
 - Prompt/body/tokenをlogしない。
@@ -1555,7 +1563,7 @@ persistence.rs（cluster state_storeへ置換）
 
 ### 33.4 Safety/operations
 
-- [ ] Unknown processへsignalしない。
+- [ ] Unknown processは無承認でsignalせず、起動時の候補提示・operator承認・signal直前のidentity再確認を行う。
 - [ ] Secret/body/session IDをlogしない。
 - [ ] Admin mutation token必須。
 - [ ] State atomic recovery。

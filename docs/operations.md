@@ -115,7 +115,7 @@ siderostat cluster restart
 
 - 通常停止はSIGTERM。Drain完了後にsignalする（spec第20.3節）。
 - Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。`allow_sigkill=false` ならmanual intervention（spec第12.4節）。
-- Unknown processへsignalしない（spec第20.2節、第38節）。
+- Unknown processへ無承認でsignalしない。起動時に既存の `siderostat` / `ds4-server` を検出した場合は、macOSの確認ダイアログ（対話端末では確認入力）で候補を提示する。承認時だけ、各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否・確認不能・identity不一致時は新しいsiderostatを起動しない（spec第20.2節、第38節）。
 - Restartはmodeを変えない。Paired Standalone / Distributed MXFP4中のchild再起動はmode遷移を引き起こさない。
 
 ## 7. Rollback

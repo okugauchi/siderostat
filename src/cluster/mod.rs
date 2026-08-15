@@ -80,8 +80,10 @@ pub use platform::{
 pub use process::platform_process_controller;
 pub use process::{
     ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
-    ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
-    ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
+    ObservedProcess, ProcessControlError, ProcessController, ProcessIdentity, ProcessInspector,
+    ProcessSignal, ProcessSignaler, StandaloneSupervisor, StartupProcessCandidate,
+    StartupProcessKind, VerifiedProcess, argv_sha256, discover_startup_processes,
+    wait_for_http_readiness,
 };
 #[cfg(feature = "test-support")]
 pub use production::PairTiming;
