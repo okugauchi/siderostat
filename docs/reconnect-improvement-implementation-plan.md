@@ -755,7 +755,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 操作、macOS 再起動、candidate binary の配置承認を担当する。agent はユーザーの明示的依頼なしに
 実機 service の停止、再起動、binary 上書きを行わない。
 
-### [!] H-01 実機検証の change window と rollback を準備する
+### [x] H-01 実機検証の change window と rollback を準備する
 
 - Actor: operator + agent
 - Depends on: N-03、Q-02 の判定完了
@@ -822,6 +822,19 @@ DS4 checkout `84cc882...` と binary digest（worker `344006...`、coordinator `
 `df089fca33b826c56b1b228f9507575dbddd98f1a55c32dc788ab4699c2a2191`）、worker rollback manifest SHA-256
 `be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator rollback manifest SHA-256
 `7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977`; 2026-08-15
+
+Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a5951bf21f3e898e` を両 node に配置し、candidate binary SHA-256 は両 node とも
+`c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0`、LaunchAgent plist SHA-256 は両 node とも
+`dfbb42036293a72dae2b5f9d2ebdc2134327055abf349b920ae4e9bd0aa064eb`。config checksum は coordinator
+`233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02`、worker
+`a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912`。rollback backup は削除せず保持し、manifest SHA-256 は worker
+`be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator
+`7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977`。
+
+最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
+`988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator
+`/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
+`74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。両 node の LaunchAgent は同一 candidate path を実行し、operator 承認済み startup cleanup は各 node 1 件の stale DS4 process に対して成功した。両 node の最終状態は `SoloStandaloneReady`、health/ready PASS、doctor `healthy=true`、admission serving、active request 0、node ごとの standalone DS4 child 1 件であり、H-01 の checksum / rollback / 健全 baseline 条件を満たした。H-02 は DistributedReady を着手条件とするため未着手。
 
 ### [ ] H-02 DistributedReady から cable detach/reconnect を検証する
 

@@ -111,9 +111,9 @@ config を使う場合はその config を別途記録する。commit SHA は ag
 
 | 項目 | 記録内容 | coordinator candidate | worker candidate |
 |---|---|---|---|
-| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | `6d6164922ca90aac2372a4407b77b659f19059b1` | `6d6164922ca90aac2372a4407b77b659f19059b1` |
-| candidate binary パス | 実際に LaunchAgent が起動する candidate の実パス | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat`（build source: `/Users/o/LLM/siderostat/target/release/siderostat`） | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） |
-| candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | `fd07857125e1ae6f3849c21cd7bd807c66c9c1baa8e2066c5a0f9a662546e133` | `6798f005fc39413988b2c762fc676f625107279d491eaf690ab818dfc2b47037` |
+| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | `6bde9c10c148b3a85da6c015a5951bf21f3e898e` | `6bde9c10c148b3a85da6c015a5951bf21f3e898e` |
+| candidate binary パス | 実際に LaunchAgent が起動する candidate の実パス | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） |
+| candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | `c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0` | `c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0` |
 | config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` | `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
 
 ```sh
@@ -161,6 +161,16 @@ standalone 起動を妨げた。これは service の修正や live process の�
 **互換性上の別問題**: 現在の DS4 checkout は `84cc882...` で、互換性記録 `docs/compatibility/ds4-b030961.md` の承認済み
 `b030961...` と異なる。binary digest も worker `344006...` / coordinator `982011...` で、承認済み
 worker `33f504...` / coordinator `a5b2e9...` と一致しない。lock 解消後の再検証では、承認済み DS4 artifact への復帰を先行する。
+
+**2026-08-16 H-01 完了**: `6bde9c10c148b3a85da6c015a5951bf21f3e898e` を両 node の同一 candidate として配置し、candidate binary SHA-256 は両 node とも
+`c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0`、LaunchAgent plist SHA-256 は両 node とも
+`dfbb42036293a72dae2b5f9d2ebdc2134327055abf349b920ae4e9bd0aa064eb` だった。config checksum は coordinator
+`233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02`、worker
+`a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912`。rollback backup は保持され、manifest SHA-256 は
+worker `be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator
+`7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977` である。
+
+両 node の LaunchAgent は candidate path を指し、重複 job はなく、operator 承認済み startup cleanup は worker/coordinator 各 1 件の stale DS4 process に対して実施された。最終状態は両 node とも `SoloStandaloneReady`、`/healthz=ok`、`/readyz=ready`、`cluster doctor` の `healthy=true`（`admission_serving=true`、`safe_state=true`、`target_ready=true`）で、active request は 0 件、standalone DS4 child は node ごとに 1 件、unknown/orphan process はない。最終 worker generation は 278、coordinator generation は 339。最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator `/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。H-02 は両 node が DistributedReady ではないため、まだ開始しない。
 
 ## 4. 証跡ディレクトリと記録方法
 
