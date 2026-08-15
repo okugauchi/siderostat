@@ -75,17 +75,17 @@ ifconfig bridge0
 
 | 項目 | 場所（既定） | 記録内容 | coordinator 記録 | worker 記録 |
 |---|---|---|---|---|
-| binary | `/usr/local/bin/siderostat` | 実パス + SHA-256 | | |
-| config | `$HOME/Library/Application Support/siderostat/config.toml` | 実パス（`sed` で確認） | | |
-| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | 実パス | | |
-| state file | config `cluster.state_path` | 実パス | | |
-| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | 実パス | | |
-| LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | plist の `Label` | | |
-| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | plist の `StandardOutPath`/`StandardErrorPath` が一致しているか | | |
-| admin API | config `[proxy] admin_listen`（例 `127.0.0.1:18081`） | 実値 | | |
-| `bridge0` IP | coordinator `10.99.0.1` / worker `10.99.0.2` | `ifconfig bridge0` の inet | | |
-| control port | config `[cluster] control_port`（例 `9920`） | 実値 | | |
-| ds4 distributed port | config `[cluster] ds4_distributed_port`（例 `9911`） | 実値 | | |
+| binary | `/usr/local/bin/siderostat` | 実パス + SHA-256 | `o@m4max-macstudio.local:/usr/local/bin/siderostat` / `a1ee8cb4a51cd7a8fe77d76c2e0da523b5bc54205e4479800c998323a516abde` | `/usr/local/bin/siderostat` / `21c855ec5831c6fad6f5a821323a518492662b87f30d1878723c8da00125c0cb` |
+| config | `$HOME/Library/Application Support/siderostat/config.toml` | 実パス（`sed` で確認） |  `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/config.toml` / `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` 　| `/Users/o/siderostat_backup/Users/o/Library/Application Support/siderostat/config.toml` / `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
+| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/secrets` | `/Users/o/Library/Application Support/siderostat/secrets` |
+| state file | config `cluster.state_path` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/cluster-state.json` | `/Users/o/Library/Application Support/siderostat/cluster-state.json` |
+| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/LaunchAgents/local.siderostat.runtime.plist` | `/Users/o/Library/LaunchAgents/local.siderostat.runtime.plist` |
+| LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | plist の `Label` | `gui/$(id -u)/local.siderostat.runtime` | `gui/$(id -u)/local.siderostat.runtime` |
+| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | plist の `StandardOutPath`/`StandardErrorPath` が一致しているか | (旧仕様から変更されていないため分割出力) `o@m4max-macstudio.local:/Users/o/Library/Logs/siderostat/stdout.log`, `o@m4max-macstudio.local:/Users/o/Library/Logs/siderostat/stderr.log` | `/Users/o/Library/Logs/siderostat/ds4-siderostat.log` |
+| admin API | config `[proxy] admin_listen`（例 `127.0.0.1:18081`） | 実値 | `https://admin.siderostat.m4max-macstudio.home.arpa/` (`127.0.0.1:18081`) | `127.0.0.1:18081` |
+| `bridge0` IP | coordinator `10.99.0.1` / worker `10.99.0.2` | `ifconfig bridge0` の inet | `inet 10.99.0.1 netmask 0xfffffffc broadcast 10.99.0.3` | `inet 10.99.0.2 netmask 0xfffffffc broadcast 10.99.0.3` |
+| control port | config `[cluster] control_port`（例 `9920`） | 実値 | `9920` | `9920` |
+| ds4 distributed port | config `[cluster] ds4_distributed_port`（例 `9911`） | 実値 | `9911` | `9911` |
 
 **記入例（coordinator の場合）**:
 
@@ -111,8 +111,8 @@ config を使う場合はその config を別途記録する。commit SHA は ag
 
 | 項目 | 記録内容 | coordinator candidate | worker candidate |
 |---|---|---|---|
-| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | | |
-| candidate binary パス | 導入予定ファイルの実パス（例 `/tmp/siderostat-candidate`） | | |
+| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） |  `400e492106de28e4296faf863c4b44369762119c` | `400e492106de28e4296faf863c4b44369762119c` |
+| candidate binary パス | 導入予定ファイルの実パス（例 `/tmp/siderostat-candidate`） |  | |
 | candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | | |
 | config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | | |
 
