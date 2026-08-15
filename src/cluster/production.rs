@@ -48,6 +48,9 @@ mod worker;
 
 /// The production control transport. Requests are pinned to the cluster address and authenticated
 /// independently from the public/admin planes.
+#[cfg(feature = "test-support")]
+use super::ThunderboltIpState;
+
 #[derive(Clone)]
 pub struct ProductionControlClient {
     inner: Arc<ControlClientInner>,
@@ -531,6 +534,20 @@ impl ProductionClusterRuntime {
     /// snapshot is stale relative to the latest applied epoch.
     pub fn set_network_evidence(&self, snapshot: NetworkSnapshot) -> bool {
         self.inner.network.update(snapshot)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the current network gate state derived from the shared evidence (test-support only):
+    /// `(route_scoped, peer_present, epoch, state)`. Used by the N-03 truth-table tests to
+    /// assert that every `ThunderboltIpState` maps to the expected route/peer-present outcome.
+    pub fn network_gate_status(&self) -> (bool, bool, u64, ThunderboltIpState) {
+        let snapshot = self.inner.network.snapshot();
+        (
+            self.inner.network.route_scoped(),
+            snapshot.peer_present,
+            snapshot.epoch,
+            snapshot.state,
+        )
     }
 
     /// Operator reconcile (B-03). On the coordinator the promotion tracker reset and the

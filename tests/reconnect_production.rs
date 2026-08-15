@@ -10,6 +10,7 @@ use siderostat::{
     cluster::{DistributedControlPhase, EventOwner, NetworkSnapshot, ThunderboltIpState},
     target::{ClusterState, LocalRole, ProxyTarget, StableMode},
 };
+use std::net::Ipv4Addr;
 use std::time::Duration;
 use support::{Node, TwoNode, wait_until};
 
@@ -2293,5 +2294,167 @@ async fn stale_network_evidence_is_rejected_and_pairing_keeps_latest() {
         harness.node(LocalRole::Worker),
     )
     .await;
+    harness.shutdown().await;
+}
+
+// --- N-03: P2 route/discovery reconnect matrix ---
+
+/// Build a valid, bridge0-scoped, authenticated peer snapshot at a given epoch (N-03).
+/// Mirrors what the macOS provider / harness injects for a normal attach.
+fn valid_authenticated_evidence(role: LocalRole, epoch: u64) -> NetworkSnapshot {
+    NetworkSnapshot {
+        epoch,
+        state: ThunderboltIpState::AuthenticatedPeer,
+        role,
+        local_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        expected_peer_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        peer_present: true,
+    }
+}
+
+#[tokio::test]
+async fn network_evidence_truth_table_maps_every_state_to_route_and_peer_present() {
+    // N-03 completion: every ThunderboltIpState maps to the P2 truth table (docs/
+    // pairing-network-gate.md §8) route/peer-present outcome. `PeerCandidateFound` and
+    // `AuthenticatedPeer` are the only route-scoped states; only `AuthenticatedPeer` is
+    // peer present.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    let coordinator = harness.node(LocalRole::Coordinator);
+    let cases: [(ThunderboltIpState, bool, bool); 8] = [
+        (ThunderboltIpState::ServiceMissing, false, false),
+        (ThunderboltIpState::ServiceDisabled, false, false),
+        (ThunderboltIpState::InterfaceUnavailable, false, false),
+        (ThunderboltIpState::AddressMissing, false, false),
+        (ThunderboltIpState::AddressConflict, false, false),
+        (ThunderboltIpState::ReadyNoPeer, false, false),
+        (ThunderboltIpState::PeerCandidateFound, true, false),
+        (ThunderboltIpState::AuthenticatedPeer, true, true),
+    ];
+    for (idx, (state, expect_route_scoped, expect_peer_present)) in cases.iter().enumerate() {
+        let snapshot = NetworkSnapshot {
+            epoch: (idx + 1) as u64,
+            state: *state,
+            role: coordinator.role,
+            local_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            expected_peer_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            peer_present: *expect_peer_present,
+        };
+        assert!(
+            coordinator.production.set_network_evidence(snapshot),
+            "scenario {state:?} must be applied"
+        );
+        let (route_scoped, peer_present, _, state_now) =
+            coordinator.production.network_gate_status();
+        assert_eq!(state_now, *state, "state mismatch for {state:?}");
+        assert_eq!(
+            route_scoped, *expect_route_scoped,
+            "route_scoped for {state:?} does not match truth table"
+        );
+        assert_eq!(
+            peer_present, *expect_peer_present,
+            "peer_present for {state:?} does not match truth table"
+        );
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_route_scoped_network_evidence_rejects_pairing_and_stays_solo() {
+    // N-03 action 1/2: attach works only with a valid bridge0-scoped, authenticated candidate.
+    // Every non-route-scoped observation (route detach, wrong interface/subnet/address, stale
+    // candidate, macOS API failure, Bonjour success with invalid route) must reject pairing and
+    // leave both nodes Solo serving. The harness evidence is reset to a fresh valid epoch
+    // between scenarios so each case starts from a clean, still-Solo pair.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    let scenarios: [(&str, ThunderboltIpState); 7] = [
+        ("route-detach", ThunderboltIpState::ReadyNoPeer),
+        ("wrong-interface", ThunderboltIpState::InterfaceUnavailable),
+        ("wrong-subnet", ThunderboltIpState::AddressConflict),
+        ("wrong-address", ThunderboltIpState::AddressConflict),
+        ("stale-candidate", ThunderboltIpState::ReadyNoPeer),
+        ("macos-api-failure", ThunderboltIpState::ServiceMissing),
+        (
+            "bonjour-success-route-invalid",
+            ThunderboltIpState::ReadyNoPeer,
+        ),
+    ];
+    let mut epoch: u64 = 100;
+    for (name, state) in scenarios {
+        epoch += 1;
+        for role in [LocalRole::Coordinator, LocalRole::Worker] {
+            let node = harness.node(role);
+            let snapshot = NetworkSnapshot {
+                epoch,
+                state,
+                role: node.role,
+                local_address: None,
+                expected_peer_address: None,
+                peer_present: false,
+            };
+            assert!(
+                node.production.set_network_evidence(snapshot),
+                "scenario {name}: evidence must be applied"
+            );
+        }
+
+        let error = harness
+            .pair()
+            .await
+            .expect_err(&format!("scenario {name} must not pair"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not scoped"),
+            "scenario {name}: expected RouteNotScoped, got {message}"
+        );
+
+        // Both nodes stay Solo serving; pairing never began.
+        assert_solo_serving(harness.node(LocalRole::Coordinator)).await;
+        assert_solo_serving(harness.node(LocalRole::Worker)).await;
+
+        // Restore valid evidence at a fresh epoch for the next scenario (nodes are still Solo).
+        epoch += 1;
+        for role in [LocalRole::Coordinator, LocalRole::Worker] {
+            let node = harness.node(role);
+            assert!(
+                node.production
+                    .set_network_evidence(valid_authenticated_evidence(node.role, epoch)),
+                "scenario {name}: restore must be applied"
+            );
+        }
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn bonjour_failure_with_static_valid_evidence_requires_authentication_before_peer_present() {
+    // N-03 action 3: when Bonjour is unavailable, a static fallback candidate may provide a
+    // route-scoped candidate, but that alone must not make the peer present. Peer presence
+    // requires the HMAC-authenticated handshake, which is exactly the `PeerCandidateFound`
+    // (route scoped, not yet authenticated) -> not peer present mapping in the truth table.
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    let coordinator = harness.node(LocalRole::Coordinator);
+    let static_candidate = NetworkSnapshot {
+        epoch: 50,
+        state: ThunderboltIpState::PeerCandidateFound,
+        role: coordinator.role,
+        local_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        expected_peer_address: Some(Ipv4Addr::new(127, 0, 0, 1)),
+        peer_present: false,
+    };
+    assert!(
+        coordinator
+            .production
+            .set_network_evidence(static_candidate)
+    );
+    let (route_scoped, peer_present, _, state_now) = coordinator.production.network_gate_status();
+    assert_eq!(state_now, ThunderboltIpState::PeerCandidateFound);
+    assert!(
+        route_scoped,
+        "static fallback candidate is bridge0 route scoped"
+    );
+    assert!(
+        !peer_present,
+        "static candidate alone is not peer present; HMAC authentication is required"
+    );
     harness.shutdown().await;
 }

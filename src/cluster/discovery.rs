@@ -213,6 +213,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_stale_generation_wrong_protocol_and_invalid_port() {
+        // N-03 truth table: a stale candidate (old generation), a wrong protocol version, and a
+        // zero port are all rejected, so none of them can make the peer present.
+        let mut stale = service();
+        stale.generation = 4; // input generation is 5
+        assert_eq!(
+            DiscoveryTracker::new(input()).accept_bonjour(&stale),
+            Err(CandidateError::OldGeneration)
+        );
+
+        let mut wrong_protocol = service();
+        wrong_protocol.protocol_version = 2;
+        assert_eq!(
+            DiscoveryTracker::new(input()).accept_bonjour(&wrong_protocol),
+            Err(CandidateError::WrongProtocol)
+        );
+
+        let mut invalid_port = service();
+        invalid_port.port = 0;
+        assert_eq!(
+            DiscoveryTracker::new(input()).accept_bonjour(&invalid_port),
+            Err(CandidateError::InvalidPort)
+        );
+    }
+
+    #[test]
     fn permission_failure_uses_scoped_static_fallback_only() {
         let mut tracker = DiscoveryTracker::new(input());
         assert_eq!(
