@@ -1,3 +1,5 @@
+#[cfg(feature = "test-support")]
+use super::PairTiming;
 use super::{RoleControl, now_millis};
 use crate::{
     cluster::{
@@ -60,10 +62,24 @@ impl super::ProductionClusterRuntime {
                 descriptor: self.local_descriptor().await,
             },
         };
+        let offer_sent_at = now_millis();
         let response = self.inner.client.send(&message).await?;
+        let confirm_received_at = now_millis();
         self.inner.lease.update(&response);
+        let lease_established_at = now_millis();
         tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-        self.reconcile_peer(EventOwner::Control).await
+        let stability_achieved_at = now_millis();
+        let snapshot = self.reconcile_peer(EventOwner::Control).await?;
+        let pairing_ready_at = now_millis();
+        #[cfg(feature = "test-support")]
+        self.inner.pair_timings.lock().unwrap().push(PairTiming {
+            offer_sent_at,
+            confirm_received_at,
+            lease_established_at,
+            stability_achieved_at,
+            pairing_ready_at,
+        });
+        Ok(snapshot)
     }
 
     pub async fn promote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {

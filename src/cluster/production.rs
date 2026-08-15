@@ -229,6 +229,9 @@ struct ProductionInner {
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
     /// actual production input. Fail-closed until a fresh observation is applied.
     network: Arc<NetworkEvidence>,
+    /// Test-support only: recorded pair-phase timings across pair sessions (Q-01).
+    #[cfg(feature = "test-support")]
+    pair_timings: std::sync::Mutex<Vec<PairTiming>>,
 }
 
 impl ProductionClusterRuntime {
@@ -415,6 +418,8 @@ impl ProductionClusterRuntime {
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
             network: Arc::new(NetworkEvidence::new()),
+            #[cfg(feature = "test-support")]
+            pair_timings: std::sync::Mutex::new(Vec::new()),
         };
         let runtime = Self {
             inner: Arc::new(inner),
@@ -548,6 +553,19 @@ impl ProductionClusterRuntime {
             snapshot.epoch,
             snapshot.state,
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the recorded pair-phase timings (test-support only, Q-01). Returns a copy so tests
+    /// can aggregate confirm-before-stability and convergence without holding the lock.
+    pub fn pair_timings(&self) -> Vec<PairTiming> {
+        self.inner
+            .pair_timings
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Operator reconcile (B-03). On the coordinator the promotion tracker reset and the
@@ -1273,4 +1291,17 @@ mod tests {
         assert!(!effect_requires_ack(&ControlCommand::PrepareWorker));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
     }
+}
+
+/// Test-support only: timestamps of the phases in one [`ProductionClusterRuntime::pair`]
+/// session, captured to measure whether confirm completes before the stability sleep expires
+/// (Q-01). Never contains secrets, nonces, or request bodies.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy)]
+pub struct PairTiming {
+    pub offer_sent_at: u64,
+    pub confirm_received_at: u64,
+    pub lease_established_at: u64,
+    pub stability_achieved_at: u64,
+    pub pairing_ready_at: u64,
 }

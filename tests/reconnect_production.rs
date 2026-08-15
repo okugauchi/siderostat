@@ -2458,3 +2458,137 @@ async fn bonjour_failure_with_static_valid_evidence_requires_authentication_befo
     );
     harness.shutdown().await;
 }
+
+// --- Q-01: P3 Pair timing measurement ----------------------------------------
+
+/// Q-01: measure Pair phase timing across 100 sessions (including packet-loss-equivalent cable
+/// blips and duplicate pairs) and verify every session converges without a confirm-after-
+/// stability race, extra retry, or convergence timeout. If any session fails, Q-02 (Pair
+/// confirm completion notification) becomes mandatory. Only phase timestamps are recorded,
+/// never secrets, nonces, or request bodies.
+#[tokio::test]
+async fn pair_timing_one_hundred_sessions_confirm_before_stability_and_converge() {
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    let mut sessions_converged = 0u32;
+    let mut confirm_after_stability = 0u32;
+    let mut convergence_timeouts = 0u32;
+    let mut pair_errors = 0u32;
+    let mut timings: Vec<siderostat::cluster::PairTiming> = Vec::new();
+
+    for session in 0..100 {
+        // Packet-loss equivalent: every 10th session blips the serve on both nodes so the pair
+        // must be re-established from Solo. The rest are duplicate pairs on the same session.
+        if session % 10 == 0 {
+            harness.coordinator.stop_serve().await;
+            harness.worker.stop_serve().await;
+            harness
+                .worker
+                .production
+                .reconcile()
+                .await
+                .expect("worker PeerLost reconcile after blip");
+            harness
+                .coordinator
+                .production
+                .reconcile()
+                .await
+                .expect("coordinator PeerLost reconcile after blip");
+            let solo = harness
+                .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+                .await;
+            assert!(
+                solo,
+                "session {session}: nodes did not recover to Solo before re-pair"
+            );
+            harness
+                .coordinator
+                .restart_serve()
+                .await
+                .expect("coordinator serve restart");
+            harness
+                .worker
+                .restart_serve()
+                .await
+                .expect("worker serve restart");
+        }
+
+        match harness.pair().await {
+            Ok(()) => {}
+            Err(error) => {
+                pair_errors += 1;
+                eprintln!("session {session}: pair error: {error:#}");
+                continue;
+            }
+        }
+
+        let converged = harness
+            .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+            .await;
+        if !converged {
+            convergence_timeouts += 1;
+            eprintln!(
+                "session {session}: convergence timeout; coordinator={:?} worker={:?}",
+                harness.coordinator.mode.snapshot().state,
+                harness.worker.mode.snapshot().state,
+            );
+            continue;
+        }
+        sessions_converged += 1;
+
+        // Confirm must complete before the stability sleep expires: the coordinator's pair()
+        // receives the confirm from `client.send()` and only then sleeps. Any session where the
+        // recorded confirm timestamp is after the stability-achieved timestamp indicates a race
+        // that would require Q-02.
+        let latest = harness.coordinator.production.pair_timings();
+        assert!(
+            !latest.is_empty(),
+            "session {session}: expected a recorded pair timing"
+        );
+        let timing = *latest.last().unwrap();
+        timings.push(timing);
+        if timing.confirm_received_at > timing.stability_achieved_at {
+            confirm_after_stability += 1;
+            eprintln!(
+                "session {session}: confirm after stability: confirm={} stability={}",
+                timing.confirm_received_at, timing.stability_achieved_at
+            );
+        }
+    }
+
+    harness.shutdown().await;
+
+    // Report the measurement artifact (timestamps only, no secrets).
+    let confirm_delta = |t: &siderostat::cluster::PairTiming| {
+        t.stability_achieved_at
+            .saturating_sub(t.confirm_received_at)
+    };
+    let deltas: Vec<u64> = timings.iter().map(confirm_delta).collect();
+    let mean = if deltas.is_empty() {
+        0.0
+    } else {
+        deltas.iter().map(|d| *d as f64).sum::<f64>() / deltas.len() as f64
+    };
+    let max = deltas.iter().copied().max().unwrap_or(0);
+    eprintln!(
+        "Q-01 measurement: sessions={sessions_converged}/100 confirm_after_stability={confirm_after_stability} \
+         convergence_timeouts={convergence_timeouts} pair_errors={pair_errors} \
+         confirm_before_stability_ms_mean={mean:.1} max={max}"
+    );
+
+    assert_eq!(
+        confirm_after_stability, 0,
+        "Q-01: a confirm completed after the stability sleep (race), so Q-02 is mandatory"
+    );
+    assert_eq!(
+        convergence_timeouts, 0,
+        "Q-01: a session failed to converge, so Q-02 is mandatory"
+    );
+    assert_eq!(
+        pair_errors, 0,
+        "Q-01: a pair session errored, so Q-02 is mandatory"
+    );
+    assert_eq!(
+        sessions_converged, 100,
+        "Q-01: expected all 100 sessions to converge"
+    );
+}

@@ -83,6 +83,8 @@ pub use process::{
     ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
     ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
 };
+#[cfg(feature = "test-support")]
+pub use production::PairTiming;
 pub use production::{
     ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
     OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
