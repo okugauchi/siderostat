@@ -633,7 +633,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   cargo test --all-targets --features test-support: unit 180 + integration + reconnect_production
   29 GREEN / git diff --check clean); 2026-08-15
 
-### [ ] N-03 route/discovery reconnect matrix を自動化する
+### [x] N-03 route/discovery reconnect matrix を自動化する
 
 - Actor: agent
 - Depends on: N-02
@@ -648,6 +648,38 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: security/reconnect test、共通 local gate
 - 完了条件: P2 の truth table と全 test 名が対応する
 - 停止条件: fake evidence と macOS provider の意味が一致しない
+- Evidence: branch=feature/reconnect-recovery; truth table (docs/pairing-network-gate.md §8)
+  の全行と test 名が一対一で対応することを確認した。`tests/reconnect_production.rs` に
+  `network_evidence_truth_table_maps_every_state_to_route_and_peer_present` (ThunderboltIpState
+  8 状態をループし、`PeerCandidateFound` = (route_scoped true, peer_present false) /
+  `AuthenticatedPeer` = (true, true) / 他 6 状態 = (false, false) を production の
+  `network_gate_status()` で検証、action 1 の attach と「認証未完了」行) と
+  `non_route_scoped_network_evidence_rejects_pairing_and_stays_solo` (route-detach /
+  wrong-interface / wrong-subnet / wrong-address / stale-candidate / macos-api-failure /
+  bonjour-success-route-invalid の 7 シナリオを両 node に注入し、pair が RouteNotScoped で
+  拒否され Solo serving を維持、シナリオ間は新 epoch の valid evidence で復元。action 1 の
+  detach/address loss/wrong interface/subnet/stale candidate、action 2 の Bonjour success +
+  route invalid に相当) と `bonjour_failure_with_static_valid_evidence_requires_authentication_
+  before_peer_present` (Bonjour 不可でも static fallback candidate (`PeerCandidateFound`、
+  epoch 50) は bridge0 route scoped だが `peer_present=false` のまま、HMAC 認証が必要。
+  truth table の Bonjour failure 行、action 3) を追加。`src/cluster/discovery.rs` に unit
+  test `rejects_stale_generation_wrong_protocol_and_invalid_port` (旧 generation の candidate
+  を `CandidateError::OldGeneration` で拒否、truth table の stale candidate 行) を追加。
+  action 4 (detach/attach 10 cycle の duplicate pairing / orphan recovery) は既存
+  `tests/reconnect_production.rs::paired_cable_blip_repairs_to_paired_over_10_cycles` /
+  `distributed_cable_blip_rebuilds_new_generation_over_10_cycles` (harness の
+  stop_serve/restart_serve で 10 cycle、generation 非減少) と
+  `tests/phase5_security.rs::ten_route_detach_attach_cycles_converge_without_orphan_state`
+  (WorkerControl 直接で 10 cycle、orphan なし) が GREEN のままであることを確認した。設計
+  §8 の「既存 lease は失効 (15s) まで現 mode を維持」に従い、detach 直後に即座に Solo へ
+  落ちることを期待する cycle は追加しない (設計に反する)。action 5 (古い epoch の Pair
+  offer/confirm 拒否) は N-02 の `stale_network_evidence_is_rejected_and_pairing_keeps_latest`
+  と `src/cluster/production/effects.rs` の `GenerationMismatch` 再送出
+  (offer/confirm の generation 不一致を 409 で拒否) で担保済みであることを確認した。
+  共通 local gate 全項目成功 (cargo fmt --check / cargo clippy --all-targets --all-features
+  -- -D warnings / cargo test --all-targets: unit 181 + integration GREEN / cargo test
+  --all-targets --features test-support: unit 181 + integration + reconnect_production 32 GREEN
+  / git diff --check clean); 2026-08-15
 
 ## 12. Phase Q: P3 Pair timing の判定と条件付き実装
 
