@@ -32,29 +32,65 @@ agent は operator の明示的依頼なしに実機 service の停止・再起�
 - change window 中に利用停止が可能で、進行中 inference request がない。
 - 両 node の時計が大きくずれていない（`max_clock_skew` 既定 30s 以内）。
 
-### 3.1 実機の構成情報（operator が config から確認して記録する）
+### 3.1 実機の構成情報（operator が各 node で確認して記録する）
 
-| 項目 | 場所（既定） | 記録欄 |
-|---|---|---|
-| binary | `/usr/local/bin/siderostat` | |
-| config | `$HOME/Library/Application Support/siderostat/config.toml` | |
-| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | |
-| state file | `$HOME/Library/Application Support/siderostat/cluster-state.json` | |
-| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | |
-| LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | |
-| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | |
-| admin API | config の `admin_listen`（例 `127.0.0.1:18081`） | |
-| coordinator `bridge0` | `10.99.0.1` | |
-| worker `bridge0` | `10.99.0.2` | |
-| control port | config の `cluster.control_port`（例 `9920`） | |
-| ds4 distributed port | config の `cluster.ds4_distributed_port`（例 `9911`） | |
+「記録欄」には、**既定パスや例示値ではなく、実機で実際に確認できた値を node 別に書く**。
+表の「場所（既定）」はあくまで想定値で、実機の config や LaunchAgent 設定が異なる場合がある。
+この表は H-01 の baseline 記録・rollback 手順・証跡のファイル名に使うため、**coordinator と worker の
+2 台それぞれで**確認して埋める。確認は各 node の terminal で実行する。
 
-実際の値は各 node の config で確認する。config は次のように読める。
+**確認手順（各 node で実行）**:
 
 ```sh
-plutil -p "$HOME/Library/Application Support/siderostat/config.toml" 2>/dev/null \
-  || sed -n '1,200p' "$HOME/Library/Application Support/siderostat/config.toml"
+# 1) config の実パスを確認し、中身を読む（plist 形式でない TOML のため sed で読むのが確実）
+CONFIG="$HOME/Library/Application Support/siderostat/config.toml"
+ls -l "$CONFIG"
+sed -n '1,200p' "$CONFIG"
+
+# 2) 実装済み binary のパスと SHA-256（rollback 時の比較対象）
+ls -l /usr/local/bin/siderostat
+shasum -a 256 /usr/local/bin/siderostat
+
+# 3) LaunchAgent plist の実パスと label、ログ出力先を確認
+PLIST="$HOME/Library/LaunchAgents/local.siderostat.runtime.plist"
+ls -l "$PLIST"
+/usr/libexec/PlistBuddy -c "Print :Label" "$PLIST"
+/usr/libexec/PlistBuddy -c "Print :StandardOutPath" "$PLIST"
+/usr/libexec/PlistBuddy -c "Print :StandardErrorPath" "$PLIST"
+
+# 4) admin API / control port / ds4 distributed port は config の該当キーを読む
+#    （例: [proxy] admin_listen、[cluster] control_port / ds4_distributed_port）
+# 5) bridge0 の実 IP を確認（coordinator=10.99.0.1 / worker=10.99.0.2 の想定）
+ifconfig bridge0
 ```
+
+| 項目 | 場所（既定） | 記録内容 | coordinator 記録 | worker 記録 |
+|---|---|---|---|---|
+| binary | `/usr/local/bin/siderostat` | 実パス + SHA-256 | | |
+| config | `$HOME/Library/Application Support/siderostat/config.toml` | 実パス（`sed` で確認） | | |
+| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | 実パス | | |
+| state file | config `cluster.state_path` | 実パス | | |
+| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | 実パス | | |
+| LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | plist の `Label` | | |
+| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | plist の `StandardOutPath`/`StandardErrorPath` が一致しているか | | |
+| admin API | config `[proxy] admin_listen`（例 `127.0.0.1:18081`） | 実値 | | |
+| `bridge0` IP | coordinator `10.99.0.1` / worker `10.99.0.2` | `ifconfig bridge0` の inet | | |
+| control port | config `[cluster] control_port`（例 `9920`） | 実値 | | |
+| ds4 distributed port | config `[cluster] ds4_distributed_port`（例 `9911`） | 実値 | | |
+
+**記入例（coordinator の場合）**:
+
+| 項目 | 記録内容 | coordinator 記録 |
+|---|---|---|
+| binary | 実パス + SHA-256 | `/usr/local/bin/siderostat` / `9f2d…（16 桁以上）` |
+| config | 実パス | `/Users/macstudio/Library/Application Support/siderostat/config.toml` |
+| admin API | 実値 | `127.0.0.1:18081` |
+| `bridge0` IP | `ifconfig` の inet | `10.99.0.1` |
+| control port | 実値 | `9920` |
+| ds4 distributed port | 実値 | `9911` |
+
+> **注意**: 記録するのは secret 値・token そのものではなく、パスと IP・ポート・SHA-256 などの
+> 構成情報のみ。secret / token は決して記録欄や証跡に書かない（§4.2 redaction）。
 
 ## 4. 証跡ディレクトリと記録方法
 
