@@ -86,7 +86,11 @@ pub(crate) fn list_processes() -> io::Result<Vec<ObservedProcess>> {
                 Err(error)
                     if matches!(
                         error.raw_os_error(),
-                        Some(code) if matches!(code, libc::ESRCH | libc::EPERM | libc::EACCES)
+                        Some(code)
+                            if matches!(
+                                code,
+                                libc::ESRCH | libc::EPERM | libc::EACCES | libc::EINVAL
+                            )
                     ) => {}
                 Err(error) => return Err(error),
             }
@@ -223,6 +227,16 @@ mod tests {
         assert_eq!(
             parse_procargs2(&bytes).unwrap(),
             vec![OsString::from("-m"), OsString::from("/model.gguf")]
+        );
+    }
+
+    #[test]
+    fn lists_processes_without_failing_on_transient_processes() {
+        let processes = list_processes().expect("macOS process listing should succeed");
+        assert!(
+            processes
+                .iter()
+                .any(|process| process.pid == std::process::id())
         );
     }
 }
