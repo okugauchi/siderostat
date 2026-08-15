@@ -32,7 +32,16 @@ agent は operator の明示的依頼なしに実機 service の停止・再起�
 - change window 中に利用停止が可能で、進行中 inference request がない。
 - 両 node の時計が大きくずれていない（`max_clock_skew` 既定 30s 以内）。
 
-### 3.1 実機の構成情報（operator が各 node で確認して記録する）
+### 3.1 現在稼働中の構成（＝バックアップ・rollback 対象）を記録する
+
+> **重要な区別**: 実機検証では「**実験対象（candidate）**」と「**現在稼働中（現行）**」を明確に分ける。
+> - **現在稼働中（現行）** = 検証前に `/usr/local/bin/siderostat` に導入され稼働している構成。
+>   H-01 step 3 で **削除せず backup** し、問題発生時に **rollback 先** になるもの。
+> - **candidate（実験対象）** = これから検証する新 build。**まだ導入していない**。H-01 step 2 で
+>   agent が commit SHA / binary SHA-256 / config checksum を記録し、operator の承認後に導入する。
+>
+> 本節 3.1 が記録するのは **現在稼働中（backup / rollback 対象）** の構成情報である。
+> candidate は **§3.2** に別途記録する。
 
 「記録欄」には、**既定パスや例示値ではなく、実機で実際に確認できた値を node 別に書く**。
 表の「場所（既定）」はあくまで想定値で、実機の config や LaunchAgent 設定が異なる場合がある。
@@ -91,6 +100,34 @@ ifconfig bridge0
 
 > **注意**: 記録するのは secret 値・token そのものではなく、パスと IP・ポート・SHA-256 などの
 > 構成情報のみ。secret / token は決して記録欄や証跡に書かない（§4.2 redaction）。
+
+### 3.2 candidate（実験対象）の情報を記録する
+
+3.1 の「現在稼働中」とは別に、**これから検証する candidate（実験対象）** をここに記録する。
+candidate はまだ導入しておらず、H-01 step 2 で agent が記録し、operator の承認後にのみ導入する。
+**導入前**に、導入予定の candidate binary そのもの（実機に置いたファイル）から SHA-256 を取る。
+config は通常、現在稼働中のものを流用するため checksum は現行 config と一致するが、candidate 専用の
+config を使う場合はその config を別途記録する。commit SHA は agent が repository から提供する。
+
+| 項目 | 記録内容 | coordinator candidate | worker candidate |
+|---|---|---|---|
+| commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | | |
+| candidate binary パス | 導入予定ファイルの実パス（例 `/tmp/siderostat-candidate`） | | |
+| candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | | |
+| config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | | |
+
+```sh
+# candidate binary の SHA-256 を導入前に取得（例）
+shasum -a 256 /tmp/siderostat-candidate
+# config checksum（現行 config を流用する場合）
+shasum -a 256 "$HOME/Library/Application Support/siderostat/config.toml"
+```
+
+> **導入の流れ（H-01 step 2〜3 に対応）**:
+> 1. agent が candidate の commit SHA / binary SHA-256 / config checksum をここに記録する。
+> 2. operator が現行 binary / config / state / log を backup する（§6 step 3）。
+> 3. operator の承認後にのみ、candidate binary を `/usr/local/bin/siderostat` へ配置する。
+> 4. 問題が起きたら backup した現行 binary へ戻す（rollback）。
 
 ## 4. 証跡ディレクトリと記録方法
 
