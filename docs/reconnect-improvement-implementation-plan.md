@@ -683,7 +683,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 
 ## 12. Phase Q: P3 Pair timing の判定と条件付き実装
 
-### [ ] Q-01 Pair timing を計測して実装要否を判定する
+### [x] Q-01 Pair timing を計測して実装要否を判定する
 
 - Actor: agent
 - Depends on: N-03
@@ -698,8 +698,30 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: 同じ seed で再実行可能な計測 artifact
 - 完了条件: Q-02 の「実装」または「不要」が数値で決定済み
 - 停止条件: timestamp log に secret/nonce/request body が含まれる
+- Evidence: branch=feature/reconnect-recovery; `src/cluster/production.rs` に test-support
+  限定の計測 hook を追加した (`PairTiming` 構造体 + `ProductionInner::pair_timings` +
+  `ProductionClusterRuntime::pair_timings()` アクセサ、`siderostat::cluster::PairTiming` として
+  公開)。`pair()` が offer 送信 (`offer_sent_at`) / confirm 受信 (`confirm_received_at`) /
+  lease establish (`lease_established_at`) / stability 達成 (`stability_achieved_at`) /
+  PairingReady 到達 (`pairing_ready_at`) の各タイムスタンプを記録する。タイムスタンプのみで
+  secret/nonce/request body は記録しない (停止条件を満たす)。`tests/reconnect_production.rs`
+  に `pair_timing_one_hundred_sessions_confirm_before_stability_and_converge` を追加し、
+  100 session を実行した。packet loss 相当として 10 session ごとに cable blip
+  (stop_serve + PeerLost reconcile → Solo → restart_serve) を挟み、残りは重複 pair とした。
+  計測結果: sessions=100/100 収束、confirm_after_stability=0、convergence_timeouts=0、
+  pair_errors=0、confirm は stability 達成の平均 102.6ms / 最大 104ms 前に完了 (stability
+  sleep は 100ms)。これは現 protocol が `pair()` 内で `client.send()` が confirm を同期受信
+  してから required_peer_stability の sleep に入る構造であるため、confirm 未完了のまま
+  sleep が満了する race が構造的に存在しないことを裏付ける。action 3 の「sleep 満了後に
+  confirm 未完了」は 0 件、余分な retry も収束 timeout も 0 件。再実行コマンド:
+  `cargo test --test reconnect_production --features test-support pair_timing_one_hundred_
+  sessions_confirm_before_stability_and_converge -- --nocapture` (同じ固定シナリオで再実行
+  可能)。action 5 の「P3 不要」を Q-02 の Evidence に転記した。共通 local gate 全項目成功
+  (cargo fmt --check / cargo clippy --all-targets --all-features -- -D warnings / cargo test
+  --all-targets: unit 181 + integration GREEN / cargo test --all-targets --features test-support:
+  unit 181 + integration + reconnect_production 33 GREEN / git diff --check clean); 2026-08-15
 
-### [ ] Q-02 Pair confirm 完了通知を実装する、または不要判定を記録する
+### [x] Q-02 Pair confirm 完了通知を実装する、または不要判定を記録する
 
 - Actor: agent
 - Depends on: Q-01
@@ -713,6 +735,19 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: 100 session 計測の再実行、共通 local gate
 - 完了条件: sleep の race がない、または現 protocol では問題がないと evidence で確定
 - 停止条件: stability sleep の延長だけで解決しようとする
+- Evidence: branch=feature/reconnect-recovery; 不要判定を記録する。Q-01 の 100 session 計測
+  (packet loss 相当の cable blip 10 回 + 重複 pair 90 回) で、全 session が収束し、
+  confirm が stability sleep 前に完了する session が 0 件 (confirm_after_stability=0)、
+  収束 timeout 0 件、pair error 0 件だった。現 protocol では `pair()` が
+  `client.send()` で Pair の confirm response を同期受信してから
+  required_peer_stability の sleep に入るため、confirm 未完了のまま sleep が満了する
+  race は構造的に存在しない。したがって、lease/session commit を watch/notify して
+  `pair()` が confirm 完了を deadline 付きで待つ通知機構 (action 1) は不要と判定する。
+  action 4 の「不要な場合、code を変更せず Q-01 の根拠を転記」に従い、production code
+  は変更せず (計測 hook は test-support 限定)、Q-01 の Evidence をここへ転記した。
+  stability sleep の延長では解決しない (停止条件を満たす)。Q-01 の計測テスト
+  `pair_timing_one_hundred_sessions_confirm_before_stability_and_converge` を再実行して
+  GREEN (100/100 収束) であることを確認済み。共通 local gate 全項目成功。2026-08-15
 
 ## 13. Phase H: ユーザー手作業を含む 2 node 実機検証
 
