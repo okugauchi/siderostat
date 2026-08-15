@@ -25,8 +25,8 @@
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/USERNAME/Library/Logs/local.siderostat.runtime/ds4-server_siderostat.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/ds4-siderostat.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/USERNAME/Library/Logs/local.siderostat.runtime/ds4-server_siderostat.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/ds4-siderostat.log</string>
 </dict>
 </plist>

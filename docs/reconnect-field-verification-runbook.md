@@ -42,8 +42,7 @@ agent は operator の明示的依頼なしに実機 service の停止・再起�
 | state file | `$HOME/Library/Application Support/siderostat/cluster-state.json` | |
 | LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | |
 | LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | |
-| stdout log | `$HOME/Library/Logs/siderostat/stdout.log` | |
-| stderr log | `$HOME/Library/Logs/siderostat/stderr.log` | |
+| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | |
 | admin API | config の `admin_listen`（例 `127.0.0.1:18081`） | |
 | coordinator `bridge0` | `10.99.0.1` | |
 | worker `bridge0` | `10.99.0.2` | |
@@ -117,8 +116,7 @@ ps -o pid,ppid,pgid,etime,command -ax | grep -E 'siderostat|ds4-server' | grep -
 ### 5.4 ログ確認
 
 ```sh
-tail -n 200 "$HOME/Library/Logs/siderostat/stdout.log"
-tail -n 200 "$HOME/Library/Logs/siderostat/stderr.log"
+tail -n 200 "$HOME/Library/Logs/siderostat/ds4-siderostat.log"
 # または unified log（必要時）:
 # log show --last 5m --predicate 'process == "siderostat"'
 ```

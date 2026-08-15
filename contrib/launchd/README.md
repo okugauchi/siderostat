@@ -8,7 +8,7 @@ Exampleを作業用fileへcopyし、次の全pathを実在するabsolute pathへ
 
 - `/usr/local/bin/siderostat`: installしたproxy binary
 - `/Users/USERNAME/Library/Application Support/siderostat/config.toml`: node別config
-- `/Users/USERNAME/Library/Logs/siderostat/`: stdout/stderr directory
+- `/Users/USERNAME/Library/Logs/siderostat/ds4-siderostat.log`: stdout/stderr を単一ファイルに統合
 
 Tokenやsecret値をplist、`EnvironmentVariables`、command lineへ書きません。Configにはpermission `0600`のsecret file pathだけを設定します。
 
@@ -18,8 +18,8 @@ PLIST="$HOME/Library/LaunchAgents/local.siderostat.runtime.plist"
 CONFIG="$HOME/Library/Application Support/siderostat/config.toml"
 cp contrib/launchd/local.siderostat.runtime.plist "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/stdout.log" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/stderr.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/ds4-siderostat.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/ds4-siderostat.log" "$PLIST"
 plutil -lint "$PLIST"
 if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"

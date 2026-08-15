@@ -761,6 +761,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Depends on: N-03、Q-02 の判定完了
 - 着手可能条件: 共通 local gate と reconnect acceptance suite が GREEN
 - Files: repository 外 evidence directory、必要なら redaction 済み runbook
+  （operator 手順は `docs/reconnect-field-verification-runbook.md` に集約）
 - Actions:
   1. operator が両 node の利用停止可能時間と、進行中推論 request がないことを確認する。
   2. agent が candidate の commit SHA、binary SHA-256、config checksum を記録する。
@@ -768,6 +769,10 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   4. operator が rollback binary と `launchctl` job label を確認する。
   5. agent が両 node の baseline `cluster status --json`、`cluster doctor --json`、process identity、
      log 開始位置を採取する。
+- ログ: 実機の stdout/stderr は LaunchAgent の `StandardOutPath`/`StandardErrorPath` が
+  単一の `$HOME/Library/Logs/siderostat/ds4-siderostat.log` へ統合する運用とする。backup 対象と
+  log 開始位置の採取はこの単一ファイルに対して行い、`stdout.log` / `stderr.log` の別ファイルは
+  用いない。
 - Verification: candidate/rollback の checksum、両 node Solo または Distributed の健全な baseline
 - 完了条件: 各操作を中止して旧 binary へ戻せることを operator が確認済み
 - 停止条件: active workload、unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
