@@ -311,7 +311,9 @@ where
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+    let mut raw = [0_u8; 4];
+    raw.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_be_bytes(raw)
 }
 
 #[cfg(test)]

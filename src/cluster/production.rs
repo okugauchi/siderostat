@@ -106,11 +106,11 @@ impl ProductionControlClient {
         })
     }
 
-    fn with_lifecycle_timeout(mut self, timeout: Duration) -> Self {
+    fn with_lifecycle_timeout(mut self, timeout: Duration) -> anyhow::Result<Self> {
         Arc::get_mut(&mut self.inner)
-            .expect("control client is not cloned during construction")
+            .context("control client was unexpectedly cloned during construction")?
             .lifecycle_timeout = timeout;
-        self
+        Ok(self)
     }
 
     pub async fn send(&self, message: &ControlMessage) -> anyhow::Result<ControlResponse> {
@@ -377,7 +377,7 @@ impl ProductionClusterRuntime {
                 .timeouts
                 .stop
                 .saturating_add(config.cluster.timeouts.peer_request),
-        );
+        )?;
         let lease = LeaseStatus::new();
         let (worker_runtime, distributed_worker) = if role == LocalRole::Worker {
             let child = worker_child.context("worker child lifecycle missing")?;
@@ -562,7 +562,7 @@ impl ProductionClusterRuntime {
         self.inner
             .pair_timings
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .copied()
             .collect()
@@ -953,10 +953,13 @@ pub fn detect_cluster_role(
         // SAFETY: current belongs to the live getifaddrs list.
         let entry = unsafe { &*current };
         if !entry.ifa_addr.is_null()
+            // SAFETY: `ifa_addr` is non-null and points to the live getifaddrs entry.
             && unsafe { (*entry.ifa_addr).sa_family } as i32 == libc::AF_INET
         {
+            // SAFETY: `ifa_name` is a valid NUL-terminated interface name in the live list.
             let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
             if name == interface {
+                // SAFETY: the address family was checked as AF_INET above.
                 let socket = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
                 matches.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
                     socket.sin_addr.s_addr,
@@ -1012,19 +1015,23 @@ fn collect_interface_ipv4(interface: &str) -> anyhow::Result<ObservedInterfaceIp
     while !current.is_null() {
         // SAFETY: current belongs to the live getifaddrs list.
         let entry = unsafe { &*current };
+        // SAFETY: `ifa_name` is a valid NUL-terminated interface name in the live list.
         let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
         if name == interface {
             if entry.ifa_flags & libc::IFF_UP as u32 != 0 {
                 up = true;
             }
             if !entry.ifa_addr.is_null()
+                // SAFETY: `ifa_addr` is non-null and points to the live getifaddrs entry.
                 && unsafe { (*entry.ifa_addr).sa_family } as i32 == libc::AF_INET
             {
+                // SAFETY: the address family was checked as AF_INET above.
                 let socket = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
                 let address = Ipv4Addr::from(u32::from_be(socket.sin_addr.s_addr));
                 let prefix = if entry.ifa_netmask.is_null() {
                     0
                 } else {
+                    // SAFETY: the non-null netmask is an IPv4 sockaddr for an AF_INET address.
                     let mask = unsafe { &*(entry.ifa_netmask.cast::<libc::sockaddr_in>()) };
                     u32::from_be(mask.sin_addr.s_addr).count_ones() as u8
                 };

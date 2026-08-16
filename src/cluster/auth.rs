@@ -255,8 +255,7 @@ impl ControlAuthenticator {
         }
 
         let supplied = decode_lower_hex_32(&headers.signature)?;
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret.0).expect("HMAC accepts keys of every length");
+        let mut mac = new_hmac(&self.secret);
         mac.update(&canonical_message(
             method,
             path_and_query,
@@ -325,7 +324,7 @@ fn signature(
     nonce: &str,
     body: &[u8],
 ) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(&secret.0).expect("HMAC accepts keys of every length");
+    let mut mac = new_hmac(secret);
     mac.update(&canonical_message(
         method,
         path_and_query,
@@ -334,6 +333,11 @@ fn signature(
         body,
     ));
     mac.finalize().into_bytes().into()
+}
+
+fn new_hmac(secret: &ControlSecret) -> HmacSha256 {
+    HmacSha256::new_from_slice(&secret.0)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts keys of every length"))
 }
 
 fn canonical_message(

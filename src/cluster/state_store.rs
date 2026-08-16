@@ -193,7 +193,9 @@ impl StateStore {
                 current,
             });
         }
-        let parent = self.path.parent().expect("validated state parent");
+        let parent = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent")
+        })?;
         let temporary = sibling_path(&self.path, "tmp");
         let bytes = serde_json::to_vec_pretty(state)?;
         let mut file = OpenOptions::new()

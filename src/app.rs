@@ -28,7 +28,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
     routing::{any, get, post},
 };
 use serde::Deserialize;
@@ -713,7 +713,7 @@ pub async fn admin_http_reconcile(
         .header("content-type", "application/json")
         .header("authorization", bearer)
         .body(Body::from("{}"))
-        .expect("valid reconcile request");
+        .context("build admin reconcile request")?;
     let response = admin_router(state.clone())
         .oneshot(request)
         .await
@@ -1254,10 +1254,16 @@ fn authorized_admin(
 
 fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
     match admin.start(action) {
-        Ok(job) => json_response(
-            StatusCode::ACCEPTED,
-            serde_json::to_value(job).expect("admin job serializes"),
-        ),
+        Ok(job) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize admin job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize admin job"}),
+                )
+            }
+        },
         Err(profile) => json_response(
             StatusCode::CONFLICT,
             json!({"error": format!("fingerprint job already running for {}", profile.as_str())}),
@@ -1338,21 +1344,35 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         model_variant: state.config.standalone_model_variant,
         residency: state.config.standalone_residency,
     });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/plain; version=0.0.4")
-        .body(Body::from(body))
-        .expect("valid metrics response")
+    response_with_body(
+        StatusCode::OK,
+        "text/plain; version=0.0.4",
+        Body::from(body),
+    )
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&value).expect("JSON value must serialize"),
-        ))
-        .expect("valid JSON response")
+    let body = match serde_json::to_vec(&value) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to serialize JSON response");
+            br#"{"error":"failed to serialize JSON response"}"#.to_vec()
+        }
+    };
+    response_with_body(status, "application/json", body)
+}
+
+fn response_with_body(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Body>,
+) -> Response<Body> {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 fn admission_json(snapshot: AdmissionSnapshot) -> Value {

@@ -32,7 +32,10 @@ impl NetworkEvidence {
     /// stale (its `epoch` is strictly older than the latest applied epoch). Stale observations
     /// are rejected and do not change the current evidence.
     pub fn update(&self, snapshot: NetworkSnapshot) -> bool {
-        let mut state = self.inner.write().expect("network evidence poisoned");
+        let mut state = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if snapshot.epoch < state.observed_epoch {
             return false;
         }
@@ -46,7 +49,10 @@ impl NetworkEvidence {
     /// expected peer` and `route_scoped_to_interface`, so this is the measured value the
     /// production control handler passes as `route_scoped` (plan N-02 action 2).
     pub fn route_scoped(&self) -> bool {
-        let state = self.inner.read().expect("network evidence poisoned");
+        let state = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         matches!(
             state.snapshot.state,
             ThunderboltIpState::PeerCandidateFound | ThunderboltIpState::AuthenticatedPeer
@@ -58,7 +64,7 @@ impl NetworkEvidence {
     pub fn peer_present(&self) -> bool {
         self.inner
             .read()
-            .expect("network evidence poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot
             .peer_present
     }
@@ -67,7 +73,7 @@ impl NetworkEvidence {
     pub fn snapshot(&self) -> NetworkSnapshot {
         self.inner
             .read()
-            .expect("network evidence poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot
     }
 }

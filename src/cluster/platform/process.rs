@@ -181,7 +181,9 @@ fn parse_procargs2(buffer: &[u8]) -> io::Result<Vec<OsString>> {
             "short KERN_PROCARGS2",
         ));
     }
-    let argc = c_int::from_ne_bytes(buffer[..size_of::<c_int>()].try_into().unwrap());
+    let mut raw_argc = [0_u8; size_of::<c_int>()];
+    raw_argc.copy_from_slice(&buffer[..size_of::<c_int>()]);
+    let argc = c_int::from_ne_bytes(raw_argc);
     if argc <= 0 || argc > 4096 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

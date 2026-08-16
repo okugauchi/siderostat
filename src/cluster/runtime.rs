@@ -172,11 +172,19 @@ impl ModeRuntime {
         control: &mut C,
         now_millis: u64,
     ) -> Result<ClusterSnapshot, RuntimeError> {
+        let peer_present = control.peer_lease().peer_present(now_millis);
+        self.reconcile_peer_with_presence(owner, peer_present).await
+    }
+
+    pub async fn reconcile_peer_with_presence(
+        &self,
+        owner: EventOwner,
+        peer_present: bool,
+    ) -> Result<ClusterSnapshot, RuntimeError> {
         let current = self.cluster.snapshot();
         if self.role == LocalRole::Unknown {
             return Ok(current);
         }
-        let peer_present = control.peer_lease().peer_present(now_millis);
         let next = match (current.state, peer_present) {
             (ClusterState::SoloStandaloneReady, true) => self.form_pair(owner, current).await,
             (

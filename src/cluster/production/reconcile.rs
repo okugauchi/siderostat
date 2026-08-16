@@ -80,20 +80,17 @@ impl super::ProductionClusterRuntime {
         if !peer_present && self.requires_solo_fallback(state) {
             return self.recover_from_peer_loss(owner).await;
         }
-        Ok(match &self.inner.control {
+        let peer_present = match &self.inner.control {
             RoleControl::Coordinator(control) => {
-                self.inner
-                    .mode
-                    .reconcile_peer(owner, &mut *control.lock().await, now)
-                    .await?
+                control.lock().await.peer_lease().peer_present(now)
             }
-            RoleControl::Worker(control) => {
-                self.inner
-                    .mode
-                    .reconcile_peer(owner, &mut *control.lock().await, now)
-                    .await?
-            }
-        })
+            RoleControl::Worker(control) => control.lock().await.peer_lease().peer_present(now),
+        };
+        Ok(self
+            .inner
+            .mode
+            .reconcile_peer_with_presence(owner, peer_present)
+            .await?)
     }
 
     /// Whether a cluster state must fall back to a solo standalone when the peer is gone.

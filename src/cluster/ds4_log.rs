@@ -116,7 +116,11 @@ where
     let (logs, events, forwarders) = spawn_child_log_forwarders_inner(
         stdout, stderr, profile_id, generation, pid, capacity, true,
     );
-    (logs, events.expect("event receiver requested"), forwarders)
+    (
+        logs,
+        events.unwrap_or_else(|| unreachable!("event receiver requested")),
+        forwarders,
+    )
 }
 
 fn spawn_child_log_forwarders_inner<Out, Err>(

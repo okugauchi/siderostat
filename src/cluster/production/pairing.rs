@@ -77,13 +77,17 @@ impl super::ProductionClusterRuntime {
         #[cfg(feature = "test-support")]
         let pairing_ready_at = now_millis();
         #[cfg(feature = "test-support")]
-        self.inner.pair_timings.lock().unwrap().push(PairTiming {
-            offer_sent_at,
-            confirm_received_at,
-            lease_established_at,
-            stability_achieved_at,
-            pairing_ready_at,
-        });
+        self.inner
+            .pair_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PairTiming {
+                offer_sent_at,
+                confirm_received_at,
+                lease_established_at,
+                stability_achieved_at,
+                pairing_ready_at,
+            });
         Ok(snapshot)
     }
 
