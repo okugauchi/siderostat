@@ -333,6 +333,30 @@ launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 - 完了条件: coordinator-only と worker-only が各 2 回連続成功し、409 loop や古い child 再利用がない。
 - 停止条件: `launchctl` job が重複、restart throttle 未経過、runtime state 削除が必要。
 
+### 8.1 H-03 実施結果（2026-08-16、coordinator-only 1 回目）
+
+coordinator の LaunchAgent だけを再起動した。coordinator は `SoloStandaloneReady` へ復帰したが、worker の distributed child 停止が `SIGKILL is not allowed for this child` となり、約 180 秒後の recovery retry で worker は `SoloStandaloneReady` へ戻った。その後、worker は `paired` だが lease invalid / peer absent、coordinator は `unpaired` のまま `/v1/node` HTTP 409 (`peer has not established a control lease`) が継続し、自動 re-pair / promotion / `DistributedReady` に収束しなかった。
+
+このため H-03 の停止条件に従い、worker-only restart と残りの cycle は実施していない。両 node は `SoloStandaloneReady`、admission serving、active request 0、`cluster doctor healthy=true`、standalone child 各1件、LaunchAgent 各1件の安全な状態に戻っている。手動 pair/reconcile、state 削除、force kill は実施していない。
+
+Evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/cycle1-coordinator-only-failure.md`
+
+### 8.2 H-03 修正適用・再開準備（2026-08-16）
+
+失敗原因に対して、失効した認証済み peer の `/v1/node` を再 pair 用 descriptor 応答へ変更し、PeerLost recovery 後の control phase を lease 有効時だけ `Paired` とするよう修正した。auto pair は coordinator のみが実行し、DS4 child の SIGTERM 後に残留した場合は `allow_sigkill=true` の identity 再確認済み owned child を SIGKILL できる設定へ両 node を更新した。
+
+両 node を candidate `1952cd7bb2db07ffcb4e5487fed3a52949f3d2d7f85b4c35a57f7391fc4f3cb0`、`allow_sigkill=true`、更新済み LaunchAgent で再起動した。両 node は一度 `SoloStandaloneReady` へ起動後、coordinator 起点の自動 re-pair、lease valid / peer-present / route-scoped、auto promotion、`DistributedReady`、`cluster doctor --json` の `healthy=true` へ収束した。control generation は両 node `445`、distributed child は worker PID `69260` / coordinator PID `39175` の各1件だった。
+
+この確認は修正適用と H-03 再開条件の確認であり、coordinator-only / worker-only 各2 cycleの完了記録ではない。詳細 evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-fix-application.md`
+
+### 8.3 H-03 完了（2026-08-16）
+
+修正適用後、coordinator-only 2 cycle と worker-only 2 cycle を実施した。各 cycle は片側 process 再起動後に peer loss recovery、SoloStandaloneReady、自動 re-pair、auto promotion、DistributedReady へ収束した。各最終 checkpoint で両 node の `cluster doctor --json` は `healthy=true`、admission serving、active request 0、lease valid / peer-present / route-scoped、public `/v1/models` は HTTP 200 だった。
+
+distributed child は各 cycle で新しい PID/generation へ更新され、最終は worker PID `75852`、coordinator PID `40229`。LaunchAgent の runtime job は各 node 1件、orphan child はなく、新しい検証時間帯に 409 loop、`SIGKILL is not allowed for this child`、古い child 再利用はなかった。再起動直後の coordinator route-loss demotion task の終了競合ログは記録されたが、shared recovery と最終収束は成功した。
+
+Evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-summary.md`
+
 ## 9. H-04 macOS 再起動（operator の作業）
 
 前提: process 再起動の両方向が成功し、operator が長い中断を承認。

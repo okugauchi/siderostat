@@ -979,7 +979,7 @@ binary = "$HOME/LLM/ds4/ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 [ds4.dspark]
 enabled = true

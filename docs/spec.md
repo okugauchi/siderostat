@@ -434,7 +434,7 @@ coordinator:
 
 Worker requestはcoordinator peer ingressでもcountされるため、coordinator側in-flight=0がDS4に到達中の全requestの最終根拠となる。Worker ackは新しいrequestを生成しない保証として使う。
 
-Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。`allow_sigkill=false` ならmanual intervention、trueならidentity確認済みowned childだけをSIGKILLできる。
+Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。既定ではidentity確認済みowned childだけをSIGKILLできる。`allow_sigkill=false` ならmanual intervention。
 
 ## 13. Node roleとnetwork
 
@@ -922,7 +922,7 @@ ManualInterventionRequired相当で停止する。通知を表示できない場
 
 - 通常停止はSIGTERM。
 - Drain完了後にsignalする。
-- Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。
+- Stop timeout後のSIGKILLは既定で許可するが、identityを直前に再確認できたowned childだけを対象とする。`allow_sigkill=false` ならmanual intervention。
 - 起動時cleanupは、5秒通知後の既定動作または明示的な拒否オプションとして扱う。
   SIGTERM/SIGKILLの各直前にPID、executable、argv hash、start timeを再確認し、通常のprocess groupではなく
   候補process自身へsignalする。
@@ -1050,7 +1050,7 @@ binary = "$HOME/LLM/ds4/ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 [ds4.dspark]
 enabled = true

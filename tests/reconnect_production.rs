@@ -489,6 +489,66 @@ async fn peer_lost_from_distributed_ready_orphans_distributed_children() {
 }
 
 #[tokio::test]
+async fn expired_peer_lease_allows_coordinator_to_repair_pairing_after_peer_loss() {
+    // A distributed child loss expires both control leases. Once both nodes have recovered to
+    // SoloStandaloneReady, /v1/node must still expose the authenticated peer descriptor so the
+    // coordinator can negotiate the current session generation and initiate a fresh Pair.
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("initial pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("initial promotion");
+
+    harness.coordinator.stop_serve().await;
+    harness.worker.stop_serve().await;
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("worker PeerLost recovery");
+    harness
+        .coordinator
+        .production
+        .reconcile()
+        .await
+        .expect("coordinator PeerLost recovery");
+    assert!(
+        harness
+            .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(10))
+            .await,
+        "both nodes must recover to solo before repair"
+    );
+
+    harness
+        .worker
+        .restart_serve()
+        .await
+        .expect("restart worker control server");
+    harness
+        .coordinator
+        .restart_serve()
+        .await
+        .expect("restart coordinator control server");
+    harness
+        .coordinator
+        .production
+        .pair()
+        .await
+        .expect("expired lease must not block coordinator re-pair");
+
+    assert!(
+        harness
+            .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+            .await,
+        "re-pair did not converge after expired lease repair"
+    );
+    assert_paired_consistent(&harness.coordinator, &harness.worker).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn coordinator_adopts_higher_worker_generation_on_pair() {
     // P0-B: when only the worker carries a higher persistent control session generation, the
     // coordinator (session authority) adopts that higher generation via the /v1/node candidate

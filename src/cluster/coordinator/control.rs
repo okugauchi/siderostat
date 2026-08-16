@@ -116,8 +116,8 @@ impl CoordinatorControl {
         };
     }
 
-    pub fn reset_for_repair(&mut self) {
-        self.phase = if self.processor.lease().descriptor().is_some() {
+    pub fn reset_for_repair(&mut self, now_millis: u64) {
+        self.phase = if self.processor.lease().peer_present(now_millis) {
             DistributedControlPhase::Paired
         } else {
             DistributedControlPhase::Unpaired

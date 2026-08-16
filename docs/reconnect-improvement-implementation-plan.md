@@ -854,7 +854,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - 停止条件: local standalone が ready にならない、unknown process、active user request、温度/容量等の運用警告
 - Evidence: 2026-08-16 に candidate commit `8f6c86c`（両 node binary SHA-256 `a848c3d7894c9b5c508be0892ba0e4b9169b2060a327d56d4c493a9aa0de1082`）で cable detach/reconnect を 2 回連続実施。各回とも両 node が role loss 後に `SoloStandaloneReady` / `admission=serving` / distributed child 不在へ復帰し、再接続後に pairing・auto promotion・新 generation の `DistributedReady` へ収束した。最終 worker は generation 371 / distributed worker PID 50296、coordinator は generation 439 / distributed coordinator PID 36953。control phase は両 node `worker-ready`、lease valid / peer-present / route-scoped、`cluster doctor --json` は両 node `healthy=true`、active request は 0。public inference smoke は直列実行で worker/coordinator とも HTTP 200（並列 probe の一方は `max_in_flight=1` による HTTP 503、直列 retry は HTTP 200）。evidence summary: `/private/tmp/siderostat-reconnect-evidence-20260816/h02/20260816-h02-summary.md`。worker の stale distributed DS4 cleanup に各回約 3〜4 分を要したが、unknown/orphan process は残らなかった。
 
-### [ ] H-03 片側 process 再起動を方向別に検証する
+### [x] H-03 片側 process 再起動を方向別に検証する
 
 - Actor: operator（service 操作承認）+ agent（観測）
 - Depends on: H-01、H-02
@@ -870,6 +870,9 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - 完了条件: coordinator-only と worker-only が各 2 回連続成功し、409 loop や古い child 再利用がない
 - 停止条件: `launchctl` job が重複、restart throttle 未経過、runtime state 削除が必要
 - 着手準備: H-02 完了後、cable 接続済み・両 node `DistributedReady`・admission serving・active request 0・rollback candidate 保持を確認済み。次は coordinator-only restart から開始する。
+- Failure evidence (2026-08-16): coordinator-only 1 回目で coordinator は `SoloStandaloneReady` へ戻ったが、worker の distributed child 停止が `SIGKILL is not allowed for this child` となり、約 180 秒後の recovery retry で worker は `SoloStandaloneReady` へ戻った。その後 worker は `paired` だが lease invalid / peer absent のまま、coordinator は `unpaired` で `/v1/node` HTTP 409 (`peer has not established a control lease`) loop が継続し、自動 re-pair / promotion / `DistributedReady` に収束しなかった。H-03 はこの cycle で停止し、worker-only restart と残りの cycle は未実施。evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/cycle1-coordinator-only-failure.md`。
+- Fix application evidence (2026-08-16): 失効した認証済み peer の `/v1/node` を再 pair 用 descriptor 応答へ変更し、PeerLost recovery 後の phase を lease 有効時だけ `Paired` とし、auto pair を coordinator 限定にした。両 node の `allow_sigkill=true` と candidate `1952cd7bb2db07ffcb4e5487fed3a52949f3d2d7f85b4c35a57f7391fc4f3cb0` を適用後、SoloStandaloneReady から自動 re-pair / auto promotion / DistributedReady、control generation `445`、`healthy=true` へ収束した。これは修正適用と再開条件の確認であり、H-03 の coordinator-only / worker-only 各2 cycle完了ではない。evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-fix-application.md`。
+- Completion evidence (2026-08-16): 修正適用後、coordinator-only 2 cycle と worker-only 2 cycle を完了した。各 cycle で peer loss recovery、SoloStandaloneReady、自動 re-pair、auto promotion、DistributedReady、doctor `healthy=true`、public `/v1/models` HTTP 200、orphan child 不在を確認した。child は各回で新 PID/generation へ更新され、最終 worker PID `75852`、coordinator PID `40229`。新しい検証時間帯に 409 loop、`SIGKILL is not allowed for this child`、古い child 再利用はなかった。coordinator の既存 route-loss demotion task 終了競合ログはあったが、shared recovery と最終収束は成功した。evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-summary.md`。
 
 ### [ ] H-04 macOS 再起動を片側・両側で検証する
 

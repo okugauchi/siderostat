@@ -38,7 +38,7 @@ curl --fail --silent http://127.0.0.1:18081/metrics
 | Peer lease喪失 | peer_lease_seconds | Lease失効でfuture admissionを閉じ、Solo Standaloneへ収束する |
 | Unknown processが必要portを占有 | doctor、child identity | macOS右上の簡潔な通知と警告音を出し、既定5秒後にidentity再確認後に終了する。`startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で拒否し、ManualInterventionRequired相当として対応する |
 | Standalone startup failed | standalone startup log | Standalone profileの起動を確認する。Startup失敗時はUnavailableとして503を返す |
-| Drain timeout | drain log、in_flight | `allow_sigkill=false`ならmanual intervention、trueならidentity確認済みowned childだけSIGKILLできる |
+| Drain timeout | drain log、in_flight | 既定ではidentity確認済みowned childだけSIGKILLできる。`allow_sigkill=false`ならmanual intervention |
 | State corrupt | state log、doctor | Corrupt stateを保全し、standalone_safeならSolo Standalone、不能ならManualInterventionRequired |
 | Promotion失敗が3回連続 | cluster state、backoff | Auto promotionを止め、原因を取り除いてから`cluster reconcile`を実行する |
 
@@ -78,11 +78,11 @@ Peer controlは生きているがrouteが失われた場合は、route loss grac
 
 ### 3.7 Child supervision / restart
 
-DS4 childをTokio process APIでspawnし、shellを介さない。PID、canonical executable、argv hash、profile、generation、spawn timestampを保存する。Proxy再起動時はexecutable、argv、start timeを照合し、完全一致したowned childだけを自動で再所有または停止対象にする。起動時に既存の `siderostat` / `ds4-server` が見つかった場合は、macOS右上の簡潔な通知と警告音を出し、既定では5秒後に各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否は `startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で指定する。拒否、identity不一致、停止失敗の場合は起動せずManualIntervention相当で止まる。通常停止のstop timeout後SIGKILLは引き続き `allow_sigkill=true` かつidentity確認済みowned childだけ。
+DS4 childをTokio process APIでspawnし、shellを介さない。PID、canonical executable、argv hash、profile、generation、spawn timestampを保存する。Proxy再起動時はexecutable、argv、start timeを照合し、完全一致したowned childだけを自動で再所有または停止対象にする。起動時に既存の `siderostat` / `ds4-server` が見つかった場合は、macOS右上の簡潔な通知と警告音を出し、既定では5秒後に各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否は `startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で指定する。拒否、identity不一致、停止失敗の場合は起動せずManualIntervention相当で止まる。通常停止のstop timeout後SIGKILLも、既定でidentity確認済みowned childだけを対象にする。`allow_sigkill=false` ならmanual intervention。
 
 ### 3.8 Standalone startup / drain timeout
 
-Standalone startup timeout（既定900秒）を超えた場合、standalone profileの起動を確認する。Standalone upstreamがreadyでなければproxyはUnavailableとして503 + `Retry-After`を返す。Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。`allow_sigkill=false` ならmanual intervention、trueならidentity確認済みowned childだけをSIGKILLできる（spec第12.4節）。
+Standalone startup timeout（既定900秒）を超えた場合、standalone profileの起動を確認する。Standalone upstreamがreadyでなければproxyはUnavailableとして503 + `Retry-After`を返す。Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。既定ではidentity確認済みowned childだけをSIGKILLでき、`allow_sigkill=false` ならmanual intervention（spec第12.4節）。
 
 ### 3.9 Promotion backoff / manual state
 

@@ -610,7 +610,7 @@ binary = "/nonexistent/ds4-server"
 working_directory = "/nonexistent"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 [ds4.dspark]
 enabled = true

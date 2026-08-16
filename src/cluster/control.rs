@@ -252,6 +252,12 @@ impl PeerLease {
         self.descriptor.as_ref()
     }
 
+    fn matches_peer(&self, authenticated: &AuthenticatedPeer) -> bool {
+        self.descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.node_id == authenticated.node_id())
+    }
+
     pub fn route_scoped(&self) -> bool {
         self.route_scoped
     }
@@ -300,15 +306,31 @@ impl ControlProcessor {
         if !route_scoped {
             return Err(ControlError::RouteNotScoped);
         }
-        if self.lease.descriptor().is_some() {
-            self.lease
-                .renew(authenticated, self.local.generation, true, now_millis)?;
-        }
+        let lease_expires_at_millis = match self.lease.descriptor() {
+            None => None,
+            Some(_) if self.lease.expired(now_millis) => {
+                // A previously paired, authenticated peer must be able to obtain the current
+                // descriptor after a lease timeout. The coordinator needs this response to
+                // negotiate a fresh generation and send Pair; returning 409 here makes both
+                // nodes remain in SoloStandaloneReady forever. Do not establish a lease on a
+                // read-only request: the subsequent Pair command still performs the normal
+                // authenticated route and generation checks.
+                if !self.lease.matches_peer(authenticated) {
+                    return Err(ControlError::PeerNotPaired);
+                }
+                None
+            }
+            Some(_) => {
+                self.lease
+                    .renew(authenticated, self.local.generation, true, now_millis)?;
+                self.lease.expires_at_millis()
+            }
+        };
         Ok(ControlResponse {
             status: ControlResponseStatus::Applied,
             generation: self.local.generation,
             descriptor: self.local.clone(),
-            lease_expires_at_millis: self.lease.expires_at_millis(),
+            lease_expires_at_millis,
         })
     }
 
@@ -567,6 +589,63 @@ mod tests {
                 "{label}: candidate must not be lower than either known generation"
             );
         }
+    }
+
+    #[test]
+    fn expired_authenticated_peer_can_read_descriptor_to_restart_pairing() {
+        let mut processor = ControlProcessor::new(
+            NodeDescriptor {
+                protocol_version: 1,
+                node_id: "coordinator".into(),
+                role: ControlRole::Coordinator,
+                generation: 7,
+                mode: ControlMode::SoloStandalone,
+                deployment_id: Some("deployment-a".into()),
+            },
+            ControlRole::Worker,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        );
+        let authenticated =
+            AuthenticatedPeer::new_for_test("worker", "10.99.0.2".parse().unwrap(), 100);
+        let pair = ControlMessage {
+            request_id: "pair-1".into(),
+            generation: 7,
+            deployment_id: None,
+            command: ControlCommand::Pair {
+                descriptor: NodeDescriptor {
+                    protocol_version: 1,
+                    node_id: "worker".into(),
+                    role: ControlRole::Worker,
+                    generation: 7,
+                    mode: ControlMode::SoloStandalone,
+                    deployment_id: Some("deployment-a".into()),
+                },
+            },
+        };
+        processor
+            .handle_validated(
+                ControlEndpoint::Pair,
+                pair,
+                &authenticated,
+                true,
+                100,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let response = processor
+            .descriptor_response(&authenticated, true, 200)
+            .unwrap();
+        assert_eq!(response.generation, 7);
+        assert_eq!(response.lease_expires_at_millis, None);
+
+        let wrong_peer =
+            AuthenticatedPeer::new_for_test("other-worker", "10.99.0.3".parse().unwrap(), 200);
+        assert_eq!(
+            processor.descriptor_response(&wrong_peer, true, 200),
+            Err(ControlError::PeerNotPaired)
+        );
     }
 
     #[test]

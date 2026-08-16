@@ -187,6 +187,7 @@ impl super::ProductionClusterRuntime {
                 }
                 let snapshot = runtime.inner.mode.snapshot();
                 if snapshot.state == ClusterState::SoloStandaloneReady
+                    && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_pair
                 {
                     if let Err(error) = runtime.pair().await {
