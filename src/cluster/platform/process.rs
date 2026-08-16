@@ -89,7 +89,11 @@ pub(crate) fn list_processes() -> io::Result<Vec<ObservedProcess>> {
                         Some(code)
                             if matches!(
                                 code,
-                                libc::ESRCH | libc::EPERM | libc::EACCES | libc::EINVAL
+                                libc::ENOENT
+                                    | libc::ESRCH
+                                    | libc::EPERM
+                                    | libc::EACCES
+                                    | libc::EINVAL
                             )
                     ) => {}
                 Err(error) => return Err(error),
