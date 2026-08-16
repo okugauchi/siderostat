@@ -834,9 +834,9 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator
 `/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
-`74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。両 node の LaunchAgent は同一 candidate path を実行し、operator 承認済み startup cleanup は各 node 1 件の stale DS4 process に対して成功した。両 node の最終状態は `SoloStandaloneReady`、health/ready PASS、doctor `healthy=true`、admission serving、active request 0、node ごとの standalone DS4 child 1 件であり、H-01 の checksum / rollback / 健全 baseline 条件を満たした。H-02 は DistributedReady を着手条件とするため未着手。
+`74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。両 node の LaunchAgent は同一 candidate path を実行し、operator 承認済み startup cleanup は各 node 1 件の stale DS4 process に対して成功した。両 node の最終状態は `SoloStandaloneReady`、health/ready PASS、doctor `healthy=true`、admission serving、active request 0、node ごとの standalone DS4 child 1 件であり、H-01 の checksum / rollback / 健全 baseline 条件を満たした。これは H-01 完了時点の記録であり、その時点では H-02 は DistributedReady を着手条件とするため未着手だった。H-02 の実施結果は後述する。
 
-### [ ] H-02 DistributedReady から cable detach/reconnect を検証する
+### [x] H-02 DistributedReady から cable detach/reconnect を検証する
 
 - Actor: operator（物理操作）+ agent（観測）
 - Depends on: H-01
@@ -852,6 +852,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Verification: 各 checkpoint の JSON、log、PID/profile/generation、public inference smoke request
 - 完了条件: 2 回連続で 1〜5 が成功し、proxy 各 1、node ごとの DS4 child 最大 1、orphan なし
 - 停止条件: local standalone が ready にならない、unknown process、active user request、温度/容量等の運用警告
+- Evidence: 2026-08-16 に candidate commit `8f6c86c`（両 node binary SHA-256 `a848c3d7894c9b5c508be0892ba0e4b9169b2060a327d56d4c493a9aa0de1082`）で cable detach/reconnect を 2 回連続実施。各回とも両 node が role loss 後に `SoloStandaloneReady` / `admission=serving` / distributed child 不在へ復帰し、再接続後に pairing・auto promotion・新 generation の `DistributedReady` へ収束した。最終 worker は generation 371 / distributed worker PID 50296、coordinator は generation 439 / distributed coordinator PID 36953。control phase は両 node `worker-ready`、lease valid / peer-present / route-scoped、`cluster doctor --json` は両 node `healthy=true`、active request は 0。public inference smoke は直列実行で worker/coordinator とも HTTP 200（並列 probe の一方は `max_in_flight=1` による HTTP 503、直列 retry は HTTP 200）。evidence summary: `/private/tmp/siderostat-reconnect-evidence-20260816/h02/20260816-h02-summary.md`。worker の stale distributed DS4 cleanup に各回約 3〜4 分を要したが、unknown/orphan process は残らなかった。
 
 ### [ ] H-03 片側 process 再起動を方向別に検証する
 
@@ -868,6 +869,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Verification: direction ごとの status/log/process tree、public inference smoke request
 - 完了条件: coordinator-only と worker-only が各 2 回連続成功し、409 loop や古い child 再利用がない
 - 停止条件: `launchctl` job が重複、restart throttle 未経過、runtime state 削除が必要
+- 着手準備: H-02 完了後、cable 接続済み・両 node `DistributedReady`・admission serving・active request 0・rollback candidate 保持を確認済み。次は coordinator-only restart から開始する。
 
 ### [ ] H-04 macOS 再起動を片側・両側で検証する
 

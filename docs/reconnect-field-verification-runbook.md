@@ -170,7 +170,7 @@ worker `33f504...` / coordinator `a5b2e9...` と一致しない。lock 解消後
 worker `be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator
 `7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977` である。
 
-両 node の LaunchAgent は candidate path を指し、重複 job はなく、operator 承認済み startup cleanup は worker/coordinator 各 1 件の stale DS4 process に対して実施された。最終状態は両 node とも `SoloStandaloneReady`、`/healthz=ok`、`/readyz=ready`、`cluster doctor` の `healthy=true`（`admission_serving=true`、`safe_state=true`、`target_ready=true`）で、active request は 0 件、standalone DS4 child は node ごとに 1 件、unknown/orphan process はない。最終 worker generation は 278、coordinator generation は 339。最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator `/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。H-02 は両 node が DistributedReady ではないため、まだ開始しない。
+両 node の LaunchAgent は candidate path を指し、重複 job はなく、operator 承認済み startup cleanup は worker/coordinator 各 1 件の stale DS4 process に対して実施された。最終状態は両 node とも `SoloStandaloneReady`、`/healthz=ok`、`/readyz=ready`、`cluster doctor` の `healthy=true`（`admission_serving=true`、`safe_state=true`、`target_ready=true`）で、active request は 0 件、standalone DS4 child は node ごとに 1 件、unknown/orphan process はない。最終 worker generation は 278、coordinator generation は 339。最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator `/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。これは H-01 完了時点の記録であり、その時点では H-02 は両 node が DistributedReady ではないため未着手だった。
 
 ## 4. 証跡ディレクトリと記録方法
 
@@ -301,6 +301,18 @@ agent は各 checkpoint で status/doctor/log を保存する。
 
 - 完了条件: 2 回連続成功し、proxy 各 1、node ごとの DS4 child 最大 1、orphan なし。
 - 停止条件: local standalone が ready にならない、unknown process、active user request、温度/容量等の運用警告。
+
+### 7.1 H-02 実施結果（2026-08-16）
+
+candidate commit `8f6c86c`（両 node binary SHA-256: `a848c3d7894c9b5c508be0892ba0e4b9169b2060a327d56d4c493a9aa0de1082`）で、operator が cable detach/reconnect を 2 回連続実施した。各 cycle とも、detach 後に両 node が role loss を検知して `SoloStandaloneReady` / `admission=serving` / distributed child 不在へ復帰し、reconnect 後に pairing、auto promotion、新 generation の `DistributedReady` へ収束した。
+
+- cycle 1: detach 17:15:29 JST、reconnect 17:20:37 JST、最終 worker generation 361 / coordinator generation 429
+- cycle 2: detach 17:24:03 JST、reconnect 17:28:28 JST、最終 worker generation 371 / coordinator generation 439
+- 最終 child: worker distributed worker PID 50296、coordinator distributed coordinator PID 36953。standalone child は両 node とも停止。
+- 最終 control phase は両 node `worker-ready`、lease valid / peer-present / route-scoped。`cluster doctor --json` は両 node `healthy=true`、active request は 0。
+- public inference smoke は直列実行で worker/coordinator とも HTTP 200。並列 probe の一方は `max_in_flight=1` により HTTP 503 となったが、直列 retry は HTTP 200 だったため、cycle failure には分類しない。
+- worker の stale distributed DS4 cleanup に各 cycle 約 3〜4 分を要したが、local standalone は両回とも ready になり、unknown/orphan process は残らなかった。
+- Evidence summary: `/private/tmp/siderostat-reconnect-evidence-20260816/h02/20260816-h02-summary.md`
 
 ## 8. H-03 片側 process 再起動（operator の作業）
 
