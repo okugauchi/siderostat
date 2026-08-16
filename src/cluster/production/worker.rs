@@ -6,7 +6,7 @@ use crate::{
     },
     target::{ClusterState, LocalRole},
 };
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use std::{
     sync::{
         Arc,
@@ -23,6 +23,11 @@ impl super::ProductionClusterRuntime {
             .as_ref()
             .context("worker lifecycle unavailable")?;
         let current = self.inner.mode.snapshot();
+        ensure!(
+            current.state == ClusterState::PairedStandaloneReady,
+            "worker promotion requires paired standalone readiness, current state is {:?}",
+            current.state
+        );
         tracing::info!(
             event = "promotion-started",
             owner = EventOwner::Control.name(),

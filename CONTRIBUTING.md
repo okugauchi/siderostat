@@ -101,10 +101,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-テスト実行時はrepositoryの `.cargo/config.toml` が `RUST_TEST_THREADS=1` を強制する。
-これはreconnect production harnessの共有loopback resourceとfake lifecycleを保護し、
-CIとlocalで同じテストスケジュールを再現するためである。並列化を前提にしたテストを追加する場合は、
-共有resourceを使わない設計にするか、この制約を見直す変更を同じreviewへ含める。
+テストはRust test harnessの標準並列スケジュールで実行する。reconnect production harnessは
+各テストでloopback port、state path、fake lifecycleを分離するため、テスト間の共有resourceに
+依存しない。並列化を前提にしたテストを追加する場合も、port・state・child lifecycleなどの
+resourceをテスト単位で分離し、固定sleepや実行順への依存を作らない。
+
+reconnect suiteの並列確認には次を使用できる。
+
+```text
+cargo test --test reconnect_production --features test-support -- --test-threads=8
+```
 
 ### Branchの終了
 

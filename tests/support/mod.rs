@@ -196,6 +196,7 @@ pub struct FakeStandalone {
     profile: &'static str,
     pid: u32,
     start_fails: Arc<AtomicBool>,
+    stop_delay_millis: Arc<AtomicU64>,
 }
 
 impl FakeStandalone {
@@ -205,6 +206,7 @@ impl FakeStandalone {
             profile,
             pid,
             start_fails: Arc::new(AtomicBool::new(false)),
+            stop_delay_millis: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -215,6 +217,13 @@ impl FakeStandalone {
     /// Inject a standalone-start failure (A-04 failure table: SoloStandaloneStarting retry).
     pub fn set_start_fails(&self, fails: bool) {
         self.start_fails.store(fails, Ordering::SeqCst);
+    }
+
+    /// Delay standalone shutdown to reproduce the window between control Pair acceptance and
+    /// the worker's local PairingReady transition.
+    pub fn set_stop_delay(&self, delay: Duration) {
+        self.stop_delay_millis
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 }
 
@@ -235,7 +244,12 @@ impl LocalStandaloneLifecycle for FakeStandalone {
 
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
         let child = self.child.clone();
+        let stop_delay_millis = self.stop_delay_millis.clone();
         Box::pin(async move {
+            let delay = stop_delay_millis.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             child.stop();
             Ok(())
         })

@@ -868,7 +868,9 @@ impl IntoResponse for ControlHttpError {
 fn effect_requires_ack(command: &ControlCommand) -> bool {
     matches!(
         command,
-        ControlCommand::CancelGeneration
+        ControlCommand::Pair { .. }
+            | ControlCommand::PrepareWorker
+            | ControlCommand::CancelGeneration
             | ControlCommand::DistributedReady
             | ControlCommand::Demote
     )
@@ -1291,11 +1293,21 @@ mod tests {
     }
 
     #[test]
-    fn destructive_worker_effects_are_acknowledged_after_completion() {
+    fn lifecycle_effects_are_acknowledged_after_completion() {
+        assert!(effect_requires_ack(&ControlCommand::Pair {
+            descriptor: NodeDescriptor {
+                protocol_version: 1,
+                node_id: "coordinator-node".into(),
+                role: ControlRole::Coordinator,
+                generation: 1,
+                mode: super::super::ControlMode::SoloStandalone,
+                deployment_id: Some("deployment-production".into()),
+            },
+        }));
+        assert!(effect_requires_ack(&ControlCommand::PrepareWorker));
         assert!(effect_requires_ack(&ControlCommand::Demote));
         assert!(effect_requires_ack(&ControlCommand::CancelGeneration));
         assert!(effect_requires_ack(&ControlCommand::DistributedReady));
-        assert!(!effect_requires_ack(&ControlCommand::PrepareWorker));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
     }
 }

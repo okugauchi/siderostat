@@ -348,6 +348,37 @@ async fn normal_first_pair_converges_over_control_http() {
 }
 
 #[tokio::test]
+async fn pair_response_waits_for_worker_pairing_ready() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness
+        .worker
+        .standalone
+        .set_stop_delay(Duration::from_millis(500));
+
+    let coordinator = harness.coordinator.production.clone();
+    let pairing = tokio::spawn(async move { coordinator.pair().await });
+    let worker_entered_pairing = wait_until(Duration::from_secs(2), || async {
+        harness.worker.mode.snapshot().state == ClusterState::Pairing
+    })
+    .await;
+    assert!(worker_entered_pairing, "worker did not enter Pairing");
+
+    assert!(
+        !pairing.is_finished(),
+        "Pair must not acknowledge before worker PairingReady"
+    );
+    assert_ne!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady,
+        "worker must not publish PairingReady while its standalone stop is pending"
+    );
+
+    pairing.await.expect("pair task join").expect("pairing");
+    assert_paired_consistent(&harness.coordinator, &harness.worker).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn wait_until_reports_last_snapshot_on_timeout() {
     // Sanity check the deadline-based helper: a predicate that never becomes true returns
     // false, and the caller can still read the final snapshot afterwards.

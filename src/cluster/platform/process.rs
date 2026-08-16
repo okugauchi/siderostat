@@ -93,6 +93,7 @@ pub(crate) fn list_processes() -> io::Result<Vec<ObservedProcess>> {
                                     | libc::ESRCH
                                     | libc::EPERM
                                     | libc::EACCES
+                                    | libc::EIO
                                     | libc::EINVAL
                             )
                     ) => {}

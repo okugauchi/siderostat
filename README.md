@@ -69,9 +69,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-`.cargo/config.toml` はRust test harnessの `RUST_TEST_THREADS` を `1` に固定する。
-reconnect production testは共有loopback resourceとfake lifecycleを使うため、CIとlocalの
-`cargo test`を同じ直列スケジュールに揃え、並列実行時のタイミング依存を避ける。
+`.cargo/config.toml` はRust test harnessのスレッド数を固定せず、標準の並列実行を使用する。
+reconnect production testは各テストでloopback port、state path、fake lifecycleを分離するため、
+CIとlocalの通常の `cargo test` で並列実行できる。reconnect suiteの明示的な並列検証は次で行う。
+
+```bash
+cargo test --test reconnect_production --features test-support -- --test-threads=8
+```
 
 設定はTOMLで、`siderostat.example.toml`が配布用の完全例です。探索順は次のとおりです。
 
