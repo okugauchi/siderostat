@@ -707,10 +707,11 @@ impl Node {
         manifest_cache: PathBuf,
         listener: tokio::net::TcpListener,
         baseline_generation: u64,
+        control_lease: Duration,
     ) -> anyhow::Result<Self> {
         let ds4_distributed_port = free_loopback_port().await?;
         let peer_ingress_port = free_loopback_port().await?;
-        let config = test_config(
+        let mut config = test_config(
             node_id,
             coordinator_address,
             worker_address,
@@ -720,6 +721,7 @@ impl Node {
             state_path,
             manifest_cache,
         );
+        config.cluster.timeouts.control_lease = control_lease;
         let proxy = proxy_state()?;
         let standalone = Arc::new(FakeStandalone::new(
             "flash-standalone",
@@ -912,6 +914,25 @@ impl TwoNode {
         coordinator_baseline: u64,
         worker_baseline: u64,
     ) -> anyhow::Result<Self> {
+        Self::boot_with_baseline_and_control_lease(
+            coordinator_baseline,
+            worker_baseline,
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Boot both nodes with a shortened control lease so acknowledged lifecycle effects are
+    /// forced to prove that their response refreshes the inbound lease before returning.
+    pub async fn boot_with_control_lease(control_lease: Duration) -> anyhow::Result<Self> {
+        Self::boot_with_baseline_and_control_lease(0, 0, control_lease).await
+    }
+
+    async fn boot_with_baseline_and_control_lease(
+        coordinator_baseline: u64,
+        worker_baseline: u64,
+        control_lease: Duration,
+    ) -> anyhow::Result<Self> {
         // This host binds only one IPv4 loopback (127.0.0.1) and one IPv6 loopback (::1);
         // 127.0.0.2 and ::2 are not aliased, and cross-family (IPv4 vs IPv6) control
         // connections are unsupported. The two nodes are therefore isolated on the same
@@ -941,6 +962,7 @@ impl TwoNode {
             coordinator_cache,
             coordinator_listener,
             coordinator_baseline,
+            control_lease,
         )
         .await?;
         let worker = Node::build(
@@ -954,6 +976,7 @@ impl TwoNode {
             worker_cache,
             worker_listener,
             worker_baseline,
+            control_lease,
         )
         .await?;
         Ok(Self {

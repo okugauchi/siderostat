@@ -110,17 +110,50 @@ impl super::ProductionClusterRuntime {
                 }
             }
         };
-        self.inner.lease.update(&response);
-        if effect_requires_ack(&command) {
+        let response = if effect_requires_ack(&command) {
+            let response_status = response.status;
             let runtime = self.clone();
             tokio::spawn(async move { runtime.apply_effect(command).await })
                 .await
                 .map_err(|error| ControlHttpError::Effect(error.to_string()))?
                 .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
+            // Lifecycle effects can take long enough to cross the lease interval. Renew the
+            // inbound control lease after the effect completes and return that fresh expiry to
+            // the caller; otherwise a reciprocal Pair can finish successfully but the next
+            // /v1/node renewal observes the lease as expired.
+            let mut refreshed = self
+                .refresh_control_response(&authenticated, route_scoped)
+                .await?;
+            refreshed.status = response_status;
+            refreshed
         } else {
             self.spawn_effect(command);
-        }
+            response
+        };
+        self.inner.lease.update(&response);
         Ok(response)
+    }
+
+    async fn refresh_control_response(
+        &self,
+        authenticated: &AuthenticatedPeer,
+        route_scoped: bool,
+    ) -> Result<ControlResponse, ControlHttpError> {
+        let now = now_millis();
+        match &self.inner.control {
+            RoleControl::Coordinator(control) => {
+                Ok(control
+                    .lock()
+                    .await
+                    .node_descriptor(authenticated, route_scoped, now)?)
+            }
+            RoleControl::Worker(control) => {
+                Ok(control
+                    .lock()
+                    .await
+                    .node_descriptor(authenticated, route_scoped, now)?)
+            }
+        }
     }
 
     fn spawn_effect(&self, command: ControlCommand) {

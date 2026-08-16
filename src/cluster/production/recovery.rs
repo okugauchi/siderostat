@@ -102,6 +102,14 @@ impl super::ProductionClusterRuntime {
                 .await?
         };
 
+        // PeerLost invalidates the in-flight distributed control sequence. Keep the negotiated
+        // session/lease, but reset only its command phase so a subsequent Pair can establish a
+        // fresh promotion sequence without allowing a delayed Pair to rewind an active one.
+        match &self.inner.control {
+            RoleControl::Coordinator(control) => control.lock().await.reset_for_repair(),
+            RoleControl::Worker(control) => control.lock().await.reset_for_repair(),
+        }
+
         // 2. Stop the local distributed child (identity-verified, idempotent). On failure the
         //    node stays SoloStandaloneStarting + Unavailable and the next reconcile retries.
         self.stop_distributed_child().await?;

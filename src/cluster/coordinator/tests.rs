@@ -519,6 +519,18 @@ fn distributed_ack_sequence_rejects_reorder_duplicate_change_and_old_generation(
     assert_eq!(prepare.deployment_id.as_deref(), Some("deployment-a"));
     control.note_prepare_sent(7).unwrap();
     assert_eq!(
+        control.handle(
+            ControlEndpoint::Pair,
+            pair("delayed-pair"),
+            &authenticated(),
+            true,
+            NOW + 5_000,
+        ),
+        Err(ControlError::InvalidPhase {
+            phase: DistributedControlPhase::WorkerPreparing,
+        })
+    );
+    assert_eq!(
         control.rendezvous_snapshot(ClusterState::AwaitingWorkerHello, NOW + 5_000),
         RendezvousControlSnapshot {
             state: ClusterState::AwaitingWorkerHello,

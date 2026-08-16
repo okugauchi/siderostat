@@ -379,6 +379,24 @@ async fn pair_response_waits_for_worker_pairing_ready() {
 }
 
 #[tokio::test]
+async fn acknowledged_pair_refreshes_control_lease_before_returning() {
+    // The reciprocal Pair effects and stability waits take longer than this lease. The
+    // acknowledgement must therefore carry a renewed inbound lease, or the final reconcile
+    // will reject the peer as expired before the pair call returns.
+    let harness = TwoNode::boot_with_control_lease(Duration::from_millis(250))
+        .await
+        .expect("boot short-lease two-node harness");
+
+    harness
+        .pair()
+        .await
+        .expect("short-lease coordinator-initiated pair");
+    assert_paired_consistent(&harness.coordinator, &harness.worker).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn wait_until_reports_last_snapshot_on_timeout() {
     // Sanity check the deadline-based helper: a predicate that never becomes true returns
     // false, and the caller can still read the final snapshot afterwards.

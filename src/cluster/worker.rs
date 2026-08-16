@@ -254,13 +254,14 @@ impl WorkerControl {
         }
         let phase = self.phase;
         let command = message.command.clone();
+        let peer_present = self.processor.lease().peer_present(now_millis);
         let response = self.processor.handle_validated(
             endpoint,
             message,
             authenticated,
             route_scoped,
             now_millis,
-            |command| validate_worker_command(phase, command),
+            |command| validate_worker_command(phase, peer_present, command),
         )?;
         if response.status == ControlResponseStatus::Applied {
             self.phase = match command {
@@ -295,6 +296,14 @@ impl WorkerControl {
 
     pub fn advance_generation(&mut self, generation: u64) {
         self.processor.advance_generation(generation);
+        self.phase = if self.processor.lease().descriptor().is_some() {
+            DistributedControlPhase::Paired
+        } else {
+            DistributedControlPhase::Unpaired
+        };
+    }
+
+    pub fn reset_for_repair(&mut self) {
         self.phase = if self.processor.lease().descriptor().is_some() {
             DistributedControlPhase::Paired
         } else {
@@ -338,10 +347,20 @@ impl WorkerControl {
 
 fn validate_worker_command(
     phase: DistributedControlPhase,
+    peer_present: bool,
     command: &ControlCommand,
 ) -> Result<(), ControlError> {
     let valid = match command {
-        ControlCommand::Pair { .. } => true,
+        // A new Pair is valid while unpaired or paired, and after the current peer lease has
+        // actually been lost. Do not let a delayed Pair reset WorkerPreparing/WorkerReady/
+        // Draining/Drained during promotion; that would leave the mode state at
+        // DistributedReady while DistributedReady control is rejected as out of order.
+        ControlCommand::Pair { .. } => {
+            matches!(
+                phase,
+                DistributedControlPhase::Unpaired | DistributedControlPhase::Paired
+            ) || !peer_present
+        }
         ControlCommand::PrepareWorker => phase == DistributedControlPhase::Paired,
         ControlCommand::BeginDrain => phase == DistributedControlPhase::WorkerReady,
         ControlCommand::DistributedReady => phase == DistributedControlPhase::Drained,
@@ -567,6 +586,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.phase(), DistributedControlPhase::WorkerPreparing);
+        assert_eq!(
+            worker.handle(
+                ControlEndpoint::Pair,
+                ControlMessage {
+                    request_id: "delayed-pair".into(),
+                    generation: 3,
+                    deployment_id: None,
+                    command: ControlCommand::Pair {
+                        descriptor: descriptor(ControlRole::Coordinator, "coordinator"),
+                    },
+                },
+                &authenticated,
+                true,
+                1_003,
+            ),
+            Err(ControlError::InvalidPhase {
+                phase: DistributedControlPhase::WorkerPreparing,
+            })
+        );
         assert_eq!(
             worker
                 .handle(
