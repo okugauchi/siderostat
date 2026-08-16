@@ -5,3 +5,4 @@
 - Branch名に `codex/` prefixを使用しない。
 - `main`、`legacy/*`、公開済みtagへforce pushしない。
 - `docs/archive/implementation-plan-v0.1.0.md` は完了済み刷新計画の履歴であり、恒久的なGit運用の正本として扱わない。
+- See `.rust-skills/AGENTS.md` for Rust development guidelines.
