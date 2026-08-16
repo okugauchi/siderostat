@@ -24,7 +24,11 @@ pub struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the proxy and its single supervisor.
-    Serve,
+    Serve {
+        /// Decline startup cleanup when stale siderostat/DS4 processes are detected.
+        #[arg(long)]
+        decline_startup_cleanup: bool,
+    },
     /// Inspect or mutate the already-running process through its admin API.
     Cluster {
         #[command(subcommand)]
@@ -69,7 +73,7 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_with(args: Args) -> anyhow::Result<()> {
     let (config, config_path) = ModeAwareConfig::load(args.config.as_deref()).await?;
     match args.command {
-        None | Some(Command::Serve) => {
+        None => {
             initialize_logging(&config);
             info!(
                 config_path = %config_path.display(),
@@ -80,6 +84,26 @@ async fn run_with(args: Args) -> anyhow::Result<()> {
                 "configuration loaded"
             );
             app::serve(config).await
+        }
+        Some(Command::Serve {
+            decline_startup_cleanup,
+        }) => {
+            initialize_logging(&config);
+            info!(
+                config_path = %config_path.display(),
+                public_listen = %config.proxy.public_listen,
+                admin_listen = %config.proxy.admin_listen,
+                node_id = %config.cluster.node_id,
+                cluster_enabled = config.cluster.enabled,
+                "configuration loaded"
+            );
+            app::serve_with_options(
+                config,
+                app::ServeOptions {
+                    decline_startup_cleanup,
+                },
+            )
+            .await
         }
         Some(Command::Cluster { command }) => run_cluster(&config, command).await,
     }
@@ -245,7 +269,24 @@ mod tests {
         let explicit =
             Args::try_parse_from(["siderostat", "serve", "--config", "node.toml"]).unwrap();
         assert!(legacy.command.is_none());
-        assert!(matches!(explicit.command, Some(Command::Serve)));
+        assert!(matches!(
+            explicit.command,
+            Some(Command::Serve {
+                decline_startup_cleanup: false
+            })
+        ));
+    }
+
+    #[test]
+    fn serve_can_explicitly_decline_startup_cleanup() {
+        let args =
+            Args::try_parse_from(["siderostat", "serve", "--decline-startup-cleanup"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Serve {
+                decline_startup_cleanup: true
+            })
+        ));
     }
 
     #[test]

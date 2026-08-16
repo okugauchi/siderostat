@@ -101,6 +101,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
+テスト実行時はrepositoryの `.cargo/config.toml` が `RUST_TEST_THREADS=1` を強制する。
+これはreconnect production harnessの共有loopback resourceとfake lifecycleを保護し、
+CIとlocalで同じテストスケジュールを再現するためである。並列化を前提にしたテストを追加する場合は、
+共有resourceを使わない設計にするか、この制約を見直す変更を同じreviewへ含める。
+
 ### Branchの終了
 
 - Merge済みの `feature/*`、`fix/*`、`phase/*` はremote/localとも整理してよい。

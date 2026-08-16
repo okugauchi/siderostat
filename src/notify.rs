@@ -1,9 +1,9 @@
 //! Desktop notification layer for macOS.
 //!
-//! This module is a behavior-neutral add-on: it never blocks or alters the
-//! cluster state machine, proxy, or persistence. Every failure is logged as a
-//! warning and ignored, matching the philosophy that a failed notification
-//! must not interfere with local recovery.
+//! State-transition notifications are a behavior-neutral add-on: they never
+//! block or alter the cluster state machine, proxy, or persistence. Startup
+//! cleanup uses the same posting primitive for its short timed restart notice;
+//! notification failures remain non-fatal.
 //!
 //! The macOS implementation posts notifications through `/usr/bin/osascript`
 //! (`display notification`), which works from a LaunchAgent running in the
@@ -363,6 +363,24 @@ mod tests {
         let notifier = NoopNotifier;
         let result = notifier.notify(Notification::new("title", "body")).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn osascript_command_posts_a_sounding_banner() {
+        let notifier = OsascriptNotifier::new(true, true);
+        let command = notifier.command(&Notification::new(
+            "siderostat",
+            "再起動が必要です（5秒後）",
+        ));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args.first().map(String::as_str), Some("-e"));
+        assert!(args[1].contains("display notification"));
+        assert!(args[1].contains("sound name \"Glass\""));
+        assert!(args[1].contains("再起動が必要です（5秒後）"));
     }
 
     #[test]

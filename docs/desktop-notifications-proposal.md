@@ -1,9 +1,9 @@
 # siderostat デスクトップ通知 実装提案
 
-- 文書状態: 実装済み (2026-08-12)
+- 文書状態: 実装済み (2026-08-16 更新)
 - 作成日: 2026-08-12
 - 対象baseline: `develop` (`10ddf68` / リファクタリング完了後)
-- 前提: 本提案は挙動を変えない付加レイヤであり、`docs/spec.md` で定義するtarget behaviorを変更しない。
+- 前提: 通常の状態通知は付加レイヤだが、startup cleanupの既存process通知は再起動操作の既定動作を定義する。
 
 ## 1. 目的
 
@@ -90,6 +90,15 @@ sound = true        # osascript の sound name 使用
 
 `LoggingConfig` と同じ `#[serde(default)]` パターンで追加し、既存設定との後方互換を維持する。
 
+### 4.5 startup cleanup の通知
+
+起動時に既存の `siderostat` / `ds4-server` process を検出した場合は、長文の確認ダイアログを表示せず、
+`display notification` で右上バナーと `Glass` 警告音を投稿する。通知本文は「再起動が必要です（5秒後）」
+という簡潔な内容とし、5秒後に既存processをidentity再確認付きで停止して新しいsiderostatを起動する。
+既定動作を拒否したい場合は `[startup_cleanup] auto_restart = false` または
+`siderostat serve --decline-startup-cleanup` を使用する。`display notification` はボタンを持たないため、拒否を
+画面上のボタンではなく明示的な設定/CLIオプションとして提供する。
+
 ## 5. 安全設計（詳細）
 
 ### 5.1 非ブロッキング・失敗耐性
@@ -143,7 +152,7 @@ macOS の launchd はジョブをどのドメインに載せるかで実行コ�
 
 ## 7. 実施にあたっての指針
 
-- 挙動を変えない付加レイヤとし、`docs/spec.md` の target behavior を変更しない。
+- 状態遷移の通知は付加レイヤとして扱う。startup cleanupの5秒既定動作と拒否オプションは `docs/spec.md` に定義する。
 - 回帰検証は Required CI (`cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` /
   `cargo test --all-targets`) と `tests/phase1`〜`phase5` 統合テストで確認する。
 - Git運用は `CONTRIBUTING.md` に従い、1 commitを1つのreview可能な目的に限定し、実装と対応するtestを同じcommitへ含める。

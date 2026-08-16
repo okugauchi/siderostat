@@ -775,7 +775,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
   用いない。
 - Verification: candidate/rollback の checksum、両 node Solo または Distributed の健全な baseline
 - 完了条件: 各操作を中止して旧 binary へ戻せることを operator が確認済み
-- 停止条件: active workload、確認ダイアログで承認されていない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
+- 停止条件: active workload、cleanup拒否指定またはidentity確認できない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
 
 Progress evidence: candidate commit `6d6164922ca90aac2372a4407b77b659f19059b1` を固定し、worker candidate
 `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat` の SHA-256 は

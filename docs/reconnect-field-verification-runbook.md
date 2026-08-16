@@ -274,11 +274,16 @@ launchctl print "gui/$(id -u)/local.siderostat.runtime" | head -40
 launchctl print-disabled "gui/$(id -u)" | grep -i siderostat || true
 ```
 
+既存の `siderostat` / `ds4-server` process が検出された場合、macOS の右上通知と警告音で
+「再起動が必要です（5秒後）」を表示し、既定では5秒後にidentity再確認付きで停止して起動を続行する。
+拒否する場合は設定の `[startup_cleanup] auto_restart = false`、または起動時の
+`siderostat serve --decline-startup-cleanup` を使用する。
+
 5. baseline を採取する（§5 の status / doctor / process / log 開始位置）。
 
 - 完了条件: candidate / rollback の checksum が記録され、両 node が Solo または Distributed の
   健全な baseline である。
-- 停止条件: active workload、確認ダイアログで承認されていない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ。
+- 停止条件: active workload、拒否指定またはidentity確認できない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ。
 
 ## 7. H-02 cable detach/reconnect（operator の作業）
 

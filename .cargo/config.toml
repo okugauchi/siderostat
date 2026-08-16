@@ -1,3 +1,9 @@
 # cargo xtask alias: `cargo xtask <command>` runs the xtask runner.
 [alias]
 xtask = "run --package xtask --"
+
+# The production reconnect harness uses shared loopback ports and fake child
+# lifecycles. Keep every Rust test harness invocation deterministic so CI and
+# local `cargo test` runs use the same scheduling constraint.
+[env]
+RUST_TEST_THREADS = { value = "1", force = true }

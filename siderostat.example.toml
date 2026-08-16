@@ -114,3 +114,8 @@ level = "info"
 [notifications]
 enabled = true
 sound = true
+
+[startup_cleanup]
+# When stale siderostat/ds4-server processes are found, notify and restart after 5 seconds.
+# Set false to decline cleanup by default.
+auto_restart = true

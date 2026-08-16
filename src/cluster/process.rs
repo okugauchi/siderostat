@@ -37,12 +37,12 @@ pub struct ObservedProcess {
     pub start_time_micros: u64,
 }
 
-/// Process identity used for an operator-approved startup cleanup.
+/// Process identity used for an authorized startup cleanup.
 ///
 /// This deliberately omits the logical child metadata (profile/generation). A process that was
 /// started by an older siderostat, or by another launcher, cannot have that metadata, but it can
-/// still be safely targeted when the operator has explicitly approved the cleanup and the OS-level
-/// identity is re-verified immediately before every signal.
+/// still be safely targeted when startup cleanup is authorized and the OS-level identity is
+/// re-verified immediately before every signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -155,8 +155,8 @@ pub trait ProcessInspector: Send + Sync + 'static {
 pub trait ProcessSignaler: Send + Sync + 'static {
     fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()>;
 
-    /// Signal only the process itself. This is used for operator-approved adoption/cleanup of
-    /// processes that were not spawned into siderostat's process group.
+    /// Signal only the process itself. This is used for authorized adoption/cleanup of processes
+    /// that were not spawned into siderostat's process group.
     fn signal_process(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
         self.signal_process_group(pid, signal)
     }
@@ -296,11 +296,11 @@ impl ProcessController {
         }
     }
 
-    /// Stop a process only after an operator has approved it for cleanup.
+    /// Stop a process only after startup cleanup has been authorized.
     ///
     /// Unlike normal supervision this method intentionally permits SIGKILL after the grace
-    /// period. The permission comes from the explicit startup confirmation, while every signal is
-    /// still preceded by a complete identity check.
+    /// period. The permission comes from the startup cleanup decision, while every signal is still
+    /// preceded by a complete identity check.
     pub async fn force_stop_approved(
         &self,
         identity: &ProcessIdentity,

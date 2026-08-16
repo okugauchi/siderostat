@@ -61,6 +61,20 @@ impl Default for NotificationsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupCleanupConfig {
+    /// Automatically stop detected stale processes after the startup notification countdown.
+    /// Set to false when an operator wants startup cleanup to be declined by default.
+    pub auto_restart: bool,
+}
+
+impl Default for StartupCleanupConfig {
+    fn default() -> Self {
+        Self { auto_restart: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeAwareConfig {
     pub schema_version: u32,
@@ -70,6 +84,8 @@ pub struct ModeAwareConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub startup_cleanup: StartupCleanupConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1001,6 +1017,9 @@ level = "info"
 [notifications]
 enabled = true
 sound = true
+
+[startup_cleanup]
+auto_restart = true
 "#
     }
 
@@ -1082,6 +1101,7 @@ sound = true
         );
         assert!(config.notifications.enabled);
         assert!(config.notifications.sound);
+        assert!(config.startup_cleanup.auto_restart);
     }
 
     #[test]
@@ -1091,6 +1111,13 @@ sound = true
         let config: ModeAwareConfig = toml::from_str(&input).unwrap();
         assert_eq!(config.notifications.enabled, cfg!(target_os = "macos"));
         assert!(config.notifications.sound);
+    }
+
+    #[test]
+    fn startup_cleanup_defaults_are_backward_compatible() {
+        let input = mode_aware_config().replace("[startup_cleanup]\nauto_restart = true\n", "");
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert!(config.startup_cleanup.auto_restart);
     }
 
     #[test]

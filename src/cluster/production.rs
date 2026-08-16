@@ -10,10 +10,10 @@ use super::{
     PeerObservation, PromotionRetryPolicy, StandaloneSupervisor, WorkerControl,
     WorkerDistributedRuntime, spawn_network_event_monitor,
 };
+#[cfg(feature = "test-support")]
+use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
-    cluster::{
-        ClusterEvent, ClusterEventKind, ClusterFailure, ClusterSnapshot, PromotionFailureStatus,
-    },
+    cluster::{ClusterEvent, ClusterEventKind},
     config::ModeAwareConfig,
     metrics::Metrics,
     proxy::ModeAwareProxyState,

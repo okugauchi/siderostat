@@ -904,25 +904,28 @@ MXFP4 model mapは遅いためstartupより短いHELLO timeoutを設定しない
 - PID、canonical executable、argv hash、profile、generation、spawn timestampを保存する。
 - Process一覧のsubstring検索でidentityを決めない。
 - PIDだけを信用しない。
-- Unknown processへ自動ではsignalしない。起動時に `siderostat` / `ds4-server` の既存processを
-  検出した場合は、PID、実行ファイル、argv、起動時刻をoperatorへ提示し、明示承認がある場合だけ
-  operator-approved cleanupの対象にできる。
+- Unknown processへ無条件にsignalしない。起動時に `siderostat` / `ds4-server` の既存processを
+  検出した場合は、macOSの右上通知（警告音付き）で簡潔に再起動を通知し、既定5秒後に
+  起動時cleanupの対象にする。拒否は `startup_cleanup.auto_restart = false` または
+  `--decline-startup-cleanup` で明示する。
 
 ### 20.2 Recovery
 
 Proxy再起動時、macOS process APIでexecutable、argv、start timeを照合する。完全一致したowned childだけを
 自動で再所有または停止対象にする。起動直前には同一ホストの `siderostat` / `ds4-server` を列挙し、
-既存versionや外部launcher由来のprocessも候補として提示する。operatorが承認しない、確認UIを表示できない、
-または承認後のidentity再照合に失敗した場合は起動せず、ManualInterventionRequired相当で停止する。
-必要portを未知processが占有していても、承認なしにsignalしない。
+既存versionや外部launcher由来のprocessも候補にする。既定では簡潔な通知後5秒でcleanupを実行する。
+`startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` の場合は起動せず、
+ManualInterventionRequired相当で停止する。通知を表示できない場合も既定の5秒動作は変えず、warnログを残す。
+必要portを未知processが占有していても、cleanup対象としてidentityを再確認できない場合はsignalしない。
 
 ### 20.3 Signal
 
 - 通常停止はSIGTERM。
 - Drain完了後にsignalする。
 - Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。
-- 起動時のoperator-approved cleanupは、承認をSIGKILL許可として扱う。ただしSIGTERM/SIGKILLの各直前に
-  PID、executable、argv hash、start timeを再確認し、通常のprocess groupではなく候補process自身へsignalする。
+- 起動時cleanupは、5秒通知後の既定動作または明示的な拒否オプションとして扱う。
+  SIGTERM/SIGKILLの各直前にPID、executable、argv hash、start timeを再確認し、通常のprocess groupではなく
+  候補process自身へsignalする。
 - Exit statusを必ず回収する。
 
 ### 20.4 Log event
@@ -1081,6 +1084,13 @@ extra_args = ["--debug"]
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true
+
+[startup_cleanup]
+auto_restart = true
 ```
 
 Worker nodeは `cluster.node_id` とnode固有pathだけを変更する。Roleはinterface addressから決定し、設定で直接指定しない。
@@ -1316,7 +1326,9 @@ ds4_proxy_cluster_deployment_mismatch_total{field}
 - DS4 HTTPはloopbackだけ。
 - Shellを介してchildをspawnしない。
 - Config argvを1要素ずつ `Command::arg` へ渡す。
-- Unknown processを無承認ではkillしない。起動時の候補提示、operator明示承認、signal直前のidentity再確認を必須とする。
+- Unknown processを無条件ではkillしない。起動時は簡潔な通知と5秒の既定猶予を置き、拒否指定がない場合だけ
+  signal直前のidentity再確認後にcleanupする。拒否は `startup_cleanup.auto_restart = false` または
+  `--decline-startup-cleanup` で指定する。
 - Model fingerprint時にregular file/canonical pathを確認。
 - Admin mutationはtoken必須。
 - Prompt/body/tokenをlogしない。

@@ -366,7 +366,19 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
     })
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServeOptions {
+    pub decline_startup_cleanup: bool,
+}
+
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
+    serve_with_options(config, ServeOptions::default()).await
+}
+
+pub async fn serve_with_options(
+    config: ModeAwareConfig,
+    options: ServeOptions,
+) -> anyhow::Result<()> {
     validate_dspark_binding(&config).await?;
     let boot = BootInputs::load(&config).await?;
     match crate::startup_cleanup::cleanup_startup_processes(
@@ -374,6 +386,12 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         &config.ds4.binary,
         &platform_process_controller(),
         config.cluster.timeouts.stop,
+        crate::startup_cleanup::StartupCleanupOptions {
+            decline: options.decline_startup_cleanup,
+            auto_restart: config.startup_cleanup.auto_restart,
+            notifications_enabled: config.notifications.enabled,
+            notification_sound: config.notifications.sound,
+        },
     )
     .await?
     {

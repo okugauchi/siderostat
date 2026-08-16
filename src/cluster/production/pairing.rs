@@ -62,14 +62,19 @@ impl super::ProductionClusterRuntime {
                 descriptor: self.local_descriptor().await,
             },
         };
+        #[cfg(feature = "test-support")]
         let offer_sent_at = now_millis();
         let response = self.inner.client.send(&message).await?;
+        #[cfg(feature = "test-support")]
         let confirm_received_at = now_millis();
         self.inner.lease.update(&response);
+        #[cfg(feature = "test-support")]
         let lease_established_at = now_millis();
         tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
+        #[cfg(feature = "test-support")]
         let stability_achieved_at = now_millis();
         let snapshot = self.reconcile_peer(EventOwner::Control).await?;
+        #[cfg(feature = "test-support")]
         let pairing_ready_at = now_millis();
         #[cfg(feature = "test-support")]
         self.inner.pair_timings.lock().unwrap().push(PairTiming {
