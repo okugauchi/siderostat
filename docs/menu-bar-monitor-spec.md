@@ -108,6 +108,7 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | KV cache hit 累計 | `ds4_proxy_ds4_kv_cache_hits_total` | counter |
 | 直近 KV cache hit tokens | `ds4_proxy_ds4_kv_cache_hit_tokens` | gauge |
 | 直近 KV cache load ms | `ds4_proxy_ds4_kv_cache_load_ms` | gauge |
+| Decode 進行中フラグ | `ds4_proxy_ds4_generation_active` | gauge |
 | Decode completion | `ds4_proxy_ds4_generation_completion` | gauge |
 | 直近 Decode chunk TPS | `ds4_proxy_ds4_generation_chunk_tps` | gauge |
 | Decode average TPS | `ds4_proxy_ds4_generation_avg_tps` | gauge |
@@ -157,11 +158,15 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
     - offline / 不明: 2つとも赤、接続線なし
 - アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed の接続線は
   視認できる太さにする。
-- アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値だけを表示する。
-  既定値は `prefill-avg-tps` とする。選択肢は `prefill-percent`、`prefill-chunk-tps`、
-  `prefill-avg-tps`、`prefill-elapsed`、`decode-chunk-tps`、`decode-avg-tps`、`decode-elapsed`、
-  `kv-cache`、`none` とし、値がまだ取得できない場合は空表示にする。
+- アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値を優先して表示する。
+  既定値は `prefill-avg-tps` とする。選択した値が現在進行中でない場合は、進行中の
+  decode 平均 TPS（または chunk TPS）へ切り替える。これにより prefill 中は prefill の
+  スループット、decode 中は decode のスループットを表示する。
+  選択肢は `prefill-percent`、`prefill-chunk-tps`、`prefill-avg-tps`、`prefill-elapsed`、
+  `decode-chunk-tps`、`decode-avg-tps`、`decode-elapsed`、`kv-cache`、`none` とし、
+  値がまだ取得できない場合は空表示にする。
 - prefill のタイトル値は prefill 完了時にクリアする。メニュー内の詳細行も完了後は `Prefill: --` とする。
+- decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。
 - offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
@@ -208,7 +213,7 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
-live_metric = "prefill-avg-tps"            # メニューバーに表示する随時更新値
+live_metric = "prefill-avg-tps"            # メニューバーに優先表示する随時更新値
 admin_token = ""                           # /metrics に認証を設定する場合のみ使用
 ```
 

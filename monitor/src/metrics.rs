@@ -33,6 +33,7 @@ pub struct KvCacheState {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DecodeState {
+    pub active: bool,
     pub completion: u64,
     pub chunk_tps: f64,
     pub avg_tps: f64,
@@ -138,6 +139,9 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .unwrap_or(0.0),
         },
         decode: DecodeState {
+            active: samples
+                .get("ds4_proxy_ds4_generation_active")
+                .is_some_and(|v| *v != 0.0),
             completion: samples
                 .get("ds4_proxy_ds4_generation_completion")
                 .map(|v| *v as u64)
@@ -264,6 +268,8 @@ ds4_proxy_ds4_kv_cache_hit_tokens 9005
 ds4_proxy_ds4_kv_cache_load_ms 12.3
 # TYPE ds4_proxy_ds4_generation_completion gauge
 ds4_proxy_ds4_generation_completion 42
+# TYPE ds4_proxy_ds4_generation_active gauge
+ds4_proxy_ds4_generation_active 1
 # TYPE ds4_proxy_ds4_generation_chunk_tps gauge
 ds4_proxy_ds4_generation_chunk_tps 32.1
 # TYPE ds4_proxy_ds4_generation_avg_tps gauge
@@ -283,6 +289,7 @@ ds4_proxy_ds4_generation_elapsed_seconds 1.5
         assert_eq!(snapshot.kv_cache.hits_total, 7);
         assert_eq!(snapshot.kv_cache.hit_tokens, 9005);
         assert_eq!(snapshot.kv_cache.load_ms, 12.3);
+        assert!(snapshot.decode.active);
         assert_eq!(snapshot.decode.completion, 42);
         assert_eq!(snapshot.decode.chunk_tps, 32.1);
         assert_eq!(snapshot.decode.avg_tps, 28.5);

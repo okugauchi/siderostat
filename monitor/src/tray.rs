@@ -169,8 +169,6 @@ impl MonitorTray {
             ));
         } else {
             self.prefill.set_text("Prefill: --");
-            // The cluster mode is drawn by the icon, not shown as text.
-            self._tray.set_title(Some(String::new()));
         }
 
         if display.kv_hits_total > 0 {
@@ -182,7 +180,7 @@ impl MonitorTray {
             self.kv_cache.set_text("KV cache: --");
         }
 
-        if self.show_decode_tps && display.decode_completion > 0 {
+        if self.show_decode_tps && has_decode_values(display) {
             self.decode.set_text(format!(
                 "Decode: completion={} chunk={:.1}t/s avg={:.1}t/s",
                 display.decode_completion, display.decode_chunk_tps, display.decode_avg_tps
@@ -190,7 +188,7 @@ impl MonitorTray {
         } else {
             self.decode.set_text("Decode: --");
         }
-        self._tray.set_title(Some(selected_metric_title(
+        self._tray.set_title(Some(menu_bar_title(
             display,
             self.show_decode_tps,
             self.live_metric,
@@ -248,16 +246,14 @@ fn selected_metric_title(
         {
             format!("prefill {:.1}s", display.prefill_elapsed_secs)
         }
-        LiveMetric::DecodeChunkTps if show_decode_tps && display.decode_completion > 0 => {
+        LiveMetric::DecodeChunkTps if show_decode_tps && has_decode_values(display) => {
             format!("decode {:.1}t/s", display.decode_chunk_tps)
         }
-        LiveMetric::DecodeAvgTps if show_decode_tps && display.decode_completion > 0 => {
+        LiveMetric::DecodeAvgTps if show_decode_tps && has_decode_values(display) => {
             format!("decode avg {:.1}t/s", display.decode_avg_tps)
         }
         LiveMetric::DecodeElapsed
-            if show_decode_tps
-                && display.decode_completion > 0
-                && display.decode_elapsed_secs > 0.0 =>
+            if show_decode_tps && display.decode_active && display.decode_elapsed_secs > 0.0 =>
         {
             format!("decode {:.1}s", display.decode_elapsed_secs)
         }
@@ -273,6 +269,42 @@ fn selected_metric_title(
         | LiveMetric::DecodeAvgTps
         | LiveMetric::DecodeElapsed
         | LiveMetric::KvCache => String::new(),
+    }
+}
+
+fn menu_bar_title(
+    display: &DisplayState,
+    show_decode_tps: bool,
+    live_metric: LiveMetric,
+) -> String {
+    let selected = selected_metric_title(display, show_decode_tps, live_metric);
+    if !selected.is_empty() {
+        return selected;
+    }
+
+    // Keep the menu bar useful when the configured prefill metric is no longer
+    // active: switch to the currently active decode throughput instead of
+    // leaving the last prefill-only title or an empty title on screen.
+    if !matches!(live_metric, LiveMetric::None) && show_decode_tps && has_decode_values(display) {
+        return decode_throughput_title(display);
+    }
+    String::new()
+}
+
+fn has_decode_values(display: &DisplayState) -> bool {
+    display.decode_active
+        && (display.decode_completion > 0
+            || display.decode_chunk_tps > 0.0
+            || display.decode_avg_tps > 0.0)
+}
+
+fn decode_throughput_title(display: &DisplayState) -> String {
+    if display.decode_avg_tps > 0.0 {
+        format!("decode avg {:.1}t/s", display.decode_avg_tps)
+    } else if display.decode_chunk_tps > 0.0 {
+        format!("decode {:.1}t/s", display.decode_chunk_tps)
+    } else {
+        String::new()
     }
 }
 
@@ -415,6 +447,7 @@ mod tests {
             kv_hits_total: 7,
             kv_hit_tokens: 9005,
             kv_load_ms: 12.3,
+            decode_active: true,
             decode_completion: 42,
             decode_chunk_tps: 32.1,
             decode_avg_tps: 28.5,
@@ -464,6 +497,36 @@ mod tests {
         completed.prefill_active = false;
         assert_eq!(
             selected_metric_title(&completed, true, LiveMetric::PrefillAvgTps),
+            ""
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_decode_throughput_after_prefill() {
+        let mut display = DisplayState {
+            prefill_active: true,
+            prefill_total: 9005,
+            prefill_avg_tps: 100.0,
+            decode_active: true,
+            decode_completion: 42,
+            decode_avg_tps: 28.5,
+            ..DisplayState::default()
+        };
+
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
+            "prefill avg 100.0t/s"
+        );
+
+        display.prefill_active = false;
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
+            "decode avg 28.5t/s"
+        );
+
+        display.decode_active = false;
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
             ""
         );
     }
