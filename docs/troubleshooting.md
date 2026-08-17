@@ -30,7 +30,7 @@ curl --fail --silent http://127.0.0.1:18081/metrics
 | Control HMACが不一致/clock skew/nonce replay | control log、metrics | Secret fileとclock skewを確認する。不正HMACは拒否され、stateは進まない |
 | PairがHTTP 409で反復 | `cluster status --json`のcluster/control generation、control phase/lease、pair log | 現行coordinatorのoffer/confirmはpeerのgenerationを先に取り込む。旧binary、persisted session不一致、route/lease失敗を確認し、state/model/cacheを削除せず証跡を保存する |
 | Peer ingressがwrong source/token/hopを拒否 | peer ingress log | Peer proxy tokenとsource IPを確認する。専用の物理Thunderbolt linkを信頼境界とする |
-| Deployment mismatch | `cluster status`、deployment_mismatch_total | Paired Standaloneを維持し、promotionは拒否される。Binary/model/checkpoint/argvを一致させる |
+| Deployment mismatch | `cluster status`、deployment_mismatch_total | 自動修復できない構成不一致としてSolo Standaloneへ収束し、自動pairingを停止する。Binary/model/checkpoint/argvを一致させてからreconcileする |
 | Manifest stale | fingerprint job | `cluster fingerprint` で再fingerprintする。staleの間はpromotionしない |
 | Hello timeout | rendezvous、hello_total | 実DS4 worker HELLOなしでpromotionしない。Rendezvous timeout後に原因を確認する |
 | Unknown DS4 schema | log、hello_total | fail closedでpromotionを拒否する。Unknown formatはlog転送だけ行いstateを進めない |
@@ -67,7 +67,7 @@ Bonjour advertisement/browseは`bridge0`に限定される。Resolved addressが
 
 ### 3.4 Deployment mismatch / promotion拒否
 
-Distributed profileの承認済みbinary digest集合、full source commit、model digest、checkpoint、context、layer split、wire schema、argv profileを比較する。各nodeのlocal binary digestが共通の承認集合に含まれない場合、またはcompatibility fieldが1つでも不一致/不明ならMXFP4 promotionを拒否するが、Paired Standaloneは維持できる（spec第15.3節）。`ds4_proxy_cluster_deployment_mismatch_total{field}`で不一致fieldを確認する。未知binaryを集合へ自動追加せず、対象digest pairのactual acceptanceをcompatibility recordへ記録してから両manifestの集合を同時更新する。両nodeのMXFP4 content SHA-256を一致させ、manifestを再fingerprintしてから再試行する。実HELLOなしでpromotionしない（spec第33.3節）。
+Distributed profileの承認済みbinary digest集合、full source commit、model digest、checkpoint、context、layer split、wire schema、argv profileを比較する。各nodeのlocal binary digestが共通の承認集合に含まれない場合、またはcompatibility fieldが1つでも不一致/不明ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。ユーザーには構成不一致とStandalone待機を通知する。`ds4_proxy_cluster_deployment_mismatch_total{field}`で不一致fieldを確認し、未知binaryを集合へ自動追加せず、対象digest pairのactual acceptanceをcompatibility recordへ記録してから両manifestの集合を同時更新する。両nodeのMXFP4 content SHA-256を一致させ、manifestを再fingerprintしてからreconcileまたはruntime再起動で再試行する。実HELLOなしでpromotionしない（spec第33.3節）。
 
 ### 3.5 Hello / route
 

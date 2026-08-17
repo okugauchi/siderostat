@@ -1,10 +1,10 @@
 use super::{
-    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
-    ControlResponse, ControlRole, ControlSecret, CoordinatorControl, CoordinatorDistributedRuntime,
-    CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts, DistributedControlPhase,
-    DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor, DistributedManifest,
-    DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE, HEADER_NONCE,
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
+    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
+    ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
+    CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
+    DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
+    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE,
+    HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
     LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
     NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
     PeerObservation, PromotionRetryPolicy, StandaloneSupervisor, WorkerControl,
@@ -34,7 +34,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -202,6 +202,9 @@ impl ProductionControlClient {
         let status = response.status();
         let bytes = response.bytes().await?;
         if !status.is_success() {
+            if status == StatusCode::PRECONDITION_FAILED {
+                return Err(anyhow::Error::new(ControlError::DeploymentMismatch));
+            }
             anyhow::bail!(
                 "peer control {} returned {}: {}",
                 path,
@@ -266,6 +269,7 @@ struct ProductionInner {
     config: ModeAwareConfig,
     manifest: DistributedManifest,
     recovery: Arc<recovery::PeerLossRecovery>,
+    automatic_pairing_blocked: AtomicBool,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
     /// actual production input. Fail-closed until a fresh observation is applied.
@@ -461,6 +465,7 @@ impl ProductionClusterRuntime {
             config,
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
+            automatic_pairing_blocked: AtomicBool::new(false),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
             pair_timings: std::sync::Mutex::new(Vec::new()),
@@ -620,6 +625,9 @@ impl ProductionClusterRuntime {
     /// coordinator promotion tracker, so the local manual state is cleared through the mode
     /// runtime instead.
     pub async fn operator_reconcile(&self) -> anyhow::Result<OperatorReconcileOutcome> {
+        self.inner
+            .automatic_pairing_blocked
+            .store(false, Ordering::Release);
         let was_manual =
             self.inner.mode.snapshot().state == ClusterState::ManualInterventionRequired;
         if let Some(runtime) = self.inner.coordinator_runtime.get() {
@@ -646,6 +654,16 @@ impl ProductionClusterRuntime {
 
     pub fn role(&self) -> LocalRole {
         self.inner.role
+    }
+
+    pub(super) fn block_automatic_pairing(&self) {
+        self.inner
+            .automatic_pairing_blocked
+            .store(true, Ordering::Release);
+    }
+
+    pub(super) fn automatic_pairing_blocked(&self) -> bool {
+        self.inner.automatic_pairing_blocked.load(Ordering::Acquire)
     }
 
     /// Fetch the coordinator's Prometheus metrics through the authenticated control plane.

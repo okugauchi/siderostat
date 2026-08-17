@@ -39,12 +39,52 @@ impl super::ProductionClusterRuntime {
         &self,
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        self.recover_to_solo(owner, ClusterEventKind::PeerLost, "peer-lost")
+            .await
+    }
+
+    /// Recover from a non-repairable deployment mismatch. The local node becomes Solo
+    /// Standalone and automatic pairing remains blocked until operator reconcile.
+    pub async fn recover_from_deployment_mismatch(
+        &self,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        self.block_automatic_pairing();
+        self.recover_to_solo(
+            EventOwner::Recovery,
+            ClusterEventKind::DeploymentMismatch,
+            "deployment-mismatch",
+        )
+        .await
+    }
+
+    async fn recover_to_solo(
+        &self,
+        owner: EventOwner,
+        recovery_event: ClusterEventKind,
+        recovery_name: &'static str,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         let recovery = self.inner.recovery.clone();
         let _guard = recovery.lock().await;
         let current = self.inner.mode.snapshot();
 
-        // Idempotent: an already-solo node has no distributed child to recover.
+        // Idempotent: an already-solo node has no distributed child to recover. A deployment
+        // mismatch still records a new failure snapshot so the desktop notifier can explain why
+        // automatic pairing stopped without needlessly restarting standalone.
         if current.state == ClusterState::SoloStandaloneReady {
+            if recovery_event == ClusterEventKind::DeploymentMismatch {
+                let marked = self
+                    .inner
+                    .mode
+                    .cluster_handle()
+                    .apply(ClusterEvent {
+                        expected_generation: current.generation,
+                        kind: recovery_event,
+                    })
+                    .await?;
+                self.inner.proxy.set_target(marked.target, true);
+                self.inner.proxy.admission().start_serving();
+                return Ok(marked);
+            }
             return Ok(current);
         }
         // Stale: this cluster generation was already recovered to SoloReady; do not touch
@@ -71,7 +111,7 @@ impl super::ProductionClusterRuntime {
         );
 
         tracing::info!(
-            event = "peer-lost",
+            event = recovery_name,
             owner = owner.name(),
             from = ?current.state,
             result = "success",
@@ -97,14 +137,15 @@ impl super::ProductionClusterRuntime {
                 .cluster_handle()
                 .apply(ClusterEvent {
                     expected_generation: current.generation,
-                    kind: ClusterEventKind::PeerLost,
+                    kind: recovery_event,
                 })
                 .await?
         };
 
-        // PeerLost invalidates the in-flight distributed control sequence. Keep the negotiated
-        // session/lease, but reset only its command phase so a subsequent Pair can establish a
-        // fresh promotion sequence without allowing a delayed Pair to rewind an active one.
+        // The recovery event invalidates the in-flight distributed control sequence. Keep the
+        // negotiated session/lease, but reset only its command phase so a subsequent Pair can
+        // establish a fresh promotion sequence without allowing a delayed Pair to rewind an
+        // active one.
         let repair_now = now_millis();
         match &self.inner.control {
             RoleControl::Coordinator(control) => control.lock().await.reset_for_repair(repair_now),

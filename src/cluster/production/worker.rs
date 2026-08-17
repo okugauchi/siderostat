@@ -189,6 +189,7 @@ impl super::ProductionClusterRuntime {
                 if snapshot.state == ClusterState::SoloStandaloneReady
                     && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_pair
+                    && !runtime.automatic_pairing_blocked()
                 {
                     if let Err(error) = runtime.pair().await {
                         tracing::debug!(error = %error, "automatic pairing attempt failed");

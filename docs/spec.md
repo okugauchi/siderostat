@@ -231,7 +231,7 @@ Peer presentは次をすべて満たす状態とする。
 
 ICMP echoだけでpeer presentと判定しない。
 
-Peer presentになったら、distributed compatibilityの成否にかかわらずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed MXFP4へのpromotionを試みる。不一致ならPaired Standaloneを維持する。
+Peer presentになったら、まずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed MXFP4へのpromotionを試みる。自動修復できないdeployment不一致を検出した場合は、両nodeをSolo Standaloneへ収束させ、同じ原因による自動pairingの再試行を止める。
 
 ## 10. HTTP reverse proxy contract
 
@@ -669,7 +669,7 @@ Standalone manifestはlocal childのidentity、設定drift、診断に使用す�
 
 ### 15.3 Compatibility
 
-Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。1つでも不一致/不明ならPaired Standaloneを維持する。
+Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。deployment mismatch（control planeのHTTP 412）を検出した場合はpromotionを拒否し、両nodeをSolo Standaloneへ収束させる。自動pairingはoperator reconcileまたはruntime再起動まで再試行しない。
 
 Binary digestはnode-local child identityと未知rebuildの検出に引き続き使用するが、cross-nodeでのbyte-for-byte一致は要求しない。`-mcpu=native`等による機種別binaryを承認集合へ追加するには、そのdigest pair、full source commit、wire schema、対象model/topologyでactual acceptanceを完了してcompatibility recordへ記録する。Source commitや自己申告のwire schemaだけで未知binaryを自動承認してはならない。
 
@@ -869,6 +869,8 @@ Peer lease/linkが失われた場合：
 - Coordinatorは必要ならdistributedを停止してlocal standaloneを起動しSoloStandaloneReady。
 - Workerはpublic admissionをBlockしlocal standaloneを起動後、targetをLocalStandaloneへ変更してSoloStandaloneReady。
 - Peer通知不能でもlocal recoveryを妨げない。
+
+Distributed deploymentの不一致を検出した場合も同じlocal recoveryを実行する。この場合はSoloStandaloneReadyへの遷移後も失敗理由を保持し、ユーザーへ構成不一致と自動pairing停止を通知する。原因を解消した後、operator reconcileまたはruntime再起動で自動pairingを再開する。
 
 ### 18.6 Failure/backoff
 
@@ -1454,7 +1456,7 @@ persistence.rs（cluster state_storeへ置換）
 | Unauthenticated Bonjour result | candidate破棄、current mode維持 |
 | peer control HMAC不正 | request拒否、Solo/Paired current mode維持 |
 | peer proxy token不正 | peer ingress 403 |
-| deployment mismatch | Paired Standalone、MXFP4 promotion禁止 |
+| deployment mismatch | Solo Standaloneへ収束、MXFP4 promotion禁止、自動pairing停止 |
 | manifest stale | Paired Standalone、再fingerprint要求 |
 | HELLO timeout | MXFP4 worker停止、Paired Standalone、backoff |
 | unknown HELLO/log schema | promotion拒否、Paired Standalone |
@@ -1506,7 +1508,7 @@ persistence.rs（cluster state_storeへ置換）
 2. Peer認証後、workerをdrainしてPaired Standalone。
 3. Worker public requestがcoordinator peer ingress経由でlocal standaloneへ届く。
 4. Peer ingressがinvalid token/hop/sourceを拒否。
-5. Paired Standaloneでdeployment mismatchでもstandalone service継続。
+5. deployment mismatchでは構成不一致を通知し、両nodeがSolo Standaloneへ収束してstandalone serviceを継続する。
 6. Compatible deploymentで実HELLO受信。
 7. Cluster-wide drain中、新規requestは503、既存streamは完走。
 8. Coordinator側in-flight=0までDS4を停止しない。

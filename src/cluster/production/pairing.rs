@@ -44,7 +44,14 @@ impl super::ProductionClusterRuntime {
         // learns the worker's control session generation from /v1/node, computes a candidate
         // that is no lower than either side, and advances its own generation before offering so
         // a higher worker generation converges direction-independently.
-        let peer = self.inner.client.node().await?;
+        let peer = match self.inner.client.node().await {
+            Ok(peer) => peer,
+            Err(error) if is_control_deployment_mismatch(&error) => {
+                self.recover_from_deployment_mismatch().await?;
+                return Ok(self.inner.mode.snapshot());
+            }
+            Err(error) => return Err(error),
+        };
         let candidate = match &self.inner.control {
             RoleControl::Coordinator(control) => {
                 let mut control = control.lock().await;
@@ -64,7 +71,14 @@ impl super::ProductionClusterRuntime {
         };
         #[cfg(feature = "test-support")]
         let offer_sent_at = now_millis();
-        let response = self.inner.client.send(&message).await?;
+        let response = match self.inner.client.send(&message).await {
+            Ok(response) => response,
+            Err(error) if is_control_deployment_mismatch(&error) => {
+                self.recover_from_deployment_mismatch().await?;
+                return Ok(self.inner.mode.snapshot());
+            }
+            Err(error) => return Err(error),
+        };
         #[cfg(feature = "test-support")]
         let confirm_received_at = now_millis();
         self.inner.lease.update(&response);
@@ -121,12 +135,23 @@ impl super::ProductionClusterRuntime {
         let hello = match self.prepare_and_accept_hello(awaiting).await {
             Ok(hello) => hello,
             Err(error) => {
+                let deployment_mismatch = Self::is_deployment_mismatch(&error);
                 let retry_with_backoff = matches!(
-                    error,
+                    &error,
                     PromotionHelloError::Rendezvous(Ds4HelloError::Timeout)
                         | PromotionHelloError::WorkerStartupTimeout
                 );
-                self.recover_preflight_promotion().await;
+                if deployment_mismatch {
+                    self.block_automatic_pairing();
+                    if let Err(recovery_error) = self.recover_from_deployment_mismatch().await {
+                        tracing::error!(
+                            error = %recovery_error,
+                            "deployment mismatch recovery failed"
+                        );
+                    }
+                } else {
+                    self.recover_preflight_promotion().await;
+                }
                 // spec.md §31: HELLO timeout backs off and retries promotion. Record it in the
                 // same coordinator promotion tracker as the other backoff targets so the
                 // reconnect is not misreported as a reconnect (peer loss) failure.
@@ -332,6 +357,15 @@ impl super::ProductionClusterRuntime {
         }
     }
 
+    fn is_deployment_mismatch(error: &PromotionHelloError) -> bool {
+        match error {
+            PromotionHelloError::Control(ControlError::DeploymentMismatch)
+            | PromotionHelloError::Rendezvous(Ds4HelloError::DeploymentMismatch) => true,
+            PromotionHelloError::Preflight(error) => is_control_deployment_mismatch(error),
+            _ => false,
+        }
+    }
+
     /// The current control session generation (P0-B). Persisted separately from the cluster
     /// generation so a negotiated session survives restart (design §7).
     pub async fn control_session_generation(&self) -> u64 {
@@ -370,4 +404,10 @@ impl super::ProductionClusterRuntime {
         };
         descriptor
     }
+}
+
+fn is_control_deployment_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ControlError>()
+        .is_some_and(|error| *error == ControlError::DeploymentMismatch)
 }

@@ -51,9 +51,25 @@ cargo xtask fingerprint-models [options]
 | `--shared-secret-dir <dir>` | 共有する cluster-control / peer-proxy の供給元（legacy `.key` も可） |
 | `--ds4-source-commit <sha>` | distributed manifest の verified DS4 commit（初回 install で必須） |
 | `--ds4-binary-digest <sha>...` | distributed manifest の承認済み binary digest 集合（既定: 実機 digest） |
+| `--peer-ds4-binary-digest <sha>...` | 相手nodeの binary digest。自nodeのdigestはinstall時に計算して集合へ自動追加 |
 | `--hash-models` | GGUFのSHA-256を確認せず計算・更新する（既定はプロンプト、既定選択は実行しない） |
 | `--ci` | インストール前に Required CI gate を実行 |
 | `--start` | LaunchAgent を bootstrap + kickstart する（ds4-server を再起動） |
+
+2-nodeでnative最適化の異なるds4-serverを使う場合は、各nodeで相手側のdigestだけを指定する。
+installは自nodeのdigestを計算し、相手側のdigestと合わせて同じ
+`compatible_ds4_binary_sha256`集合を両nodeのmanifestへ書き出す。
+
+```sh
+# coordinator: workerのdigestを指定
+cargo xtask install --peer-ds4-binary-digest "<worker-ds4-sha256>"
+
+# worker: coordinatorのdigestを指定
+cargo xtask install --peer-ds4-binary-digest "<coordinator-ds4-sha256>"
+```
+
+`--ds4-binary-digest`は承認済み集合全体を明示する上級者向け指定として残している。
+両オプションは同時に指定できない。
 
 ### 手順認識の訂正（ユーザーの当初理解に対して）
 

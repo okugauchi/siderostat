@@ -74,7 +74,7 @@ cargo xtask fingerprint-models --ds4-server "/absolute/path/to/ds4-server"
 
 `cargo xtask install`はGGUFのSHA-256計算について確認を表示し、既定の`N`ではこのcacheを使う。`Y`を選ぶとinstall中に再計算する。cacheがない、またはファイルが記録時から変更されている場合、`N`のinstallは安全側に停止し、`cargo xtask fingerprint-models`の実行を案内する。非対話で再計算する場合は`cargo xtask install --hash-models`を指定する。
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
+Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`siderostat.example.toml`のplaceholder pathへ合わせる。
 

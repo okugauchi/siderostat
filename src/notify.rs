@@ -9,7 +9,10 @@
 //! (`display notification`), which works from a LaunchAgent running in the
 //! user's `gui/<uid>` (Aqua) session. Non-macOS targets are a no-op.
 
-use crate::target::ClusterState;
+use crate::{
+    cluster::{ClusterFailure, ClusterSnapshot},
+    target::ClusterState,
+};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -228,6 +231,23 @@ impl DesktopNotificationService {
         }
     }
 
+    /// Handle a transition while retaining the failure attached to the resulting snapshot.
+    /// This lets a recoverable state transition and a non-repairable failure use different
+    /// user-facing messages even when both end in Solo Standalone.
+    pub fn observe_snapshot_transition(
+        &mut self,
+        previous: ClusterSnapshot,
+        current: ClusterSnapshot,
+    ) {
+        if let Some(notification) = notification_for_snapshot_transition(
+            previous.state,
+            current.state,
+            current.last_failure,
+        ) {
+            self.maybe_notify(notification);
+        }
+    }
+
     /// Handle a startup notification explicitly. The transition monitor only
     /// subscribes after boot, so boot transitions are reported here.
     pub fn observe_startup(&mut self, state: ClusterState) {
@@ -289,6 +309,23 @@ fn notification_for_transition(
     previous: ClusterState,
     current: ClusterState,
 ) -> Option<Notification> {
+    notification_for_snapshot_transition(previous, current, None)
+}
+
+fn notification_for_snapshot_transition(
+    previous: ClusterState,
+    current: ClusterState,
+    failure: Option<ClusterFailure>,
+) -> Option<Notification> {
+    if current == ClusterState::SoloStandaloneReady
+        && failure == Some(ClusterFailure::DeploymentMismatch)
+    {
+        return Some(Notification::new(
+            "siderostat",
+            "2台の ds4-server の構成が一致しないため Distributed Inference を開始できません。設定を確認して再試行してください。Standalone モードで待機します",
+        ));
+    }
+
     match (previous, current) {
         (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => Some(Notification::new(
             "siderostat",
@@ -329,7 +366,7 @@ pub async fn run_desktop_notifier(
     let mut previous = *snapshots.borrow_and_update();
     while snapshots.changed().await.is_ok() {
         let current = *snapshots.borrow_and_update();
-        service.observe_transition(previous.state, current.state);
+        service.observe_snapshot_transition(previous, current);
         previous = current;
     }
 }
@@ -453,6 +490,21 @@ mod tests {
                 "{previous:?} -> {current:?}"
             );
         }
+    }
+
+    #[test]
+    fn deployment_mismatch_notification_explains_solo_fallback() {
+        let notification = notification_for_snapshot_transition(
+            ClusterState::SoloStandaloneStarting,
+            ClusterState::SoloStandaloneReady,
+            Some(ClusterFailure::DeploymentMismatch),
+        )
+        .expect("deployment mismatch should notify");
+
+        assert_eq!(
+            notification.body,
+            "2台の ds4-server の構成が一致しないため Distributed Inference を開始できません。設定を確認して再試行してください。Standalone モードで待機します"
+        );
     }
 
     #[tokio::test]

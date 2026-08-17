@@ -43,6 +43,10 @@ pub struct InstallArgs {
     /// Approved ds4 binary digest(s) for the distributed manifest (repeatable).
     #[arg(long)]
     pub ds4_binary_digest: Vec<String>,
+    /// Peer ds4 binary digest(s) for the distributed manifest (repeatable).
+    /// The locally installed digest is computed and added automatically.
+    #[arg(long)]
+    pub peer_ds4_binary_digest: Vec<String>,
     /// Compute/update GGUF SHA-256 values without prompting.
     #[arg(long)]
     pub hash_models: bool,
@@ -61,6 +65,10 @@ pub struct FingerprintModelsArgs {
 }
 
 pub fn install(args: &InstallArgs) -> Result<()> {
+    if !args.ds4_binary_digest.is_empty() && !args.peer_ds4_binary_digest.is_empty() {
+        anyhow::bail!("--ds4-binary-digest and --peer-ds4-binary-digest cannot be used together");
+    }
+
     if args.ci {
         run_ci_gates()?;
     }
@@ -588,7 +596,9 @@ fn resolve_manifest_inputs(
             .map(|m| m.ds4_source_commit.clone()),
     };
 
-    let approved = if !args.ds4_binary_digest.is_empty() {
+    let approved = if !args.peer_ds4_binary_digest.is_empty() {
+        resolve_compatible_digest_inputs(&local_digest, &args.peer_ds4_binary_digest)
+    } else if !args.ds4_binary_digest.is_empty() {
         args.ds4_binary_digest.clone()
     } else {
         prior
@@ -599,6 +609,15 @@ fn resolve_manifest_inputs(
     };
 
     Ok((source_commit, approved))
+}
+
+/// Build the compatibility inputs for the peer-digest workflow. The manifest
+/// generator sorts and deduplicates this list, so this helper only appends the
+/// local digest to the operator-supplied peer digests.
+fn resolve_compatible_digest_inputs(local: &str, peer_digests: &[String]) -> Vec<String> {
+    let mut inputs = peer_digests.to_vec();
+    inputs.push(local.to_string());
+    inputs
 }
 
 /// Install the LaunchAgent plist. `start` controls whether the job is
@@ -738,7 +757,7 @@ fn current_uid() -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_secrets;
+    use super::{ensure_secrets, resolve_compatible_digest_inputs};
     use std::fs;
 
     #[test]
@@ -772,5 +791,28 @@ mod tests {
         assert!(secret_dir.join("admin.key").is_file());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn peer_digest_inputs_include_the_local_digest() {
+        let local = "11".repeat(32);
+        let peer = "22".repeat(32);
+
+        assert_eq!(
+            resolve_compatible_digest_inputs(&local, std::slice::from_ref(&peer)),
+            vec![peer.clone(), local]
+        );
+    }
+
+    #[test]
+    fn peer_digest_inputs_preserve_multiple_peer_builds() {
+        let local = "11".repeat(32);
+        let peer_a = "22".repeat(32);
+        let peer_b = "33".repeat(32);
+
+        assert_eq!(
+            resolve_compatible_digest_inputs(&local, &[peer_a.clone(), peer_b.clone()]),
+            vec![peer_a, peer_b, local]
+        );
     }
 }

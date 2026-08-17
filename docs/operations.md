@@ -120,9 +120,9 @@ siderostat cluster doctor
 siderostat cluster reconcile
 ```
 
-`cluster reconcile` はobserved stateをdesired stateへ収束させる。原因を先に特定し、deployment mismatch、manifest stale、Hello timeoutなどの原因を取り除いてから実行する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
+`cluster reconcile` はobserved stateをdesired stateへ収束させる。deployment mismatchのような自動修復できない不一致では、両nodeがSolo Standaloneへ収束し、自動pairingも停止する。原因を先に特定して取り除いてからreconcileを実行する。原因不明のままreconcileを繰り返しても、同一原因で再びSolo Standaloneへ収束する。
 
-`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱う（plan B-03）。そのため、原因除去後のreconcileでtrackerの失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する。解除後に `siderostat cluster status` で `state` が `paired-standalone-ready`（または期待するstable state）へ戻り、同一原因の失敗回数が保持されないことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
+`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱う（plan B-03）。そのため、原因除去後のreconcileでtrackerの失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する。deployment mismatchからの復旧後は `siderostat cluster status` で `state` が `solo-standalone-ready` から期待するpaired stateへ進むことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びSolo Standaloneへ収束する。
 
 PeerLost recovery中の `cluster reconcile` は、まず `PeerLossRecovery` ownerによる local recovery
 （admission block → distributed child stop → standalone start → SoloStandaloneReady）へ収束する。

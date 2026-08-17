@@ -42,7 +42,7 @@ fn failure_table_and_finite_promotion_retry_match_policy() {
         ),
         (
             ClusterFailure::DeploymentMismatch,
-            FailureAction::PairedStandalone,
+            FailureAction::SoloStandalone,
         ),
         (
             ClusterFailure::ManifestStale,

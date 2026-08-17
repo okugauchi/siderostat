@@ -106,7 +106,12 @@ impl super::ProductionClusterRuntime {
                         log_pair_generation_mismatch(expected, received, cluster_generation);
                         return Err(ControlError::GenerationMismatch { expected, received }.into());
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        if error == ControlError::DeploymentMismatch {
+                            self.schedule_deployment_mismatch_recovery();
+                        }
+                        return Err(error.into());
+                    }
                 }
             }
             RoleControl::Worker(control) => {
@@ -122,7 +127,12 @@ impl super::ProductionClusterRuntime {
                         log_pair_generation_mismatch(expected, received, cluster_generation);
                         return Err(ControlError::GenerationMismatch { expected, received }.into());
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        if error == ControlError::DeploymentMismatch {
+                            self.schedule_deployment_mismatch_recovery();
+                        }
+                        return Err(error.into());
+                    }
                 }
             }
         };
@@ -208,6 +218,15 @@ impl super::ProductionClusterRuntime {
             ControlCommand::Drained | ControlCommand::WorkerEvent { .. } => {}
         }
         Ok(())
+    }
+
+    fn schedule_deployment_mismatch_recovery(&self) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = runtime.recover_from_deployment_mismatch().await {
+                tracing::error!(error = %error, "deployment mismatch recovery failed");
+            }
+        });
     }
 }
 
