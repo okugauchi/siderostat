@@ -374,6 +374,14 @@ macOS 再起動は operator が行い、agent は再起動前後の観測を担�
   DistributedReady へ戻る。
 - 停止条件: OS update、別 service、disk encryption unlock 等が検証条件を変える。
 
+### 9.1 H-04 完了（2026-08-17）
+
+coordinator-only（Mac Studio）、worker-only（MacBook Pro）、両 node 同時再起動の3ケースを完了した。各ケースとも login/LaunchAgent 復帰後、手動 pair/reconcile・state 削除・force kill なしで自動 pairing、promotion、`DistributedReady` へ収束した。最終 checkpoint は両 node `cluster doctor --json` `healthy=true`、admission serving、in-flight 0、lease valid / peer-present / route-scoped、public `/v1/models` HTTP 200、LaunchAgent 各1件、DS4 child 各1件だった。
+
+両 node 同時再起動後の boot time は worker `2026-08-17 09:03:42`、coordinator `2026-08-17 09:03:40`。最終 worker child は PID `2578` / generation `449`、coordinator child は PID `1068` / generation `607`、control generation は両 node `601`。boot 後の log window に 409 loop、`SIGKILL is not allowed for this child`、orphan child はなかった。promotion 中の一時的な admission blocked / HTTP 503 は最終 checkpoint 前に serving / HTTP 200 へ復帰した。
+
+Evidence: `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-summary.md`
+
 ## 10. H-05 evidence 集約と acceptance 判定
 
 1. scenario ごとに build、操作、所要時間、generation、child identity 変化、結果を表にする。

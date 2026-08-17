@@ -874,7 +874,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Fix application evidence (2026-08-16): 失効した認証済み peer の `/v1/node` を再 pair 用 descriptor 応答へ変更し、PeerLost recovery 後の phase を lease 有効時だけ `Paired` とし、auto pair を coordinator 限定にした。両 node の `allow_sigkill=true` と candidate `1952cd7bb2db07ffcb4e5487fed3a52949f3d2d7f85b4c35a57f7391fc4f3cb0` を適用後、SoloStandaloneReady から自動 re-pair / auto promotion / DistributedReady、control generation `445`、`healthy=true` へ収束した。これは修正適用と再開条件の確認であり、H-03 の coordinator-only / worker-only 各2 cycle完了ではない。evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-fix-application.md`。
 - Completion evidence (2026-08-16): 修正適用後、coordinator-only 2 cycle と worker-only 2 cycle を完了した。各 cycle で peer loss recovery、SoloStandaloneReady、自動 re-pair、auto promotion、DistributedReady、doctor `healthy=true`、public `/v1/models` HTTP 200、orphan child 不在を確認した。child は各回で新 PID/generation へ更新され、最終 worker PID `75852`、coordinator PID `40229`。新しい検証時間帯に 409 loop、`SIGKILL is not allowed for this child`、古い child 再利用はなかった。coordinator の既存 route-loss demotion task 終了競合ログはあったが、shared recovery と最終収束は成功した。evidence: `/private/tmp/siderostat-reconnect-evidence-20260816/h03/20260816-h03-summary.md`。
 
-### [ ] H-04 macOS 再起動を片側・両側で検証する
+### [x] H-04 macOS 再起動を片側・両側で検証する
 
 - Actor: operator（macOS 再起動）+ agent（再接続後の観測）
 - Depends on: H-03
@@ -889,6 +889,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Verification: 3 ケースの時系列 JSON/log、LaunchAgent 1 process、DS4 child 最大 1、public inference smoke request
 - 完了条件: 片側再起動の両方向と両側再起動が、手動 pair/reconcile や state 削除なしで DistributedReady へ戻る
 - 停止条件: OS update、別 service、disk encryption unlock 等が検証条件を変える
+- Completion evidence (2026-08-17): coordinator-only、worker-only、両 node 同時再起動の3ケースを実施し、いずれも login/LaunchAgent 復帰後に手動 pair/reconcile や state 削除なしで両 node が `DistributedReady` へ収束した。各ケースで `cluster doctor --json` は `healthy=true`、admission serving、public `/v1/models` は HTTP 200、LaunchAgent は各 node 1件、DS4 child は各 node 最大1件だった。最終ケースの boot time は worker `2026-08-17 09:03:42`、coordinator `2026-08-17 09:03:40`、control generation `601`、worker child PID/generation `2578/449`、coordinator child PID/generation `1068/607`、cluster generation は worker `452` / coordinator `609`。boot 後の log window に 409 loop、`SIGKILL is not allowed for this child`、orphan child はなく、証跡は `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-summary.md`。
 
 ### [ ] H-05 実機 evidence を判定し rollback を確認する
 
