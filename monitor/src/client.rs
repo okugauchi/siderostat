@@ -5,7 +5,14 @@ use crate::{
     metrics::{MetricsSnapshot, parse_metrics},
 };
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use std::time::Duration;
+
+#[derive(Debug, Deserialize)]
+struct ClusterRoutingState {
+    role: String,
+    target: String,
+}
 
 #[derive(Clone)]
 pub struct MetricsClient {
@@ -43,10 +50,33 @@ impl MetricsClient {
         self.offline_backoff
     }
 
-    /// Fetch and parse the current metrics. Returns `None` when the endpoint
-    /// is unreachable or malformed; the caller treats that as offline.
+    /// Fetch and parse the metrics source for the current serving node.
+    ///
+    /// A worker serving through the coordinator reads the coordinator snapshot through the
+    /// worker's loopback `/metrics/coordinator` endpoint. The siderostat worker authenticates
+    /// that hop over the existing control plane, so the coordinator's admin listener remains
+    /// loopback-only.
     pub async fn fetch_metrics(&self) -> Result<MetricsSnapshot> {
-        let url = format!("{}/metrics", self.base_url);
+        let routing = self.fetch_cluster_routing().await?;
+        let path = metrics_path(&routing);
+        self.fetch_metrics_at(path).await
+    }
+
+    async fn fetch_cluster_routing(&self) -> Result<ClusterRoutingState> {
+        let url = format!("{}/cluster", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("cluster endpoint returned {}", response.status()));
+        }
+        response.json().await.context("parse cluster response")
+    }
+
+    async fn fetch_metrics_at(&self, path: &str) -> Result<MetricsSnapshot> {
+        let url = format!("{}{path}", self.base_url);
         let mut request = self.http.get(&url);
         if let Some(token) = &self.admin_token {
             request = request.bearer_auth(token);
@@ -60,6 +90,14 @@ impl MetricsClient {
             .await
             .context("read metrics response body")?;
         Ok(parse_metrics(&text))
+    }
+}
+
+fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
+    if routing.role == "worker" && routing.target == "coordinator" {
+        "/metrics/coordinator"
+    } else {
+        "/metrics"
     }
 }
 
@@ -82,5 +120,23 @@ mod tests {
             ..MonitorConfig::default()
         };
         assert!(MetricsClient::new(&config).is_err());
+    }
+
+    #[test]
+    fn selects_coordinator_metrics_when_worker_targets_coordinator() {
+        let routing = ClusterRoutingState {
+            role: "worker".into(),
+            target: "coordinator".into(),
+        };
+        assert_eq!(metrics_path(&routing), "/metrics/coordinator");
+    }
+
+    #[test]
+    fn keeps_local_metrics_for_worker_solo_mode() {
+        let routing = ClusterRoutingState {
+            role: "worker".into(),
+            target: "local-standalone".into(),
+        };
+        assert_eq!(metrics_path(&routing), "/metrics");
     }
 }

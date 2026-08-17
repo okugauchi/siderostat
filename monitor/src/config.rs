@@ -11,6 +11,21 @@ use std::{env, fs, path::PathBuf, time::Duration};
 const DEFAULT_CONFIG_FILE: &str = "monitor.toml";
 const DEFAULT_ADMIN_LISTEN: &str = "http://127.0.0.1:18081";
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveMetric {
+    PrefillPercent,
+    PrefillChunkTps,
+    #[default]
+    PrefillAvgTps,
+    PrefillElapsed,
+    DecodeChunkTps,
+    DecodeAvgTps,
+    DecodeElapsed,
+    KvCache,
+    None,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MonitorConfig {
@@ -18,6 +33,7 @@ pub struct MonitorConfig {
     pub poll_interval_secs: u64,
     pub offline_backoff_secs: u64,
     pub show_decode_tps: bool,
+    pub live_metric: LiveMetric,
     pub admin_token: Option<String>,
 }
 
@@ -28,6 +44,7 @@ impl Default for MonitorConfig {
             poll_interval_secs: 2,
             offline_backoff_secs: 5,
             show_decode_tps: true,
+            live_metric: LiveMetric::default(),
             admin_token: None,
         }
     }
@@ -96,6 +113,7 @@ mod tests {
         assert_eq!(config.poll_interval_secs, 2);
         assert_eq!(config.offline_backoff_secs, 5);
         assert!(config.show_decode_tps);
+        assert_eq!(config.live_metric, LiveMetric::PrefillAvgTps);
         assert!(path.is_some());
     }
 
@@ -107,6 +125,7 @@ admin_listen = "http://127.0.0.1:18081"
 poll_interval_secs = 3
 offline_backoff_secs = 7
 show_decode_tps = false
+live_metric = "decode-chunk-tps"
 admin_token = "secret"
 "#,
         )
@@ -115,6 +134,7 @@ admin_token = "secret"
         assert_eq!(config.poll_interval_secs, 3);
         assert_eq!(config.offline_backoff_secs, 7);
         assert!(!config.show_decode_tps);
+        assert_eq!(config.live_metric, LiveMetric::DecodeChunkTps);
         assert_eq!(config.admin_token.as_deref(), Some("secret"));
         config.validate().unwrap();
     }

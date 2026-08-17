@@ -38,6 +38,22 @@ impl super::ProductionClusterRuntime {
         .authenticate(&self.inner.authenticator, now_millis())?)
     }
 
+    pub(super) async fn handle_metrics(
+        &self,
+        source: SocketAddr,
+        headers: HeaderMap,
+    ) -> Result<String, ControlHttpError> {
+        self.authenticate("GET", super::CONTROL_METRICS_PATH, &[], source, &headers)
+            .await?;
+        if self.inner.role != LocalRole::Coordinator {
+            return Err(ControlError::CommandNotAllowed.into());
+        }
+        if !self.inner.network.route_scoped() {
+            return Err(ControlError::RouteNotScoped.into());
+        }
+        Ok(self.render_control_metrics())
+    }
+
     pub(super) async fn handle(
         &self,
         endpoint: ControlEndpoint,

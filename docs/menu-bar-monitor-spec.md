@@ -11,7 +11,7 @@
 macOS のメニューバーに常駐するアイコン型モニターで、次を可視化する。
 
 - siderostat の cluster mode / state / target readiness
-- DS4 の prefill loading progress（チャンク進行・%・cached tokens）
+- DS4 の prefill loading progress（チャンク進行・%・chunk/average token/s・経過秒・cached tokens）
 - KV cache hit / miss の状況（hit tokens、load 時間、累計）
 - generation（デコード）の直近 TPS
 
@@ -59,7 +59,13 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 
 ### 3.2 通信仕様
 
-- モニターは `GET {admin_listen}/metrics` をポーリングする。
+- モニターはまず `GET {admin_listen}/cluster` で現在の role/target を確認し、通常は
+  `GET {admin_listen}/metrics` をポーリングする。
+- worker が coordinator target で稼働している場合は、worker の
+  `GET {admin_listen}/metrics/coordinator` を使う。この endpoint は本体が既存の HMAC
+  control plane 経由で coordinator の `GET /v1/metrics` を取得して返す。
+- coordinator の admin API は loopback 限定のままとし、monitor が coordinator の
+  `admin_listen` を直接参照する構成にはしない。
 - ポーリング間隔は既定 2 秒、設定で変更可能。
 - 本体に到達できない場合（接続失敗・タイムアウト・HTTP エラー）は offline 状態とし、
   ポーリング間隔を 5 秒へバックオフする。本体復帰を自動検出する。
@@ -96,12 +102,16 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | prefill total tokens | `ds4_proxy_ds4_prefill_total` | gauge |
 | prefill percent | `ds4_proxy_ds4_prefill_percent` | gauge |
 | prefill cached tokens | `ds4_proxy_ds4_prefill_cached` | gauge |
+| prefill chunk TPS | `ds4_proxy_ds4_prefill_chunk_tps` | gauge |
+| prefill average TPS | `ds4_proxy_ds4_prefill_avg_tps` | gauge |
+| prefill elapsed seconds | `ds4_proxy_ds4_prefill_elapsed_seconds` | gauge |
 | KV cache hit 累計 | `ds4_proxy_ds4_kv_cache_hits_total` | counter |
 | 直近 KV cache hit tokens | `ds4_proxy_ds4_kv_cache_hit_tokens` | gauge |
 | 直近 KV cache load ms | `ds4_proxy_ds4_kv_cache_load_ms` | gauge |
 | Decode completion | `ds4_proxy_ds4_generation_completion` | gauge |
 | 直近 Decode chunk TPS | `ds4_proxy_ds4_generation_chunk_tps` | gauge |
 | Decode average TPS | `ds4_proxy_ds4_generation_avg_tps` | gauge |
+| Decode elapsed seconds | `ds4_proxy_ds4_generation_elapsed_seconds` | gauge |
 
 ### 4.3 DS4 ログフォーマット（実機ソースで確認済み）
 
@@ -147,12 +157,12 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
     - offline / 不明: 2つとも赤、接続線なし
 - アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed の接続線は
   視認できる太さにする。
-- アイコンのタイトル（または代替テキスト）には、最後に更新されたメトリクスだけを表示する:
-  - 通常時: 空（mode はアイコン描画のみで表現）
-  - prefill 進行中: `prefill 45%` のように % を優先表示
-  - KV cache 更新時: `KV 9005t/12.3ms`
-  - Decode 更新時: `decode 32.1t/s`
-  - offline: `offline`
+- アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値だけを表示する。
+  既定値は `prefill-avg-tps` とする。選択肢は `prefill-percent`、`prefill-chunk-tps`、
+  `prefill-avg-tps`、`prefill-elapsed`、`decode-chunk-tps`、`decode-avg-tps`、`decode-elapsed`、
+  `kv-cache`、`none` とし、値がまだ取得できない場合は空表示にする。
+- prefill のタイトル値は prefill 完了時にクリアする。メニュー内の詳細行も完了後は `Prefill: --` とする。
+- offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
 ### 5.2 メニュー構成
@@ -165,8 +175,7 @@ State:   solo-standalone-ready
 Gen:     42
 Target:  local-standalone (ready)
 ────────────────────────
-Prefill: 4096/9005 (45.5%)   ← 進行中のみ
-  cached: 0 tokens
+Prefill: 4096/9005 (45.5%) chunk=123.4t/s avg=100.0t/s elapsed=10.0s cached=0
 ────────────────────────
 KV cache: hit tokens=9005 load=12.3ms
   total hits: 7
@@ -199,6 +208,7 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
+live_metric = "prefill-avg-tps"            # メニューバーに表示する随時更新値
 admin_token = ""                           # /metrics に認証を設定する場合のみ使用
 ```
 
@@ -206,12 +216,14 @@ admin_token = ""                           # /metrics に認証を設定する�
   操作は `launchctl` を使うため、再起動操作には使用しない。
 
 - 設定が存在しない場合は既定値で動作する。
+- 設定変更は Monitor の再起動後に反映される。
 - 未知フィールドは拒否する（本体 config と同じ `deny_unknown_fields` 方針）。
 
 ## 7. セキュリティ
 
 - admin token は設定ファイルまたは環境変数から読み、ログ・メニューへ出力しない。
-- 通信は loopback（admin_listen）限定とする。
+- monitor と本体の通信は loopback（admin_listen）限定とする。worker 本体と coordinator
+  本体のメトリクス転送は、既存の source-pinned HMAC control plane に限定する。
 - モニターのログに API レスポンス本文（cluster 状態の JSON）をそのまま出力しない。
 
 ## 8. 非機能要件
@@ -285,5 +297,7 @@ Phase 1〜4 は 2026-08-17 に実装済みとする。
 - Phase 3: `monitor/src/tray.rs`、`main.rs`（完了）
 - Phase 4: 本体の prefill / KV cache / generation イベントを `Metrics` の DS4 gauge として公開し、
   モニターの Decode 表示へ接続（完了）
+- worker の Paired/Distributed 時は、worker の loopback admin API から認証済み control plane
+  経由で coordinator metrics を取得する経路を追加（完了）
 - Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
-  テストとコンパイルを検証済み（本体 188 tests、monitor 18 tests、xtask 2 tests、Required CI 成功）
+  テストとコンパイルを検証済み（本体 189 tests、monitor 20 tests、xtask 2 tests、Required CI 成功）

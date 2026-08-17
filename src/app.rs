@@ -1124,6 +1124,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/readyz", get(ready))
         .route("/cluster", get(cluster))
         .route("/metrics", get(metrics))
+        .route("/metrics/coordinator", get(coordinator_metrics))
         .route("/cluster/reconcile", post(reconcile))
         .route("/cluster/pair", post(pair))
         .route("/cluster/promote", post(promote))
@@ -1349,6 +1350,46 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         "text/plain; version=0.0.4",
         Body::from(body),
     )
+}
+
+/// Return coordinator metrics for the worker-side monitor without exposing the coordinator's
+/// loopback-only admin listener. The production runtime performs the authenticated control-plane
+/// request to the coordinator and returns the Prometheus text unchanged.
+async fn coordinator_metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let production = state
+        .production
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(production) = production else {
+        return response_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain; charset=utf-8",
+            Body::from("coordinator metrics unavailable"),
+        );
+    };
+    if production.role() != LocalRole::Worker {
+        return response_with_body(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            Body::from("coordinator metrics are only available on a worker"),
+        );
+    }
+    match production.fetch_coordinator_metrics().await {
+        Ok(body) => response_with_body(
+            StatusCode::OK,
+            "text/plain; version=0.0.4",
+            Body::from(body),
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "coordinator metrics fetch failed");
+            response_with_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/plain; charset=utf-8",
+                Body::from("coordinator metrics unavailable"),
+            )
+        }
+    }
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {

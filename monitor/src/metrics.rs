@@ -19,6 +19,9 @@ pub struct PrefillState {
     pub total: u64,
     pub percent: f64,
     pub cached: u64,
+    pub chunk_tps: f64,
+    pub avg_tps: f64,
+    pub elapsed_secs: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -33,6 +36,7 @@ pub struct DecodeState {
     pub completion: u64,
     pub chunk_tps: f64,
     pub avg_tps: f64,
+    pub elapsed_secs: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -106,6 +110,18 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .get("ds4_proxy_ds4_prefill_cached")
                 .map(|v| *v as u64)
                 .unwrap_or(0),
+            chunk_tps: samples
+                .get("ds4_proxy_ds4_prefill_chunk_tps")
+                .copied()
+                .unwrap_or(0.0),
+            avg_tps: samples
+                .get("ds4_proxy_ds4_prefill_avg_tps")
+                .copied()
+                .unwrap_or(0.0),
+            elapsed_secs: samples
+                .get("ds4_proxy_ds4_prefill_elapsed_seconds")
+                .copied()
+                .unwrap_or(0.0),
         },
         kv_cache: KvCacheState {
             hits_total: samples
@@ -132,6 +148,10 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .unwrap_or(0.0),
             avg_tps: samples
                 .get("ds4_proxy_ds4_generation_avg_tps")
+                .copied()
+                .unwrap_or(0.0),
+            elapsed_secs: samples
+                .get("ds4_proxy_ds4_generation_elapsed_seconds")
                 .copied()
                 .unwrap_or(0.0),
         },
@@ -230,6 +250,12 @@ ds4_proxy_ds4_prefill_total 9005
 ds4_proxy_ds4_prefill_percent 45.5
 # TYPE ds4_proxy_ds4_prefill_cached gauge
 ds4_proxy_ds4_prefill_cached 0
+# TYPE ds4_proxy_ds4_prefill_chunk_tps gauge
+ds4_proxy_ds4_prefill_chunk_tps 123.4
+# TYPE ds4_proxy_ds4_prefill_avg_tps gauge
+ds4_proxy_ds4_prefill_avg_tps 100.0
+# TYPE ds4_proxy_ds4_prefill_elapsed_seconds gauge
+ds4_proxy_ds4_prefill_elapsed_seconds 10.0
 # TYPE ds4_proxy_ds4_kv_cache_hits_total counter
 ds4_proxy_ds4_kv_cache_hits_total 7
 # TYPE ds4_proxy_ds4_kv_cache_hit_tokens gauge
@@ -242,6 +268,8 @@ ds4_proxy_ds4_generation_completion 42
 ds4_proxy_ds4_generation_chunk_tps 32.1
 # TYPE ds4_proxy_ds4_generation_avg_tps gauge
 ds4_proxy_ds4_generation_avg_tps 28.5
+# TYPE ds4_proxy_ds4_generation_elapsed_seconds gauge
+ds4_proxy_ds4_generation_elapsed_seconds 1.5
 "#;
         let snapshot = parse_metrics(text);
         assert!(snapshot.prefill.active);
@@ -249,12 +277,16 @@ ds4_proxy_ds4_generation_avg_tps 28.5
         assert_eq!(snapshot.prefill.total, 9005);
         assert_eq!(snapshot.prefill.percent, 45.5);
         assert_eq!(snapshot.prefill.cached, 0);
+        assert_eq!(snapshot.prefill.chunk_tps, 123.4);
+        assert_eq!(snapshot.prefill.avg_tps, 100.0);
+        assert_eq!(snapshot.prefill.elapsed_secs, 10.0);
         assert_eq!(snapshot.kv_cache.hits_total, 7);
         assert_eq!(snapshot.kv_cache.hit_tokens, 9005);
         assert_eq!(snapshot.kv_cache.load_ms, 12.3);
         assert_eq!(snapshot.decode.completion, 42);
         assert_eq!(snapshot.decode.chunk_tps, 32.1);
         assert_eq!(snapshot.decode.avg_tps, 28.5);
+        assert_eq!(snapshot.decode.elapsed_secs, 1.5);
     }
 
     #[test]

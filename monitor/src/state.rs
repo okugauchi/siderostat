@@ -2,13 +2,6 @@
 
 use crate::metrics::{MetricsSnapshot, MonitorStatus};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LatestMetric {
-    Prefill,
-    KvCache,
-    Decode,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayState {
     pub status: MonitorStatus,
@@ -22,13 +15,16 @@ pub struct DisplayState {
     pub prefill_total: u64,
     pub prefill_percent: f64,
     pub prefill_cached: u64,
+    pub prefill_chunk_tps: f64,
+    pub prefill_avg_tps: f64,
+    pub prefill_elapsed_secs: f64,
     pub kv_hits_total: u64,
     pub kv_hit_tokens: u64,
     pub kv_load_ms: f64,
     pub decode_completion: u64,
     pub decode_chunk_tps: f64,
     pub decode_avg_tps: f64,
-    pub latest_metric: Option<LatestMetric>,
+    pub decode_elapsed_secs: f64,
 }
 
 impl Default for DisplayState {
@@ -45,13 +41,16 @@ impl Default for DisplayState {
             prefill_total: 0,
             prefill_percent: 0.0,
             prefill_cached: 0,
+            prefill_chunk_tps: 0.0,
+            prefill_avg_tps: 0.0,
+            prefill_elapsed_secs: 0.0,
             kv_hits_total: 0,
             kv_hit_tokens: 0,
             kv_load_ms: 0.0,
             decode_completion: 0,
             decode_chunk_tps: 0.0,
             decode_avg_tps: 0.0,
-            latest_metric: None,
+            decode_elapsed_secs: 0.0,
         }
     }
 }
@@ -59,18 +58,6 @@ impl Default for DisplayState {
 impl DisplayState {
     /// Apply a successful metrics poll.
     pub fn apply_metrics(&mut self, snapshot: &MetricsSnapshot) {
-        let prefill_changed = self.prefill_active != snapshot.prefill.active
-            || self.prefill_current != snapshot.prefill.current
-            || self.prefill_total != snapshot.prefill.total
-            || self.prefill_percent != snapshot.prefill.percent
-            || self.prefill_cached != snapshot.prefill.cached;
-        let kv_cache_changed = self.kv_hits_total != snapshot.kv_cache.hits_total
-            || self.kv_hit_tokens != snapshot.kv_cache.hit_tokens
-            || self.kv_load_ms != snapshot.kv_cache.load_ms;
-        let decode_changed = self.decode_completion != snapshot.decode.completion
-            || self.decode_chunk_tps != snapshot.decode.chunk_tps
-            || self.decode_avg_tps != snapshot.decode.avg_tps;
-
         self.status = MonitorStatus::Online;
         self.cluster_mode = snapshot.cluster_mode.clone();
         self.cluster_state = snapshot.cluster_state.clone();
@@ -82,21 +69,16 @@ impl DisplayState {
         self.prefill_total = snapshot.prefill.total;
         self.prefill_percent = snapshot.prefill.percent;
         self.prefill_cached = snapshot.prefill.cached;
+        self.prefill_chunk_tps = snapshot.prefill.chunk_tps;
+        self.prefill_avg_tps = snapshot.prefill.avg_tps;
+        self.prefill_elapsed_secs = snapshot.prefill.elapsed_secs;
         self.kv_hits_total = snapshot.kv_cache.hits_total;
         self.kv_hit_tokens = snapshot.kv_cache.hit_tokens;
         self.kv_load_ms = snapshot.kv_cache.load_ms;
         self.decode_completion = snapshot.decode.completion;
         self.decode_chunk_tps = snapshot.decode.chunk_tps;
         self.decode_avg_tps = snapshot.decode.avg_tps;
-        if prefill_changed {
-            self.latest_metric = Some(LatestMetric::Prefill);
-        }
-        if kv_cache_changed {
-            self.latest_metric = Some(LatestMetric::KvCache);
-        }
-        if decode_changed {
-            self.latest_metric = Some(LatestMetric::Decode);
-        }
+        self.decode_elapsed_secs = snapshot.decode.elapsed_secs;
     }
 
     /// Mark the monitor as offline after a failed poll.
@@ -122,6 +104,9 @@ mod tests {
                 total: 9005,
                 percent: 45.5,
                 cached: 0,
+                chunk_tps: 123.4,
+                avg_tps: 100.0,
+                elapsed_secs: 10.0,
             },
             kv_cache: crate::metrics::KvCacheState {
                 hits_total: 3,
@@ -132,6 +117,7 @@ mod tests {
                 completion: 42,
                 chunk_tps: 32.1,
                 avg_tps: 28.5,
+                elapsed_secs: 1.5,
             },
         }
     }
@@ -145,8 +131,9 @@ mod tests {
         assert_eq!(state.generation, Some(7));
         assert!(state.prefill_active);
         assert_eq!(state.prefill_percent, 45.5);
+        assert_eq!(state.prefill_avg_tps, 100.0);
         assert_eq!(state.decode_completion, 42);
-        assert_eq!(state.latest_metric, Some(LatestMetric::Decode));
+        assert_eq!(state.decode_elapsed_secs, 1.5);
     }
 
     #[test]

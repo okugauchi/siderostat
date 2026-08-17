@@ -714,6 +714,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | Method | Path | 用途 |
 |---|---|---|
 | `GET` | `/v1/node` | node descriptor、mode、deployment、lease |
+| `GET` | `/v1/metrics` | 認証済み peer から coordinator の Prometheus metrics を取得 |
 | `POST` | `/v1/pair` | Paired Standalone形成 |
 | `POST` | `/v1/prepare-worker` | MXFP4 worker準備 |
 | `POST` | `/v1/begin-drain` | cluster-wide drain開始 |
@@ -723,7 +724,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | `POST` | `/v1/distributed-ready` | complete route成立後にworker admissionを再開 |
 | `POST` | `/v1/demote` | Paired/Solo Standaloneへの復帰要求 |
 
-同一generationの再送はidempotent。古いgenerationは409、deployment不一致は412。`GET /v1/node` はDS4 inference health queryではなく、process membershipとcluster stateだけを返す。
+同一generationの再送はidempotent。古いgenerationは409、deployment不一致は412。`GET /v1/node` はDS4 inference health queryではなく、process membershipとcluster stateだけを返す。`GET /v1/metrics` は coordinator の role だけが応答し、認証済み worker からの read-only request に限定する。control plane の source IP、node ID、HMAC、nonce を検証し、route が bridge0 に scoped でない場合は拒否する。
 
 ### 16.4 Lease
 
@@ -1160,6 +1161,7 @@ Loopback `127.0.0.1:18081` default。
 | `GET` | `/readyz` | current target readiness |
 | `GET` | `/cluster` | role、mode、state、generation、target、lease、child、Thunderbolt IP/discovery状態、active standalone profile ID/model variant/residency |
 | `GET` | `/metrics` | Prometheus text |
+| `GET` | `/metrics/coordinator` | worker が control plane 経由で取得した coordinator の Prometheus text |
 | `POST` | `/cluster/reconcile` | observed stateをdesired stateへ収束 |
 | `POST` | `/cluster/pair` | Paired Standaloneを要求 |
 | `POST` | `/cluster/promote` | MXFP4 promotion要求 |
@@ -1311,6 +1313,21 @@ ds4_proxy_cluster_child_restarts_total{profile,reason}
 ds4_proxy_standalone_profile_info{node_id,model_variant,residency}
 ds4_proxy_cluster_hello_total{result,reason}
 ds4_proxy_cluster_deployment_mismatch_total{field}
+ds4_proxy_ds4_prefill_active
+ds4_proxy_ds4_prefill_current
+ds4_proxy_ds4_prefill_total
+ds4_proxy_ds4_prefill_percent
+ds4_proxy_ds4_prefill_cached
+ds4_proxy_ds4_prefill_chunk_tps
+ds4_proxy_ds4_prefill_avg_tps
+ds4_proxy_ds4_prefill_elapsed_seconds
+ds4_proxy_ds4_kv_cache_hits_total
+ds4_proxy_ds4_kv_cache_hit_tokens
+ds4_proxy_ds4_kv_cache_load_ms
+ds4_proxy_ds4_generation_completion
+ds4_proxy_ds4_generation_chunk_tps
+ds4_proxy_ds4_generation_avg_tps
+ds4_proxy_ds4_generation_elapsed_seconds
 ```
 
 `model_variant` と `residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない。

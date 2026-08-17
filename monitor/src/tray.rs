@@ -4,10 +4,7 @@
 //! requirement). The menu reflects the current `DisplayState`; the polling
 //! task shares state through the mutex passed to `update`.
 
-use crate::{
-    metrics::MonitorStatus,
-    state::{DisplayState, LatestMetric},
-};
+use crate::{config::LiveMetric, metrics::MonitorStatus, state::DisplayState};
 use anyhow::{Context, Result};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -37,6 +34,7 @@ pub struct MonitorTray {
     kv_cache: MenuItem,
     decode: MenuItem,
     show_decode_tps: bool,
+    live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
     _proxy_restart: MenuItem,
     _monitor_restart: MenuItem,
@@ -45,7 +43,7 @@ pub struct MonitorTray {
 
 impl MonitorTray {
     /// Build the tray icon and its static menu structure.
-    pub fn new(show_decode_tps: bool) -> Result<Self> {
+    pub fn new(show_decode_tps: bool, live_metric: LiveMetric) -> Result<Self> {
         let icon = icon_for(None, true)?;
         let header = MenuItem::new("siderostat", false, None);
         let mode = MenuItem::new("Mode: --", false, None);
@@ -94,6 +92,7 @@ impl MonitorTray {
             kv_cache,
             decode,
             show_decode_tps,
+            live_metric,
             _separator: separator,
             _proxy_restart: proxy_restart,
             _monitor_restart: monitor_restart,
@@ -159,14 +158,15 @@ impl MonitorTray {
 
         if display.prefill_active {
             self.prefill.set_text(format!(
-                "Prefill: {}/{} ({:.1}%)  cached={}",
+                "Prefill: {}/{} ({:.1}%) chunk={:.1}t/s avg={:.1}t/s elapsed={:.1}s cached={}",
                 display.prefill_current,
                 display.prefill_total,
                 display.prefill_percent,
+                display.prefill_chunk_tps,
+                display.prefill_avg_tps,
+                display.prefill_elapsed_secs,
                 display.prefill_cached
             ));
-            self._tray
-                .set_title(Some(format!("prefill {:.0}%", display.prefill_percent)));
         } else {
             self.prefill.set_text("Prefill: --");
             // The cluster mode is drawn by the icon, not shown as text.
@@ -190,8 +190,11 @@ impl MonitorTray {
         } else {
             self.decode.set_text("Decode: --");
         }
-        self._tray
-            .set_title(Some(latest_metric_title(display, self.show_decode_tps)));
+        self._tray.set_title(Some(selected_metric_title(
+            display,
+            self.show_decode_tps,
+            self.live_metric,
+        )));
         let _ = self._tray.set_tooltip(Some(format!(
             "siderostat node={} state={}",
             display.node_id.as_deref().unwrap_or("--"),
@@ -215,18 +218,61 @@ impl MonitorTray {
     }
 }
 
-fn latest_metric_title(display: &DisplayState, show_decode_tps: bool) -> String {
-    match display.latest_metric {
-        Some(LatestMetric::Prefill) if display.prefill_total > 0 => {
+fn selected_metric_title(
+    display: &DisplayState,
+    show_decode_tps: bool,
+    live_metric: LiveMetric,
+) -> String {
+    match live_metric {
+        LiveMetric::PrefillPercent if display.prefill_active && display.prefill_total > 0 => {
             format!("prefill {:.0}%", display.prefill_percent)
         }
-        Some(LatestMetric::KvCache) if display.kv_hits_total > 0 => {
+        LiveMetric::PrefillChunkTps
+            if display.prefill_active
+                && display.prefill_total > 0
+                && display.prefill_chunk_tps > 0.0 =>
+        {
+            format!("prefill {:.1}t/s", display.prefill_chunk_tps)
+        }
+        LiveMetric::PrefillAvgTps
+            if display.prefill_active
+                && display.prefill_total > 0
+                && display.prefill_avg_tps > 0.0 =>
+        {
+            format!("prefill avg {:.1}t/s", display.prefill_avg_tps)
+        }
+        LiveMetric::PrefillElapsed
+            if display.prefill_active
+                && display.prefill_total > 0
+                && display.prefill_elapsed_secs > 0.0 =>
+        {
+            format!("prefill {:.1}s", display.prefill_elapsed_secs)
+        }
+        LiveMetric::DecodeChunkTps if show_decode_tps && display.decode_completion > 0 => {
+            format!("decode {:.1}t/s", display.decode_chunk_tps)
+        }
+        LiveMetric::DecodeAvgTps if show_decode_tps && display.decode_completion > 0 => {
+            format!("decode avg {:.1}t/s", display.decode_avg_tps)
+        }
+        LiveMetric::DecodeElapsed
+            if show_decode_tps
+                && display.decode_completion > 0
+                && display.decode_elapsed_secs > 0.0 =>
+        {
+            format!("decode {:.1}s", display.decode_elapsed_secs)
+        }
+        LiveMetric::KvCache if display.kv_hits_total > 0 => {
             format!("KV {}t/{:.1}ms", display.kv_hit_tokens, display.kv_load_ms)
         }
-        Some(LatestMetric::Decode) if show_decode_tps && display.decode_completion > 0 => {
-            format!("decode {:.1}t/s", display.decode_avg_tps)
-        }
-        _ => String::new(),
+        LiveMetric::None
+        | LiveMetric::PrefillPercent
+        | LiveMetric::PrefillChunkTps
+        | LiveMetric::PrefillAvgTps
+        | LiveMetric::PrefillElapsed
+        | LiveMetric::DecodeChunkTps
+        | LiveMetric::DecodeAvgTps
+        | LiveMetric::DecodeElapsed
+        | LiveMetric::KvCache => String::new(),
     }
 }
 
@@ -358,26 +404,67 @@ mod tests {
     }
 
     #[test]
-    fn title_shows_only_the_latest_metric() {
-        let mut display = DisplayState {
+    fn title_shows_the_selected_metric() {
+        let display = DisplayState {
+            prefill_active: true,
             prefill_total: 9005,
             prefill_percent: 45.5,
+            prefill_chunk_tps: 123.4,
+            prefill_avg_tps: 100.0,
+            prefill_elapsed_secs: 10.0,
             kv_hits_total: 7,
             kv_hit_tokens: 9005,
             kv_load_ms: 12.3,
             decode_completion: 42,
+            decode_chunk_tps: 32.1,
             decode_avg_tps: 28.5,
+            decode_elapsed_secs: 1.5,
             ..DisplayState::default()
         };
 
-        display.latest_metric = Some(LatestMetric::Prefill);
-        assert_eq!(latest_metric_title(&display, true), "prefill 46%");
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::PrefillPercent),
+            "prefill 46%"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::PrefillChunkTps),
+            "prefill 123.4t/s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::PrefillAvgTps),
+            "prefill avg 100.0t/s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::PrefillElapsed),
+            "prefill 10.0s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::KvCache),
+            "KV 9005t/12.3ms"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::DecodeChunkTps),
+            "decode 32.1t/s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::DecodeAvgTps),
+            "decode avg 28.5t/s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, true, LiveMetric::DecodeElapsed),
+            "decode 1.5s"
+        );
+        assert_eq!(
+            selected_metric_title(&display, false, LiveMetric::DecodeAvgTps),
+            ""
+        );
+        assert_eq!(selected_metric_title(&display, true, LiveMetric::None), "");
 
-        display.latest_metric = Some(LatestMetric::KvCache);
-        assert_eq!(latest_metric_title(&display, true), "KV 9005t/12.3ms");
-
-        display.latest_metric = Some(LatestMetric::Decode);
-        assert_eq!(latest_metric_title(&display, true), "decode 28.5t/s");
-        assert_eq!(latest_metric_title(&display, false), "");
+        let mut completed = display;
+        completed.prefill_active = false;
+        assert_eq!(
+            selected_metric_title(&completed, true, LiveMetric::PrefillAvgTps),
+            ""
+        );
     }
 }

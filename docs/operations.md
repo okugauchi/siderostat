@@ -76,6 +76,12 @@ Redaction（spec第25.3節）:
 
 `GET /metrics` はPrometheus text formatで返す。Loopback `127.0.0.1:18081`（既定）にのみbindする。
 
+worker が Paired Standalone または Distributed MXFP4 で coordinator を target にしている
+場合、メニューバーモニターは worker の `/metrics/coordinator` を利用する。この endpoint
+は coordinator の loopback admin API を公開せず、worker の署名付き control request で
+coordinator の `/v1/metrics` を取得する。worker が Solo Standalone の場合は従来どおり
+worker 自身の `/metrics` を利用する。
+
 ```sh
 curl --fail --silent http://127.0.0.1:18081/metrics
 ```

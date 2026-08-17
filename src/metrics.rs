@@ -26,12 +26,27 @@ struct Ds4MetricsState {
     prefill_total: u64,
     prefill_percent: f64,
     prefill_cached: u64,
+    prefill_chunk_tps: f64,
+    prefill_avg_tps: f64,
+    prefill_elapsed_secs: f64,
     kv_cache_hits: u64,
     kv_cache_hit_tokens: u64,
     kv_cache_load_ms: f64,
     generation_completion: u64,
     generation_chunk_tps: f64,
     generation_avg_tps: f64,
+    generation_elapsed_secs: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillProgress {
+    pub current: u64,
+    pub total: u64,
+    pub percent: f64,
+    pub cached: u64,
+    pub chunk_tps: f64,
+    pub avg_tps: f64,
+    pub elapsed_secs: f64,
 }
 
 #[derive(Default)]
@@ -142,16 +157,19 @@ impl Metrics {
 
     /// Record DS4 prefill progress. When `current >= total` the prefill is
     /// considered finished and the active flag is cleared.
-    pub fn prefill_progress(&self, current: u64, total: u64, percent: f64, cached: u64) {
+    pub fn prefill_progress(&self, progress: PrefillProgress) {
         let mut ds4 = self
             .ds4
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ds4.prefill_active = current < total;
-        ds4.prefill_current = current;
-        ds4.prefill_total = total;
-        ds4.prefill_percent = percent;
-        ds4.prefill_cached = cached;
+        ds4.prefill_active = progress.current < progress.total;
+        ds4.prefill_current = progress.current;
+        ds4.prefill_total = progress.total;
+        ds4.prefill_percent = progress.percent;
+        ds4.prefill_cached = progress.cached;
+        ds4.prefill_chunk_tps = progress.chunk_tps;
+        ds4.prefill_avg_tps = progress.avg_tps;
+        ds4.prefill_elapsed_secs = progress.elapsed_secs;
     }
 
     /// Record a DS4 KV cache hit.
@@ -166,7 +184,13 @@ impl Metrics {
     }
 
     /// Record the latest DS4 generation progress values for the monitor.
-    pub fn generation_progress(&self, completion: u64, chunk_tps: f64, avg_tps: f64) {
+    pub fn generation_progress(
+        &self,
+        completion: u64,
+        chunk_tps: f64,
+        avg_tps: f64,
+        elapsed_secs: f64,
+    ) {
         let mut ds4 = self
             .ds4
             .lock()
@@ -174,6 +198,7 @@ impl Metrics {
         ds4.generation_completion = completion;
         ds4.generation_chunk_tps = chunk_tps;
         ds4.generation_avg_tps = avg_tps;
+        ds4.generation_elapsed_secs = elapsed_secs;
     }
 
     pub fn render_mode_aware(&self, snapshot: MetricSnapshot<'_>) -> String {
@@ -298,6 +323,24 @@ impl Metrics {
             "ds4_proxy_ds4_prefill_cached {}",
             ds4.prefill_cached
         );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_chunk_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_chunk_tps {}",
+            ds4.prefill_chunk_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_avg_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_avg_tps {}",
+            ds4.prefill_avg_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_elapsed_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_elapsed_seconds {}",
+            ds4.prefill_elapsed_secs
+        );
         output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hits_total counter\n");
         let _ = writeln!(
             output,
@@ -333,6 +376,12 @@ impl Metrics {
             output,
             "ds4_proxy_ds4_generation_avg_tps {}",
             ds4.generation_avg_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_elapsed_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_elapsed_seconds {}",
+            ds4.generation_elapsed_secs
         );
         drop(ds4);
         output
@@ -711,28 +760,48 @@ mod tests {
     #[test]
     fn renders_ds4_prefill_and_kv_cache_gauges() {
         let metrics = Metrics::default();
-        metrics.prefill_progress(4096, 9005, 45.5, 0);
+        metrics.prefill_progress(PrefillProgress {
+            current: 4096,
+            total: 9005,
+            percent: 45.5,
+            cached: 0,
+            chunk_tps: 123.4,
+            avg_tps: 100.0,
+            elapsed_secs: 10.0,
+        });
         metrics.kv_cache_hit(9005, 12.3);
         metrics.kv_cache_hit(1024, 3.1);
-        metrics.generation_progress(42, 32.1, 28.5);
+        metrics.generation_progress(42, 32.1, 28.5, 1.5);
         let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_active 1"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_current 4096"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_total 9005"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_percent 45.5"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_cached 0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_chunk_tps 123.4"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_avg_tps 100"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_elapsed_seconds 10"));
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hits_total 2"));
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hit_tokens 1024"));
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_load_ms 3.1"));
         assert!(rendered.contains("ds4_proxy_ds4_generation_completion 42"));
         assert!(rendered.contains("ds4_proxy_ds4_generation_chunk_tps 32.1"));
         assert!(rendered.contains("ds4_proxy_ds4_generation_avg_tps 28.5"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_elapsed_seconds 1.5"));
     }
 
     #[test]
     fn prefill_completion_clears_active_flag() {
         let metrics = Metrics::default();
-        metrics.prefill_progress(9005, 9005, 100.0, 0);
+        metrics.prefill_progress(PrefillProgress {
+            current: 9005,
+            total: 9005,
+            percent: 100.0,
+            cached: 0,
+            chunk_tps: 123.4,
+            avg_tps: 100.0,
+            elapsed_secs: 10.0,
+        });
         let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_active 0"));
     }

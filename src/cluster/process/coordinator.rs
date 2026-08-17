@@ -95,8 +95,19 @@ impl DistributedCoordinatorSupervisor {
                                 total,
                                 percent,
                                 cached,
+                                chunk_tps,
+                                avg_tps,
+                                elapsed_secs,
                             } => {
-                                metrics.prefill_progress(current, total, percent, cached);
+                                metrics.prefill_progress(crate::metrics::PrefillProgress {
+                                    current,
+                                    total,
+                                    percent,
+                                    cached,
+                                    chunk_tps,
+                                    avg_tps,
+                                    elapsed_secs,
+                                });
                             }
                             Ds4LogEvent::KvCacheHit { tokens, load_ms } => {
                                 metrics.kv_cache_hit(tokens, load_ms);
@@ -105,8 +116,14 @@ impl DistributedCoordinatorSupervisor {
                                 completion,
                                 chunk_tps,
                                 avg_tps,
+                                elapsed_secs,
                             } => {
-                                metrics.generation_progress(completion, chunk_tps, avg_tps);
+                                metrics.generation_progress(
+                                    completion,
+                                    chunk_tps,
+                                    avg_tps,
+                                    elapsed_secs,
+                                );
                             }
                             Ds4LogEvent::HttpListening { .. }
                             | Ds4LogEvent::DsparkActivated => {}

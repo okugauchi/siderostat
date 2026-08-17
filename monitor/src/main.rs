@@ -1,7 +1,8 @@
 //! siderostat-monitor: macOS menu bar monitor for siderostat.
 //!
-//! Polls the siderostat `/metrics` endpoint and renders the state through a
-//! tray-icon menu bar item. Polling runs on a separate thread; the AppKit
+//! Polls the siderostat admin metrics endpoints and renders the state through a
+//! tray-icon menu bar item. Worker/coordinator routing is selected from `/cluster`.
+//! Polling runs on a separate thread; the AppKit
 //! event loop runs on the main thread (tray-icon macOS requirement) and a
 //! CFRunLoop timer refreshes the tray from the shared state.
 
@@ -69,7 +70,7 @@ fn main() -> Result<()> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     tracing::info!("NSApplication ready (accessory policy)");
 
-    let tray = MonitorTray::new(config.show_decode_tps)?;
+    let tray = MonitorTray::new(config.show_decode_tps, config.live_metric)?;
     {
         let display = shared
             .lock()

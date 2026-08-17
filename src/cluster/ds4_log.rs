@@ -37,6 +37,9 @@ pub enum Ds4LogEvent {
         total: u64,
         percent: f64,
         cached: u64,
+        chunk_tps: f64,
+        avg_tps: f64,
+        elapsed_secs: f64,
     },
     KvCacheHit {
         tokens: u64,
@@ -46,6 +49,7 @@ pub enum Ds4LogEvent {
         completion: u64,
         chunk_tps: f64,
         avg_tps: f64,
+        elapsed_secs: f64,
     },
 }
 
@@ -260,12 +264,31 @@ fn parse_prefill_progress(line: &str) -> Option<Ds4LogEvent> {
         .trim()
         .parse()
         .unwrap_or(0);
+    let chunk_tps = value_after_marker(rest, "chunk=").unwrap_or(0.0);
+    let avg_tps = value_after_marker(rest, "avg=").unwrap_or(0.0);
+    let elapsed_secs = rest
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.strip_suffix('s')?.parse().ok())
+        .unwrap_or(0.0);
     Some(Ds4LogEvent::PrefillProgress {
         current,
         total,
         percent,
         cached,
+        chunk_tps,
+        avg_tps,
+        elapsed_secs,
     })
+}
+
+fn value_after_marker(text: &str, marker: &str) -> Option<f64> {
+    text.split_once(marker)?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Parse `ds4: kv cache hit text tokens=9005 ... load=12.3 ms file=...`.
@@ -311,10 +334,16 @@ fn parse_generation_progress(line: &str) -> Option<Ds4LogEvent> {
         .next()?
         .parse()
         .ok()?;
+    let elapsed_secs = rest
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.strip_suffix('s')?.parse().ok())
+        .unwrap_or(0.0);
     Some(Ds4LogEvent::GenerationProgress {
         completion,
         chunk_tps,
         avg_tps,
+        elapsed_secs,
     })
 }
 
@@ -447,6 +476,9 @@ mod tests {
                 total: 9005,
                 percent: 45.5,
                 cached: 0,
+                chunk_tps: 123.4,
+                avg_tps: 100.0,
+                elapsed_secs: 10.0,
             })
         );
         assert_eq!(
@@ -458,6 +490,9 @@ mod tests {
                 total: 9005,
                 percent: 91.0,
                 cached: 2048,
+                chunk_tps: 200.0,
+                avg_tps: 180.0,
+                elapsed_secs: 20.0,
             })
         );
     }
@@ -485,6 +520,7 @@ mod tests {
                 completion: 42,
                 chunk_tps: 32.1,
                 avg_tps: 28.5,
+                elapsed_secs: 1.5,
             })
         );
     }

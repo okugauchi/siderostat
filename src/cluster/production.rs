@@ -15,7 +15,7 @@ use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
     cluster::{ClusterEvent, ClusterEventKind},
     config::ModeAwareConfig,
-    metrics::Metrics,
+    metrics::{MetricSnapshot, Metrics},
     proxy::ModeAwareProxyState,
     target::{ClusterState, LocalRole},
 };
@@ -24,7 +24,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -45,6 +45,8 @@ mod pairing;
 mod reconcile;
 mod recovery;
 mod worker;
+
+const CONTROL_METRICS_PATH: &str = "/v1/metrics";
 
 /// The production control transport. Requests are pinned to the cluster address and authenticated
 /// independently from the public/admin planes.
@@ -125,6 +127,44 @@ impl ProductionControlClient {
     pub async fn node(&self) -> anyhow::Result<ControlResponse> {
         self.request(reqwest::Method::GET, "/v1/node", Vec::new(), None)
             .await
+    }
+
+    async fn metrics(&self) -> anyhow::Result<String> {
+        let timestamp = now_millis();
+        let body = Vec::new();
+        let signed = self.inner.authenticator.sign(
+            self.inner.local_node_id.clone(),
+            reqwest::Method::GET.as_str(),
+            CONTROL_METRICS_PATH,
+            timestamp,
+            uuid::Uuid::new_v4().simple().to_string(),
+            &body,
+        )?;
+        let response = self
+            .inner
+            .client
+            .get(
+                self.inner
+                    .base
+                    .join(CONTROL_METRICS_PATH.trim_start_matches('/'))?,
+            )
+            .header(HEADER_NODE, signed.node_id())
+            .header(HEADER_TIMESTAMP, signed.timestamp_millis())
+            .header(HEADER_NONCE, signed.nonce())
+            .header(HEADER_SIGNATURE, signed.signature())
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "peer control {} returned {}: {}",
+                CONTROL_METRICS_PATH,
+                status,
+                String::from_utf8_lossy(&body)
+            );
+        }
+        Ok(String::from_utf8(body.to_vec())?)
     }
 
     async fn request(
@@ -212,6 +252,7 @@ struct ProductionInner {
     peer_address: IpAddr,
     descriptor: NodeDescriptor,
     authenticator: ControlAuthenticator,
+    metrics: Arc<Metrics>,
     control: RoleControl,
     client: ProductionControlClient,
     lease: LeaseStatus,
@@ -290,6 +331,7 @@ impl ProductionClusterRuntime {
             mode,
             proxy,
             standalone,
+            metrics,
             manifest,
             control_secret,
             peer_control_port,
@@ -313,6 +355,7 @@ impl ProductionClusterRuntime {
         mode: Arc<ModeRuntime>,
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<dyn LocalStandaloneLifecycle>,
+        metrics: Arc<Metrics>,
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
         peer_control_port: u16,
@@ -404,6 +447,7 @@ impl ProductionClusterRuntime {
                 ControlSecret::new(control_secret)?,
                 peer_address,
             ),
+            metrics,
             control,
             client,
             lease,
@@ -453,6 +497,7 @@ impl ProductionClusterRuntime {
             mode,
             proxy,
             standalone,
+            Arc::new(Metrics::default()),
             manifest,
             control_secret,
             peer_control_port,
@@ -603,6 +648,34 @@ impl ProductionClusterRuntime {
         self.inner.role
     }
 
+    /// Fetch the coordinator's Prometheus metrics through the authenticated control plane.
+    ///
+    /// The worker must not connect to the coordinator's loopback-only admin listener directly.
+    /// This read-only path keeps the admin API private while reusing the existing source-pinned
+    /// HMAC control channel.
+    pub async fn fetch_coordinator_metrics(&self) -> anyhow::Result<String> {
+        ensure!(
+            self.inner.role == LocalRole::Worker,
+            "coordinator metrics can only be fetched from a worker"
+        );
+        self.inner.client.metrics().await
+    }
+
+    pub(super) fn render_control_metrics(&self) -> String {
+        self.inner.metrics.render_mode_aware(MetricSnapshot {
+            node_id: &self.inner.descriptor.node_id,
+            interface: &self.inner.config.cluster.interface,
+            target: self.inner.proxy.target_snapshot(),
+            admission: self.inner.proxy.admission().snapshot(),
+            cluster: Some(self.inner.mode.snapshot()),
+            peer_lease_seconds: 0.0,
+            thunderbolt_ip_state: "unknown",
+            discovery_results: 0,
+            model_variant: self.inner.config.ds4.standalone.model_variant,
+            residency: self.inner.config.ds4.standalone.residency,
+        })
+    }
+
     pub fn listen_addr(&self) -> SocketAddr {
         SocketAddr::new(
             self.inner.local_address,
@@ -613,6 +686,7 @@ impl ProductionClusterRuntime {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/node", get(control_node))
+            .route("/v1/metrics", get(control_metrics))
             .route("/v1/pair", post(control_pair))
             .route("/v1/prepare-worker", post(control_prepare))
             .route("/v1/begin-drain", post(control_begin_drain))
@@ -901,6 +975,22 @@ macro_rules! control_handler {
 }
 
 control_handler!(control_node, ControlEndpoint::Node, "GET");
+
+async fn control_metrics(
+    State(runtime): State<ProductionClusterRuntime>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ControlHttpError> {
+    let body = runtime.handle_metrics(source, headers).await?;
+    let mut response = Response::new(body.into());
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    Ok(response)
+}
+
 control_handler!(control_pair, ControlEndpoint::Pair, "POST");
 control_handler!(control_prepare, ControlEndpoint::PrepareWorker, "POST");
 control_handler!(control_begin_drain, ControlEndpoint::BeginDrain, "POST");
@@ -1240,6 +1330,28 @@ mod tests {
         }))
     }
 
+    async fn signed_metrics(
+        State(authenticator): State<Arc<ControlAuthenticator>>,
+        ConnectInfo(source): ConnectInfo<SocketAddr>,
+        headers: HeaderMap,
+    ) -> Result<Response, ControlHttpError> {
+        let signed = SignedControlHeaders::from_header_values(
+            header(&headers, HEADER_NODE)?,
+            header(&headers, HEADER_TIMESTAMP)?,
+            header(&headers, HEADER_NONCE)?,
+            header(&headers, HEADER_SIGNATURE)?,
+        )?;
+        ControlRequest {
+            method: "GET",
+            path_and_query: CONTROL_METRICS_PATH,
+            body: &[],
+            source_ip: source.ip(),
+            headers: &signed,
+        }
+        .authenticate(&authenticator, now_millis())?;
+        Ok((StatusCode::OK, "coordinator metrics").into_response())
+    }
+
     #[tokio::test]
     async fn real_http_client_pins_source_and_authenticates_control_body() {
         let secret = vec![0x61; 32];
@@ -1289,6 +1401,40 @@ mod tests {
             .unwrap();
         assert_eq!(response.descriptor.node_id, "worker-node");
         assert_eq!(response.generation, 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_client_uses_the_authenticated_control_path() {
+        let secret = vec![0x62; 32];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/v1/metrics", get(signed_metrics))
+            .with_state(Arc::new(ControlAuthenticator::new_at_source(
+                ControlSecret::new(secret.clone()).unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            )));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ProductionControlClient::new(
+            "worker-node".into(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            port,
+            secret,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(client.metrics().await.unwrap(), "coordinator metrics");
         server.abort();
     }
 
