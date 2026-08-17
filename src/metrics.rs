@@ -29,6 +29,9 @@ struct Ds4MetricsState {
     kv_cache_hits: u64,
     kv_cache_hit_tokens: u64,
     kv_cache_load_ms: f64,
+    generation_completion: u64,
+    generation_chunk_tps: f64,
+    generation_avg_tps: f64,
 }
 
 #[derive(Default)]
@@ -160,6 +163,17 @@ impl Metrics {
         ds4.kv_cache_hits = ds4.kv_cache_hits.saturating_add(1);
         ds4.kv_cache_hit_tokens = tokens;
         ds4.kv_cache_load_ms = load_ms;
+    }
+
+    /// Record the latest DS4 generation progress values for the monitor.
+    pub fn generation_progress(&self, completion: u64, chunk_tps: f64, avg_tps: f64) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.generation_completion = completion;
+        ds4.generation_chunk_tps = chunk_tps;
+        ds4.generation_avg_tps = avg_tps;
     }
 
     pub fn render_mode_aware(&self, snapshot: MetricSnapshot<'_>) -> String {
@@ -301,6 +315,24 @@ impl Metrics {
             output,
             "ds4_proxy_ds4_kv_cache_load_ms {}",
             ds4.kv_cache_load_ms
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_completion gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_completion {}",
+            ds4.generation_completion
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_chunk_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_chunk_tps {}",
+            ds4.generation_chunk_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_avg_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_avg_tps {}",
+            ds4.generation_avg_tps
         );
         drop(ds4);
         output
@@ -682,6 +714,7 @@ mod tests {
         metrics.prefill_progress(4096, 9005, 45.5, 0);
         metrics.kv_cache_hit(9005, 12.3);
         metrics.kv_cache_hit(1024, 3.1);
+        metrics.generation_progress(42, 32.1, 28.5);
         let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_active 1"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_current 4096"));
@@ -691,6 +724,9 @@ mod tests {
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hits_total 2"));
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hit_tokens 1024"));
         assert!(rendered.contains("ds4_proxy_ds4_kv_cache_load_ms 3.1"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_completion 42"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_chunk_tps 32.1"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_avg_tps 28.5"));
     }
 
     #[test]

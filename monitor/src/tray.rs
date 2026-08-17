@@ -4,7 +4,10 @@
 //! requirement). The menu reflects the current `DisplayState`; the polling
 //! task shares state through the mutex passed to `update`.
 
-use crate::{metrics::MonitorStatus, state::DisplayState};
+use crate::{
+    metrics::MonitorStatus,
+    state::{DisplayState, LatestMetric},
+};
 use anyhow::{Context, Result};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -12,14 +15,15 @@ use tray_icon::{
 };
 
 const MENU_QUIT: &str = "quit";
-const MENU_RESTART: &str = "restart";
+const MENU_PROXY_RESTART: &str = "proxy-restart";
+const MENU_MONITOR_RESTART: &str = "monitor-restart";
 
 /// Icon drawing colors.
 const GREEN: [u8; 4] = [0x2e, 0xcc, 0x71, 0xff]; // operating state
 const RED: [u8; 4] = [0xe7, 0x4c, 0x3c, 0xff]; // non-operating state
 const LINE: [u8; 4] = [0x3f, 0x3f, 0x3f, 0xff]; // connector line
 
-const ICON_SIZE: u32 = 16;
+const ICON_SIZE: u32 = 18;
 const ICON_SUB: f32 = 4.0; // supersample factor for smooth circles
 
 pub struct MonitorTray {
@@ -32,14 +36,16 @@ pub struct MonitorTray {
     prefill: MenuItem,
     kv_cache: MenuItem,
     decode: MenuItem,
+    show_decode_tps: bool,
     _separator: PredefinedMenuItem,
-    _restart: MenuItem,
+    _proxy_restart: MenuItem,
+    _monitor_restart: MenuItem,
     _quit: MenuItem,
 }
 
 impl MonitorTray {
     /// Build the tray icon and its static menu structure.
-    pub fn new() -> Result<Self> {
+    pub fn new(show_decode_tps: bool) -> Result<Self> {
         let icon = icon_for(None, true)?;
         let header = MenuItem::new("siderostat", false, None);
         let mode = MenuItem::new("Mode: --", false, None);
@@ -49,8 +55,9 @@ impl MonitorTray {
         let prefill = MenuItem::new("Prefill: --", false, None);
         let kv_cache = MenuItem::new("KV cache: --", false, None);
         let decode = MenuItem::new("Decode: --", false, None);
-        let restart = MenuItem::with_id(MENU_RESTART, "siderostat(runtime) の再起動", true, None);
-        let quit = MenuItem::with_id(MENU_QUIT, "Monitor を終了", true, None);
+        let proxy_restart = MenuItem::with_id(MENU_PROXY_RESTART, "Proxy 再起動", true, None);
+        let monitor_restart = MenuItem::with_id(MENU_MONITOR_RESTART, "Monitor 再起動", true, None);
+        let quit = MenuItem::with_id(MENU_QUIT, "終了", true, None);
 
         let menu = Menu::new();
         menu.append(&header)?;
@@ -65,7 +72,8 @@ impl MonitorTray {
         menu.append(&kv_cache)?;
         menu.append(&decode)?;
         menu.append(&PredefinedMenuItem::separator())?;
-        menu.append(&restart)?;
+        menu.append(&proxy_restart)?;
+        menu.append(&monitor_restart)?;
         menu.append(&quit)?;
 
         let tray = TrayIconBuilder::new()
@@ -85,8 +93,10 @@ impl MonitorTray {
             prefill,
             kv_cache,
             decode,
+            show_decode_tps,
             _separator: separator,
-            _restart: restart,
+            _proxy_restart: proxy_restart,
+            _monitor_restart: monitor_restart,
             _quit: quit,
         })
     }
@@ -172,9 +182,16 @@ impl MonitorTray {
             self.kv_cache.set_text("KV cache: --");
         }
 
-        // Decode TPS is not available from the current metrics, so show a
-        // placeholder instead of the cluster-mode abbreviation.
-        self.decode.set_text("Decode: --");
+        if self.show_decode_tps && display.decode_completion > 0 {
+            self.decode.set_text(format!(
+                "Decode: completion={} chunk={:.1}t/s avg={:.1}t/s",
+                display.decode_completion, display.decode_chunk_tps, display.decode_avg_tps
+            ));
+        } else {
+            self.decode.set_text("Decode: --");
+        }
+        self._tray
+            .set_title(Some(latest_metric_title(display, self.show_decode_tps)));
         let _ = self._tray.set_tooltip(Some(format!(
             "siderostat node={} state={}",
             display.node_id.as_deref().unwrap_or("--"),
@@ -188,8 +205,28 @@ impl MonitorTray {
     }
 
     /// Check whether a menu event requests a siderostat runtime restart.
-    pub fn is_restart_event(event: &MenuEvent) -> bool {
-        *event.id() == MenuId::new(MENU_RESTART)
+    pub fn is_proxy_restart_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_PROXY_RESTART)
+    }
+
+    /// Check whether a menu event requests a monitor restart.
+    pub fn is_monitor_restart_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_MONITOR_RESTART)
+    }
+}
+
+fn latest_metric_title(display: &DisplayState, show_decode_tps: bool) -> String {
+    match display.latest_metric {
+        Some(LatestMetric::Prefill) if display.prefill_total > 0 => {
+            format!("prefill {:.0}%", display.prefill_percent)
+        }
+        Some(LatestMetric::KvCache) if display.kv_hits_total > 0 => {
+            format!("KV {}t/{:.1}ms", display.kv_hit_tokens, display.kv_load_ms)
+        }
+        Some(LatestMetric::Decode) if show_decode_tps && display.decode_completion > 0 => {
+            format!("decode {:.1}t/s", display.decode_avg_tps)
+        }
+        _ => String::new(),
     }
 }
 
@@ -205,7 +242,7 @@ fn icon_for(mode: Option<&str>, offline: bool) -> Result<Icon> {
 /// operating, red otherwise. The `distributed-mxfp4` mode additionally draws a
 /// connector line between the two circles.
 fn icon_rgba(mode: Option<&str>, offline: bool) -> Vec<u8> {
-    let (left, right, connected) = if offline {
+    let (top, bottom, connected) = if offline {
         (false, false, false)
     } else {
         match mode {
@@ -215,13 +252,13 @@ fn icon_rgba(mode: Option<&str>, offline: bool) -> Vec<u8> {
             _ => (true, false, false),
         }
     };
-    let left_color = if left { GREEN } else { RED };
-    let right_color = if right { GREEN } else { RED };
+    let top_color = if top { GREEN } else { RED };
+    let bottom_color = if bottom { GREEN } else { RED };
 
-    let left_cx = 4.0;
-    let right_cx = 12.0;
-    let cy = 8.0;
-    let radius = 2.5;
+    let cx = 9.0;
+    let top_cy = 4.5;
+    let bottom_cy = 13.5;
+    let radius = 3.25;
 
     let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
     let inv = 1.0 / ICON_SUB;
@@ -233,11 +270,11 @@ fn icon_rgba(mode: Option<&str>, offline: bool) -> Vec<u8> {
                 for sx in 0..ICON_SUB as i32 {
                     let x = px as f32 + (sx as f32 + 0.5) * inv;
                     let y = py as f32 + (sy as f32 + 0.5) * inv;
-                    let color: [u8; 4] = if in_circle(x, y, left_cx, cy, radius) {
-                        left_color
-                    } else if in_circle(x, y, right_cx, cy, radius) {
-                        right_color
-                    } else if connected && on_connector(x, y, left_cx, right_cx, cy) {
+                    let color: [u8; 4] = if in_circle(x, y, cx, top_cy, radius) {
+                        top_color
+                    } else if in_circle(x, y, cx, bottom_cy, radius) {
+                        bottom_color
+                    } else if connected && on_connector(x, y, top_cy, bottom_cy, cx) {
                         LINE
                     } else {
                         [0, 0, 0, 0]
@@ -265,9 +302,9 @@ fn in_circle(x: f32, y: f32, cx: f32, cy: f32, radius: f32) -> bool {
 /// The connector line spans between the two circle centers. Parts that fall
 /// inside a filled circle are covered by the circle, so only the gap between
 /// the circles is visible.
-fn on_connector(x: f32, y: f32, left_cx: f32, right_cx: f32, cy: f32) -> bool {
-    const HALF_THICK: f32 = 1.0;
-    x >= left_cx && x <= right_cx && (y - cy).abs() <= HALF_THICK
+fn on_connector(x: f32, y: f32, top_cy: f32, bottom_cy: f32, cx: f32) -> bool {
+    const HALF_THICK: f32 = 1.5;
+    y >= top_cy && y <= bottom_cy && (x - cx).abs() <= HALF_THICK
 }
 
 #[cfg(test)]
@@ -279,9 +316,9 @@ mod tests {
         rgba[idx..idx + 4].try_into().unwrap()
     }
 
-    /// Center pixels of the left and right circles, and the gap between them.
+    /// Center pixels of the top and bottom circles, and the gap between them.
     fn key_pixels(rgba: &[u8]) -> ([u8; 4], [u8; 4], [u8; 4]) {
-        (pixel(rgba, 4, 8), pixel(rgba, 12, 8), pixel(rgba, 8, 8))
+        (pixel(rgba, 9, 4), pixel(rgba, 9, 13), pixel(rgba, 9, 9))
     }
 
     #[test]
@@ -318,5 +355,29 @@ mod tests {
         assert_eq!(left, RED);
         assert_eq!(right, RED);
         assert_eq!(gap[3], 0, "offline must not draw a connector");
+    }
+
+    #[test]
+    fn title_shows_only_the_latest_metric() {
+        let mut display = DisplayState {
+            prefill_total: 9005,
+            prefill_percent: 45.5,
+            kv_hits_total: 7,
+            kv_hit_tokens: 9005,
+            kv_load_ms: 12.3,
+            decode_completion: 42,
+            decode_avg_tps: 28.5,
+            ..DisplayState::default()
+        };
+
+        display.latest_metric = Some(LatestMetric::Prefill);
+        assert_eq!(latest_metric_title(&display, true), "prefill 46%");
+
+        display.latest_metric = Some(LatestMetric::KvCache);
+        assert_eq!(latest_metric_title(&display, true), "KV 9005t/12.3ms");
+
+        display.latest_metric = Some(LatestMetric::Decode);
+        assert_eq!(latest_metric_title(&display, true), "decode 28.5t/s");
+        assert_eq!(latest_metric_title(&display, false), "");
     }
 }

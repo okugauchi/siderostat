@@ -7,6 +7,7 @@
 
 mod client;
 mod config;
+mod launchd;
 mod metrics;
 mod state;
 mod tray;
@@ -20,17 +21,10 @@ use objc2_core_foundation::{
 };
 use std::{
     ffi::c_void,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicPtr, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
 };
 use tray_icon::menu::MenuEvent;
-
-/// Raw pointer to the shared NSApplication, so the Send+Sync menu event handler
-/// can terminate the app without capturing the non-Sync object.
-static APP_PTR: AtomicPtr<NSApplication> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Main-thread refresh context for the CFRunLoop timer. The tray pointer stays
 /// valid because the tray is created on the main thread and lives until the
@@ -53,9 +47,7 @@ fn main() -> Result<()> {
     let shared = Arc::new(Mutex::new(DisplayState::default()));
 
     // Polling runs on a separate thread with its own Tokio runtime so the
-    // main thread stays free for the AppKit menu bar event loop. The restart
-    // menu handler shares a clone of the client with the polling task.
-    let restart_client = Arc::new(client.clone());
+    // main thread stays free for the AppKit menu bar event loop.
     let poll_client = client;
     let poll_state = shared.clone();
     thread::Builder::new()
@@ -77,7 +69,7 @@ fn main() -> Result<()> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     tracing::info!("NSApplication ready (accessory policy)");
 
-    let tray = MonitorTray::new()?;
+    let tray = MonitorTray::new(config.show_decode_tps)?;
     {
         let display = shared
             .lock()
@@ -85,50 +77,36 @@ fn main() -> Result<()> {
         tray.update(&display);
     }
 
-    // Quit from the menu terminates the app. The Send+Sync event-handler
-    // closure cannot capture `Retained<NSApplication>` (not Send), so reach it
-    // through an AtomicPtr global; the app lives for the process lifetime.
-    // Restart from the menu posts to the authenticated admin API on a
-    // dedicated thread so the AppKit main loop is never blocked.
-    APP_PTR.store(
-        (&*app as *const NSApplication).cast_mut(),
-        Ordering::Relaxed,
-    );
+    // LaunchAgent operations run on dedicated threads so the AppKit main loop is
+    // never blocked. Stopping this monitor is delegated to launchd, which also
+    // keeps the runtime and monitor job lifecycle consistent.
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if MonitorTray::is_quit_event(&event) {
             tracing::info!("quit requested from menu");
-            let ptr = APP_PTR.load(Ordering::Relaxed);
-            // SAFETY: APP_PTR is set before the handler can fire and the app
-            // object outlives the process (main blocks in `app.run()`).
-            unsafe { (*ptr).terminate(None) };
-        } else if MonitorTray::is_restart_event(&event) {
-            tracing::info!("restart requested from menu");
-            let client = restart_client.clone();
+            let _ = thread::Builder::new()
+                .name("siderostat-monitor-stop".into())
+                .spawn(|| {
+                    if let Err(error) = launchd::bootout_runtime_and_monitor() {
+                        tracing::warn!(error = %error, "LaunchAgent stop failed");
+                    }
+                });
+        } else if MonitorTray::is_proxy_restart_event(&event) {
+            tracing::info!("proxy restart requested from menu");
+            let _ = thread::Builder::new()
+                .name("siderostat-proxy-restart".into())
+                .spawn(move || {
+                    if let Err(error) = launchd::kickstart(launchd::RUNTIME_LABEL) {
+                        tracing::warn!(error = %error, "Proxy restart failed");
+                    }
+                });
+        } else if MonitorTray::is_monitor_restart_event(&event) {
+            tracing::info!("monitor restart requested from menu");
             let _ = thread::Builder::new()
                 .name("siderostat-monitor-restart".into())
                 .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    runtime.block_on(async move {
-                        match client.request_restart().await {
-                            Ok(job) => {
-                                let job_id = job
-                                    .get("job_id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("?");
-                                tracing::info!(
-                                    job_id = job_id,
-                                    "siderostat runtime restart accepted"
-                                );
-                            }
-                            Err(error) => tracing::warn!(
-                                error = %error,
-                                "siderostat runtime restart failed"
-                            ),
-                        }
-                    });
-                    Ok::<(), anyhow::Error>(())
+                    if let Err(error) = launchd::kickstart(launchd::MONITOR_LABEL) {
+                        tracing::warn!(error = %error, "Monitor restart failed");
+                    }
                 });
         }
     }));

@@ -26,6 +26,15 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
 
+`siderostat-monitor` も `local.siderostat.monitor` の LaunchAgent として登録します。
+モニターのメニューからは、次のジョブ操作を実行します。
+
+- `Proxy 再起動`: `gui/<uid>/local.siderostat.runtime` を kickstart
+- `Monitor 再起動`: `gui/<uid>/local.siderostat.monitor` を kickstart
+- `終了`: runtime と monitor の両方を bootout
+
+monitor の plist は `cargo xtask install` で同じ `LaunchAgents` ディレクトリへ配置されます。
+
 `ProgramArguments`の各要素がabsolute pathまたは固定subcommandであり、placeholderが残っていないことを登録前に確認します。
 
 ## GUIドメイン必須

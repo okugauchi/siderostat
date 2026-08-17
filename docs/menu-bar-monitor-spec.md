@@ -41,8 +41,9 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 │  - DS4 child stdout/stderr │
 │    をパイプで直接読取       │
 │  - parse_ds4_log_event で  │
-│    prefill / kv cache を   │
-│    構造化イベント化         │
+│    prefill / kv cache /    │
+│    generation を構造化     │
+│    イベント化              │
 │  - admin API /metrics で   │
 │    状態を公開              │
 └───────────┬──────────────┘
@@ -64,9 +65,10 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
   ポーリング間隔を 5 秒へバックオフする。本体復帰を自動検出する。
 - 現状の `/metrics` は認証なしで公開されているため、モニターはトークンなしで取得する。
   将来 `/metrics` に認証が付く場合は、admin token を Bearer で送る設定を追加する。
-- メニュー「siderostat(runtime) の再起動」は `POST {admin_listen}/cluster/restart` を
-  Bearer（hex 形式の admin token）で呼ぶ。このエンドポイントは認証必須のため `admin_token`
-  設定が必要。失敗時もモニターは継続し、結果をログに記録する。
+- メニュー操作は `gui/<uid>` ドメインの LaunchAgent に委譲する。「Proxy 再起動」は
+  `local.siderostat.runtime`、「Monitor 再起動」は `local.siderostat.monitor` を
+  `launchctl kickstart -k` する。「終了」は両方のジョブを `launchctl bootout` する。
+  操作失敗時もモニターは継続し、結果をログに記録する。
 
 ## 4. データソース
 
@@ -82,12 +84,12 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | target readiness | `ds4_proxy_target_ready` |
 | node_id | `ds4_proxy_cluster_*` の label |
 
-### 4.2 prefill / KV cache メトリクス（本体側の将来拡張）
+### 4.2 prefill / KV cache / Decode メトリクス
 
-モニターの主要表示項目（prefill progress、KV cache hit）は、本体側に次のメトリクスを追加して
-公開することを前提とする。本体側の実装は別タスクとし、本仕様はモニター側の表示仕様を定義する。
+モニターの主要表示項目（prefill progress、KV cache hit、Decode）は、本体が公開する次の
+メトリクスから取得する。
 
-| 値 | family（案） | 型 |
+| 値 | family | 型 |
 |---|---|---|
 | prefill 進行中フラグ | `ds4_proxy_ds4_prefill_active` | gauge |
 | prefill current tokens | `ds4_proxy_ds4_prefill_current` | gauge |
@@ -97,6 +99,9 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | KV cache hit 累計 | `ds4_proxy_ds4_kv_cache_hits_total` | counter |
 | 直近 KV cache hit tokens | `ds4_proxy_ds4_kv_cache_hit_tokens` | gauge |
 | 直近 KV cache load ms | `ds4_proxy_ds4_kv_cache_load_ms` | gauge |
+| Decode completion | `ds4_proxy_ds4_generation_completion` | gauge |
+| 直近 Decode chunk TPS | `ds4_proxy_ds4_generation_chunk_tps` | gauge |
+| Decode average TPS | `ds4_proxy_ds4_generation_avg_tps` | gauge |
 
 ### 4.3 DS4 ログフォーマット（実機ソースで確認済み）
 
@@ -136,13 +141,17 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
   - 赤の円: 非稼働状態（non-operating）
   - 常に2つの円を表示する。
   - mode → 描画の対応:
-    - `solo`（solo-standalone）: 左が緑・右が赤、2つの円は直線で接続されていない
+    - `solo`（solo-standalone）: 上が緑・下が赤、2つの円は直線で接続されていない
     - `paired`（paired-standalone）: 2つとも緑、2つの円は直線で接続されていない
-    - `dist`（distributed-mxfp4）: 2つとも緑、2つの円を接続する1本の直線を描画
+    - `dist`（distributed-mxfp4）: 2つとも緑、2つの円を接続する縦線を描画
     - offline / 不明: 2つとも赤、接続線なし
-- アイコンのタイトル（または代替テキスト）に状態を要約表示する:
+- アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed の接続線は
+  視認できる太さにする。
+- アイコンのタイトル（または代替テキスト）には、最後に更新されたメトリクスだけを表示する:
   - 通常時: 空（mode はアイコン描画のみで表現）
   - prefill 進行中: `prefill 45%` のように % を優先表示
+  - KV cache 更新時: `KV 9005t/12.3ms`
+  - Decode 更新時: `decode 32.1t/s`
   - offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
@@ -162,17 +171,18 @@ Prefill: 4096/9005 (45.5%)   ← 進行中のみ
 KV cache: hit tokens=9005 load=12.3ms
   total hits: 7
 ────────────────────────
-Decode:  32.1 t/s (直近)   ← TPS 実装後
+Decode:  completion=42 chunk=32.1t/s avg=28.5t/s
 ────────────────────────
-siderostat(runtime) の再起動
-Monitor を終了
+Proxy 再起動
+Monitor 再起動
+終了
 ```
 
 - セクションは状態に応じて動的に表示する（prefill 非進行中は prefill 行を出さない）。
-- 「Monitor を終了」はモニター自身だけを終了する。siderostat 本体には影響しない。
-- 「siderostat(runtime) の再起動」は認証付き admin API `POST /cluster/restart` を呼び、
-  本体の current profile child を再起動する。モニター自身は終了しない。
-  `admin_token` 未設定・不正の場合は失敗し、メニュー表示には影響しない（ログに記録）。
+- 「Proxy 再起動」は `gui/<uid>/local.siderostat.runtime` を `launchctl kickstart -k` する。
+- 「Monitor 再起動」は `gui/<uid>/local.siderostat.monitor` を `launchctl kickstart -k` する。
+- 「終了」は `local.siderostat.runtime` と `local.siderostat.monitor` の両方を `launchctl bootout`
+  する。siderostat 本体の管理外プロセスは対象にしない。
 
 ### 5.3 offline 表示
 
@@ -189,12 +199,11 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
-admin_token = ""                           # hex 形式の admin token（再起動メニューで必須）
+admin_token = ""                           # /metrics に認証を設定する場合のみ使用
 ```
 
-- `admin_token` は本体の `admin.key`（生 bytes）を hex エンコードした値で、
-  `siderostat cluster restart` が送る Bearer と同一。未設定だと「siderostat(runtime) の
-  再起動」は 401 で失敗する。
+- `admin_token` は将来 `/metrics` に認証を設定する場合に使用する。本仕様の LaunchAgent
+  操作は `launchctl` を使うため、再起動操作には使用しない。
 
 - 設定が存在しない場合は既定値で動作する。
 - 未知フィールドは拒否する（本体 config と同じ `deny_unknown_fields` 方針）。
@@ -229,18 +238,19 @@ siderostat/
 │       ├── client.rs       # admin API クライアント
 │       ├── metrics.rs      # Prometheus text パーサー
 │       ├── state.rs        # 表示状態の保持・更新
-│       └── tray.rs         # tray-icon によるメニューバー UI
+│       ├── tray.rs         # tray-icon によるメニューバー UI
+│       └── launchd.rs      # LaunchAgent の kickstart / bootout
 └── docs/
     └── menu-bar-monitor-spec.md
 ```
 
 ## 10. テスト方針
 
-- **Prometheus text パーサー**: 既存 `/metrics` の fixture と、prefill/cache family を含む
+- **Prometheus text パーサー**: 既存 `/metrics` の fixture と、prefill/cache/decode family を含む
   fixture をパースするユニットテスト。未知 family は無視する。
-- **状態更新ロジック**: パース結果から表示状態（prefill %、cache hit 累計、offline 判定）が
+- **状態更新ロジック**: パース結果から表示状態（prefill %、cache hit 累計、Decode TPS、offline 判定）が
   正しく更新されることのユニットテスト。
-- **UI**: tray-icon の表示は手動確認とする。CI ではコンパイルとパーサー/状態ロジックのみ
+- **UI**: tray-icon の表示と LaunchAgent 操作は手動確認とする。CI ではコンパイルとパーサー/状態ロジックのみ
   テストする。
 - 本体の統合テスト（`tests/phase*`）はモニターの有無に依存せず、workspace 全体の Required CI
   （`cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` /
@@ -269,11 +279,11 @@ siderostat/
 | 4 | 本体側の prefill / KV cache メトリクス追加 | `parse_ds4_log_event` 拡張、`metrics.rs` |
 | 5 | 統合・動作確認（実 DS4 で prefill 中の表示確認） | 受け入れ証跡 |
 
-Phase 1〜4 は 2026-08-12 に実装済みとする。
+Phase 1〜4 は 2026-08-17 に実装済みとする。
 - Phase 1: workspace 化 + monitor crate skeleton（完了）
 - Phase 2: `monitor/src/config.rs`、`metrics.rs`、`client.rs`、`state.rs`（完了）
 - Phase 3: `monitor/src/tray.rs`、`main.rs`（完了）
-- Phase 4: 本体 `parse_ds4_log_event` 拡張（prefill / kv cache / generation、タイムスタンプ除去）と
-  `Metrics` の DS4 gauge 公開（完了）
+- Phase 4: 本体の prefill / KV cache / generation イベントを `Metrics` の DS4 gauge として公開し、
+  モニターの Decode 表示へ接続（完了）
 - Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
   テストとコンパイルを検証済み（本体 170 tests、monitor 13 tests、Required CI 成功）

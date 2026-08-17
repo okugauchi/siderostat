@@ -29,6 +29,13 @@ pub struct KvCacheState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecodeState {
+    pub completion: u64,
+    pub chunk_tps: f64,
+    pub avg_tps: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetricsSnapshot {
     pub cluster_mode: Option<String>,
     pub cluster_state: Option<String>,
@@ -37,6 +44,7 @@ pub struct MetricsSnapshot {
     pub node_id: Option<String>,
     pub prefill: PrefillState,
     pub kv_cache: KvCacheState,
+    pub decode: DecodeState,
 }
 
 /// Parse a Prometheus text exposition into a `MetricsSnapshot`. Unknown or
@@ -110,6 +118,20 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .unwrap_or(0),
             load_ms: samples
                 .get("ds4_proxy_ds4_kv_cache_load_ms")
+                .copied()
+                .unwrap_or(0.0),
+        },
+        decode: DecodeState {
+            completion: samples
+                .get("ds4_proxy_ds4_generation_completion")
+                .map(|v| *v as u64)
+                .unwrap_or(0),
+            chunk_tps: samples
+                .get("ds4_proxy_ds4_generation_chunk_tps")
+                .copied()
+                .unwrap_or(0.0),
+            avg_tps: samples
+                .get("ds4_proxy_ds4_generation_avg_tps")
                 .copied()
                 .unwrap_or(0.0),
         },
@@ -214,6 +236,12 @@ ds4_proxy_ds4_kv_cache_hits_total 7
 ds4_proxy_ds4_kv_cache_hit_tokens 9005
 # TYPE ds4_proxy_ds4_kv_cache_load_ms gauge
 ds4_proxy_ds4_kv_cache_load_ms 12.3
+# TYPE ds4_proxy_ds4_generation_completion gauge
+ds4_proxy_ds4_generation_completion 42
+# TYPE ds4_proxy_ds4_generation_chunk_tps gauge
+ds4_proxy_ds4_generation_chunk_tps 32.1
+# TYPE ds4_proxy_ds4_generation_avg_tps gauge
+ds4_proxy_ds4_generation_avg_tps 28.5
 "#;
         let snapshot = parse_metrics(text);
         assert!(snapshot.prefill.active);
@@ -224,6 +252,9 @@ ds4_proxy_ds4_kv_cache_load_ms 12.3
         assert_eq!(snapshot.kv_cache.hits_total, 7);
         assert_eq!(snapshot.kv_cache.hit_tokens, 9005);
         assert_eq!(snapshot.kv_cache.load_ms, 12.3);
+        assert_eq!(snapshot.decode.completion, 42);
+        assert_eq!(snapshot.decode.chunk_tps, 32.1);
+        assert_eq!(snapshot.decode.avg_tps, 28.5);
     }
 
     #[test]

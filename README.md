@@ -18,7 +18,7 @@ siderostat は、DS4のHTTP endpointを透過的にstreaming中継し、単一no
 - DS4 source/protocol contract、承認済みbinary集合、model、checkpoint、argvの互換性をfail closedで検証
 - LaunchAgent、local CLI、構造化log、Prometheus互換metrics、loopback admin APIを提供
 - macOSデスクトップ通知で起動・standalone再起動・distributed状態遷移を可視化（`[notifications]`で無効化可）
-- macOSメニューバー常駐モニター（`monitor/` crate）でDS4のprefill progress・KV cache hitを可視化（設計中）
+- macOSメニューバー常駐モニター（`monitor/` crate）でDS4のprefill progress・KV cache hit・Decode TPSを可視化
 - 外部databaseまたはcluster state serviceなしで動作し、永続化するのはcluster lifecycle stateだけ
 
 ## モードとトポロジ
