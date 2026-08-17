@@ -1,23 +1,30 @@
 use super::{
-    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage,
-    ControlRequest, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
+    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
+    ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
     CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
-    DistributedCoordinatorSupervisor, DistributedManifest, DistributedWorkerSupervisor,
-    HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, ModeRuntime, NodeDescriptor,
-    PromotionRetryPolicy, RendezvousControlSnapshot, RendezvousListener, SignedControlHeaders,
-    StandaloneSupervisor, WorkerControl, WorkerDistributedRuntime, WorkerHelloExpectation,
+    DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
+    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE,
+    HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
+    LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
+    NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
+    PeerObservation, PromotionRetryPolicy, StandaloneSupervisor, WorkerControl,
+    WorkerDistributedRuntime, spawn_network_event_monitor,
 };
+#[cfg(feature = "test-support")]
+use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
+    cluster::{ClusterEvent, ClusterEventKind},
     config::ModeAwareConfig,
+    metrics::{MetricSnapshot, Metrics},
     proxy::ModeAwareProxyState,
-    target::{ClusterState, LocalRole, StableMode},
+    target::{ClusterState, LocalRole},
 };
 use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -33,8 +40,19 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod effects;
+mod pairing;
+mod reconcile;
+mod recovery;
+mod worker;
+
+const CONTROL_METRICS_PATH: &str = "/v1/metrics";
+
 /// The production control transport. Requests are pinned to the cluster address and authenticated
 /// independently from the public/admin planes.
+#[cfg(feature = "test-support")]
+use super::ThunderboltIpState;
+
 #[derive(Clone)]
 pub struct ProductionControlClient {
     inner: Arc<ControlClientInner>,
@@ -46,6 +64,19 @@ struct ControlClientInner {
     local_node_id: String,
     authenticator: ControlAuthenticator,
     lifecycle_timeout: Duration,
+}
+
+/// Outcome of an operator reconcile on the production runtime (B-03). Distinguishes whether a
+/// coordinator promotion tracker was present so the admin response can be explicit for worker /
+/// role-unknown nodes and for non-manual coordinator states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorReconcileOutcome {
+    /// A coordinator runtime existed: the promotion tracker was reset and, if the node was in
+    /// `ManualInterventionRequired`, the state was cleared as one atomic operation.
+    Coordinator { manual_cleared: bool },
+    /// No coordinator promotion tracker on this node (worker or unknown role). The local manual
+    /// state, if any, was cleared through the mode runtime.
+    NotCoordinator { manual_cleared: bool },
 }
 
 impl ProductionControlClient {
@@ -77,11 +108,11 @@ impl ProductionControlClient {
         })
     }
 
-    fn with_lifecycle_timeout(mut self, timeout: Duration) -> Self {
+    fn with_lifecycle_timeout(mut self, timeout: Duration) -> anyhow::Result<Self> {
         Arc::get_mut(&mut self.inner)
-            .expect("control client is not cloned during construction")
+            .context("control client was unexpectedly cloned during construction")?
             .lifecycle_timeout = timeout;
-        self
+        Ok(self)
     }
 
     pub async fn send(&self, message: &ControlMessage) -> anyhow::Result<ControlResponse> {
@@ -96,6 +127,44 @@ impl ProductionControlClient {
     pub async fn node(&self) -> anyhow::Result<ControlResponse> {
         self.request(reqwest::Method::GET, "/v1/node", Vec::new(), None)
             .await
+    }
+
+    async fn metrics(&self) -> anyhow::Result<String> {
+        let timestamp = now_millis();
+        let body = Vec::new();
+        let signed = self.inner.authenticator.sign(
+            self.inner.local_node_id.clone(),
+            reqwest::Method::GET.as_str(),
+            CONTROL_METRICS_PATH,
+            timestamp,
+            uuid::Uuid::new_v4().simple().to_string(),
+            &body,
+        )?;
+        let response = self
+            .inner
+            .client
+            .get(
+                self.inner
+                    .base
+                    .join(CONTROL_METRICS_PATH.trim_start_matches('/'))?,
+            )
+            .header(HEADER_NODE, signed.node_id())
+            .header(HEADER_TIMESTAMP, signed.timestamp_millis())
+            .header(HEADER_NONCE, signed.nonce())
+            .header(HEADER_SIGNATURE, signed.signature())
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "peer control {} returned {}: {}",
+                CONTROL_METRICS_PATH,
+                status,
+                String::from_utf8_lossy(&body)
+            );
+        }
+        Ok(String::from_utf8(body.to_vec())?)
     }
 
     async fn request(
@@ -133,6 +202,9 @@ impl ProductionControlClient {
         let status = response.status();
         let bytes = response.bytes().await?;
         if !status.is_success() {
+            if status == StatusCode::PRECONDITION_FAILED {
+                return Err(anyhow::Error::new(ControlError::DeploymentMismatch));
+            }
             anyhow::bail!(
                 "peer control {} returned {}: {}",
                 path,
@@ -183,18 +255,28 @@ struct ProductionInner {
     peer_address: IpAddr,
     descriptor: NodeDescriptor,
     authenticator: ControlAuthenticator,
+    metrics: Arc<Metrics>,
     control: RoleControl,
     client: ProductionControlClient,
     lease: LeaseStatus,
     mode: Arc<ModeRuntime>,
     proxy: Arc<ModeAwareProxyState>,
-    standalone: Arc<StandaloneSupervisor>,
+    standalone: Arc<dyn LocalStandaloneLifecycle>,
     worker_runtime: Option<WorkerDistributedRuntime>,
     coordinator_runtime: OnceLock<CoordinatorDistributedRuntime>,
-    distributed_coordinator: Option<Arc<DistributedCoordinatorSupervisor>>,
-    distributed_worker: Option<Arc<DistributedWorkerSupervisor>>,
+    distributed_coordinator: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+    distributed_worker: Option<Arc<dyn DistributedWorkerLifecycle>>,
     config: ModeAwareConfig,
     manifest: DistributedManifest,
+    recovery: Arc<recovery::PeerLossRecovery>,
+    automatic_pairing_blocked: AtomicBool,
+    /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
+    /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
+    /// actual production input. Fail-closed until a fresh observation is applied.
+    network: Arc<NetworkEvidence>,
+    /// Test-support only: recorded pair-phase timings across pair sessions (Q-01).
+    #[cfg(feature = "test-support")]
+    pair_timings: std::sync::Mutex<Vec<PairTiming>>,
 }
 
 impl ProductionClusterRuntime {
@@ -205,8 +287,85 @@ impl ProductionClusterRuntime {
         mode: Arc<ModeRuntime>,
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<StandaloneSupervisor>,
+        metrics: Arc<Metrics>,
         manifest: DistributedManifest,
         control_secret: Vec<u8>,
+        control_session_generation: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
+        {
+            Some(Arc::new(DistributedWorkerSupervisor::new(
+                super::build_distributed_worker_command(
+                    &config.ds4,
+                    config.cluster.coordinator_address,
+                    config.cluster.ds4_distributed_port,
+                )?,
+                config.cluster.timeouts.stop,
+                config.ds4.allow_sigkill,
+                metrics.clone(),
+            )))
+        } else {
+            None
+        };
+        let coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>> =
+            if role == LocalRole::Coordinator {
+                Some(Arc::new(DistributedCoordinatorSupervisor::new(
+                    super::build_distributed_coordinator_command(
+                        &config.ds4,
+                        config.cluster.coordinator_address,
+                        config.cluster.ds4_distributed_port,
+                    )?,
+                    Url::parse(&format!(
+                        "http://{}:{}/v1/models",
+                        config.ds4.http_host, config.ds4.http_port
+                    ))?,
+                    config.cluster.timeouts.coordinator_startup,
+                    Duration::from_secs(1),
+                    config.cluster.timeouts.stop,
+                    config.ds4.allow_sigkill,
+                    metrics.clone(),
+                )))
+            } else {
+                None
+            };
+        let peer_control_port = config.cluster.control_port;
+        let runtime = Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            metrics,
+            manifest,
+            control_secret,
+            peer_control_port,
+            control_session_generation,
+            worker_child,
+            coordinator_child,
+        )?;
+        // N-02: share verified network observations into the control plane so `route_scoped` is
+        // measured, not hard-coded. The monitor runs only for production (`new`); tests inject
+        // evidence directly via `new_with_lifecycles`.
+        runtime.start_network_evidence_monitor();
+        Ok(runtime)
+    }
+
+    /// Shared constructor. Production uses [`Self::new`]; tests inject fake child lifecycles via
+    /// [`Self::new_with_lifecycles`] (test-support only).
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        metrics: Arc<Metrics>,
+        manifest: DistributedManifest,
+        control_secret: Vec<u8>,
+        peer_control_port: u16,
+        control_session_generation: Option<u64>,
+        worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
+        coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
     ) -> anyhow::Result<Self> {
         ensure!(role != LocalRole::Unknown, "cluster role is unknown");
         manifest.validate()?;
@@ -225,11 +384,13 @@ impl ProductionClusterRuntime {
             LocalRole::Unknown => unreachable!(),
         };
         let local_control_id = config.cluster.node_id.clone();
+        let control_session_generation =
+            control_session_generation.unwrap_or_else(|| mode.snapshot().generation);
         let descriptor = NodeDescriptor {
             protocol_version: 1,
             node_id: local_control_id.clone(),
             role: control_role,
-            generation: mode.snapshot().generation,
+            generation: control_session_generation,
             mode: super::ControlMode::SoloStandalone,
             deployment_id: Some(deployment_id),
         };
@@ -252,7 +413,7 @@ impl ProductionClusterRuntime {
             local_control_id,
             local_address,
             peer_address,
-            config.cluster.control_port,
+            peer_control_port,
             control_secret.clone(),
             config.cluster.timeouts.peer_connect,
             config.cluster.timeouts.peer_request,
@@ -263,18 +424,10 @@ impl ProductionClusterRuntime {
                 .timeouts
                 .stop
                 .saturating_add(config.cluster.timeouts.peer_request),
-        );
+        )?;
         let lease = LeaseStatus::new();
         let (worker_runtime, distributed_worker) = if role == LocalRole::Worker {
-            let child = Arc::new(DistributedWorkerSupervisor::new(
-                super::build_distributed_worker_command(
-                    &config.ds4,
-                    config.cluster.coordinator_address,
-                    config.cluster.ds4_distributed_port,
-                )?,
-                config.cluster.timeouts.stop,
-                config.ds4.allow_sigkill,
-            ));
+            let child = worker_child.context("worker child lifecycle missing")?;
             (
                 Some(WorkerDistributedRuntime::new(
                     proxy.admission().clone(),
@@ -289,7 +442,7 @@ impl ProductionClusterRuntime {
         } else {
             (None, None)
         };
-        let mut inner = ProductionInner {
+        let inner = ProductionInner {
             role,
             local_address,
             peer_address,
@@ -298,6 +451,7 @@ impl ProductionClusterRuntime {
                 ControlSecret::new(control_secret)?,
                 peer_address,
             ),
+            metrics,
             control,
             client,
             lease,
@@ -306,33 +460,56 @@ impl ProductionClusterRuntime {
             standalone,
             worker_runtime,
             coordinator_runtime: OnceLock::new(),
-            distributed_coordinator: None,
+            distributed_coordinator: coordinator_child,
             distributed_worker,
             config,
             manifest,
+            recovery: Arc::new(recovery::PeerLossRecovery::default()),
+            automatic_pairing_blocked: AtomicBool::new(false),
+            network: Arc::new(NetworkEvidence::new()),
+            #[cfg(feature = "test-support")]
+            pair_timings: std::sync::Mutex::new(Vec::new()),
         };
-        if role == LocalRole::Coordinator {
-            inner.distributed_coordinator = Some(Arc::new(DistributedCoordinatorSupervisor::new(
-                super::build_distributed_coordinator_command(
-                    &inner.config.ds4,
-                    inner.config.cluster.coordinator_address,
-                    inner.config.cluster.ds4_distributed_port,
-                )?,
-                Url::parse(&format!(
-                    "http://{}:{}/v1/models",
-                    inner.config.ds4.http_host, inner.config.ds4.http_port
-                ))?,
-                inner.config.cluster.timeouts.coordinator_startup,
-                Duration::from_secs(1),
-                inner.config.cluster.timeouts.stop,
-                inner.config.ds4.allow_sigkill,
-            )));
-        }
         let runtime = Self {
             inner: Arc::new(inner),
         };
         runtime.finish_coordinator()?;
         Ok(runtime)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    /// Build a production-equivalent runtime for tests with injected fake child lifecycles.
+    /// The control HTTP layer and state machine are identical to production; only the child
+    /// process supervisors are replaced so tests can record start/stop and inject faults.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_lifecycles(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        manifest: DistributedManifest,
+        control_secret: Vec<u8>,
+        peer_control_port: u16,
+        control_session_generation: Option<u64>,
+        worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
+        coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            Arc::new(Metrics::default()),
+            manifest,
+            control_secret,
+            peer_control_port,
+            control_session_generation,
+            worker_child,
+            coordinator_child,
+        )
     }
 
     fn finish_coordinator(&self) -> anyhow::Result<()> {
@@ -376,8 +553,145 @@ impl ProductionClusterRuntime {
             .map_err(|_| anyhow::anyhow!("coordinator runtime initialized twice"))
     }
 
+    #[cfg(feature = "test-support")]
+    /// Record a promotion failure on the coordinator's promotion tracker (test-support only).
+    /// Used to drive a production runtime into Backoff so the periodic-reconcile recovery path
+    /// (B-02) can be exercised without waiting on a real promotion timeout.
+    pub async fn record_promotion_failure(
+        &self,
+        failure: ClusterFailure,
+        now_millis: u64,
+    ) -> anyhow::Result<ClusterSnapshot> {
+        let runtime = self
+            .inner
+            .coordinator_runtime
+            .get()
+            .context("coordinator runtime unavailable")?;
+        runtime
+            .record_promotion_failure(failure, now_millis)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the coordinator's promotion tracker status (test-support only). Used to assert that
+    /// operator reconcile resets the manual failure count (B-03 completion condition).
+    pub async fn promotion_failure_status(&self) -> Option<PromotionFailureStatus> {
+        let runtime = self.inner.coordinator_runtime.get()?;
+        Some(runtime.promotion_failure_status().await)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Inject a verified network snapshot into the shared network evidence (test-support only).
+    /// Used by the reconnect harness to give each node a valid, bridge0-scoped, authenticated
+    /// peer candidate so the production control plane derives `route_scoped` from production
+    /// input rather than a hard-coded constant (N-02). Returns `false` when the injected
+    /// snapshot is stale relative to the latest applied epoch.
+    pub fn set_network_evidence(&self, snapshot: NetworkSnapshot) -> bool {
+        self.inner.network.update(snapshot)
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the current network gate state derived from the shared evidence (test-support only):
+    /// `(route_scoped, peer_present, epoch, state)`. Used by the N-03 truth-table tests to
+    /// assert that every `ThunderboltIpState` maps to the expected route/peer-present outcome.
+    pub fn network_gate_status(&self) -> (bool, bool, u64, ThunderboltIpState) {
+        let snapshot = self.inner.network.snapshot();
+        (
+            self.inner.network.route_scoped(),
+            snapshot.peer_present,
+            snapshot.epoch,
+            snapshot.state,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Read the recorded pair-phase timings (test-support only, Q-01). Returns a copy so tests
+    /// can aggregate confirm-before-stability and convergence without holding the lock.
+    pub fn pair_timings(&self) -> Vec<PairTiming> {
+        self.inner
+            .pair_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Operator reconcile (B-03). On the coordinator the promotion tracker reset and the
+    /// `OperatorReconcile` state event are one atomic operation through
+    /// [`CoordinatorDistributedRuntime::operator_reconcile`], so the manual failure count does
+    /// not carry over after the state is cleared. On a worker / role-unknown node there is no
+    /// coordinator promotion tracker, so the local manual state is cleared through the mode
+    /// runtime instead.
+    pub async fn operator_reconcile(&self) -> anyhow::Result<OperatorReconcileOutcome> {
+        self.inner
+            .automatic_pairing_blocked
+            .store(false, Ordering::Release);
+        let was_manual =
+            self.inner.mode.snapshot().state == ClusterState::ManualInterventionRequired;
+        if let Some(runtime) = self.inner.coordinator_runtime.get() {
+            runtime.operator_reconcile().await?;
+            return Ok(OperatorReconcileOutcome::Coordinator {
+                manual_cleared: was_manual,
+            });
+        }
+        if was_manual {
+            let current = self.inner.mode.snapshot();
+            self.inner
+                .mode
+                .cluster_handle()
+                .apply(ClusterEvent {
+                    expected_generation: current.generation,
+                    kind: ClusterEventKind::OperatorReconcile,
+                })
+                .await?;
+        }
+        Ok(OperatorReconcileOutcome::NotCoordinator {
+            manual_cleared: was_manual,
+        })
+    }
+
     pub fn role(&self) -> LocalRole {
         self.inner.role
+    }
+
+    pub(super) fn block_automatic_pairing(&self) {
+        self.inner
+            .automatic_pairing_blocked
+            .store(true, Ordering::Release);
+    }
+
+    pub(super) fn automatic_pairing_blocked(&self) -> bool {
+        self.inner.automatic_pairing_blocked.load(Ordering::Acquire)
+    }
+
+    /// Fetch the coordinator's Prometheus metrics through the authenticated control plane.
+    ///
+    /// The worker must not connect to the coordinator's loopback-only admin listener directly.
+    /// This read-only path keeps the admin API private while reusing the existing source-pinned
+    /// HMAC control channel.
+    pub async fn fetch_coordinator_metrics(&self) -> anyhow::Result<String> {
+        ensure!(
+            self.inner.role == LocalRole::Worker,
+            "coordinator metrics can only be fetched from a worker"
+        );
+        self.inner.client.metrics().await
+    }
+
+    pub(super) fn render_control_metrics(&self) -> String {
+        self.inner.metrics.render_mode_aware(MetricSnapshot {
+            node_id: &self.inner.descriptor.node_id,
+            interface: &self.inner.config.cluster.interface,
+            target: self.inner.proxy.target_snapshot(),
+            admission: self.inner.proxy.admission().snapshot(),
+            cluster: Some(self.inner.mode.snapshot()),
+            peer_lease_seconds: 0.0,
+            thunderbolt_ip_state: "unknown",
+            discovery_results: 0,
+            model_variant: self.inner.config.ds4.standalone.model_variant,
+            residency: self.inner.config.ds4.standalone.residency,
+        })
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -390,6 +704,7 @@ impl ProductionClusterRuntime {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/node", get(control_node))
+            .route("/v1/metrics", get(control_metrics))
             .route("/v1/pair", post(control_pair))
             .route("/v1/prepare-worker", post(control_prepare))
             .route("/v1/begin-drain", post(control_begin_drain))
@@ -402,606 +717,149 @@ impl ProductionClusterRuntime {
             .with_state(self.clone())
     }
 
-    pub async fn pair(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        ensure!(
-            self.inner.role == LocalRole::Coordinator,
-            "pairing must be initiated by the coordinator"
-        );
-        let message = ControlMessage {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            generation: self.control_generation().await,
-            deployment_id: self.inner.descriptor.deployment_id.clone(),
-            command: ControlCommand::Pair {
-                descriptor: self.local_descriptor().await,
-            },
-        };
-        let response = self.inner.client.send(&message).await?;
-        self.inner.lease.update(&response);
-        tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-        self.reconcile_peer().await
-    }
-
-    pub async fn promote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        ensure!(
-            self.inner.role == LocalRole::Coordinator,
-            "only the coordinator may promote"
-        );
-        let current = self.inner.mode.snapshot();
-        ensure!(
-            current.state == ClusterState::PairedStandaloneReady,
-            "cluster is not paired standalone"
-        );
-        let awaiting = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: current.generation,
-                kind: super::ClusterEventKind::BeginPromotion,
-            })
-            .await?;
-        let hello = match self.prepare_and_accept_hello(awaiting).await {
-            Ok(hello) => hello,
-            Err(error) => {
-                self.recover_preflight_promotion().await;
-                return Err(error);
-            }
-        };
-        let prerequisites = {
-            let RoleControl::Coordinator(control) = &self.inner.control else {
-                unreachable!()
-            };
-            let control = control.lock().await;
-            control.phase() == super::DistributedControlPhase::WorkerReady
-                && control.peer_present(now_millis())
-        };
-        let lease = self.inner.lease.clone();
-        let snapshot = self
-            .inner
-            .coordinator_runtime
-            .get()
-            .context("coordinator runtime unavailable")?
-            .promote_validated(
-                hello,
-                prerequisites,
-                Arc::new(move || lease.valid()),
-                now_millis(),
-            )
-            .await?;
-        let ready = {
-            let RoleControl::Coordinator(control) = &self.inner.control else {
-                unreachable!()
-            };
-            control
-                .lock()
-                .await
-                .distributed_ready_message(uuid::Uuid::new_v4().to_string())?
-        };
-        self.inner.client.send(&ready).await?;
-        if self.inner.config.cluster.policy.auto_demote {
-            let coordinator = self
-                .inner
-                .coordinator_runtime
-                .get()
-                .context("coordinator runtime unavailable")?
-                .clone();
-            tokio::spawn(async move {
-                if let Err(error) = coordinator.wait_route_loss_and_demote().await {
-                    tracing::error!(error = %error, "automatic distributed demotion failed");
-                }
-            });
-        }
-        Ok(snapshot)
-    }
-
-    async fn prepare_and_accept_hello(
-        &self,
-        awaiting: crate::cluster::ClusterSnapshot,
-    ) -> anyhow::Result<super::Ds4Hello> {
-        let control_snapshot = RendezvousControlSnapshot {
-            state: awaiting.state,
-            generation: awaiting.generation,
-            deployment_id: self.inner.descriptor.deployment_id.clone(),
-            lease_valid: self.inner.lease.valid(),
-        };
-        let worker_start = self
-            .inner
-            .config
-            .ds4
-            .mxfp4
-            .worker_layers
-            .split_once(':')
-            .context("invalid worker layer range")?
-            .0
-            .parse::<u32>()?;
-        let listener = RendezvousListener::bind(
-            SocketAddr::new(
-                self.inner.local_address,
-                self.inner.config.cluster.ds4_distributed_port,
-            ),
-            WorkerHelloExpectation {
-                coordinator_address: self.inner.local_address,
-                worker_address: self.inner.peer_address,
-                control: control_snapshot.clone(),
-                layer_start: worker_start,
-                layer_end: u32::MAX,
-                has_output: true,
-                context_size: self.inner.config.ds4.mxfp4.context_size,
-                model_name: self.inner.manifest.model_family.clone(),
-            },
-        )
-        .await?;
-        let prepare = {
-            let RoleControl::Coordinator(control) = &self.inner.control else {
-                unreachable!()
-            };
-            let mut control = control.lock().await;
-            let message = control.prepare_worker_message(uuid::Uuid::new_v4().to_string())?;
-            control.note_prepare_sent(message.generation)?;
-            message
-        };
-        let response = self.inner.client.send(&prepare).await?;
-        self.inner.lease.update(&response);
-        let runtime = self.clone();
-        let hello = listener
-            .accept_one(
-                self.inner.config.cluster.timeouts.rendezvous_hello,
-                move || RendezvousControlSnapshot {
-                    state: runtime.inner.mode.snapshot().state,
-                    generation: runtime.inner.mode.snapshot().generation,
-                    deployment_id: runtime.inner.descriptor.deployment_id.clone(),
-                    lease_valid: runtime.inner.lease.valid(),
-                },
-            )
-            .await?;
-        let deadline =
-            tokio::time::Instant::now() + self.inner.config.cluster.timeouts.worker_startup;
-        loop {
-            let ready = {
-                let RoleControl::Coordinator(control) = &self.inner.control else {
-                    unreachable!()
-                };
-                control.lock().await.phase() == super::DistributedControlPhase::WorkerReady
-            };
-            if ready {
-                break;
-            }
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "worker Ready timed out"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok(hello)
-    }
-
-    async fn recover_preflight_promotion(&self) {
-        let cancel = match &self.inner.control {
-            RoleControl::Coordinator(control) => control
-                .lock()
-                .await
-                .cancel_generation_message(uuid::Uuid::new_v4().to_string())
-                .ok(),
-            RoleControl::Worker(_) => None,
-        };
-        if let Some(cancel) = cancel
-            && let Err(error) = self.inner.client.send(&cancel).await
-        {
-            tracing::warn!(error = %error, "worker promotion cancellation failed");
-        }
-        let current = self.inner.mode.snapshot();
-        if matches!(
-            current.state,
-            ClusterState::AwaitingWorkerHello
-                | ClusterState::Promoting
-                | ClusterState::DistributedStarting
-        ) && let Ok(paired) = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: current.generation,
-                kind: super::ClusterEventKind::PromotionFailed,
-            })
-            .await
-        {
-            self.inner.proxy.set_target(paired.target, true);
-            self.inner.proxy.admission().start_serving();
-        }
-    }
-
-    pub async fn demote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        ensure!(
-            self.inner.role == LocalRole::Coordinator,
-            "only the coordinator may demote"
-        );
-        self.inner
-            .coordinator_runtime
-            .get()
-            .context("coordinator runtime unavailable")?
-            .demote()
-            .await
-            .map_err(Into::into)
-    }
-
-    pub async fn reconcile(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        match self.inner.client.node().await {
-            Ok(response) => {
-                self.inner.lease.update(&response);
-                self.reconcile_peer().await
-            }
-            Err(error) => {
-                self.invalidate_route().await;
-                let snapshot = self.reconcile_peer().await?;
-                tracing::warn!(error = %error, "peer control reconciliation failed");
-                Ok(snapshot)
-            }
-        }
-    }
-
-    async fn reconcile_peer(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+    /// Read-only diagnostics snapshot for the reconnect diagnostics contract
+    /// (`docs/reconnect-diagnostics-contract.md`). Never mutates the runtime and never exposes
+    /// secrets, signatures, nonces, or full deployment IDs.
+    pub async fn diagnostics(&self) -> ProductionDiagnostics {
+        let inner = &self.inner;
         let now = now_millis();
-        Ok(match &self.inner.control {
+        let (generation, phase, role, lease) = match &inner.control {
             RoleControl::Coordinator(control) => {
-                self.inner
-                    .mode
-                    .reconcile_peer(&mut *control.lock().await, now)
-                    .await?
+                let control = control.lock().await;
+                (
+                    control.generation(),
+                    control.phase(),
+                    ControlRole::Coordinator,
+                    lease_diagnostics(control.peer_lease(), now),
+                )
             }
             RoleControl::Worker(control) => {
-                self.inner
-                    .mode
-                    .reconcile_peer(&mut *control.lock().await, now)
-                    .await?
-            }
-        })
-    }
-
-    async fn invalidate_route(&self) {
-        match &self.inner.control {
-            RoleControl::Coordinator(control) => control.lock().await.invalidate_route(),
-            RoleControl::Worker(control) => control.lock().await.invalidate_route(),
-        }
-    }
-
-    async fn control_generation(&self) -> u64 {
-        match &self.inner.control {
-            RoleControl::Coordinator(control) => control
-                .lock()
-                .await
-                .peer_lease()
-                .descriptor()
-                .map_or(self.inner.descriptor.generation, |d| d.generation),
-            RoleControl::Worker(control) => control
-                .lock()
-                .await
-                .peer_lease()
-                .descriptor()
-                .map_or(self.inner.descriptor.generation, |d| d.generation),
-        }
-    }
-
-    async fn local_descriptor(&self) -> NodeDescriptor {
-        let mut descriptor = self.inner.descriptor.clone();
-        descriptor.generation = self.control_generation().await;
-        descriptor.mode = match self.inner.mode.snapshot().stable_mode {
-            StableMode::SoloStandalone => super::ControlMode::SoloStandalone,
-            StableMode::PairedStandalone => super::ControlMode::PairedStandalone,
-            StableMode::DistributedMxfp4 => super::ControlMode::DistributedMxfp4,
-        };
-        descriptor
-    }
-
-    async fn authenticate(
-        &self,
-        method: &str,
-        path: &str,
-        body: &[u8],
-        source: SocketAddr,
-        headers: &HeaderMap,
-    ) -> Result<super::AuthenticatedPeer, ControlHttpError> {
-        let signed = SignedControlHeaders::from_header_values(
-            header(headers, HEADER_NODE)?,
-            header(headers, HEADER_TIMESTAMP)?,
-            header(headers, HEADER_NONCE)?,
-            header(headers, HEADER_SIGNATURE)?,
-        )?;
-        Ok(ControlRequest {
-            method,
-            path_and_query: path,
-            body,
-            source_ip: source.ip(),
-            headers: &signed,
-        }
-        .authenticate(&self.inner.authenticator, now_millis())?)
-    }
-
-    async fn handle(
-        &self,
-        endpoint: ControlEndpoint,
-        method: &str,
-        body: Bytes,
-        source: SocketAddr,
-        headers: HeaderMap,
-    ) -> Result<ControlResponse, ControlHttpError> {
-        let path = endpoint_path(endpoint);
-        let authenticated = self
-            .authenticate(method, path, &body, source, &headers)
-            .await?;
-        let now = now_millis();
-        if endpoint == ControlEndpoint::Node {
-            return match &self.inner.control {
-                RoleControl::Coordinator(control) => {
-                    Ok(control
-                        .lock()
-                        .await
-                        .node_descriptor(&authenticated, true, now)?)
-                }
-                RoleControl::Worker(control) => {
-                    Ok(control
-                        .lock()
-                        .await
-                        .node_descriptor(&authenticated, true, now)?)
-                }
-            };
-        }
-        let message: ControlMessage = serde_json::from_slice(&body)
-            .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
-        let command = message.command.clone();
-        let response = match &self.inner.control {
-            RoleControl::Coordinator(control) => {
-                control
-                    .lock()
-                    .await
-                    .handle(endpoint, message, &authenticated, true, now)?
-            }
-            RoleControl::Worker(control) => {
-                control
-                    .lock()
-                    .await
-                    .handle(endpoint, message, &authenticated, true, now)?
+                let control = control.lock().await;
+                (
+                    control.generation(),
+                    control.phase(),
+                    ControlRole::Worker,
+                    lease_diagnostics(control.peer_lease(), now),
+                )
             }
         };
-        self.inner.lease.update(&response);
-        if effect_requires_ack(&command) {
-            let runtime = self.clone();
-            tokio::spawn(async move { runtime.apply_effect(command).await })
-                .await
-                .map_err(|error| ControlHttpError::Effect(error.to_string()))?
-                .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
-        } else {
-            self.spawn_effect(command);
+        let standalone_ready = inner.mode.snapshot().local_standalone_ready;
+        let children = ChildrenDiagnostics {
+            standalone: Some(child_diagnostics(
+                inner.standalone.child_identity().await,
+                inner.standalone.is_running().await.ok(),
+                Some(standalone_ready),
+            )),
+            distributed_coordinator: match &inner.distributed_coordinator {
+                Some(supervisor) => Some(child_diagnostics(
+                    supervisor.child_identity().await,
+                    supervisor.is_running().await.ok(),
+                    None,
+                )),
+                None => None,
+            },
+            distributed_worker: match &inner.distributed_worker {
+                Some(supervisor) => Some(child_diagnostics(
+                    supervisor.child_identity().await,
+                    supervisor.is_running().await.ok(),
+                    None,
+                )),
+                None => None,
+            },
+        };
+        ProductionDiagnostics {
+            control_session: ControlSessionDiagnostics {
+                generation,
+                phase,
+                role,
+                lease,
+            },
+            children,
         }
-        Ok(response)
     }
+}
 
-    fn spawn_effect(&self, command: ControlCommand) {
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = runtime.apply_effect(command).await {
-                tracing::error!(error = %error, "peer control side effect failed");
-            }
-        });
+fn lease_diagnostics(lease: &super::PeerLease, now: u64) -> LeaseDiagnostics {
+    let expires_at = lease.expires_at_millis();
+    let valid = expires_at.is_some_and(|expires| now < expires);
+    LeaseDiagnostics {
+        valid,
+        expires_at_millis: expires_at,
+        route_scoped: lease.route_scoped(),
+        peer_present: lease.peer_present(now),
+        peer: lease.descriptor().map(|descriptor| PeerDiagnostics {
+            node_id: descriptor.node_id.clone(),
+            role: descriptor.role,
+            generation: descriptor.generation,
+            mode: descriptor.mode,
+        }),
     }
+}
 
-    async fn apply_effect(&self, command: ControlCommand) -> anyhow::Result<()> {
-        match command {
-            ControlCommand::Pair { .. } => {
-                if self.inner.role == LocalRole::Worker {
-                    let reply = ControlMessage {
-                        request_id: uuid::Uuid::new_v4().to_string(),
-                        generation: self.control_generation().await,
-                        deployment_id: self.inner.descriptor.deployment_id.clone(),
-                        command: ControlCommand::Pair {
-                            descriptor: self.local_descriptor().await,
-                        },
-                    };
-                    let response = self.inner.client.send(&reply).await?;
-                    self.inner.lease.update(&response);
-                }
-                tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-                self.reconcile_peer().await?;
-            }
-            ControlCommand::PrepareWorker => self.prepare_worker().await?,
-            ControlCommand::BeginDrain => self.worker_drained().await?,
-            ControlCommand::CancelGeneration | ControlCommand::Demote => self.stop_worker().await?,
-            ControlCommand::DistributedReady => {
-                self.inner.proxy.admission().start_serving();
-            }
-            ControlCommand::Drained | ControlCommand::WorkerEvent { .. } => {}
-        }
-        Ok(())
-    }
-
-    async fn prepare_worker(&self) -> anyhow::Result<()> {
-        let worker = self
-            .inner
-            .worker_runtime
+fn child_diagnostics(
+    identity: Option<crate::cluster::ChildIdentity>,
+    running: Option<bool>,
+    ready: Option<bool>,
+) -> ChildDiagnostics {
+    ChildDiagnostics {
+        pid: identity.as_ref().map(|identity| identity.pid),
+        profile: identity
             .as_ref()
-            .context("worker lifecycle unavailable")?;
-        let current = self.inner.mode.snapshot();
-        let awaiting = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: current.generation,
-                kind: super::ClusterEventKind::BeginPromotion,
-            })
-            .await?;
-        let generation = awaiting.generation;
-        let lease = self.inner.lease.clone();
-        worker
-            .prepare(generation, Arc::new(move || lease.valid()))
-            .await?;
-        let promoting = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: generation,
-                kind: super::ClusterEventKind::WorkerHelloAccepted,
-            })
-            .await?;
-        let starting = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: promoting.generation,
-                kind: super::ClusterEventKind::DistributedChildStarted,
-            })
-            .await?;
-        let ready = self
-            .inner
-            .mode
-            .cluster_handle()
-            .apply(super::ClusterEvent {
-                expected_generation: starting.generation,
-                kind: super::ClusterEventKind::DistributedRouteReady,
-            })
-            .await?;
-        self.inner.proxy.set_target(ready.target, true);
-        let message = match &self.inner.control {
-            RoleControl::Worker(control) => control
-                .lock()
-                .await
-                .worker_ready_message(uuid::Uuid::new_v4().to_string())?,
-            RoleControl::Coordinator(_) => anyhow::bail!("prepare-worker received by coordinator"),
-        };
-        self.inner.client.send(&message).await?;
-        Ok(())
+            .map(|identity| identity.profile_id.clone()),
+        generation: identity.as_ref().map(|identity| identity.generation),
+        running: running.unwrap_or(false),
+        ready,
     }
+}
 
-    async fn worker_drained(&self) -> anyhow::Result<()> {
-        // `WorkerDistributedRuntime::prepare` already drained this ingress before stopping the
-        // standalone child. BeginDrain is therefore an acknowledgement barrier, not a second
-        // drain with the worker's later state-machine generation.
-        let message = match &self.inner.control {
-            RoleControl::Worker(control) => control
-                .lock()
-                .await
-                .drained_message(uuid::Uuid::new_v4().to_string())?,
-            RoleControl::Coordinator(_) => anyhow::bail!("begin-drain received by coordinator"),
-        };
-        self.inner.client.send(&message).await?;
-        Ok(())
-    }
+/// Read-only reconnect diagnostics. Field semantics are fixed by
+/// `docs/reconnect-diagnostics-contract.md`; only additive changes are allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionDiagnostics {
+    pub control_session: ControlSessionDiagnostics,
+    pub children: ChildrenDiagnostics,
+}
 
-    async fn stop_worker(&self) -> anyhow::Result<()> {
-        if let Some(worker) = &self.inner.worker_runtime {
-            let current = self.inner.mode.snapshot();
-            worker.cancel().await?;
-            let paired = match current.state {
-                ClusterState::DistributedReady => {
-                    let demoting = self
-                        .inner
-                        .mode
-                        .cluster_handle()
-                        .apply(super::ClusterEvent {
-                            expected_generation: current.generation,
-                            kind: super::ClusterEventKind::BeginDemotion,
-                        })
-                        .await?;
-                    self.inner
-                        .mode
-                        .cluster_handle()
-                        .apply(super::ClusterEvent {
-                            expected_generation: demoting.generation,
-                            kind: super::ClusterEventKind::PairingReady,
-                        })
-                        .await?
-                }
-                ClusterState::AwaitingWorkerHello
-                | ClusterState::Promoting
-                | ClusterState::DistributedStarting => {
-                    self.inner
-                        .mode
-                        .cluster_handle()
-                        .apply(super::ClusterEvent {
-                            expected_generation: current.generation,
-                            kind: super::ClusterEventKind::PromotionFailed,
-                        })
-                        .await?
-                }
-                ClusterState::PairedStandaloneReady => current,
-                state => anyhow::bail!("worker cannot stop distributed child from {state:?}"),
-            };
-            self.inner.proxy.set_target(paired.target, true);
-            self.inner.proxy.admission().start_serving();
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlSessionDiagnostics {
+    pub generation: u64,
+    pub phase: DistributedControlPhase,
+    pub role: ControlRole,
+    pub lease: LeaseDiagnostics,
+}
 
-    pub fn start_reconcile_task(&self) -> tokio::task::JoinHandle<()> {
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            let promotion_running = Arc::new(AtomicBool::new(false));
-            let lease_refresh = runtime.inner.config.cluster.timeouts.control_lease / 3;
-            let period = runtime
-                .inner
-                .config
-                .cluster
-                .discovery
-                .reconcile_interval
-                .min(lease_refresh.max(Duration::from_millis(100)));
-            let mut interval = tokio::time::interval(period);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(error) = runtime.reconcile().await {
-                    tracing::error!(error = %error, "production cluster reconcile failed");
-                }
-                let snapshot = runtime.inner.mode.snapshot();
-                if snapshot.state == ClusterState::SoloStandaloneReady
-                    && runtime.inner.config.cluster.policy.auto_pair
-                {
-                    if let Err(error) = runtime.pair().await {
-                        tracing::debug!(error = %error, "automatic pairing attempt failed");
-                    }
-                } else if snapshot.state == ClusterState::PairedStandaloneReady
-                    && runtime.inner.role == LocalRole::Coordinator
-                    && runtime.inner.config.cluster.policy.auto_promote
-                    && promotion_running
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let promotion_runtime = runtime.clone();
-                    let promotion_running = promotion_running.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = promotion_runtime.promote().await {
-                            tracing::error!(error = %error, "automatic promotion failed");
-                        }
-                        promotion_running.store(false, Ordering::Release);
-                    });
-                }
-            }
-        })
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseDiagnostics {
+    pub valid: bool,
+    pub expires_at_millis: Option<u64>,
+    pub route_scoped: bool,
+    pub peer_present: bool,
+    pub peer: Option<PeerDiagnostics>,
+}
 
-    pub async fn stop_distributed(&self) -> anyhow::Result<()> {
-        if let Some(worker) = &self.inner.distributed_worker {
-            super::DistributedWorkerLifecycle::stop(worker.as_ref()).await?;
-        }
-        if let Some(coordinator) = &self.inner.distributed_coordinator {
-            super::DistributedCoordinatorLifecycle::stop(coordinator.as_ref()).await?;
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDiagnostics {
+    pub node_id: String,
+    pub role: ControlRole,
+    pub generation: u64,
+    pub mode: ControlMode,
+}
 
-    pub async fn distributed_child_identity(&self) -> Option<super::ChildIdentity> {
-        match self.inner.role {
-            LocalRole::Coordinator => match &self.inner.distributed_coordinator {
-                Some(child) => child.child_identity().await,
-                None => None,
-            },
-            LocalRole::Worker => match &self.inner.distributed_worker {
-                Some(child) => child.child_identity().await,
-                None => None,
-            },
-            LocalRole::Unknown => None,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChildrenDiagnostics {
+    pub standalone: Option<ChildDiagnostics>,
+    pub distributed_coordinator: Option<ChildDiagnostics>,
+    pub distributed_worker: Option<ChildDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildDiagnostics {
+    pub pid: Option<u32>,
+    pub profile: Option<String>,
+    pub generation: Option<u64>,
+    pub running: bool,
+    /// `Some` for the standalone child (readiness confirmed); `None` for distributed children.
+    pub ready: Option<bool>,
 }
 
 // This type is filled out together with coordinator promotion below; keeping transport lifecycle
@@ -1102,7 +960,9 @@ impl IntoResponse for ControlHttpError {
 fn effect_requires_ack(command: &ControlCommand) -> bool {
     matches!(
         command,
-        ControlCommand::CancelGeneration
+        ControlCommand::Pair { .. }
+            | ControlCommand::PrepareWorker
+            | ControlCommand::CancelGeneration
             | ControlCommand::DistributedReady
             | ControlCommand::Demote
     )
@@ -1133,6 +993,22 @@ macro_rules! control_handler {
 }
 
 control_handler!(control_node, ControlEndpoint::Node, "GET");
+
+async fn control_metrics(
+    State(runtime): State<ProductionClusterRuntime>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ControlHttpError> {
+    let body = runtime.handle_metrics(source, headers).await?;
+    let mut response = Response::new(body.into());
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    Ok(response)
+}
+
 control_handler!(control_pair, ControlEndpoint::Pair, "POST");
 control_handler!(control_prepare, ControlEndpoint::PrepareWorker, "POST");
 control_handler!(control_begin_drain, ControlEndpoint::BeginDrain, "POST");
@@ -1187,10 +1063,13 @@ pub fn detect_cluster_role(
         // SAFETY: current belongs to the live getifaddrs list.
         let entry = unsafe { &*current };
         if !entry.ifa_addr.is_null()
+            // SAFETY: `ifa_addr` is non-null and points to the live getifaddrs entry.
             && unsafe { (*entry.ifa_addr).sa_family } as i32 == libc::AF_INET
         {
+            // SAFETY: `ifa_name` is a valid NUL-terminated interface name in the live list.
             let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
             if name == interface {
+                // SAFETY: the address family was checked as AF_INET above.
                 let socket = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
                 matches.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
                     socket.sin_addr.s_addr,
@@ -1206,7 +1085,10 @@ pub fn detect_cluster_role(
     match matches.as_slice() {
         [address] if *address == coordinator => Ok(LocalRole::Coordinator),
         [address] if *address == worker => Ok(LocalRole::Worker),
-        [] => anyhow::bail!("cluster interface {interface} has no IPv4 address"),
+        // Thunderboltケーブル未接続などでIPv4アドレスが未設定の場合、クラスタ判定は
+        // 保留(Unknown)として扱う。siderostatはstandaloneで動作できる設計であり、起動を失敗させてはならない。
+        // アドレスが複数ある場合のみ設定矛盾としてbailする。
+        [] => Ok(LocalRole::Unknown),
         _ => anyhow::bail!(
             "cluster interface {interface} has conflicting IPv4 addresses: {matches:?}"
         ),
@@ -1222,9 +1104,212 @@ pub fn detect_cluster_role(
     anyhow::bail!("production cluster role detection requires macOS")
 }
 
+/// IPv4 addresses and link state observed on an interface via `getifaddrs`.
+#[cfg(target_os = "macos")]
+struct ObservedInterfaceIpv4 {
+    addresses: Vec<Ipv4Assignment>,
+    up: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn collect_interface_ipv4(interface: &str) -> anyhow::Result<ObservedInterfaceIpv4> {
+    use std::ffi::CStr;
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes a linked list owned until freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut raw) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut up = false;
+    let mut addresses = Vec::new();
+    let mut current = raw;
+    while !current.is_null() {
+        // SAFETY: current belongs to the live getifaddrs list.
+        let entry = unsafe { &*current };
+        // SAFETY: `ifa_name` is a valid NUL-terminated interface name in the live list.
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+        if name == interface {
+            if entry.ifa_flags & libc::IFF_UP as u32 != 0 {
+                up = true;
+            }
+            if !entry.ifa_addr.is_null()
+                // SAFETY: `ifa_addr` is non-null and points to the live getifaddrs entry.
+                && unsafe { (*entry.ifa_addr).sa_family } as i32 == libc::AF_INET
+            {
+                // SAFETY: the address family was checked as AF_INET above.
+                let socket = unsafe { &*(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
+                let address = Ipv4Addr::from(u32::from_be(socket.sin_addr.s_addr));
+                let prefix = if entry.ifa_netmask.is_null() {
+                    0
+                } else {
+                    // SAFETY: the non-null netmask is an IPv4 sockaddr for an AF_INET address.
+                    let mask = unsafe { &*(entry.ifa_netmask.cast::<libc::sockaddr_in>()) };
+                    u32::from_be(mask.sin_addr.s_addr).count_ones() as u8
+                };
+                addresses.push(Ipv4Assignment { address, prefix });
+            }
+        }
+        current = entry.ifa_next;
+    }
+    // SAFETY: raw is the head returned by getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(raw) };
+    addresses.sort_by_key(|a| a.address);
+    addresses.dedup_by_key(|a| a.address);
+    Ok(ObservedInterfaceIpv4 { addresses, up })
+}
+
+/// Build a [`NetworkObservation`] from the live interface state (N-02). Uses only `getifaddrs`
+/// (spec §13.1), never shell output parsing or network configuration changes (N-02 停止条件).
+/// The peer candidate is the configured counterpart; its route is treated as `bridge0`-scoped
+/// when the peer shares a subnet with a local `bridge0` address (fixed topology, spec §13.1
+/// item 6). Fail-closed: if the interface is missing, down, or has no IPv4 address, the service
+/// observation is `None`, which maps to `ServiceMissing`/`InterfaceUnavailable` and never to a
+/// peer-present state.
+#[cfg(target_os = "macos")]
+pub fn observe_network_observation(
+    interface: &str,
+    coordinator: IpAddr,
+    worker: IpAddr,
+    peer_address: IpAddr,
+) -> anyhow::Result<NetworkObservation> {
+    let IpAddr::V4(coordinator) = coordinator else {
+        anyhow::bail!("cluster coordinator address must be IPv4");
+    };
+    let IpAddr::V4(worker) = worker else {
+        anyhow::bail!("cluster worker address must be IPv4");
+    };
+    let IpAddr::V4(peer) = peer_address else {
+        anyhow::bail!("cluster peer address must be IPv4");
+    };
+    let observed = collect_interface_ipv4(interface)?;
+    let service = if !observed.up || observed.addresses.is_empty() {
+        None
+    } else {
+        Some(NetworkServiceObservation {
+            enabled: true,
+            ipv4_enabled: true,
+            configured_addresses: observed.addresses.clone(),
+        })
+    };
+    let interface_observation = InterfaceObservation {
+        name: interface.to_string(),
+        up: observed.up,
+        ipv4_addresses: observed.addresses.clone(),
+    };
+    let route_scoped = observed.addresses.iter().any(|assignment| {
+        let mask = if assignment.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - assignment.prefix)
+        };
+        u32::from(assignment.address) & mask == u32::from(peer) & mask
+    });
+    let peer_observation = PeerObservation {
+        candidate_address: Some(peer),
+        route_scoped_to_interface: route_scoped,
+        authenticated: false,
+    };
+    Ok(NetworkObservation {
+        // The caller (monitor) fills the monotonic epoch per rescan.
+        epoch: 0,
+        expected_interface: interface.to_string(),
+        coordinator_address: coordinator,
+        worker_address: worker,
+        // The initial topology fixes the peer pair on a /30 (spec §13.1). The interface
+        // observation carries the actual netmask-derived prefix for role assessment.
+        expected_prefix: 30,
+        service,
+        interface: Some(interface_observation),
+        peer: peer_observation,
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl ProductionClusterRuntime {
+    /// Start the production network-evidence monitor (N-02 action 1 & 4). Reuses
+    /// `spawn_network_event_monitor` + `MacOsDynamicStoreWatcher` so a fresh observation is
+    /// produced on the initial rescan, after debounced link/ipv4/setup events, and on the
+    /// periodic reconcile interval (recovering lost events). Each rescan assigns a strictly
+    /// increasing epoch; the shared [`NetworkEvidence`] rejects stale observations. The task is
+    /// detached and owns the dynamic-store watcher, living for the process lifetime.
+    fn start_network_evidence_monitor(&self) {
+        let config = &self.inner.config;
+        let evidence = self.inner.network.clone();
+        let interface = config.cluster.interface.clone();
+        let coordinator = config.cluster.coordinator_address;
+        let worker = config.cluster.worker_address;
+        let peer = match self.inner.role {
+            LocalRole::Coordinator => worker,
+            LocalRole::Worker => coordinator,
+            LocalRole::Unknown => return,
+        };
+        let (rescans, mut rescan_receiver) = tokio::sync::mpsc::channel(16);
+        let (handle, monitor_task) = match spawn_network_event_monitor(
+            0,
+            config.cluster.discovery.event_debounce,
+            config.cluster.discovery.reconcile_interval,
+            64,
+            rescans,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(error = %error, "network evidence monitor unavailable");
+                return;
+            }
+        };
+        let watcher = match MacOsDynamicStoreWatcher::start(&interface, handle) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "dynamic store watcher unavailable; network evidence stays fail-closed until reconcile"
+                );
+                None
+            }
+        };
+        // monitor_task (debounce + reconcile) runs independently once started.
+        std::mem::drop(monitor_task);
+        tokio::spawn(async move {
+            // Keep the dynamic-store watcher alive for the lifetime of the monitor task.
+            let _watcher = watcher;
+            let mut epoch: u64 = 0;
+            while let Some(request) = rescan_receiver.recv().await {
+                epoch = epoch.saturating_add(1);
+                match observe_network_observation(&interface, coordinator, worker, peer) {
+                    Ok(mut observation) => {
+                        observation.epoch = epoch;
+                        let snapshot = NetworkSnapshot::from_observation(&observation);
+                        if evidence.update(snapshot) {
+                            tracing::debug!(
+                                reason = ?request.reason,
+                                epoch,
+                                state = ?snapshot.state,
+                                "network evidence updated"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "network observation failed; evidence stays fail-closed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ProductionClusterRuntime {
+    /// Non-macOS has no network evidence provider; the shared evidence stays fail-closed, which
+    /// is safe (no peer is ever considered route-scoped).
+    fn start_network_evidence_monitor(&self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::{ControlRequest, SignedControlHeaders};
 
     async fn signed_pair(
         State(authenticator): State<Arc<ControlAuthenticator>>,
@@ -1261,6 +1346,28 @@ mod tests {
             },
             lease_expires_at_millis: Some(now_millis() + 1_000),
         }))
+    }
+
+    async fn signed_metrics(
+        State(authenticator): State<Arc<ControlAuthenticator>>,
+        ConnectInfo(source): ConnectInfo<SocketAddr>,
+        headers: HeaderMap,
+    ) -> Result<Response, ControlHttpError> {
+        let signed = SignedControlHeaders::from_header_values(
+            header(&headers, HEADER_NODE)?,
+            header(&headers, HEADER_TIMESTAMP)?,
+            header(&headers, HEADER_NONCE)?,
+            header(&headers, HEADER_SIGNATURE)?,
+        )?;
+        ControlRequest {
+            method: "GET",
+            path_and_query: CONTROL_METRICS_PATH,
+            body: &[],
+            source_ip: source.ip(),
+            headers: &signed,
+        }
+        .authenticate(&authenticator, now_millis())?;
+        Ok((StatusCode::OK, "coordinator metrics").into_response())
     }
 
     #[tokio::test]
@@ -1315,12 +1422,69 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn metrics_client_uses_the_authenticated_control_path() {
+        let secret = vec![0x62; 32];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/v1/metrics", get(signed_metrics))
+            .with_state(Arc::new(ControlAuthenticator::new_at_source(
+                ControlSecret::new(secret.clone()).unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            )));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ProductionControlClient::new(
+            "worker-node".into(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            port,
+            secret,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(client.metrics().await.unwrap(), "coordinator metrics");
+        server.abort();
+    }
+
     #[test]
-    fn destructive_worker_effects_are_acknowledged_after_completion() {
+    fn lifecycle_effects_are_acknowledged_after_completion() {
+        assert!(effect_requires_ack(&ControlCommand::Pair {
+            descriptor: NodeDescriptor {
+                protocol_version: 1,
+                node_id: "coordinator-node".into(),
+                role: ControlRole::Coordinator,
+                generation: 1,
+                mode: super::super::ControlMode::SoloStandalone,
+                deployment_id: Some("deployment-production".into()),
+            },
+        }));
+        assert!(effect_requires_ack(&ControlCommand::PrepareWorker));
         assert!(effect_requires_ack(&ControlCommand::Demote));
         assert!(effect_requires_ack(&ControlCommand::CancelGeneration));
         assert!(effect_requires_ack(&ControlCommand::DistributedReady));
-        assert!(!effect_requires_ack(&ControlCommand::PrepareWorker));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
     }
+}
+
+/// Test-support only: timestamps of the phases in one [`ProductionClusterRuntime::pair`]
+/// session, captured to measure whether confirm completes before the stability sleep expires
+/// (Q-01). Never contains secrets, nonces, or request bodies.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy)]
+pub struct PairTiming {
+    pub offer_sent_at: u64,
+    pub confirm_received_at: u64,
+    pub lease_established_at: u64,
+    pub stability_achieved_at: u64,
+    pub pairing_ready_at: u64,
 }

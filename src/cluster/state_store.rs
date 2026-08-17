@@ -52,6 +52,12 @@ pub struct PersistentChild {
 pub struct PersistentClusterState {
     pub schema_version: u32,
     pub generation: u64,
+    /// Control session generation (P0-B, `docs/control-session-negotiation.md` §7). Kept
+    /// separate from the cluster `generation` so a negotiated session survives a restart.
+    /// `#[serde(default)]` lets older schema-version-1 state files (without this field) still
+    /// load; callers fall back to the cluster generation when absent.
+    #[serde(default)]
+    pub control_session_generation: u64,
     pub desired_mode: PersistentMode,
     pub last_stable_mode: PersistentMode,
     pub cluster_state: String,
@@ -159,6 +165,13 @@ impl StateStore {
         if let Err(error) = state.validate() {
             return Err(self.preserve_corrupt(error.to_string())?);
         }
+        // G-03 / design §7: an older fixture that predates the control session generation field
+        // loads with the default 0; normalize it up to the cluster generation so the session
+        // never starts lower than the persisted cluster generation.
+        let state = PersistentClusterState {
+            control_session_generation: state.control_session_generation.max(state.generation),
+            ..state
+        };
         *self
             .last_generation
             .lock()
@@ -180,7 +193,9 @@ impl StateStore {
                 current,
             });
         }
-        let parent = self.path.parent().expect("validated state parent");
+        let parent = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent")
+        })?;
         let temporary = sibling_path(&self.path, "tmp");
         let bytes = serde_json::to_vec_pretty(state)?;
         let mut file = OpenOptions::new()
@@ -259,6 +274,7 @@ mod tests {
         PersistentClusterState {
             schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
             generation,
+            control_session_generation: generation,
             desired_mode: PersistentMode::SoloStandalone,
             last_stable_mode: PersistentMode::SoloStandalone,
             cluster_state: "solo-standalone-ready".into(),
@@ -291,6 +307,48 @@ mod tests {
         ));
         assert_eq!(store.load().unwrap().unwrap(), state(8));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn control_session_generation_round_trips_and_older_fixture_defaults_to_cluster_generation() {
+        // G-03 / design §7: control session generation is a separate persisted field. It
+        // round-trips through save/load, and an older schema-version-1 fixture that omits the
+        // field (added with #[serde(default)]) still loads, defaulting to the cluster
+        // generation so the session never drops below the persisted cluster generation.
+        let path = temporary_state_path();
+        let store = StateStore::acquire(&path).unwrap();
+
+        let mut negotiated = state(4);
+        negotiated.control_session_generation = 102;
+        store.save(&negotiated).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.generation, 4, "cluster generation is preserved");
+        assert_eq!(
+            loaded.control_session_generation, 102,
+            "control session generation is preserved separately"
+        );
+
+        // Older fixture without the field: still loads through StateStore::load(), which
+        // normalizes the absent field (serde default 0) up to the cluster generation.
+        let legacy_path = temporary_state_path();
+        let legacy_store = StateStore::acquire(&legacy_path).unwrap();
+        let old_json = serde_json::to_string(&state(4)).unwrap();
+        let without_field = serde_json::from_str::<serde_json::Value>(&old_json).unwrap();
+        let without_field = without_field.as_object().unwrap().clone();
+        let without_field = without_field
+            .into_iter()
+            .filter(|(key, _)| key != "control_session_generation")
+            .collect::<serde_json::Map<_, _>>();
+        fs::write(&legacy_path, serde_json::to_vec(&without_field).unwrap()).unwrap();
+        let legacy = legacy_store.load().unwrap().unwrap();
+        assert_eq!(legacy.generation, 4);
+        assert_eq!(
+            legacy.control_session_generation, 4,
+            "missing field defaults to the cluster generation"
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(legacy_path.parent().unwrap()).unwrap();
     }
 
     #[test]

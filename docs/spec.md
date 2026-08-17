@@ -231,7 +231,7 @@ Peer presentは次をすべて満たす状態とする。
 
 ICMP echoだけでpeer presentと判定しない。
 
-Peer presentになったら、distributed compatibilityの成否にかかわらずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed MXFP4へのpromotionを試みる。不一致ならPaired Standaloneを維持する。
+Peer presentになったら、まずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed MXFP4へのpromotionを試みる。自動修復できないdeployment不一致を検出した場合は、両nodeをSolo Standaloneへ収束させ、同じ原因による自動pairingの再試行を止める。
 
 ## 10. HTTP reverse proxy contract
 
@@ -344,7 +344,7 @@ X-DS4-Peer-Proxy-Token: <secret>
 X-DS4-Proxy-Hop: 1
 ```
 
-- Tokenは32 random bytes以上、mode `0600` のfileから読む。
+- Tokenは32 random bytes以上の生バイト列をmode `0600`のfileから読む。SSH秘密鍵やPEMではない。
 - Coordinatorはconstant-timeで比較する。
 - Hopが1以外、token不正、source IP不一致を403で拒否する。
 - Peer ingressはtoken headerをlocal DS4へ転送しない。
@@ -434,7 +434,7 @@ coordinator:
 
 Worker requestはcoordinator peer ingressでもcountされるため、coordinator側in-flight=0がDS4に到達中の全requestの最終根拠となる。Worker ackは新しいrequestを生成しない保証として使う。
 
-Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。`allow_sigkill=false` ならmanual intervention、trueならidentity確認済みowned childだけをSIGKILLできる。
+Drain timeoutを超えた場合、進行中requestを別modelで再実行しない。既定ではidentity確認済みowned childだけをSIGKILLできる。`allow_sigkill=false` ならmanual intervention。
 
 ## 13. Node roleとnetwork
 
@@ -669,7 +669,7 @@ Standalone manifestはlocal childのidentity、設定drift、診断に使用す�
 
 ### 15.3 Compatibility
 
-Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。1つでも不一致/不明ならPaired Standaloneを維持する。
+Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。deployment mismatch（control planeのHTTP 412）を検出した場合はpromotionを拒否し、両nodeをSolo Standaloneへ収束させる。自動pairingはoperator reconcileまたはruntime再起動まで再試行しない。
 
 Binary digestはnode-local child identityと未知rebuildの検出に引き続き使用するが、cross-nodeでのbyte-for-byte一致は要求しない。`-mcpu=native`等による機種別binaryを承認集合へ追加するには、そのdigest pair、full source commit、wire schema、対象model/topologyでactual acceptanceを完了してcompatibility recordへ記録する。Source commitや自己申告のwire schemaだけで未知binaryを自動承認してはならない。
 
@@ -702,7 +702,9 @@ NONCE + "\n" +
 LOWERCASE_HEX_SHA256(BODY)
 ```
 
-- Secretは32 random bytes以上、mode `0600` file。
+- Secret/token fileは32 random bytes以上の生バイト列、mode `0600`。標準のcanonical file名は
+  拡張子なしの`cluster-control`、`peer-proxy`、`admin`とする。既存の`.key` fileはinstall時の
+  移行対象として扱ってよい。
 - Constant-timeで署名比較。
 - Clock skew 30秒以内。
 - Nonceを5分保持してreplay拒否。
@@ -714,6 +716,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | Method | Path | 用途 |
 |---|---|---|
 | `GET` | `/v1/node` | node descriptor、mode、deployment、lease |
+| `GET` | `/v1/metrics` | 認証済み peer から coordinator の Prometheus metrics を取得 |
 | `POST` | `/v1/pair` | Paired Standalone形成 |
 | `POST` | `/v1/prepare-worker` | MXFP4 worker準備 |
 | `POST` | `/v1/begin-drain` | cluster-wide drain開始 |
@@ -723,7 +726,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | `POST` | `/v1/distributed-ready` | complete route成立後にworker admissionを再開 |
 | `POST` | `/v1/demote` | Paired/Solo Standaloneへの復帰要求 |
 
-同一generationの再送はidempotent。古いgenerationは409、deployment不一致は412。`GET /v1/node` はDS4 inference health queryではなく、process membershipとcluster stateだけを返す。
+同一generationの再送はidempotent。古いgenerationは409、deployment不一致は412。`GET /v1/node` はDS4 inference health queryではなく、process membershipとcluster stateだけを返す。`GET /v1/metrics` は coordinator の role だけが応答し、認証済み worker からの read-only request に限定する。control plane の source IP、node ID、HMAC、nonce を検証し、route が bridge0 に scoped でない場合は拒否する。
 
 ### 16.4 Lease
 
@@ -867,6 +870,8 @@ Peer lease/linkが失われた場合：
 - Workerはpublic admissionをBlockしlocal standaloneを起動後、targetをLocalStandaloneへ変更してSoloStandaloneReady。
 - Peer通知不能でもlocal recoveryを妨げない。
 
+Distributed deploymentの不一致を検出した場合も同じlocal recoveryを実行する。この場合はSoloStandaloneReadyへの遷移後も失敗理由を保持し、ユーザーへ構成不一致と自動pairing停止を通知する。原因を解消した後、operator reconcileまたはruntime再起動で自動pairingを再開する。
+
 ### 18.6 Failure/backoff
 
 同一原因のpromotion失敗が3回連続したらauto promotionを止める。Standalone upstreamがreadyならproxyはServingを継続し、cluster stateだけManualInterventionRequiredとする。Operator reconcileまで再試行しない。
@@ -904,17 +909,28 @@ MXFP4 model mapは遅いためstartupより短いHELLO timeoutを設定しない
 - PID、canonical executable、argv hash、profile、generation、spawn timestampを保存する。
 - Process一覧のsubstring検索でidentityを決めない。
 - PIDだけを信用しない。
-- Unknown processへsignalしない。
+- Unknown processへ無条件にsignalしない。起動時に `siderostat` / `ds4-server` の既存processを
+  検出した場合は、macOSの右上通知（警告音付き）で簡潔に再起動を通知し、既定5秒後に
+  起動時cleanupの対象にする。拒否は `startup_cleanup.auto_restart = false` または
+  `--decline-startup-cleanup` で明示する。
 
 ### 20.2 Recovery
 
-Proxy再起動時、macOS process APIでexecutable、argv、start timeを照合する。完全一致したowned childだけを再所有または停止対象にする。Unknown processが必要portを占有する場合はManualInterventionRequired。
+Proxy再起動時、macOS process APIでexecutable、argv、start timeを照合する。完全一致したowned childだけを
+自動で再所有または停止対象にする。起動直前には同一ホストの `siderostat` / `ds4-server` を列挙し、
+既存versionや外部launcher由来のprocessも候補にする。既定では簡潔な通知後5秒でcleanupを実行する。
+`startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` の場合は起動せず、
+ManualInterventionRequired相当で停止する。通知を表示できない場合も既定の5秒動作は変えず、warnログを残す。
+必要portを未知processが占有していても、cleanup対象としてidentityを再確認できない場合はsignalしない。
 
 ### 20.3 Signal
 
 - 通常停止はSIGTERM。
 - Drain完了後にsignalする。
-- Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。
+- Stop timeout後のSIGKILLは既定で許可するが、identityを直前に再確認できたowned childだけを対象とする。`allow_sigkill=false` ならmanual intervention。
+- 起動時cleanupは、5秒通知後の既定動作または明示的な拒否オプションとして扱う。
+  SIGTERM/SIGKILLの各直前にPID、executable、argv hash、start timeを再確認し、通常のprocess groupではなく
+  候補process自身へsignalする。
 - Exit statusを必ず回収する。
 
 ### 20.4 Log event
@@ -979,11 +995,11 @@ schema_version = 2
 public_listen = "127.0.0.1:18080"
 admin_listen = "127.0.0.1:18081"
 request_body_limit_bytes = 33554432
-max_in_flight = 1
+max_in_flight = 2
 
 [proxy.timeouts]
 connect = "5s"
-response_headers = "60s"
+response_headers = "3600s"
 first_body_byte = "300s"
 stream_idle = "300s"
 
@@ -1007,9 +1023,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -1039,7 +1055,7 @@ binary = "$HOME/LLM/ds4/ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 [ds4.dspark]
 enabled = true
@@ -1073,6 +1089,13 @@ extra_args = ["--debug"]
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true
+
+[startup_cleanup]
+auto_restart = true
 ```
 
 Worker nodeは `cluster.node_id` とnode固有pathだけを変更する。Roleはinterface addressから決定し、設定で直接指定しない。
@@ -1142,6 +1165,7 @@ Loopback `127.0.0.1:18081` default。
 | `GET` | `/readyz` | current target readiness |
 | `GET` | `/cluster` | role、mode、state、generation、target、lease、child、Thunderbolt IP/discovery状態、active standalone profile ID/model variant/residency |
 | `GET` | `/metrics` | Prometheus text |
+| `GET` | `/metrics/coordinator` | worker が control plane 経由で取得した coordinator の Prometheus text |
 | `POST` | `/cluster/reconcile` | observed stateをdesired stateへ収束 |
 | `POST` | `/cluster/pair` | Paired Standaloneを要求 |
 | `POST` | `/cluster/promote` | MXFP4 promotion要求 |
@@ -1293,6 +1317,22 @@ ds4_proxy_cluster_child_restarts_total{profile,reason}
 ds4_proxy_standalone_profile_info{node_id,model_variant,residency}
 ds4_proxy_cluster_hello_total{result,reason}
 ds4_proxy_cluster_deployment_mismatch_total{field}
+ds4_proxy_ds4_prefill_active
+ds4_proxy_ds4_prefill_current
+ds4_proxy_ds4_prefill_total
+ds4_proxy_ds4_prefill_percent
+ds4_proxy_ds4_prefill_cached
+ds4_proxy_ds4_prefill_chunk_tps
+ds4_proxy_ds4_prefill_avg_tps
+ds4_proxy_ds4_prefill_elapsed_seconds
+ds4_proxy_ds4_kv_cache_hits_total
+ds4_proxy_ds4_kv_cache_hit_tokens
+ds4_proxy_ds4_kv_cache_load_ms
+ds4_proxy_ds4_generation_active
+ds4_proxy_ds4_generation_completion
+ds4_proxy_ds4_generation_chunk_tps
+ds4_proxy_ds4_generation_avg_tps
+ds4_proxy_ds4_generation_elapsed_seconds
 ```
 
 `model_variant` と `residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない。
@@ -1308,7 +1348,9 @@ ds4_proxy_cluster_deployment_mismatch_total{field}
 - DS4 HTTPはloopbackだけ。
 - Shellを介してchildをspawnしない。
 - Config argvを1要素ずつ `Command::arg` へ渡す。
-- Unknown processをkillしない。
+- Unknown processを無条件ではkillしない。起動時は簡潔な通知と5秒の既定猶予を置き、拒否指定がない場合だけ
+  signal直前のidentity再確認後にcleanupする。拒否は `startup_cleanup.auto_restart = false` または
+  `--decline-startup-cleanup` で指定する。
 - Model fingerprint時にregular file/canonical pathを確認。
 - Admin mutationはtoken必須。
 - Prompt/body/tokenをlogしない。
@@ -1415,7 +1457,7 @@ persistence.rs（cluster state_storeへ置換）
 | Unauthenticated Bonjour result | candidate破棄、current mode維持 |
 | peer control HMAC不正 | request拒否、Solo/Paired current mode維持 |
 | peer proxy token不正 | peer ingress 403 |
-| deployment mismatch | Paired Standalone、MXFP4 promotion禁止 |
+| deployment mismatch | Solo Standaloneへ収束、MXFP4 promotion禁止、自動pairing停止 |
 | manifest stale | Paired Standalone、再fingerprint要求 |
 | HELLO timeout | MXFP4 worker停止、Paired Standalone、backoff |
 | unknown HELLO/log schema | promotion拒否、Paired Standalone |
@@ -1467,7 +1509,7 @@ persistence.rs（cluster state_storeへ置換）
 2. Peer認証後、workerをdrainしてPaired Standalone。
 3. Worker public requestがcoordinator peer ingress経由でlocal standaloneへ届く。
 4. Peer ingressがinvalid token/hop/sourceを拒否。
-5. Paired Standaloneでdeployment mismatchでもstandalone service継続。
+5. deployment mismatchでは構成不一致を通知し、両nodeがSolo Standaloneへ収束してstandalone serviceを継続する。
 6. Compatible deploymentで実HELLO受信。
 7. Cluster-wide drain中、新規requestは503、既存streamは完走。
 8. Coordinator側in-flight=0までDS4を停止しない。
@@ -1555,7 +1597,7 @@ persistence.rs（cluster state_storeへ置換）
 
 ### 33.4 Safety/operations
 
-- [ ] Unknown processへsignalしない。
+- [ ] Unknown processは無承認でsignalせず、起動時の候補提示・operator承認・signal直前のidentity再確認を行う。
 - [ ] Secret/body/session IDをlogしない。
 - [ ] Admin mutation token必須。
 - [ ] State atomic recovery。

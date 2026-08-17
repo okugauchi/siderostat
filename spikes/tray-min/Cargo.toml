@@ -1,0 +1,12 @@
+[package]
+name = "tray-min"
+version = "0.1.0"
+edition = "2024"
+description = "minimal macOS tray-icon experiment"
+
+[dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+tray-icon = "0.24"
+
+[workspace]

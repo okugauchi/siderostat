@@ -45,6 +45,36 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub sound: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: cfg!(target_os = "macos"),
+            sound: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupCleanupConfig {
+    /// Automatically stop detected stale processes after the startup notification countdown.
+    /// Set to false when an operator wants startup cleanup to be declined by default.
+    pub auto_restart: bool,
+}
+
+impl Default for StartupCleanupConfig {
+    fn default() -> Self {
+        Self { auto_restart: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeAwareConfig {
     pub schema_version: u32,
@@ -52,6 +82,10 @@ pub struct ModeAwareConfig {
     pub cluster: ClusterConfig,
     pub ds4: Ds4Config,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub startup_cleanup: StartupCleanupConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,11 +257,30 @@ pub enum ModelVariant {
     Mxfp4,
 }
 
+impl ModelVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            ModelVariant::Q2 => "q2",
+            ModelVariant::Q2Q4 => "q2-q4",
+            ModelVariant::Mxfp4 => "mxfp4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Residency {
     Resident,
     SsdStreaming,
+}
+
+impl Residency {
+    pub fn name(self) -> &'static str {
+        match self {
+            Residency::Resident => "resident",
+            Residency::SsdStreaming => "ssd-streaming",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,87 +452,47 @@ fn validate_dns_sd_name(service_type: &str, domain: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// 各durationを非ゼロ検証する。名前はフィールドパスから生成するため、duration追加時に
+/// 検証名とフィールド参照が二重管理になることはない。
+macro_rules! require_positive_duration {
+    ($config:expr, $($group:ident.$field:ident.$leaf:ident),+ $(,)?) => {
+        $(
+            anyhow::ensure!(
+                !$config.$group.$field.$leaf.is_zero(),
+                concat!(
+                    stringify!($group), ".", stringify!($field), ".", stringify!($leaf),
+                    " must be greater than zero"
+                )
+            );
+        )+
+    };
+}
+
 fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
-    let durations = [
-        ("proxy.timeouts.connect", config.proxy.timeouts.connect),
-        (
-            "proxy.timeouts.response_headers",
-            config.proxy.timeouts.response_headers,
-        ),
-        (
-            "proxy.timeouts.first_body_byte",
-            config.proxy.timeouts.first_body_byte,
-        ),
-        (
-            "proxy.timeouts.stream_idle",
-            config.proxy.timeouts.stream_idle,
-        ),
-        (
-            "cluster.discovery.event_debounce",
-            config.cluster.discovery.event_debounce,
-        ),
-        (
-            "cluster.discovery.reconcile_interval",
-            config.cluster.discovery.reconcile_interval,
-        ),
-        (
-            "cluster.security.max_clock_skew",
-            config.cluster.security.max_clock_skew,
-        ),
-        (
-            "cluster.security.nonce_ttl",
-            config.cluster.security.nonce_ttl,
-        ),
-        (
-            "cluster.policy.required_peer_stability",
-            config.cluster.policy.required_peer_stability,
-        ),
-        (
-            "cluster.policy.route_loss_grace",
-            config.cluster.policy.route_loss_grace,
-        ),
-        (
-            "cluster.policy.promotion_backoff",
-            config.cluster.policy.promotion_backoff,
-        ),
-        (
-            "cluster.timeouts.peer_connect",
-            config.cluster.timeouts.peer_connect,
-        ),
-        (
-            "cluster.timeouts.peer_request",
-            config.cluster.timeouts.peer_request,
-        ),
-        (
-            "cluster.timeouts.control_lease",
-            config.cluster.timeouts.control_lease,
-        ),
-        ("cluster.timeouts.drain", config.cluster.timeouts.drain),
-        ("cluster.timeouts.stop", config.cluster.timeouts.stop),
-        (
-            "cluster.timeouts.rendezvous_hello",
-            config.cluster.timeouts.rendezvous_hello,
-        ),
-        (
-            "cluster.timeouts.worker_startup",
-            config.cluster.timeouts.worker_startup,
-        ),
-        (
-            "cluster.timeouts.coordinator_startup",
-            config.cluster.timeouts.coordinator_startup,
-        ),
-        (
-            "cluster.timeouts.complete_route",
-            config.cluster.timeouts.complete_route,
-        ),
-        (
-            "cluster.timeouts.standalone_startup",
-            config.cluster.timeouts.standalone_startup,
-        ),
-    ];
-    for (name, duration) in durations {
-        anyhow::ensure!(!duration.is_zero(), "{name} must be greater than zero");
-    }
+    require_positive_duration!(
+        config,
+        proxy.timeouts.connect,
+        proxy.timeouts.response_headers,
+        proxy.timeouts.first_body_byte,
+        proxy.timeouts.stream_idle,
+        cluster.discovery.event_debounce,
+        cluster.discovery.reconcile_interval,
+        cluster.security.max_clock_skew,
+        cluster.security.nonce_ttl,
+        cluster.policy.required_peer_stability,
+        cluster.policy.route_loss_grace,
+        cluster.policy.promotion_backoff,
+        cluster.timeouts.peer_connect,
+        cluster.timeouts.peer_request,
+        cluster.timeouts.control_lease,
+        cluster.timeouts.drain,
+        cluster.timeouts.stop,
+        cluster.timeouts.rendezvous_hello,
+        cluster.timeouts.worker_startup,
+        cluster.timeouts.coordinator_startup,
+        cluster.timeouts.complete_route,
+        cluster.timeouts.standalone_startup,
+    );
     anyhow::ensure!(
         config.cluster.timeouts.rendezvous_hello >= config.cluster.timeouts.worker_startup,
         "cluster.timeouts.rendezvous_hello must not be shorter than worker_startup"
@@ -861,6 +874,38 @@ fn parse_duration(value: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// 検証テスト用: 指定したドット区切りパスのdurationをゼロにする。
+#[cfg(test)]
+fn zero_duration_at(config: &mut ModeAwareConfig, path: &str) {
+    let duration = match path {
+        "proxy.timeouts.connect" => &mut config.proxy.timeouts.connect,
+        "proxy.timeouts.response_headers" => &mut config.proxy.timeouts.response_headers,
+        "proxy.timeouts.first_body_byte" => &mut config.proxy.timeouts.first_body_byte,
+        "proxy.timeouts.stream_idle" => &mut config.proxy.timeouts.stream_idle,
+        "cluster.discovery.event_debounce" => &mut config.cluster.discovery.event_debounce,
+        "cluster.discovery.reconcile_interval" => &mut config.cluster.discovery.reconcile_interval,
+        "cluster.security.max_clock_skew" => &mut config.cluster.security.max_clock_skew,
+        "cluster.security.nonce_ttl" => &mut config.cluster.security.nonce_ttl,
+        "cluster.policy.required_peer_stability" => {
+            &mut config.cluster.policy.required_peer_stability
+        }
+        "cluster.policy.route_loss_grace" => &mut config.cluster.policy.route_loss_grace,
+        "cluster.policy.promotion_backoff" => &mut config.cluster.policy.promotion_backoff,
+        "cluster.timeouts.peer_connect" => &mut config.cluster.timeouts.peer_connect,
+        "cluster.timeouts.peer_request" => &mut config.cluster.timeouts.peer_request,
+        "cluster.timeouts.control_lease" => &mut config.cluster.timeouts.control_lease,
+        "cluster.timeouts.drain" => &mut config.cluster.timeouts.drain,
+        "cluster.timeouts.stop" => &mut config.cluster.timeouts.stop,
+        "cluster.timeouts.rendezvous_hello" => &mut config.cluster.timeouts.rendezvous_hello,
+        "cluster.timeouts.worker_startup" => &mut config.cluster.timeouts.worker_startup,
+        "cluster.timeouts.coordinator_startup" => &mut config.cluster.timeouts.coordinator_startup,
+        "cluster.timeouts.complete_route" => &mut config.cluster.timeouts.complete_route,
+        "cluster.timeouts.standalone_startup" => &mut config.cluster.timeouts.standalone_startup,
+        _ => unreachable!("unknown duration path {path}"),
+    };
+    *duration = Duration::ZERO;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,9 +947,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -934,7 +979,7 @@ binary = "$HOME/LLM/ds4/ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 [ds4.dspark]
 enabled = true
@@ -968,6 +1013,13 @@ extra_args = ["--debug"]
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true
+
+[startup_cleanup]
+auto_restart = true
 "#
     }
 
@@ -1003,9 +1055,11 @@ level = "info"
             config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
             config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
             config.ds4.mxfp4.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
-            config.cluster.security.control_secret_file = self.file("control.key", &[1; 32], 0o600);
-            config.cluster.security.peer_proxy_token_file = self.file("peer.key", &[2; 32], 0o600);
-            config.cluster.security.admin_token_file = self.file("admin.key", &[3; 32], 0o600);
+            config.cluster.security.control_secret_file =
+                self.file("cluster-control", &[1; 32], 0o600);
+            config.cluster.security.peer_proxy_token_file =
+                self.file("peer-proxy", &[2; 32], 0o600);
+            config.cluster.security.admin_token_file = self.file("admin", &[3; 32], 0o600);
             config.cluster.state_path = self.root.join("cluster-state.json");
             config.cluster.manifest_cache_dir = self.root.join("manifests");
             config.ds4.standalone.kv_disk_dir = self.root.join("standalone-kv");
@@ -1047,6 +1101,25 @@ level = "info"
             config.cluster.timeouts.rendezvous_hello,
             Duration::from_secs(900)
         );
+        assert!(config.notifications.enabled);
+        assert!(config.notifications.sound);
+        assert!(config.startup_cleanup.auto_restart);
+    }
+
+    #[test]
+    fn notifications_section_defaults_are_backward_compatible() {
+        let input =
+            mode_aware_config().replace("[notifications]\nenabled = true\nsound = true\n", "");
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert_eq!(config.notifications.enabled, cfg!(target_os = "macos"));
+        assert!(config.notifications.sound);
+    }
+
+    #[test]
+    fn startup_cleanup_defaults_are_backward_compatible() {
+        let input = mode_aware_config().replace("[startup_cleanup]\nauto_restart = true\n", "");
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert!(config.startup_cleanup.auto_restart);
     }
 
     #[test]
@@ -1273,10 +1346,6 @@ level = "info"
     #[test]
     fn rejects_zero_or_inconsistent_timeouts() {
         let files = ConfigTestFiles::new();
-        let mut zero = files.config();
-        zero.proxy.timeouts.connect = Duration::ZERO;
-        assert!(zero.validate().unwrap_err().to_string().contains("connect"));
-
         let mut inconsistent = files.config();
         inconsistent.cluster.timeouts.rendezvous_hello = Duration::from_secs(1);
         assert!(
@@ -1286,6 +1355,43 @@ level = "info"
                 .to_string()
                 .contains("rendezvous_hello")
         );
+    }
+
+    #[test]
+    fn rejects_every_duration_at_zero_with_dotted_path() {
+        let files = ConfigTestFiles::new();
+        let paths = [
+            "proxy.timeouts.connect",
+            "proxy.timeouts.response_headers",
+            "proxy.timeouts.first_body_byte",
+            "proxy.timeouts.stream_idle",
+            "cluster.discovery.event_debounce",
+            "cluster.discovery.reconcile_interval",
+            "cluster.security.max_clock_skew",
+            "cluster.security.nonce_ttl",
+            "cluster.policy.required_peer_stability",
+            "cluster.policy.route_loss_grace",
+            "cluster.policy.promotion_backoff",
+            "cluster.timeouts.peer_connect",
+            "cluster.timeouts.peer_request",
+            "cluster.timeouts.control_lease",
+            "cluster.timeouts.drain",
+            "cluster.timeouts.stop",
+            "cluster.timeouts.rendezvous_hello",
+            "cluster.timeouts.worker_startup",
+            "cluster.timeouts.coordinator_startup",
+            "cluster.timeouts.complete_route",
+            "cluster.timeouts.standalone_startup",
+        ];
+        for path in paths {
+            let mut config = files.config();
+            zero_duration_at(&mut config, path);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{path} must be greater than zero")),
+                "expected {path} to be validated, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1366,5 +1472,15 @@ level = "info"
                     .contains("must not override generated option")
             );
         }
+    }
+
+    #[test]
+    fn enum_names_are_stable_metric_labels() {
+        assert_eq!(ModelVariant::Q2.name(), "q2");
+        assert_eq!(ModelVariant::Q2Q4.name(), "q2-q4");
+        assert_eq!(ModelVariant::Mxfp4.name(), "mxfp4");
+
+        assert_eq!(Residency::Resident.name(), "resident");
+        assert_eq!(Residency::SsdStreaming.name(), "ssd-streaming");
     }
 }

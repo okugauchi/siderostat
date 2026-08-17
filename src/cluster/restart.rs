@@ -165,6 +165,7 @@ mod tests {
         let state = PersistentClusterState {
             schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
             generation: 9,
+            control_session_generation: 9,
             desired_mode: PersistentMode::SoloStandalone,
             last_stable_mode: PersistentMode::SoloStandalone,
             cluster_state: "solo-standalone-ready".into(),

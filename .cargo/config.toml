@@ -1,0 +1,6 @@
+# cargo xtask alias: `cargo xtask <command>` runs the xtask runner.
+[alias]
+xtask = "run --package xtask --"
+
+# Tests use the Rust test harness' normal parallel scheduling. The production
+# reconnect harness allocates loopback ports and fake child lifecycles per test.

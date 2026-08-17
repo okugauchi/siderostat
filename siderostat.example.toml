@@ -5,7 +5,7 @@
 # - Every secret/token file must contain 32+ bytes with mode 0600; the three files and values differ.
 # - The control secret and peer proxy token values are each shared between the two nodes. The admin
 #   token is node-local.
-# Replace every PLACEHOLDER and fill the secret files before running `siderostat serve --config ...`.
+# Replace every placeholder and fill the secret files before running `siderostat serve --config ...`.
 # On a worker node, change only cluster.node_id and the node-specific paths; role is derived from the
 # interface address, never set directly.
 schema_version = 2
@@ -14,13 +14,13 @@ schema_version = 2
 public_listen = "127.0.0.1:18080"
 admin_listen = "127.0.0.1:18081"
 request_body_limit_bytes = 33554432
-max_in_flight = 1
+max_in_flight = 2
 
 [proxy.timeouts]
 connect = "5s"
-response_headers = "60s"
-first_body_byte = "300s"
-stream_idle = "300s"
+response_headers = "3600s"
+first_body_byte = "1200s"
+stream_idle = "1200s"
 
 [cluster]
 enabled = true
@@ -42,9 +42,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -91,22 +91,31 @@ model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standal
 checkpoint = "flash-0731"
 model_variant = "q2-q4"
 residency = "resident"
-context_size = 262144
+context_size = 384000
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
-kv_disk_space_mb = 262144
+kv_disk_space_mb = 131072
 extra_args = []
 
 [ds4.mxfp4]
 model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
-context_size = 262144
+context_size = 384000
 coordinator_layers = "0:19"
 worker_layers = "20:output"
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/distributed/mxfp4-0731"
-kv_disk_space_mb = 262144
+kv_disk_space_mb = 131072
 extra_args = ["--debug"]
 
 [logging]
 format = "json"
 level = "info"
+
+[notifications]
+enabled = true
+sound = true
+
+[startup_cleanup]
+# When stale siderostat/ds4-server processes are found, notify and restart after 5 seconds.
+# Set false to decline cleanup by default.
+auto_restart = true

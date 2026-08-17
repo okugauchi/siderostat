@@ -1,151 +1,147 @@
-# siderostat
+# Siderostat
 
-siderostat は、DS4のHTTP endpointを透過的にstreaming中継し、単一nodeのstandalone実行と、2 nodeのThunderbolt直結によるMXFP4 distributed実行を、ひとつのsupervisorで管理するRust製のmode-aware reverse proxy / cluster supervisorです。
+Siderostat は、DwarfStar が提供する推論サーバー `ds4-server` が稼働する2台の Apple シリコン搭載 Mac を Thunderbolt 5 で接続することで、分散推論クラスタを簡易に構成できるソフトウェアです。OpenAI 互換 API クライアントからの要求を受け付け、Thunderbolt ケーブルの接続状態に応じて転送を変更できるプロキシサーバーとして動作します。
 
-転送先はmodeだけで一意に決まります。負荷やsession IDで変更しません。公開proxy processとlisten portは、standalone / distributedのmode切替中も維持されます。
+主なユースケースとしては、MacBook Pro と Mac Studio の連携です。例えば、外出中は MacBook Proを持ち歩き、DeepSeek V4 Flash の Q2-Q4 量子化モデルでタスクを実施します。帰宅後は、あらかじめ導入・認証・モデル配置済の Mac Studio と MacBook Pro を Thunderbolt 5 ケーブルで接続するだけで、Siderostat が2台を認識し、DeepSeek V4 Flash の MXFP4 量子化モデルによる分散推論へ切り替え、夜間バッチ処理などの計算資源として利用します。再び外出するときにケーブルを外せば、MacBook Pro は単独稼働へ戻り、Q2-Q4 量子化モデルでタスクを実施できます。Mac Studio を手動で選択したり、推論の接続先を変更する必要はありません。
+
+> [!NOTE]
+> Siderostat が `ds4-server` で動作確認しているモデルは DeepSeek V4 Flash だけです。GLM 5.2 などの他のモデルは対象外です。
+
+> [!NOTE]
+> 対応する構成は、Thunderbolt Bridge で接続した2台構成だけです。3台以上の構成や、任意の台数で構成する分散処理には対応していません。
+
 
 ## 主な機能
 
-- OpenAI互換pathと未知pathの透過streaming中継（bodyをbufferしない）
-- 3 mode: Solo Standalone、Paired Standalone、Distributed MXFP4
-- peer不在時はlocal standalone profileへ転送し、peer存在時はcoordinatorへ集約
-- standalone profileとしてQ2、Q2-Q4、MXFP4を選択でき、resident常駐またはDS4のSSD streamingを利用
-- resident StandaloneでDSpark support GGUFを型付き設定し、fingerprintと実activation logをfail closedで検証
-- compatibleなpeerが揃った場合、実DS4 worker HELLOとcomplete route確認の後、MXFP4 distributedへ自動昇格
-- worker/route喪失時にstandalone profileへ自動降格
-- standaloneとdistributedのKV cacheを分離
-- proxy admissionとDS4 process drainを連動し、mode切替時に新規admissionを閉じる
-- DS4 source/protocol contract、承認済みbinary集合、model、checkpoint、argvの互換性をfail closedで検証
-- LaunchAgent、local CLI、構造化log、Prometheus互換metrics、loopback admin APIを提供
-- 外部databaseまたはcluster state serviceなしで動作し、永続化するのはcluster lifecycle stateだけ
+- 各 Mac で `ds4-server` を単独で起動し、推論を提供する
+- 2台の接続、認証、稼働状態を自動的に確認する
+- 2台が Thunderbolt 接続されたとき、分散推論へ自動的に切り替える
+- Thunderbolt 接続や相手ノードに問題が起きたとき、単独稼働へ戻す
+- `ds4-server` の起動、停止、再起動を管理する
+- macOS の通知とメニューバーのモニターで状態や Prefill / Decode の処理速度を表示する
+- 推論本文、認証情報、秘密情報をログに保存しない
 
-## モードとトポロジ
 
-初期topologyはThunderbolt Bridgeで直結した2 nodeだけです。
+## 対応する2台構成
 
-| node | `bridge0` IPv4 | 役割 |
+2台の役割は、IP over Thunderbolt 接続の仮想 Bridge に割り当てた固定 IPv4 アドレスから静的に決まります。接続管理と分散処理の調整を担う協調ノード（以下、コーディネーター）と、分散処理の一部を担う作業ノード（以下、ワーカー）に分かれます。
+
+| 役割 | 主な担当 | Thunderbolt Bridge のアドレス(例) |
 |---|---|---|
-| coordinator | `10.99.0.1` | standalone実行、peer ingress、rendezvous、distributed coordinator |
-| worker | `10.99.0.2` | standalone実行、distributed worker |
+| コーディネーター | 2台の接続管理、分散処理の調整 | `10.99.0.1` |
+| ワーカー | 分散処理の一部を担当 | `10.99.0.2` |
 
-Roleは`bridge0`のIPv4から自動判定します。その他、未設定、競合はunknownとして、cluster listenerを開始しません。Roleはconfigで指定しません。
+役割を設定ファイルへ直接書き込む必要はありません。アドレスが未設定、重複、または想定外の場合は、安全のため2台構成の機能を開始せず、その Mac の単独稼働を維持します。
 
-- クライアントは各nodeのpublic ingress `127.0.0.1:18080`（既定）へ接続します。
-- Solo Standalone: 両nodeとも自身のlocal upstream `127.0.0.1:8000`（既定）へ転送します。
-- Paired Standalone / Distributed MXFP4: workerのrequestはcoordinatorのpeer ingress `10.99.0.1:18082`（既定）へ転送され、coordinatorのupstreamで処理されます。
-- Cluster controlは `10.99.0.1:9920 <-> 10.99.0.2:9920`（既定）。DS4 distributed native protocolはcoordinator `10.99.0.1:9911`（既定）で受けます。
-- DS4 HTTP endpointは両nodeともloopbackにbindし、Thunderbolt Bridgeまたは通常LANへ公開しません。
+## 動作状態
 
-Peer presentは、`bridge0`の期待address、`bridge0` scoped route、HMAC認証済みnode descriptor、有効なcontrol lease、`required_peer_stability`（既定5秒）の継続をすべて満たす状態だけです。Bonjour結果やICMPだけではpeer presentにしません。
+### 単独稼働
 
-## プロファイル
+相手ノードを利用せず、その Mac の `ds4-server` だけで推論します。相手ノードが停止中、Thunderbolt 接続が外れている場合も、この状態でサービスを継続できます。
 
-| standalone profile | residency | DS4起動形態 |
-|---|---|---|
-| Q2 | resident または ssd-streaming | HTTP server |
-| Q2-Q4 | resident または ssd-streaming | HTTP server |
-| MXFP4 | resident または ssd-streaming | HTTP server |
+### 接続済み単独稼働
 
-`ssd-streaming`はDS4の`--ssd-streaming`を意味します。model variantと混同しません。`resident`ではSSD streaming optionを生成しません。Standalone profileはnode固有でよく、coordinatorとworkerのmodel variant、residency、tuning値の一致をpairing条件にしません。
+相手ノードとの接続と認証は完了していますが、分散推論はまだ開始していない状態です。分散処理の準備が整うまでは、安全のため単独稼働を使用します。
 
-DSparkは現行DS4ではresident Standalone限定です。`[ds4.dspark]`の型付き設定から`--mtp`、`--dspark`と任意のconfidence/strictだけを生成します。Support GGUFのSHA-256/sizeはStandalone manifestとchild spawn前に照合し、DS4 activation eventをreadiness期限内に確認できなければ起動を失敗させます。Pathとfull digestはadmin response/logへ出しません。
+### 分散推論
 
-Distributed profileはstandalone profileと独立です。初期実装では`distributed-mxfp4`を使い、coordinatorがHTTP + distributed coordinator、workerがdistributed worker（HTTPなし）です。
+2台の `ds4-server` が協力して、1つの推論を処理する状態です。設定サンプルでは、DeepSeek V4 Flash の MXFP4 モデルを使用します。分散推論へ切り替えられない場合は、単独稼働へ戻ります。
 
-- coordinator layers: `0:19`、worker layers: `20:output`（既定）。gap、overlap、layer 0欠落、output head欠落は拒否します。
-- Distributedに用いる両nodeのMXFP4 content SHA-256を一致させます。
-- Standaloneとdistributedは異なる`--kv-disk-dir`を必須とし、同じGGUFを使う場合も共有しません。
+状態の切り替え中は、新しい要求が一時的に HTTP 503 で拒否されることがあります。切り替えに失敗した要求を、Siderostat が別の状態で自動的に再実行することはありません。
 
-## クイックスタート
+## 導入前に必要なもの
 
-Rust stable（edition 2024）が必要です。実DS4 binaryとmodelを使う準備・検証は [`docs/installation.md`](docs/installation.md) に従います。
+- Apple シリコンを搭載した macOS の Mac 2台
+- 2台を接続する Thunderbolt 5 ケーブル
+- macOS の IP over Thunderbolt 有効化
+- `ds4-server` の実行ファイル
+- DeepSeek V4 Flash のモデルファイル（`download_model.sh` で Hugging Face からダウンロード可能）と対応する `ds4-server` 設定
+- ビルドとインストールのための Rust 安定版実行環境
 
-```bash
-cargo build --release
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+`ds4-server` とモデルの取得元、モデルの対応状況、Mac ごとの実行ファイルの確認方法は、[導入ガイド](docs/installation.md)を参照してください。
+
+## インストール
+
+2台それぞれで行います。モデルを配置したあと、モデルのハッシュ値を一度計算し、 `cargo xtask install` で Siderostat(プロキシサーバー本体)、macOSメニューバー常駐型のモニター、設定ファイル、macOS のログイン起動項目を配置します。
+
+```sh
+cd /path/to/siderostat
+cargo xtask fingerprint-models
+cargo xtask install
 ```
 
-設定はTOMLで、`siderostat.example.toml`が配布用の完全例です。探索順は次のとおりです。
+`cargo xtask install` は、80 GBを超えるGGUFファイルのハッシュ値を再計算するか確認します。既定の回答は再計算しない設定です。モデルを更新・変更した場合は、`cargo xtask fingerprint-models` を再実行してください。
 
-1. `--config PATH`
-2. `SIDEROSTAT_CONFIG`
-3. `./siderostat.toml`
-4. platform既定path
+2台間の `ds4-server` 確認、モデルの配置、秘密情報の共有、分散推論の確認方法は、[導入ガイド](docs/installation.md)に記述しています。インストール後のサービスの起動を同時に行う場合は、 `cargo xtask install --start` を使用します。
 
-Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置します。Control secretとpeer proxy tokenはそれぞれ両nodeで同じ値を使い、admin tokenはnodeごとに生成します。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。`openssl rand`などで生成し、configにはfile pathだけを書きます。
+インストールで作成される主なファイルは次のとおりです。
 
-起動形式です。Subcommandなしは`serve`と同じです。
+- 設定: `~/Library/Application Support/siderostat/config.toml`
+- 秘密情報: `~/Library/Application Support/siderostat/secrets/`
+- メニューバーモニターの設定: `~/monitor.toml`
+- macOS の起動項目: `~/Library/LaunchAgents/`
 
-```bash
-siderostat --config ./node.toml
-# または
-siderostat serve --config ./node.toml
+設定を変更して再読み込みする場合は、導入後に Siderostat を再起動してください。
+
+## 利用と状態確認
+
+アプリケーションからは、次の URL を OpenAI 互換 API の接続先として使用します。
+
+```text
+http://127.0.0.1:18080/v1
 ```
 
-起動後、loopback admin APIで確認します。
+状態確認には、次のコマンドを使用できます。
 
-```bash
+```sh
+siderostat cluster status
+siderostat cluster doctor
 curl --fail --silent http://127.0.0.1:18081/healthz
 curl --fail --silent http://127.0.0.1:18081/readyz
-curl --fail --silent http://127.0.0.1:18081/cluster
-curl --fail --silent http://127.0.0.1:18081/metrics
 ```
 
-CLIのcluster commandはrunning processのadmin API clientであり、別supervisorを起動しません。
+`status` は現在の状態を表示し、`doctor` は推論を受け付けられる状態かを確認します。
+どちらも通常は状態を変更しません。
 
-```bash
-siderostat cluster status
-siderostat cluster status --json
-siderostat cluster doctor
-siderostat cluster doctor --json
-siderostat cluster reconcile
-siderostat cluster pair
-siderostat cluster promote
-siderostat cluster demote
-siderostat cluster demote --reason "operator-requested"
-siderostat cluster restart
-siderostat cluster fingerprint --profile standalone
-siderostat cluster fingerprint --profile distributed
-```
+## 通知とメニューバーモニター
 
-Mutation（pair/promote/demote/restart/fingerprint/reconcile）はloopbackでもadmin token必須です。Status/doctorはread-onlyです。`promote`は実HELLO/compatibility条件を迂回しません。
+メニューバーモニターは、次の情報を表示します。
 
-## セキュリティ
+- 現在の動作状態
+- 入力準備の進行状況と処理速度
+- KV キャッシュの利用状況
+- 生成処理の処理速度
+- 対象ノードが推論を受け付けられるかどうか
 
-- Public/admin listenerはloopback既定。peer ingress/control/DS4 distributedはThunderbolt Bridgeだけにbindします。
-- Peer ingressはsource IP、token、hopを検証します。Control planeはHMAC、timestamp、nonce、source IPを検証します。
-- Admin mutationはtoken必須です。
-- Secret/token fileは32 bytes以上、mode `0600`。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。
-- DS4 childをTokio process APIでspawnし、shellを介しません。Unknown processをkillしません。
-- Model fingerprint時にregular file/canonical pathを確認します。書換可能なsymlinkをmodel pathに使いません。
-- Authorization/API key、request/response body、prompt、session/conversation ID、peer proxy token、HMAC secret、完全model digest/deployment IDをlogしません。
+入力準備と生成処理の速度は、現在進行中の処理に合わせて表示されます。処理完了後に
+最後の値を表示し続けることはありません。
 
-DS4 native distributed trafficとpeer proxy bodyは暗号化されません。専用の物理Thunderbolt linkを信頼境界とします。
+macOS の通知では、単独稼働、2台接続、分散推論、再起動、復旧が必要な状態などを知らせます。
+
+## 安全性と通信範囲
+
+- 利用者向け API と管理 API は、既定ではその Mac 自身からだけ接続できます。
+- `ds4-server` 自体を通常の LAN へ公開しません。
+- 2台間の管理通信と分散処理通信は Thunderbolt Bridge を使用します。
+- 認証用の秘密情報は、SSH 秘密鍵や PEM 形式の鍵ではありません。Siderostat 専用の認証用データです。
+- 推論本文、入力内容、認証情報、完全なハッシュ値はログへ保存しません。
+
+Thunderbolt Bridge 上の分散処理通信は暗号化されないため、専用の物理接続を信頼境界として扱ってください。
 
 ## 制限事項
 
-- standalone/distributed切替中は503の短いwindowがあります。
-- Workerからcoordinatorへのrequestはproxyを2 hop通ります。
-- Peer data/DS4 native trafficは暗号化されません。
-- 2 node固定です。3 node以上の任意topologyは対象外です。
-- Peer discoveryは自動ですが、role addressは`10.99.0.1` / `10.99.0.2`固定で、DHCP based electionは行いません。
-- standalone/distributed間でlive KVを引き継ぎません。mode切替後はtranscriptから再構築します。
-- DS4 log textへの依存があります。
-- MXFP4 SSD streaming on MetalとMXFP4 distributedのproduction可否は、実DS4/modelを使うactual acceptance結果で決めます。
-- 現行DS4はsupport GGUFをdistributed roleでloadしないため、DSparkはMXFP4 Distributedへの昇格中には適用されません。
+- 対応する構成は2台固定です。3台以上の構成には対応していません。
+- 2台の Mac はそれぞれ異なる Apple シリコン世代でも利用できますが、`ds4-server` の実行ファイルとモデル設定が、導入時に確認された互換性条件を満たしている必要があります。
+- 同時に処理できる推論要求数には上限があります。既定では2件まで受け付けますが、モデル、入力の長さ、出力の長さ、Mac のメモリによって処理時間と同時実行の安定性が変わります。
+- 動作状態の切り替え中や `ds4-server` の起動中は、要求が一時的に失敗することがあります。
+- 要求の自動再実行は行いません。HTTP 503 や HTTP 504 を受け取った場合の再試行は、利用するアプリケーション側で判断してください。
 
 ## 関連文書
 
-- [`docs/spec.md`](docs/spec.md): 完全な仕様と受け入れ条件
-- [`docs/installation.md`](docs/installation.md): 実DS4/modelを使う導入ガイド
-- [`docs/operations.md`](docs/operations.md): 運用ガイド（status、doctor、logs、metrics、manual state、restart、rollback）
-- [`docs/troubleshooting.md`](docs/troubleshooting.md): failure symptom別の診断手順
-- [`docs/compatibility/ds4-b030961.md`](docs/compatibility/ds4-b030961.md): v0.1.0 DS4 compatibility記録
-- [`docs/compatibility/security-endurance-2026-08-06.md`](docs/compatibility/security-endurance-2026-08-06.md): security/endurance gate記録
-- [`docs/compatibility/documentation-clean-install-2026-08-10.md`](docs/compatibility/documentation-clean-install-2026-08-10.md): P6-05導入文書検証記録
-- [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md): v0.1.0 release notes
-- [`docs/releases/v0.1.0-acceptance.md`](docs/releases/v0.1.0-acceptance.md): final acceptanceとrelease artifact checksum
-- [`siderostat.example.toml`](siderostat.example.toml): 配布用config例
-- [`contrib/launchd/README.md`](contrib/launchd/README.md): macOS LaunchAgentのinstall/verify/uninstall
+- [導入ガイド](docs/installation.md): `ds4-server`、モデル、2台構成、起動項目の導入
+- [運用ガイド](docs/operations.md): 状態確認、再起動、復旧、ロールバック
+- [トラブルシューティング](docs/troubleshooting.md): 接続、認証、分散推論、起動失敗の確認
+- [メニューバーモニター仕様](docs/menu-bar-monitor-spec.md): 表示内容と設定
+- [詳細仕様](docs/spec.md): 動作条件、通信、互換性、安全性の詳細
+- [開発者向け手順](docs/development.md): ビルド、テスト、静的検査
+- [設定例](siderostat.example.toml): 導入時に使用する設定のひな形

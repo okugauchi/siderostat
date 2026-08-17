@@ -1,6 +1,6 @@
 use super::{
-    ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot, CoordinatorControl, PeerLease,
-    TransitionError, WorkerControl, spawn_state_machine,
+    ChildIdentity, ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot,
+    CoordinatorControl, EventOwner, PeerLease, TransitionError, WorkerControl, spawn_state_machine,
 };
 use crate::{
     admission::DrainError,
@@ -15,6 +15,10 @@ pub trait LocalStandaloneLifecycle: Send + Sync + 'static {
     fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
     fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>>;
+    /// Optional child identity for diagnostics. Defaults to `None`.
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        Box::pin(async { None })
+    }
 }
 
 pub trait RuntimePeerControl {
@@ -164,16 +168,25 @@ impl ModeRuntime {
 
     pub async fn reconcile_peer<C: RuntimePeerControl>(
         &self,
+        owner: EventOwner,
         control: &mut C,
         now_millis: u64,
+    ) -> Result<ClusterSnapshot, RuntimeError> {
+        let peer_present = control.peer_lease().peer_present(now_millis);
+        self.reconcile_peer_with_presence(owner, peer_present).await
+    }
+
+    pub async fn reconcile_peer_with_presence(
+        &self,
+        owner: EventOwner,
+        peer_present: bool,
     ) -> Result<ClusterSnapshot, RuntimeError> {
         let current = self.cluster.snapshot();
         if self.role == LocalRole::Unknown {
             return Ok(current);
         }
-        let peer_present = control.peer_lease().peer_present(now_millis);
         let next = match (current.state, peer_present) {
-            (ClusterState::SoloStandaloneReady, true) => self.form_pair(current).await,
+            (ClusterState::SoloStandaloneReady, true) => self.form_pair(owner, current).await,
             (
                 ClusterState::Pairing
                 | ClusterState::PairedStandaloneReady
@@ -183,7 +196,7 @@ impl ModeRuntime {
                 | ClusterState::DistributedReady
                 | ClusterState::Demoting,
                 false,
-            ) => self.fallback_to_solo(current).await,
+            ) => self.fallback_to_solo(owner, current).await,
             _ => Ok(current),
         }?;
         Ok(next)
@@ -230,7 +243,19 @@ impl ModeRuntime {
         Ok(ready)
     }
 
-    async fn form_pair(&self, current: ClusterSnapshot) -> Result<ClusterSnapshot, RuntimeError> {
+    async fn form_pair(
+        &self,
+        owner: EventOwner,
+        current: ClusterSnapshot,
+    ) -> Result<ClusterSnapshot, RuntimeError> {
+        tracing::info!(
+            event = "pairing-started",
+            owner = owner.name(),
+            from = ?current.state,
+            result = "success",
+            cluster_generation = current.generation,
+            "reconnect cluster event"
+        );
         let pairing = self
             .cluster
             .apply(ClusterEvent {
@@ -257,6 +282,15 @@ impl ModeRuntime {
                 kind: ClusterEventKind::PairingReady,
             })
             .await?;
+        tracing::info!(
+            event = "pairing-ready",
+            owner = owner.name(),
+            from = ?current.state,
+            to = ?paired.state,
+            result = "success",
+            cluster_generation = paired.generation,
+            "reconnect cluster event"
+        );
         apply_proxy_snapshot(&self.proxy, paired);
         self.proxy.admission().start_serving();
         Ok(paired)
@@ -264,8 +298,17 @@ impl ModeRuntime {
 
     async fn fallback_to_solo(
         &self,
+        owner: EventOwner,
         current: ClusterSnapshot,
     ) -> Result<ClusterSnapshot, RuntimeError> {
+        tracing::info!(
+            event = "peer-lost",
+            owner = owner.name(),
+            from = ?current.state,
+            result = "success",
+            cluster_generation = current.generation,
+            "reconnect cluster event"
+        );
         self.proxy.admission().block();
         self.proxy.set_target(
             ProxyTarget::Unavailable {
@@ -273,28 +316,83 @@ impl ModeRuntime {
             },
             false,
         );
-        let starting = self
+        tracing::info!(
+            event = "recovery-started",
+            owner = EventOwner::Recovery.name(),
+            from = ?current.state,
+            result = "success",
+            cluster_generation = current.generation,
+            "reconnect cluster event"
+        );
+        let starting = match self
             .cluster
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::PeerLost,
             })
-            .await?;
-        if self.role == LocalRole::Worker {
-            self.local
-                .start(starting.generation)
-                .await
-                .map_err(RuntimeError::LocalLifecycle)?;
+            .await
+        {
+            Ok(starting) => starting,
+            Err(error) => {
+                tracing::warn!(
+                    event = "recovery-failed",
+                    owner = EventOwner::Recovery.name(),
+                    from = ?current.state,
+                    result = "failed",
+                    cluster_generation = current.generation,
+                    error = %error,
+                    "reconnect cluster event"
+                );
+                return Err(error.into());
+            }
+        };
+        if self.role == LocalRole::Worker
+            && let Err(error) = self.local.start(starting.generation).await
+        {
+            tracing::warn!(
+                event = "recovery-failed",
+                owner = EventOwner::Recovery.name(),
+                from = ?current.state,
+                result = "failed",
+                cluster_generation = starting.generation,
+                error = %error,
+                "reconnect cluster event"
+            );
+            return Err(RuntimeError::LocalLifecycle(error));
         }
-        let ready = self
+        let ready = match self
             .cluster
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
             })
-            .await?;
+            .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                tracing::warn!(
+                    event = "recovery-failed",
+                    owner = EventOwner::Recovery.name(),
+                    from = ?current.state,
+                    result = "failed",
+                    cluster_generation = starting.generation,
+                    error = %error,
+                    "reconnect cluster event"
+                );
+                return Err(error.into());
+            }
+        };
         apply_proxy_snapshot(&self.proxy, ready);
         self.proxy.admission().start_serving();
+        tracing::info!(
+            event = "recovery-completed",
+            owner = EventOwner::Recovery.name(),
+            from = ?current.state,
+            to = ?ready.state,
+            result = "success",
+            cluster_generation = ready.generation,
+            "reconnect cluster event"
+        );
         Ok(ready)
     }
 }
@@ -434,7 +532,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .reconcile_peer(&mut control, 1_019)
+                .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_019)
                 .await
                 .unwrap()
                 .stable_mode,
@@ -445,7 +543,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             drop(permit);
         });
-        let paired = runtime.reconcile_peer(&mut control, 1_020).await.unwrap();
+        let paired = runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_020)
+            .await
+            .unwrap();
         assert_eq!(paired.stable_mode, StableMode::PairedStandalone);
         assert_eq!(
             proxy.target_snapshot(),
@@ -459,14 +560,17 @@ mod tests {
         // Bonjour result loss alone does not alter the authenticated lease.
         assert_eq!(
             runtime
-                .reconcile_peer(&mut control, 1_100)
+                .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_100)
                 .await
                 .unwrap()
                 .stable_mode,
             StableMode::PairedStandalone
         );
 
-        let solo = runtime.reconcile_peer(&mut control, 1_150).await.unwrap();
+        let solo = runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_150)
+            .await
+            .unwrap();
         assert_eq!(solo.stable_mode, StableMode::SoloStandalone);
         assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
         assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 2);
@@ -491,7 +595,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             runtime
-                .reconcile_peer(&mut control, 1_219)
+                .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_219)
                 .await
                 .unwrap()
                 .stable_mode,
@@ -499,13 +603,62 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .reconcile_peer(&mut control, 1_220)
+                .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_220)
                 .await
                 .unwrap()
                 .stable_mode,
             StableMode::PairedStandalone
         );
         assert_eq!(lifecycle.stops.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn reconnect_events_emit_structured_logs() {
+        let proxy = proxy();
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mode = ModeRuntime::spawn_ready(
+            LocalRole::Worker,
+            proxy.clone(),
+            lifecycle.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let mut control = WorkerControl::new(
+            descriptor(ControlRole::Worker, "worker"),
+            Duration::from_millis(150),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        control
+            .handle(
+                ControlEndpoint::Pair,
+                pair("pair-1"),
+                &authenticated(),
+                true,
+                1_000,
+            )
+            .unwrap();
+        let paired = mode
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_020)
+            .await
+            .unwrap();
+        assert_eq!(paired.stable_mode, StableMode::PairedStandalone);
+        let solo = mode
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(solo.stable_mode, StableMode::SoloStandalone);
+        for needle in [
+            "pairing-started",
+            "pairing-ready",
+            "peer-lost",
+            "recovery-started",
+            "recovery-completed",
+        ] {
+            assert!(logs_contain(needle), "missing structured log: {needle}");
+        }
     }
 
     #[tokio::test]
@@ -534,9 +687,15 @@ mod tests {
                 2_000,
             )
             .unwrap();
-        runtime.reconcile_peer(&mut control, 2_000).await.unwrap();
+        runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 2_000)
+            .await
+            .unwrap();
         control.invalidate_route();
-        let snapshot = runtime.reconcile_peer(&mut control, 2_001).await.unwrap();
+        let snapshot = runtime
+            .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 2_001)
+            .await
+            .unwrap();
         assert_eq!(snapshot.stable_mode, StableMode::SoloStandalone);
         assert!(!matches!(
             proxy.target_snapshot().target,

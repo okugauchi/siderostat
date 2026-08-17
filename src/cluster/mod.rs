@@ -9,6 +9,7 @@ mod ds4_hello;
 mod ds4_log;
 mod manifest;
 mod network_events;
+mod network_evidence;
 mod network_snapshot;
 mod platform;
 mod process;
@@ -65,6 +66,7 @@ pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,
     SpawnNetworkMonitorError, spawn_network_event_monitor,
 };
+pub use network_evidence::NetworkEvidence;
 pub use network_snapshot::{
     InterfaceObservation, Ipv4Assignment, NetworkObservation, NetworkServiceObservation,
     NetworkSnapshot, PeerObservation, ThunderboltIpState,
@@ -78,20 +80,29 @@ pub use platform::{
 pub use process::platform_process_controller;
 pub use process::{
     ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
-    ObservedProcess, ProcessControlError, ProcessController, ProcessInspector, ProcessSignal,
-    ProcessSignaler, StandaloneSupervisor, VerifiedProcess, argv_sha256, wait_for_http_readiness,
+    ObservedProcess, ProcessControlError, ProcessController, ProcessIdentity, ProcessInspector,
+    ProcessSignal, ProcessSignaler, StandaloneSupervisor, StartupProcessCandidate,
+    StartupProcessKind, VerifiedProcess, argv_sha256, discover_startup_processes,
+    wait_for_http_readiness,
 };
-pub use production::{ProductionClusterRuntime, ProductionControlClient, detect_cluster_role};
+#[cfg(feature = "test-support")]
+pub use production::PairTiming;
+pub use production::{
+    ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
+    OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
+    ProductionDiagnostics, detect_cluster_role,
+};
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
     required_port_available,
 };
 pub use role::{RoleAssessment, assess_role};
 pub use runtime::{LocalStandaloneLifecycle, ModeRuntime, RuntimeError, RuntimePeerControl};
+pub(crate) use state::transition_name;
 pub use state::{
-    ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot, FailureAction,
-    PromotionFailureStatus, PromotionFailureTracker, PromotionRetryDecision, PromotionTrackerError,
-    TransitionError, failure_action, spawn_state_machine,
+    ClusterEvent, ClusterEventKind, ClusterFailure, ClusterHandle, ClusterSnapshot, EventOwner,
+    FailureAction, PromotionFailureStatus, PromotionFailureTracker, PromotionRetryDecision,
+    PromotionTrackerError, TransitionError, failure_action, spawn_state_machine,
 };
 pub use state_store::{
     PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,

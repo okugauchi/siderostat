@@ -11,6 +11,7 @@ pub struct ClusterSnapshot {
     pub state: ClusterState,
     pub target: ProxyTarget,
     pub local_standalone_ready: bool,
+    pub last_failure: Option<ClusterFailure>,
 }
 
 impl ClusterSnapshot {
@@ -42,6 +43,7 @@ impl ClusterSnapshot {
             state,
             target: resolve_target(role, stable_mode, state, local_standalone_ready),
             local_standalone_ready,
+            last_failure: None,
         }
     }
 }
@@ -58,6 +60,7 @@ pub enum ClusterEventKind {
     DistributedChildStarted,
     DistributedRouteReady,
     PromotionFailed,
+    DeploymentMismatch,
     BeginDemotion,
     PeerLost,
     EnterBackoff,
@@ -89,6 +92,29 @@ pub enum ClusterFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOwner {
+    PeriodicReconcile,
+    RouteLossMonitor,
+    Admin,
+    Control,
+    Promotion,
+    Recovery,
+}
+
+impl EventOwner {
+    pub fn name(self) -> &'static str {
+        match self {
+            EventOwner::PeriodicReconcile => "periodic-reconcile",
+            EventOwner::RouteLossMonitor => "route-loss-monitor",
+            EventOwner::Admin => "admin",
+            EventOwner::Control => "control",
+            EventOwner::Promotion => "promotion",
+            EventOwner::Recovery => "recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAction {
     MaintainCurrent,
     RejectRequest,
@@ -116,12 +142,15 @@ pub fn failure_action(failure: ClusterFailure) -> FailureAction {
         ClusterFailure::InvalidControlHmac | ClusterFailure::InvalidPeerProxyToken => {
             FailureAction::RejectRequest
         }
-        ClusterFailure::DeploymentMismatch | ClusterFailure::ManifestStale => {
-            FailureAction::PairedStandalone
+        ClusterFailure::DeploymentMismatch => FailureAction::SoloStandalone,
+        ClusterFailure::ManifestStale => FailureAction::PairedStandalone,
+        // spec.md §31: HELLO timeout and coordinator startup timeout back off and retry
+        // promotion; an unknown HELLO/log schema is refused promotion but stays Paired
+        // Standalone (no backoff) so an operator can correct the peer.
+        ClusterFailure::HelloTimeout | ClusterFailure::CoordinatorStartupTimeout => {
+            FailureAction::PromotionBackoff
         }
-        ClusterFailure::HelloTimeout
-        | ClusterFailure::UnknownDs4Schema
-        | ClusterFailure::CoordinatorStartupTimeout => FailureAction::PromotionBackoff,
+        ClusterFailure::UnknownDs4Schema => FailureAction::PairedStandalone,
         ClusterFailure::RouteIncomplete => FailureAction::PairedStandalone,
         ClusterFailure::ChildIdentityUnknown => FailureAction::ManualIntervention,
         ClusterFailure::StandaloneStartFailed => FailureAction::Unavailable,
@@ -314,7 +343,7 @@ pub fn spawn_state_machine(
                 publisher.send_replace(next);
             } else if let Err(error) = &result {
                 tracing::warn!(
-                    event = "cluster_transition",
+                    event = "cluster-transition-rejected",
                     from = ?current.state,
                     to = ?current.state,
                     reason = ?command.event.kind,
@@ -336,8 +365,22 @@ pub fn spawn_state_machine(
     )
 }
 
+pub(crate) fn transition_name(from: ClusterState, to: ClusterState) -> &'static str {
+    match (from, to) {
+        (ClusterState::SoloStandaloneReady, ClusterState::Pairing) => "pair",
+        (ClusterState::PairedStandaloneReady, ClusterState::AwaitingWorkerHello)
+        | (ClusterState::AwaitingWorkerHello, ClusterState::Promoting)
+        | (ClusterState::Promoting, ClusterState::DistributedStarting)
+        | (ClusterState::DistributedStarting, ClusterState::DistributedReady) => "promote",
+        (ClusterState::DistributedReady, ClusterState::Demoting)
+        | (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => "demote",
+        _ => "reconcile",
+    }
+}
+
 fn cluster_event_name(event: ClusterEventKind, state: ClusterState) -> &'static str {
     match (event, state) {
+        (ClusterEventKind::DeploymentMismatch, _) => "deployment_mismatch",
         (_, ClusterState::SoloStandaloneReady) => "solo_standalone_ready",
         (ClusterEventKind::BeginPairing, _) => "pairing_started",
         (_, ClusterState::PairedStandaloneReady) => "paired_standalone_ready",
@@ -418,6 +461,25 @@ fn transition(
             ClusterState::PairedStandaloneReady,
             current.role != LocalRole::Worker,
         ),
+        (
+            ClusterState::Pairing
+            | ClusterState::PairedStandaloneReady
+            | ClusterState::AwaitingWorkerHello
+            | ClusterState::Promoting
+            | ClusterState::DistributedStarting
+            | ClusterState::DistributedReady
+            | ClusterState::Demoting,
+            ClusterEventKind::DeploymentMismatch,
+        ) => (
+            StableMode::SoloStandalone,
+            ClusterState::SoloStandaloneStarting,
+            false,
+        ),
+        (ClusterState::SoloStandaloneReady, ClusterEventKind::DeploymentMismatch) => (
+            StableMode::SoloStandalone,
+            ClusterState::SoloStandaloneReady,
+            true,
+        ),
         (ClusterState::DistributedReady, ClusterEventKind::BeginDemotion) => {
             (StableMode::DistributedMxfp4, ClusterState::Demoting, false)
         }
@@ -433,7 +495,8 @@ fn transition(
             | ClusterState::Promoting
             | ClusterState::DistributedStarting
             | ClusterState::DistributedReady
-            | ClusterState::Demoting,
+            | ClusterState::Demoting
+            | ClusterState::Backoff,
             ClusterEventKind::PeerLost,
         ) => (
             StableMode::SoloStandalone,
@@ -463,13 +526,23 @@ fn transition(
             });
         }
     };
-    Ok(ClusterSnapshot::new(
+    let mut next = ClusterSnapshot::new(
         current.generation + 1,
         current.role,
         mode,
         state,
         local_ready,
-    ))
+    );
+    next.last_failure = match event.kind {
+        ClusterEventKind::DeploymentMismatch => Some(ClusterFailure::DeploymentMismatch),
+        ClusterEventKind::LocalStandaloneReady
+            if current.state == ClusterState::SoloStandaloneStarting =>
+        {
+            current.last_failure
+        }
+        _ => None,
+    };
+    Ok(next)
 }
 
 fn stable_ready_state(mode: StableMode) -> ClusterState {
@@ -528,6 +601,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_mismatch_converges_to_solo_and_keeps_failure_context() {
+        let (handle, task) =
+            spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 8);
+        handle
+            .apply(event(0, ClusterEventKind::BeginSoloStandalone))
+            .await
+            .unwrap();
+        handle
+            .apply(event(1, ClusterEventKind::LocalStandaloneReady))
+            .await
+            .unwrap();
+        handle
+            .apply(event(2, ClusterEventKind::BeginPairing))
+            .await
+            .unwrap();
+        handle
+            .apply(event(3, ClusterEventKind::PairingReady))
+            .await
+            .unwrap();
+
+        let starting = handle
+            .apply(event(4, ClusterEventKind::DeploymentMismatch))
+            .await
+            .unwrap();
+        assert_eq!(starting.state, ClusterState::SoloStandaloneStarting);
+        assert_eq!(
+            starting.last_failure,
+            Some(ClusterFailure::DeploymentMismatch)
+        );
+
+        let ready = handle
+            .apply(event(5, ClusterEventKind::LocalStandaloneReady))
+            .await
+            .unwrap();
+        assert_eq!(ready.state, ClusterState::SoloStandaloneReady);
+        assert_eq!(ready.last_failure, Some(ClusterFailure::DeploymentMismatch));
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn concurrent_events_are_serialized_by_single_writer() {
         let (handle, task) =
             spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 16);
@@ -553,5 +666,47 @@ mod tests {
             ClusterState::SoloStandaloneStarting
         );
         task.abort();
+    }
+
+    #[test]
+    fn transition_name_classifies_promotion_and_demotion_paths() {
+        assert_eq!(
+            transition_name(ClusterState::SoloStandaloneReady, ClusterState::Pairing),
+            "pair"
+        );
+        assert_eq!(
+            transition_name(
+                ClusterState::PairedStandaloneReady,
+                ClusterState::AwaitingWorkerHello
+            ),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::AwaitingWorkerHello, ClusterState::Promoting),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Promoting, ClusterState::DistributedStarting),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(
+                ClusterState::DistributedStarting,
+                ClusterState::DistributedReady
+            ),
+            "promote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::DistributedReady, ClusterState::Demoting),
+            "demote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Demoting, ClusterState::PairedStandaloneReady),
+            "demote"
+        );
+        assert_eq!(
+            transition_name(ClusterState::Booting, ClusterState::SoloStandaloneStarting),
+            "reconcile"
+        );
     }
 }

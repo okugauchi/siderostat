@@ -165,7 +165,8 @@ pub struct MacOsBonjourOperation {
     _context: Box<CallbackContext>,
 }
 
-// DNSServiceRef is only processed through `&mut self`; callbacks use a bounded Tokio sender.
+// SAFETY: DNSServiceRef is only processed through `&mut self`; callbacks use a bounded Tokio
+// sender, and `_context` keeps callback state alive for the lifetime of the operation.
 unsafe impl Send for MacOsBonjourOperation {}
 
 pub fn bridge0_interface_index() -> io::Result<u32> {
@@ -443,6 +444,8 @@ unsafe extern "C" fn resolve_callback(
         } else if txt_record.is_null() {
             return;
         } else {
+            // SAFETY: DNS-SD supplies `txt_len` readable bytes for a non-null TXT record during
+            // this callback.
             unsafe { std::slice::from_raw_parts(txt_record, usize::from(txt_len)) }
         };
         let (protocol_version, node_id) = parse_txt_record(txt);

@@ -84,11 +84,14 @@ fn run_dynamic_store(
         return;
     };
     let run_loop = CFRunLoop::get_current();
+    // SAFETY: `kCFRunLoopCommonModes` is an immutable Core Foundation static constant used as a
+    // valid run-loop mode for the source registration.
     run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
     if ready.send(Ok(run_loop.clone())).is_err() {
         return;
     }
     CFRunLoop::run_current();
+    // SAFETY: this is the same immutable Core Foundation mode used when registering the source.
     run_loop.remove_source(&source, unsafe { kCFRunLoopCommonModes });
 }
 

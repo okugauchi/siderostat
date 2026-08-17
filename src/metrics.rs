@@ -1,9 +1,10 @@
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     app::target_name,
-    cluster::ClusterSnapshot,
+    cluster::{ClusterSnapshot, transition_name},
     config::{ModelVariant, Residency},
     proxy::ModeAwareTargetSnapshot,
+    target::ClusterState,
 };
 use std::{
     collections::HashMap,
@@ -18,11 +19,43 @@ struct Summary {
     count: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct Ds4MetricsState {
+    prefill_active: bool,
+    prefill_current: u64,
+    prefill_total: u64,
+    prefill_percent: f64,
+    prefill_cached: u64,
+    prefill_chunk_tps: f64,
+    prefill_avg_tps: f64,
+    prefill_elapsed_secs: f64,
+    kv_cache_hits: u64,
+    kv_cache_hit_tokens: u64,
+    kv_cache_load_ms: f64,
+    generation_completion: u64,
+    generation_chunk_tps: f64,
+    generation_avg_tps: f64,
+    generation_elapsed_secs: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillProgress {
+    pub current: u64,
+    pub total: u64,
+    pub percent: f64,
+    pub cached: u64,
+    pub chunk_tps: f64,
+    pub avg_tps: f64,
+    pub elapsed_secs: f64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     counters: Mutex<HashMap<String, u64>>,
     summaries: Mutex<HashMap<String, Summary>>,
     in_flight: Mutex<HashMap<(String, String), u64>>,
+    generation_in_flight: Mutex<u64>,
+    ds4: Mutex<Ds4MetricsState>,
 }
 
 pub struct RequestMetricGuard {
@@ -37,6 +70,7 @@ pub struct RequestMetricGuard {
     method: String,
     path_template: &'static str,
     in_flight_before: u64,
+    tracks_generation: bool,
 }
 
 impl Metrics {
@@ -49,13 +83,24 @@ impl Metrics {
         path_template: &'static str,
     ) -> RequestMetricGuard {
         let key = (ingress.to_owned(), target.to_owned());
-        let mut gauges = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let gauge = gauges.entry(key).or_default();
-        let in_flight_before = *gauge;
-        *gauge += 1;
+        let in_flight_before = {
+            let mut gauges = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let gauge = gauges.entry(key).or_default();
+            let in_flight_before = *gauge;
+            *gauge += 1;
+            in_flight_before
+        };
+        let tracks_generation = is_generation_path(path_template);
+        if tracks_generation {
+            let mut generation_in_flight = self
+                .generation_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *generation_in_flight += 1;
+        }
         RequestMetricGuard {
             metrics: self.clone(),
             ingress,
@@ -68,13 +113,14 @@ impl Metrics {
             method,
             path_template,
             in_flight_before,
+            tracks_generation,
         }
     }
 
     pub fn transition(
         &self,
-        from: &'static str,
-        to: &'static str,
+        from: ClusterState,
+        to: ClusterState,
         result: &'static str,
         reason: &'static str,
         seconds: f64,
@@ -82,8 +128,8 @@ impl Metrics {
         self.increment(
             "ds4_proxy_cluster_transitions_total",
             &[
-                ("from", from),
-                ("to", to),
+                ("from", from.name()),
+                ("to", to.name()),
                 ("result", result),
                 ("reason", reason),
             ],
@@ -121,6 +167,63 @@ impl Metrics {
             "ds4_proxy_peer_discovery_events_total",
             &[("source", source), ("result", result)],
         );
+    }
+
+    /// Record DS4 prefill progress. When `current >= total` the prefill is
+    /// considered finished and the active flag is cleared.
+    pub fn prefill_progress(&self, progress: PrefillProgress) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.prefill_active = progress.current < progress.total;
+        ds4.prefill_current = progress.current;
+        ds4.prefill_total = progress.total;
+        ds4.prefill_percent = progress.percent;
+        ds4.prefill_cached = progress.cached;
+        ds4.prefill_chunk_tps = progress.chunk_tps;
+        ds4.prefill_avg_tps = progress.avg_tps;
+        ds4.prefill_elapsed_secs = progress.elapsed_secs;
+    }
+
+    /// Record a DS4 KV cache hit.
+    pub fn kv_cache_hit(&self, tokens: u64, load_ms: f64) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.kv_cache_hits = ds4.kv_cache_hits.saturating_add(1);
+        ds4.kv_cache_hit_tokens = tokens;
+        ds4.kv_cache_load_ms = load_ms;
+    }
+
+    /// Record the latest DS4 generation progress values for the monitor.
+    pub fn generation_progress(
+        &self,
+        completion: u64,
+        chunk_tps: f64,
+        avg_tps: f64,
+        elapsed_secs: f64,
+    ) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.generation_completion = completion;
+        ds4.generation_chunk_tps = chunk_tps;
+        ds4.generation_avg_tps = avg_tps;
+        ds4.generation_elapsed_secs = elapsed_secs;
+    }
+
+    fn reset_generation(&self) {
+        let mut ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.generation_completion = 0;
+        ds4.generation_chunk_tps = 0.0;
+        ds4.generation_avg_tps = 0.0;
+        ds4.generation_elapsed_secs = 0.0;
     }
 
     pub fn render_mode_aware(&self, snapshot: MetricSnapshot<'_>) -> String {
@@ -169,8 +272,8 @@ impl Metrics {
                 .cluster
                 .map_or(("booting", "unknown", 0), |cluster| {
                     (
-                        cluster_state_name(cluster),
-                        cluster_mode_name(cluster),
+                        cluster.state.name(),
+                        cluster.stable_mode.name(),
                         cluster.generation,
                     )
                 });
@@ -212,9 +315,111 @@ impl Metrics {
         let _ = writeln!(
             output,
             "ds4_proxy_standalone_profile_info{{node_id=\"{node_id}\",model_variant=\"{}\",residency=\"{}\"}} 1",
-            model_variant_name(snapshot.model_variant),
-            residency_name(snapshot.residency),
+            snapshot.model_variant.name(),
+            snapshot.residency.name(),
         );
+        let generation_active = *self
+            .generation_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            > 0;
+        let ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_active gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_active {}",
+            u8::from(ds4.prefill_active)
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_current gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_current {}",
+            ds4.prefill_current
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_total gauge\n");
+        let _ = writeln!(output, "ds4_proxy_ds4_prefill_total {}", ds4.prefill_total);
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_percent gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_percent {}",
+            ds4.prefill_percent
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_cached gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_cached {}",
+            ds4.prefill_cached
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_chunk_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_chunk_tps {}",
+            ds4.prefill_chunk_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_avg_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_avg_tps {}",
+            ds4.prefill_avg_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_elapsed_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_elapsed_seconds {}",
+            ds4.prefill_elapsed_secs
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hits_total counter\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_hits_total {}",
+            ds4.kv_cache_hits
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hit_tokens gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_hit_tokens {}",
+            ds4.kv_cache_hit_tokens
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_kv_cache_load_ms gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_kv_cache_load_ms {}",
+            ds4.kv_cache_load_ms
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_active gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_active {}",
+            u8::from(generation_active)
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_completion gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_completion {}",
+            ds4.generation_completion
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_chunk_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_chunk_tps {}",
+            ds4.generation_chunk_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_avg_tps gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_avg_tps {}",
+            ds4.generation_avg_tps
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_elapsed_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_elapsed_seconds {}",
+            ds4.generation_elapsed_secs
+        );
+        drop(ds4);
         output
     }
 
@@ -254,6 +459,21 @@ impl Metrics {
         if let Some(value) = gauges.get_mut(&key) {
             *value = value.saturating_sub(1);
         }
+        drop(gauges);
+
+        if guard.tracks_generation {
+            let generation_finished = {
+                let mut generation_in_flight = self
+                    .generation_in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *generation_in_flight = generation_in_flight.saturating_sub(1);
+                *generation_in_flight == 0
+            };
+            if generation_finished {
+                self.reset_generation();
+            }
+        }
     }
 
     fn increment(&self, name: &'static str, labels: &[(&'static str, &str)]) {
@@ -275,6 +495,10 @@ impl Metrics {
         summary.sum += value;
         summary.count += 1;
     }
+}
+
+fn is_generation_path(path_template: &str) -> bool {
+    matches!(path_template, "/v1/chat/completions" | "/v1/completions")
 }
 
 impl RequestMetricGuard {
@@ -399,60 +623,6 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn transition_name(from: &str, to: &str) -> &'static str {
-    match (from, to) {
-        ("solo-standalone-ready", "pairing") => "pair",
-        ("paired-standalone-ready", "awaiting-worker-hello")
-        | ("awaiting-worker-hello", "promoting")
-        | ("promoting", "distributed-starting")
-        | ("distributed-starting", "distributed-ready") => "promote",
-        ("distributed-ready", "demoting") | ("demoting", "paired-standalone-ready") => "demote",
-        _ => "reconcile",
-    }
-}
-
-fn cluster_state_name(snapshot: ClusterSnapshot) -> &'static str {
-    use crate::target::ClusterState::*;
-    match snapshot.state {
-        Booting => "booting",
-        SoloStandaloneStarting => "solo-standalone-starting",
-        SoloStandaloneReady => "solo-standalone-ready",
-        Pairing => "pairing",
-        PairedStandaloneReady => "paired-standalone-ready",
-        AwaitingWorkerHello => "awaiting-worker-hello",
-        Promoting => "promoting",
-        DistributedStarting => "distributed-starting",
-        DistributedReady => "distributed-ready",
-        Demoting => "demoting",
-        Backoff => "backoff",
-        ManualInterventionRequired => "manual-intervention-required",
-    }
-}
-
-fn cluster_mode_name(snapshot: ClusterSnapshot) -> &'static str {
-    use crate::target::StableMode::*;
-    match snapshot.stable_mode {
-        SoloStandalone => "solo-standalone",
-        PairedStandalone => "paired-standalone",
-        DistributedMxfp4 => "distributed-mxfp4",
-    }
-}
-
-fn model_variant_name(value: ModelVariant) -> &'static str {
-    match value {
-        ModelVariant::Q2 => "q2",
-        ModelVariant::Q2Q4 => "q2-q4",
-        ModelVariant::Mxfp4 => "mxfp4",
-    }
-}
-
-fn residency_name(value: Residency) -> &'static str {
-    match value {
-        Residency::Resident => "resident",
-        Residency::SsdStreaming => "ssd-streaming",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +700,7 @@ mod tests {
             "ds4_proxy_standalone_profile_info",
             "ds4_proxy_cluster_hello_total",
             "ds4_proxy_cluster_deployment_mismatch_total",
+            "ds4_proxy_ds4_generation_active",
         ] {
             assert!(rendered.contains(family), "missing metric family {family}");
         }
@@ -619,8 +790,8 @@ mod tests {
     fn cluster_event_counters_use_only_finite_diagnostic_labels() {
         let metrics = Metrics::default();
         metrics.transition(
-            "paired-standalone-ready",
-            "awaiting-worker-hello",
+            ClusterState::PairedStandaloneReady,
+            ClusterState::AwaitingWorkerHello,
             "success",
             "state-change",
             0.25,
@@ -640,5 +811,68 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn renders_ds4_prefill_and_kv_cache_gauges() {
+        let metrics = Arc::new(Metrics::default());
+        metrics.prefill_progress(PrefillProgress {
+            current: 4096,
+            total: 9005,
+            percent: 45.5,
+            cached: 0,
+            chunk_tps: 123.4,
+            avg_tps: 100.0,
+            elapsed_secs: 10.0,
+        });
+        metrics.kv_cache_hit(9005, 12.3);
+        metrics.kv_cache_hit(1024, 3.1);
+        let request = metrics.begin_request(
+            "public",
+            "local-standalone",
+            "req-generation".into(),
+            "POST".into(),
+            "/v1/chat/completions",
+        );
+        metrics.generation_progress(42, 32.1, 28.5, 1.5);
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_active 1"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_current 4096"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_total 9005"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_percent 45.5"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_cached 0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_chunk_tps 123.4"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_avg_tps 100"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_elapsed_seconds 10"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hits_total 2"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_hit_tokens 1024"));
+        assert!(rendered.contains("ds4_proxy_ds4_kv_cache_load_ms 3.1"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_completion 42"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_chunk_tps 32.1"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_avg_tps 28.5"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_elapsed_seconds 1.5"));
+        assert!(rendered.contains("ds4_proxy_ds4_generation_active 1"));
+
+        drop(request);
+        let cleared = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(cleared.contains("ds4_proxy_ds4_generation_active 0"));
+        assert!(cleared.contains("ds4_proxy_ds4_generation_completion 0"));
+        assert!(cleared.contains("ds4_proxy_ds4_generation_avg_tps 0"));
+    }
+
+    #[test]
+    fn prefill_completion_clears_active_flag() {
+        let metrics = Metrics::default();
+        metrics.prefill_progress(PrefillProgress {
+            current: 9005,
+            total: 9005,
+            percent: 100.0,
+            cached: 0,
+            chunk_tps: 123.4,
+            avg_tps: 100.0,
+            elapsed_secs: 10.0,
+        });
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_active 0"));
     }
 }

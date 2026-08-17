@@ -2,10 +2,6 @@ use super::{
     ChildLogForwarders, ChildLogRecord, Ds4Command, Ds4LogEvent, spawn_child_log_forwarders,
     spawn_child_log_forwarders_with_events,
 };
-use crate::cluster::{
-    DistributedCoordinatorLifecycle, DistributedWorkerLifecycle, LocalStandaloneLifecycle,
-};
-use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
@@ -22,6 +18,14 @@ use tokio::{
 };
 use url::Url;
 
+mod coordinator;
+mod standalone;
+mod worker;
+
+pub use coordinator::DistributedCoordinatorSupervisor;
+pub use standalone::StandaloneSupervisor;
+pub use worker::DistributedWorkerSupervisor;
+
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
@@ -31,6 +35,78 @@ pub struct ObservedProcess {
     pub executable: PathBuf,
     pub argv: Vec<OsString>,
     pub start_time_micros: u64,
+}
+
+/// Process identity used for an authorized startup cleanup.
+///
+/// This deliberately omits the logical child metadata (profile/generation). A process that was
+/// started by an older siderostat, or by another launcher, cannot have that metadata, but it can
+/// still be safely targeted when startup cleanup is authorized and the OS-level identity is
+/// re-verified immediately before every signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub executable: PathBuf,
+    pub argv_sha256: [u8; 32],
+    pub process_start_micros: u64,
+}
+
+impl ProcessIdentity {
+    pub fn from_observed(observed: &ObservedProcess) -> Self {
+        Self {
+            pid: observed.pid,
+            executable: observed.executable.clone(),
+            argv_sha256: argv_sha256(observed.executable.as_os_str(), &observed.argv),
+            process_start_micros: observed.start_time_micros,
+        }
+    }
+
+    fn matches(&self, observed: &ObservedProcess) -> bool {
+        self.pid == observed.pid
+            && self.executable == observed.executable
+            && self.argv_sha256 == argv_sha256(observed.executable.as_os_str(), &observed.argv)
+            && self.process_start_micros == observed.start_time_micros
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupProcessKind {
+    Siderostat,
+    Ds4,
+}
+
+impl StartupProcessKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Siderostat => "siderostat",
+            Self::Ds4 => "ds4-server",
+        }
+    }
+}
+
+/// A locally running process that can conflict with this siderostat instance at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupProcessCandidate {
+    pub kind: StartupProcessKind,
+    pub observed: ObservedProcess,
+}
+
+impl StartupProcessCandidate {
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity::from_observed(&self.observed)
+    }
+
+    pub fn command_line(&self) -> String {
+        let mut values = Vec::with_capacity(self.observed.argv.len() + 1);
+        values.push(self.observed.executable.display().to_string());
+        values.extend(
+            self.observed
+                .argv
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned()),
+        );
+        values.join(" ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,10 +122,13 @@ pub struct ChildIdentity {
 
 impl ChildIdentity {
     fn matches(&self, observed: &ObservedProcess) -> bool {
-        self.pid == observed.pid
-            && self.executable == observed.executable
-            && self.argv_sha256 == argv_sha256(observed.executable.as_os_str(), &observed.argv)
-            && self.process_start_micros == observed.start_time_micros
+        ProcessIdentity {
+            pid: self.pid,
+            executable: self.executable.clone(),
+            argv_sha256: self.argv_sha256,
+            process_start_micros: self.process_start_micros,
+        }
+        .matches(observed)
     }
 }
 
@@ -75,6 +154,12 @@ pub trait ProcessInspector: Send + Sync + 'static {
 
 pub trait ProcessSignaler: Send + Sync + 'static {
     fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()>;
+
+    /// Signal only the process itself. This is used for authorized adoption/cleanup of processes
+    /// that were not spawned into siderostat's process group.
+    fn signal_process(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
+        self.signal_process_group(pid, signal)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +234,23 @@ impl ProcessController {
         Ok(())
     }
 
+    pub fn signal_approved_process(
+        &self,
+        identity: &ProcessIdentity,
+        signal: ProcessSignal,
+    ) -> Result<(), ProcessControlError> {
+        let observed = self
+            .inspector
+            .observe(identity.pid)?
+            .ok_or(ProcessControlError::NotRunning)?;
+        if !identity.matches(&observed) {
+            return Err(ProcessControlError::IdentityMismatch);
+        }
+        self.signaler
+            .signal_process(identity.pid, signal)
+            .map_err(ProcessControlError::Io)
+    }
+
     pub async fn stop_recovered_owned(
         &self,
         identity: &ChildIdentity,
@@ -193,6 +295,68 @@ impl ProcessController {
             }
         }
     }
+
+    /// Stop a process only after startup cleanup has been authorized.
+    ///
+    /// Unlike normal supervision this method intentionally permits SIGKILL after the grace
+    /// period. The permission comes from the startup cleanup decision, while every signal is still
+    /// preceded by a complete identity check.
+    pub async fn force_stop_approved(
+        &self,
+        identity: &ProcessIdentity,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<(), ProcessControlError> {
+        if timeout.is_zero() || poll_interval.is_zero() {
+            return Err(ProcessControlError::InvalidReadinessTiming);
+        }
+        match self.signal_approved_process(identity, ProcessSignal::Terminate) {
+            Ok(()) => {}
+            Err(ProcessControlError::NotRunning) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify_process(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < deadline => continue,
+                Ok(_) => break,
+            }
+        }
+        self.signal_approved_process(identity, ProcessSignal::Kill)?;
+        let kill_deadline = Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(
+                poll_interval.min(kill_deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+            match self.verify_process(identity) {
+                Err(ProcessControlError::NotRunning) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) if Instant::now() < kill_deadline => {}
+                Ok(_) => return Err(ProcessControlError::StopTimeout),
+            }
+        }
+    }
+
+    fn verify_process(
+        &self,
+        identity: &ProcessIdentity,
+    ) -> Result<ProcessIdentity, ProcessControlError> {
+        let observed = self
+            .inspector
+            .observe(identity.pid)?
+            .ok_or(ProcessControlError::NotRunning)?;
+        if !identity.matches(&observed) {
+            return Err(ProcessControlError::IdentityMismatch);
+        }
+        Ok(identity.clone())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,6 +366,42 @@ pub fn platform_process_controller() -> ProcessController {
         Arc::new(MacOsProcessInspector),
         Arc::new(MacOsProcessSignaler),
     )
+}
+
+/// Discover likely stale siderostat/DS4 processes before the new supervisor acquires its state
+/// lock or binds its listeners. The non-macOS implementation is intentionally empty because the
+/// supported production process-identity API is macOS-specific.
+pub fn discover_startup_processes(
+    current_pid: u32,
+    configured_ds4_binary: &std::path::Path,
+) -> io::Result<Vec<StartupProcessCandidate>> {
+    #[cfg(target_os = "macos")]
+    {
+        let configured_name = configured_ds4_binary.file_name();
+        let processes = crate::cluster::platform::process::list_processes()?;
+        Ok(processes
+            .into_iter()
+            .filter(|observed| observed.pid != current_pid)
+            .filter_map(|observed| {
+                let executable_name = observed.executable.file_name();
+                let kind = if executable_name.is_some_and(|name| name == "siderostat") {
+                    Some(StartupProcessKind::Siderostat)
+                } else if executable_name.is_some_and(|name| name == "ds4-server")
+                    || configured_name.is_some() && executable_name == configured_name
+                {
+                    Some(StartupProcessKind::Ds4)
+                } else {
+                    None
+                }?;
+                Some(StartupProcessCandidate { kind, observed })
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (current_pid, configured_ds4_binary);
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -232,551 +432,69 @@ pub struct ManagedChild {
     controller: ProcessController,
 }
 
-#[derive(Clone)]
-pub struct StandaloneSupervisor {
-    inner: Arc<StandaloneSupervisorInner>,
-}
-
-#[derive(Clone)]
-pub struct DistributedWorkerSupervisor {
-    inner: Arc<DistributedWorkerSupervisorInner>,
-}
-
-struct DistributedWorkerSupervisorInner {
-    command: Ds4Command,
-    stop_timeout: Duration,
-    allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
-}
-
-#[derive(Clone)]
-pub struct DistributedCoordinatorSupervisor {
-    inner: Arc<DistributedCoordinatorSupervisorInner>,
-}
-
-struct DistributedCoordinatorSupervisorInner {
-    command: Ds4Command,
-    models_url: Url,
-    client: reqwest::Client,
-    http_startup_timeout: Duration,
-    poll_interval: Duration,
-    stop_timeout: Duration,
-    allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
-    route: tokio::sync::watch::Sender<CoordinatorRouteState>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CoordinatorRouteState {
-    http_ready: bool,
-    worker_registered: bool,
-    complete_route: bool,
-}
-
-struct StandaloneSupervisorInner {
-    command: Ds4Command,
-    models_url: Url,
-    client: reqwest::Client,
-    startup_timeout: Duration,
-    poll_interval: Duration,
-    stop_timeout: Duration,
-    allow_sigkill: bool,
-    child: tokio::sync::Mutex<Option<SupervisedChild>>,
-}
-
 struct SupervisedChild {
     child: ManagedChild,
     _log_forwarders: ChildLogForwarders,
     log_task: tokio::task::JoinHandle<()>,
 }
 
-impl StandaloneSupervisor {
-    pub fn new(
-        command: Ds4Command,
-        models_url: Url,
-        startup_timeout: Duration,
-        poll_interval: Duration,
-        stop_timeout: Duration,
-        allow_sigkill: bool,
-    ) -> Self {
+/// Shared slot management for a single supervised child. All supervisors use the same
+/// child_identity / is_running / stop / begin_start lifecycle so that the per-supervisor code
+/// only differs where the startup conditions actually differ (readiness waits, dspark activation,
+/// route observation).
+struct SupervisedSlot {
+    child: tokio::sync::Mutex<Option<SupervisedChild>>,
+}
+
+impl SupervisedSlot {
+    fn new() -> Self {
         Self {
-            inner: Arc::new(StandaloneSupervisorInner {
-                command,
-                models_url,
-                client: reqwest::Client::new(),
-                startup_timeout,
-                poll_interval,
-                stop_timeout,
-                allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
-            }),
+            child: tokio::sync::Mutex::new(None),
         }
     }
 
-    pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
+    async fn child_identity(&self) -> Option<ChildIdentity> {
+        self.child
             .lock()
             .await
             .as_ref()
             .map(|current| current.child.identity().clone())
     }
 
-    #[cfg(target_os = "macos")]
-    async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        if let Some(current) = slot.as_mut()
-            && current.child.try_wait()?.is_none()
-        {
-            return Ok(());
-        }
-        *slot = None;
-        let startup_deadline = Instant::now() + self.inner.startup_timeout;
-        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let stdout = child
-            .take_stdout()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let stderr = child
-            .take_stderr()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let (mut logs, mut events, forwarders) = spawn_child_log_forwarders_with_events(
-            stdout,
-            stderr,
-            Arc::from(child.identity().profile_id.as_str()),
-            child.identity().generation,
-            child.identity().pid,
-            256,
-        );
-        let (dspark_activation, mut dspark_activation_rx) = tokio::sync::watch::channel(false);
-        let activation_profile = self.inner.command.profile.profile_id.clone();
-        let log_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(event) = events.recv() => {
-                        if event == Ds4LogEvent::DsparkActivated {
-                            dspark_activation.send_replace(true);
-                            tracing::info!(
-                                event = "dspark-activated",
-                                profile = %activation_profile,
-                                generation,
-                                "DS4 standalone feature activated"
-                            );
-                        }
-                    }
-                    Some(record) = logs.recv() => {
-                        tracing::info!(
-                            profile = %record.profile_id,
-                            generation = record.generation,
-                            pid = record.pid,
-                            stream = ?record.stream,
-                            truncated = record.truncated,
-                            event = ?record.event,
-                            line_bytes = record.line.len(),
-                            "DS4 child log"
-                        );
-                    }
-                    else => break,
-                }
-            }
-        });
-        if let Err(error) = child
-            .wait_http_ready(
-                &self.inner.client,
-                &self.inner.models_url,
-                self.inner.startup_timeout,
-                self.inner.poll_interval,
-            )
-            .await
-        {
-            let _ = child
-                .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-                .await;
-            log_task.abort();
-            return Err(error.into());
-        }
-        if self.inner.command.profile.dspark_required && !*dspark_activation_rx.borrow() {
-            let remaining = startup_deadline.saturating_duration_since(Instant::now());
-            let activation_observed = match tokio::time::timeout(
-                remaining,
-                dspark_activation_rx.wait_for(|activated| *activated),
-            )
-            .await
-            {
-                Ok(Ok(activated)) => *activated,
-                Ok(Err(_)) | Err(_) => false,
-            };
-            if !activation_observed {
-                let _ = child
-                    .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-                    .await;
-                log_task.abort();
-                return Err(ProcessControlError::DsparkActivationTimeout.into());
-            }
-        }
-        *slot = Some(SupervisedChild {
-            child,
-            _log_forwarders: forwarders,
-            log_task,
-        });
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    async fn start_inner(&self, _generation: u64) -> anyhow::Result<()> {
-        anyhow::bail!("managed DS4 supervision requires macOS")
-    }
-
-    async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            return Ok(());
-        };
-        let result = current
-            .child
-            .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-            .await;
-        current.log_task.abort();
-        result?;
-        Ok(())
-    }
-
-    async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
+    async fn is_running(&self) -> anyhow::Result<bool> {
+        let mut slot = self.child.lock().await;
         let Some(current) = slot.as_mut() else {
             return Ok(false);
         };
         Ok(current.child.try_wait()?.is_none())
     }
-}
 
-impl DistributedWorkerSupervisor {
-    pub fn new(command: Ds4Command, stop_timeout: Duration, allow_sigkill: bool) -> Self {
-        Self {
-            inner: Arc::new(DistributedWorkerSupervisorInner {
-                command,
-                stop_timeout,
-                allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
-            }),
-        }
+    async fn stop(&self, stop_timeout: Duration, allow_sigkill: bool) -> anyhow::Result<()> {
+        let mut slot = self.child.lock().await;
+        let Some(mut current) = slot.take() else {
+            return Ok(());
+        };
+        let result = current.child.stop(stop_timeout, allow_sigkill).await;
+        current.log_task.abort();
+        result?;
+        Ok(())
     }
 
-    pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .map(|current| current.child.identity().clone())
-    }
-
-    #[cfg(target_os = "macos")]
-    async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
+    /// Locks the slot and clears any stale child so a replacement can be placed. Returns `None`
+    /// when a child is already running; callers treat that as a no-op start.
+    async fn begin_start(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::MutexGuard<'_, Option<SupervisedChild>>>> {
+        let mut slot = self.child.lock().await;
         if let Some(current) = slot.as_mut()
             && current.child.try_wait()?.is_none()
         {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(stale) = slot.take() {
             stale.log_task.abort();
         }
-        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let (mut logs, forwarders) = child.start_log_forwarding(256)?;
-        let log_task = tokio::spawn(async move {
-            while let Some(record) = logs.recv().await {
-                tracing::info!(
-                    profile = %record.profile_id,
-                    generation = record.generation,
-                    pid = record.pid,
-                    stream = ?record.stream,
-                    truncated = record.truncated,
-                    event = ?record.event,
-                    line_bytes = record.line.len(),
-                    "DS4 distributed worker log"
-                );
-            }
-        });
-        *slot = Some(SupervisedChild {
-            child,
-            _log_forwarders: forwarders,
-            log_task,
-        });
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    async fn start_inner(&self, _generation: u64) -> anyhow::Result<()> {
-        anyhow::bail!("managed DS4 supervision requires macOS")
-    }
-
-    async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            return Ok(());
-        };
-        let result = current
-            .child
-            .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-            .await;
-        current.log_task.abort();
-        result?;
-        Ok(())
-    }
-
-    async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(current) = slot.as_mut() else {
-            return Ok(false);
-        };
-        Ok(current.child.try_wait()?.is_none())
-    }
-}
-
-impl DistributedCoordinatorSupervisor {
-    pub fn new(
-        command: Ds4Command,
-        models_url: Url,
-        http_startup_timeout: Duration,
-        poll_interval: Duration,
-        stop_timeout: Duration,
-        allow_sigkill: bool,
-    ) -> Self {
-        let (route, _) = tokio::sync::watch::channel(CoordinatorRouteState::default());
-        Self {
-            inner: Arc::new(DistributedCoordinatorSupervisorInner {
-                command,
-                models_url,
-                client: reqwest::Client::new(),
-                http_startup_timeout,
-                poll_interval,
-                stop_timeout,
-                allow_sigkill,
-                child: tokio::sync::Mutex::new(None),
-                route,
-            }),
-        }
-    }
-
-    pub async fn child_identity(&self) -> Option<ChildIdentity> {
-        self.inner
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .map(|current| current.child.identity().clone())
-    }
-
-    #[cfg(target_os = "macos")]
-    async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        if let Some(current) = slot.as_mut()
-            && current.child.try_wait()?.is_none()
-        {
-            return Ok(());
-        }
-        if let Some(stale) = slot.take() {
-            stale.log_task.abort();
-        }
-        self.inner
-            .route
-            .send_replace(CoordinatorRouteState::default());
-        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
-        let stdout = child
-            .take_stdout()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let stderr = child
-            .take_stderr()
-            .ok_or(ProcessControlError::MissingLogPipe)?;
-        let (mut logs, mut events, forwarders) = spawn_child_log_forwarders_with_events(
-            stdout,
-            stderr,
-            Arc::from(child.identity().profile_id.as_str()),
-            child.identity().generation,
-            child.identity().pid,
-            256,
-        );
-        let route = self.inner.route.clone();
-        let log_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(event) = events.recv() => {
-                        let mut state = *route.borrow();
-                        match event {
-                            Ds4LogEvent::WorkerRegistered { .. } => state.worker_registered = true,
-                            Ds4LogEvent::CompleteRouteReady { .. } => state.complete_route = true,
-                            Ds4LogEvent::WorkerRemoved { .. } => {
-                                state.worker_registered = false;
-                                state.complete_route = false;
-                            }
-                            Ds4LogEvent::RouteIncomplete { .. } => state.complete_route = false,
-                            Ds4LogEvent::HttpListening { .. } | Ds4LogEvent::DsparkActivated => {}
-                        }
-                        route.send_replace(state);
-                    }
-                    Some(record) = logs.recv() => {
-                        tracing::info!(
-                            profile = %record.profile_id,
-                            generation = record.generation,
-                            pid = record.pid,
-                            stream = ?record.stream,
-                            truncated = record.truncated,
-                            event = ?record.event,
-                            line_bytes = record.line.len(),
-                            "DS4 distributed coordinator log"
-                        );
-                    }
-                    else => break,
-                }
-            }
-        });
-        if let Err(error) = child
-            .wait_http_ready(
-                &self.inner.client,
-                &self.inner.models_url,
-                self.inner.http_startup_timeout,
-                self.inner.poll_interval,
-            )
-            .await
-        {
-            let _ = child
-                .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-                .await;
-            log_task.abort();
-            return Err(error.into());
-        }
-        let mut state = *self.inner.route.borrow();
-        state.http_ready = true;
-        self.inner.route.send_replace(state);
-        *slot = Some(SupervisedChild {
-            child,
-            _log_forwarders: forwarders,
-            log_task,
-        });
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    async fn start_inner(&self, _generation: u64) -> anyhow::Result<()> {
-        anyhow::bail!("managed DS4 supervision requires macOS")
-    }
-
-    async fn stop_inner(&self) -> anyhow::Result<()> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(mut current) = slot.take() else {
-            self.inner
-                .route
-                .send_replace(CoordinatorRouteState::default());
-            return Ok(());
-        };
-        let result = current
-            .child
-            .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
-            .await;
-        current.log_task.abort();
-        self.inner
-            .route
-            .send_replace(CoordinatorRouteState::default());
-        result?;
-        Ok(())
-    }
-
-    async fn is_running_inner(&self) -> anyhow::Result<bool> {
-        let mut slot = self.inner.child.lock().await;
-        let Some(current) = slot.as_mut() else {
-            return Ok(false);
-        };
-        Ok(current.child.try_wait()?.is_none())
-    }
-
-    async fn wait_ready_inner(&self) -> anyhow::Result<()> {
-        let mut route = self.inner.route.subscribe();
-        loop {
-            let state = *route.borrow_and_update();
-            if state.http_ready && state.worker_registered && state.complete_route {
-                return Ok(());
-            }
-            if !self.is_running_inner().await? {
-                anyhow::bail!("distributed coordinator exited before complete route");
-            }
-            tokio::select! {
-                result = route.changed() => result.map_err(|_| anyhow::anyhow!("route monitor stopped"))?,
-                () = tokio::time::sleep(self.inner.poll_interval) => {}
-            }
-        }
-    }
-
-    async fn wait_route_loss_inner(&self) -> anyhow::Result<()> {
-        let mut route = self.inner.route.subscribe();
-        loop {
-            let state = *route.borrow_and_update();
-            if !state.http_ready || !state.worker_registered || !state.complete_route {
-                return Ok(());
-            }
-            if !self.is_running_inner().await? {
-                return Ok(());
-            }
-            tokio::select! {
-                result = route.changed() => result.map_err(|_| anyhow::anyhow!("route monitor stopped"))?,
-                () = tokio::time::sleep(self.inner.poll_interval) => {}
-            }
-        }
-    }
-}
-
-impl LocalStandaloneLifecycle for StandaloneSupervisor {
-    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.start_inner(generation).await })
-    }
-
-    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.stop_inner().await })
-    }
-
-    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.is_running_inner().await })
-    }
-}
-
-impl DistributedWorkerLifecycle for DistributedWorkerSupervisor {
-    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.start_inner(generation).await })
-    }
-
-    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.stop_inner().await })
-    }
-
-    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.is_running_inner().await })
-    }
-}
-
-impl DistributedCoordinatorLifecycle for DistributedCoordinatorSupervisor {
-    fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.start_inner(generation).await })
-    }
-
-    fn wait_ready(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.wait_ready_inner().await })
-    }
-
-    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.stop_inner().await })
-    }
-
-    fn wait_route_loss(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { supervisor.wait_route_loss_inner().await })
+        Ok(Some(slot))
     }
 }
 
@@ -862,6 +580,35 @@ impl ManagedChild {
         let stdout = self.take_stdout().expect("stdout presence checked above");
         let stderr = self.take_stderr().expect("stderr presence checked above");
         Ok(spawn_child_log_forwarders(
+            stdout,
+            stderr,
+            Arc::from(self.identity.profile_id.as_str()),
+            self.identity.generation,
+            self.identity.pid,
+            capacity,
+        ))
+    }
+
+    pub fn start_log_forwarding_with_events(
+        &mut self,
+        capacity: usize,
+    ) -> Result<
+        (
+            mpsc::Receiver<ChildLogRecord>,
+            mpsc::UnboundedReceiver<Ds4LogEvent>,
+            ChildLogForwarders,
+        ),
+        ProcessControlError,
+    > {
+        if capacity == 0 {
+            return Err(ProcessControlError::InvalidLogCapacity);
+        }
+        if self.child.stdout.is_none() || self.child.stderr.is_none() {
+            return Err(ProcessControlError::MissingLogPipe);
+        }
+        let stdout = self.take_stdout().expect("stdout presence checked above");
+        let stderr = self.take_stderr().expect("stderr presence checked above");
+        Ok(spawn_child_log_forwarders_with_events(
             stdout,
             stderr,
             Arc::from(self.identity.profile_id.as_str()),
@@ -1016,6 +763,7 @@ fn system_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::DistributedWorkerLifecycle;
     use std::sync::Mutex;
 
     #[derive(Clone)]
@@ -1110,6 +858,45 @@ mod tests {
             Err(ProcessControlError::NotRunning)
         ));
         assert!(signaler.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_external_process_is_terminated_after_identity_recheck() {
+        let observed = observed();
+        let slot = Arc::new(Mutex::new(Some(observed.clone())));
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let signaler = Arc::new(ApprovedSignaler {
+            observed: slot.clone(),
+            signals: signals.clone(),
+        });
+        let controller = ProcessController::new(Arc::new(Inspector(slot)), signaler);
+        controller
+            .force_stop_approved(
+                &ProcessIdentity::from_observed(&observed),
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signals.lock().unwrap().as_slice(),
+            &[(42, ProcessSignal::Terminate)]
+        );
+    }
+
+    struct ApprovedSignaler {
+        observed: Arc<Mutex<Option<ObservedProcess>>>,
+        signals: Arc<Mutex<Vec<(u32, ProcessSignal)>>>,
+    }
+
+    impl ProcessSignaler for ApprovedSignaler {
+        fn signal_process_group(&self, pid: u32, signal: ProcessSignal) -> io::Result<()> {
+            self.signals.lock().unwrap().push((pid, signal));
+            if signal == ProcessSignal::Terminate {
+                *self.observed.lock().unwrap() = None;
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -1223,7 +1010,12 @@ mod tests {
                 dspark_required: false,
             },
         };
-        let supervisor = DistributedWorkerSupervisor::new(command, Duration::from_secs(2), false);
+        let supervisor = DistributedWorkerSupervisor::new(
+            command,
+            Duration::from_secs(2),
+            false,
+            Arc::new(crate::metrics::Metrics::default()),
+        );
         supervisor.start(13).await.unwrap();
         assert!(supervisor.is_running().await.unwrap());
         assert_eq!(supervisor.child_identity().await.unwrap().generation, 13);

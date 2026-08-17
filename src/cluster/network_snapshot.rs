@@ -43,6 +43,9 @@ pub struct PeerObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkObservation {
+    /// Monotonic observation epoch. Each rescan (initial, debounced notification, reconcile)
+    /// produces a strictly increasing epoch so stale observations can be rejected (N-02).
+    pub epoch: u64,
     pub expected_interface: String,
     pub coordinator_address: Ipv4Addr,
     pub worker_address: Ipv4Addr,
@@ -54,6 +57,9 @@ pub struct NetworkObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkSnapshot {
+    /// Observation epoch copied from the source [`NetworkObservation`]. Used to reject stale
+    /// observations and to verify a snapshot is not older than the request-time epoch (N-02).
+    pub epoch: u64,
     pub state: ThunderboltIpState,
     pub role: LocalRole,
     pub local_address: Option<Ipv4Addr>,
@@ -64,16 +70,16 @@ pub struct NetworkSnapshot {
 impl NetworkSnapshot {
     pub fn from_observation(observation: &NetworkObservation) -> Self {
         let Some(service) = &observation.service else {
-            return unavailable(ThunderboltIpState::ServiceMissing);
+            return unavailable(observation.epoch, ThunderboltIpState::ServiceMissing);
         };
         if !service.enabled || !service.ipv4_enabled {
-            return unavailable(ThunderboltIpState::ServiceDisabled);
+            return unavailable(observation.epoch, ThunderboltIpState::ServiceDisabled);
         }
         let Some(interface) = &observation.interface else {
-            return unavailable(ThunderboltIpState::InterfaceUnavailable);
+            return unavailable(observation.epoch, ThunderboltIpState::InterfaceUnavailable);
         };
         if interface.name != observation.expected_interface || !interface.up {
-            return unavailable(ThunderboltIpState::InterfaceUnavailable);
+            return unavailable(observation.epoch, ThunderboltIpState::InterfaceUnavailable);
         }
 
         let role = assess_role(
@@ -87,11 +93,14 @@ impl NetworkSnapshot {
             address: local_address,
         } = role
         else {
-            return unavailable(match role {
-                RoleAssessment::Missing => ThunderboltIpState::AddressMissing,
-                RoleAssessment::Conflict => ThunderboltIpState::AddressConflict,
-                RoleAssessment::Known { .. } => unreachable!(),
-            });
+            return unavailable(
+                observation.epoch,
+                match role {
+                    RoleAssessment::Missing => ThunderboltIpState::AddressMissing,
+                    RoleAssessment::Conflict => ThunderboltIpState::AddressConflict,
+                    RoleAssessment::Known { .. } => unreachable!(),
+                },
+            );
         };
         if assess_role(
             &service.configured_addresses,
@@ -102,7 +111,7 @@ impl NetworkSnapshot {
             role,
             address: local_address,
         }) {
-            return unavailable(ThunderboltIpState::AddressConflict);
+            return unavailable(observation.epoch, ThunderboltIpState::AddressConflict);
         }
 
         let expected_peer_address = match role {
@@ -120,6 +129,7 @@ impl NetworkSnapshot {
             ThunderboltIpState::ReadyNoPeer
         };
         Self {
+            epoch: observation.epoch,
             state,
             role,
             local_address: Some(local_address),
@@ -127,10 +137,33 @@ impl NetworkSnapshot {
             peer_present: state == ThunderboltIpState::AuthenticatedPeer,
         }
     }
+
+    /// True when this snapshot's epoch is strictly older than `newer_epoch`. A stale snapshot
+    /// must not be used for a pairing / route decision (N-02).
+    pub fn stale_relative_to(&self, newer_epoch: u64) -> bool {
+        self.epoch < newer_epoch
+    }
 }
 
-fn unavailable(state: ThunderboltIpState) -> NetworkSnapshot {
+impl Default for NetworkSnapshot {
+    /// Fail-closed default: no observation has been applied, so neither route scoping nor peer
+    /// presence holds. The production control plane must not establish/renew a lease before a
+    /// fresh observation is available.
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            state: ThunderboltIpState::ReadyNoPeer,
+            role: LocalRole::Unknown,
+            local_address: None,
+            expected_peer_address: None,
+            peer_present: false,
+        }
+    }
+}
+
+fn unavailable(epoch: u64, state: ThunderboltIpState) -> NetworkSnapshot {
     NetworkSnapshot {
+        epoch,
         state,
         role: LocalRole::Unknown,
         local_address: None,
@@ -155,6 +188,7 @@ mod tests {
 
     fn ready_observation() -> NetworkObservation {
         NetworkObservation {
+            epoch: 7,
             expected_interface: "bridge0".into(),
             coordinator_address: COORDINATOR,
             worker_address: WORKER,
@@ -211,6 +245,21 @@ mod tests {
         let snapshot = NetworkSnapshot::from_observation(&observation);
         assert_eq!(snapshot.state, ThunderboltIpState::AuthenticatedPeer);
         assert!(snapshot.peer_present);
+    }
+
+    #[test]
+    fn snapshot_carries_observation_epoch_and_rejects_stale_relative_to() {
+        let mut observation = ready_observation(); // epoch 7
+        let snapshot = NetworkSnapshot::from_observation(&observation);
+        assert_eq!(snapshot.epoch, 7);
+        assert!(!snapshot.stale_relative_to(7));
+        assert!(snapshot.stale_relative_to(8));
+
+        // An observation with an older epoch produces a stale snapshot that must not be used.
+        observation.epoch = 3;
+        let stale = NetworkSnapshot::from_observation(&observation);
+        assert_eq!(stale.epoch, 3);
+        assert!(stale.stale_relative_to(snapshot.epoch));
     }
 
     #[test]

@@ -19,12 +19,14 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
   <key>ProcessType</key>
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/USERNAME/Library/Logs/siderostat/stdout.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/ds4-siderostat.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/USERNAME/Library/Logs/siderostat/stderr.log</string>
+  <string>/Users/USERNAME/Library/Logs/siderostat/ds4-siderostat.log</string>
 </dict>
 </plist>

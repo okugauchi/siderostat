@@ -1,0 +1,40 @@
+{
+  "entries": {
+    "standalone-model": {
+      "meta": {
+        "device_id": 16777229,
+        "inode": 16902234,
+        "size": 97591747456,
+        "modified_nanos": 1786236311340922155
+      },
+      "digest": "659e22fbd01c9e13ea37a57c8d9c41e0a8819dffa3473d3c5286ee44b2d3398f"
+    },
+    "ds4-binary": {
+      "meta": {
+        "device_id": 16777229,
+        "inode": 17485823,
+        "size": 2330152,
+        "modified_nanos": 1786405656361367018
+      },
+      "digest": "344006e44d412787dea5af8e25c689f77136aac7379be4545402995ddbb3e1f2"
+    },
+    "dspark-support": {
+      "meta": {
+        "device_id": 16777229,
+        "inode": 16910733,
+        "size": 5989114272,
+        "modified_nanos": 1786238298838064069
+      },
+      "digest": "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360"
+    },
+    "mxfp4-model": {
+      "meta": {
+        "device_id": 16777229,
+        "inode": 16913696,
+        "size": 155976458848,
+        "modified_nanos": 1786243625587995579
+      },
+      "digest": "0e3a161b670f686128ec5f92a601dfde616a37bf5e7e48999fa2d32471b57ec6"
+    }
+  }
+}

@@ -5,11 +5,31 @@ pub enum LocalRole {
     Unknown,
 }
 
+impl LocalRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            LocalRole::Coordinator => "coordinator",
+            LocalRole::Worker => "worker",
+            LocalRole::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StableMode {
     SoloStandalone,
     PairedStandalone,
     DistributedMxfp4,
+}
+
+impl StableMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            StableMode::SoloStandalone => "solo-standalone",
+            StableMode::PairedStandalone => "paired-standalone",
+            StableMode::DistributedMxfp4 => "distributed-mxfp4",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +46,25 @@ pub enum ClusterState {
     Demoting,
     Backoff,
     ManualInterventionRequired,
+}
+
+impl ClusterState {
+    pub fn name(self) -> &'static str {
+        match self {
+            ClusterState::Booting => "booting",
+            ClusterState::SoloStandaloneStarting => "solo-standalone-starting",
+            ClusterState::SoloStandaloneReady => "solo-standalone-ready",
+            ClusterState::Pairing => "pairing",
+            ClusterState::PairedStandaloneReady => "paired-standalone-ready",
+            ClusterState::AwaitingWorkerHello => "awaiting-worker-hello",
+            ClusterState::Promoting => "promoting",
+            ClusterState::DistributedStarting => "distributed-starting",
+            ClusterState::DistributedReady => "distributed-ready",
+            ClusterState::Demoting => "demoting",
+            ClusterState::Backoff => "backoff",
+            ClusterState::ManualInterventionRequired => "manual-intervention-required",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +304,47 @@ mod tests {
             ProxyTarget::Unavailable {
                 reason: UnavailableReason::UnknownRoleWithoutLocalStandalone,
             }
+        );
+    }
+    #[test]
+    fn enum_names_are_stable_metric_labels() {
+        assert_eq!(LocalRole::Coordinator.name(), "coordinator");
+        assert_eq!(LocalRole::Worker.name(), "worker");
+        assert_eq!(LocalRole::Unknown.name(), "unknown");
+
+        assert_eq!(StableMode::SoloStandalone.name(), "solo-standalone");
+        assert_eq!(StableMode::PairedStandalone.name(), "paired-standalone");
+        assert_eq!(StableMode::DistributedMxfp4.name(), "distributed-mxfp4");
+
+        assert_eq!(ClusterState::Booting.name(), "booting");
+        assert_eq!(
+            ClusterState::SoloStandaloneStarting.name(),
+            "solo-standalone-starting"
+        );
+        assert_eq!(
+            ClusterState::SoloStandaloneReady.name(),
+            "solo-standalone-ready"
+        );
+        assert_eq!(ClusterState::Pairing.name(), "pairing");
+        assert_eq!(
+            ClusterState::PairedStandaloneReady.name(),
+            "paired-standalone-ready"
+        );
+        assert_eq!(
+            ClusterState::AwaitingWorkerHello.name(),
+            "awaiting-worker-hello"
+        );
+        assert_eq!(ClusterState::Promoting.name(), "promoting");
+        assert_eq!(
+            ClusterState::DistributedStarting.name(),
+            "distributed-starting"
+        );
+        assert_eq!(ClusterState::DistributedReady.name(), "distributed-ready");
+        assert_eq!(ClusterState::Demoting.name(), "demoting");
+        assert_eq!(ClusterState::Backoff.name(), "backoff");
+        assert_eq!(
+            ClusterState::ManualInterventionRequired.name(),
+            "manual-intervention-required"
         );
     }
 }

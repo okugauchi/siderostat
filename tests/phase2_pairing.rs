@@ -4,8 +4,8 @@ use futures::future::BoxFuture;
 use siderostat::{
     cluster::{
         ControlAuthenticator, ControlCommand, ControlEndpoint, ControlMessage, ControlMode,
-        ControlRole, ControlSecret, LocalStandaloneLifecycle, ModeRuntime, NodeDescriptor,
-        WorkerControl,
+        ControlRole, ControlSecret, EventOwner, LocalStandaloneLifecycle, ModeRuntime,
+        NodeDescriptor, WorkerControl,
     },
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
@@ -191,13 +191,19 @@ async fn fake_upstreams_converge_solo_paired_solo() {
             1_000,
         )
         .unwrap();
-    runtime.reconcile_peer(&mut control, 1_020).await.unwrap();
+    runtime
+        .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_020)
+        .await
+        .unwrap();
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "coordinator-local"
     );
 
-    runtime.reconcile_peer(&mut control, 1_150).await.unwrap();
+    runtime
+        .reconcile_peer(EventOwner::PeriodicReconcile, &mut control, 1_150)
+        .await
+        .unwrap();
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "worker-solo"

@@ -252,6 +252,16 @@ impl PeerLease {
         self.descriptor.as_ref()
     }
 
+    fn matches_peer(&self, authenticated: &AuthenticatedPeer) -> bool {
+        self.descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.node_id == authenticated.node_id())
+    }
+
+    pub fn route_scoped(&self) -> bool {
+        self.route_scoped
+    }
+
     pub fn invalidate_route(&mut self) {
         self.route_scoped = false;
     }
@@ -296,15 +306,31 @@ impl ControlProcessor {
         if !route_scoped {
             return Err(ControlError::RouteNotScoped);
         }
-        if self.lease.descriptor().is_some() {
-            self.lease
-                .renew(authenticated, self.local.generation, true, now_millis)?;
-        }
+        let lease_expires_at_millis = match self.lease.descriptor() {
+            None => None,
+            Some(_) if self.lease.expired(now_millis) => {
+                // A previously paired, authenticated peer must be able to obtain the current
+                // descriptor after a lease timeout. The coordinator needs this response to
+                // negotiate a fresh generation and send Pair; returning 409 here makes both
+                // nodes remain in SoloStandaloneReady forever. Do not establish a lease on a
+                // read-only request: the subsequent Pair command still performs the normal
+                // authenticated route and generation checks.
+                if !self.lease.matches_peer(authenticated) {
+                    return Err(ControlError::PeerNotPaired);
+                }
+                None
+            }
+            Some(_) => {
+                self.lease
+                    .renew(authenticated, self.local.generation, true, now_millis)?;
+                self.lease.expires_at_millis()
+            }
+        };
         Ok(ControlResponse {
             status: ControlResponseStatus::Applied,
             generation: self.local.generation,
             descriptor: self.local.clone(),
-            lease_expires_at_millis: self.lease.expires_at_millis(),
+            lease_expires_at_millis,
         })
     }
 
@@ -416,6 +442,18 @@ impl ControlProcessor {
     pub(crate) fn local_descriptor(&self) -> &NodeDescriptor {
         &self.local
     }
+
+    /// Compute the session candidate generation for a Pair offer/confirm: the larger of the
+    /// local control session generation and the peer's reported generation. Never lower than
+    /// either side's known value (design §4). The result cannot exceed `u64::MAX`, but the
+    /// computation is explicit so `u64::MAX` is never treated as an overflow.
+    pub(crate) fn candidate_generation(&self, peer_generation: u64) -> Result<u64, ControlError> {
+        Ok(if peer_generation > self.local.generation {
+            peer_generation
+        } else {
+            self.local.generation
+        })
+    }
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -508,6 +546,107 @@ impl ControlRequest<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_generation_never_lowers_the_known_control_session_generation() {
+        // Table-driven (G-02, design §4): the candidate for a Pair offer/confirm is the larger
+        // of the local control session generation and the peer's reported generation, so a
+        // higher worker generation is adopted direction-independently and the candidate never
+        // overflows.
+        fn processor_at(generation: u64) -> ControlProcessor {
+            ControlProcessor::new(
+                NodeDescriptor {
+                    protocol_version: 1,
+                    node_id: "coordinator".into(),
+                    role: ControlRole::Coordinator,
+                    generation,
+                    mode: ControlMode::SoloStandalone,
+                    deployment_id: Some("deployment-a".into()),
+                },
+                ControlRole::Worker,
+                Duration::from_secs(15),
+                Duration::from_secs(5),
+            )
+        }
+        let cases: [(u64, u64, u64, &str); 5] = [
+            (7u64, 7u64, 7, "equal generations keep the local value"),
+            (7, 102, 102, "higher peer generation is adopted"),
+            (102, 7, 102, "higher local generation is kept"),
+            (
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                "u64::MAX is preserved without overflow",
+            ),
+            (0, u64::MAX, u64::MAX, "peer at u64::MAX is adopted"),
+        ];
+        for (local, peer, expected, label) in cases {
+            let processor = processor_at(local);
+            let candidate = processor.candidate_generation(peer).expect(label);
+            assert_eq!(candidate, expected, "{label}");
+            assert!(
+                candidate >= local && candidate >= peer,
+                "{label}: candidate must not be lower than either known generation"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_authenticated_peer_can_read_descriptor_to_restart_pairing() {
+        let mut processor = ControlProcessor::new(
+            NodeDescriptor {
+                protocol_version: 1,
+                node_id: "coordinator".into(),
+                role: ControlRole::Coordinator,
+                generation: 7,
+                mode: ControlMode::SoloStandalone,
+                deployment_id: Some("deployment-a".into()),
+            },
+            ControlRole::Worker,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        );
+        let authenticated =
+            AuthenticatedPeer::new_for_test("worker", "10.99.0.2".parse().unwrap(), 100);
+        let pair = ControlMessage {
+            request_id: "pair-1".into(),
+            generation: 7,
+            deployment_id: None,
+            command: ControlCommand::Pair {
+                descriptor: NodeDescriptor {
+                    protocol_version: 1,
+                    node_id: "worker".into(),
+                    role: ControlRole::Worker,
+                    generation: 7,
+                    mode: ControlMode::SoloStandalone,
+                    deployment_id: Some("deployment-a".into()),
+                },
+            },
+        };
+        processor
+            .handle_validated(
+                ControlEndpoint::Pair,
+                pair,
+                &authenticated,
+                true,
+                100,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let response = processor
+            .descriptor_response(&authenticated, true, 200)
+            .unwrap();
+        assert_eq!(response.generation, 7);
+        assert_eq!(response.lease_expires_at_millis, None);
+
+        let wrong_peer =
+            AuthenticatedPeer::new_for_test("other-worker", "10.99.0.3".parse().unwrap(), 200);
+        assert_eq!(
+            processor.descriptor_response(&wrong_peer, true, 200),
+            Err(ControlError::PeerNotPaired)
+        );
+    }
 
     #[test]
     fn recognizes_only_the_control_protocol_method_and_path_pairs() {

@@ -1,34 +1,40 @@
+#[cfg(target_os = "macos")]
+use crate::cluster::MacOsDynamicStoreWatcher;
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     cluster::{
-        AdminAction, AdminController, AdminExecutor, AdminFuture, ClusterEvent, ClusterEventKind,
-        ClusterHandle, DistributedManifest, FingerprintProfile, ModeRuntime,
-        PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState, PersistentMode,
-        PersistentProxyTarget, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
-        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
-        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
-        required_port_available,
+        AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
+        ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
+        DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
+        ModeRuntime, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION, PeerDiagnostics,
+        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
+        ProductionClusterRuntime, RestartDecision, StandaloneManifest, StandaloneSupervisor,
+        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
+        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
+        spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
+    notify::{DesktopNotificationService, NotifyPlatform, build_notifier},
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
     },
-    target::{ClusterState, LocalRole, ProxyTarget, StableMode, UnavailableReason},
+    target::{LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
+
 use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
     routing::{any, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -52,6 +58,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
+    production: RwLock<Option<ProductionClusterRuntime>>,
 }
 
 impl AppState {
@@ -107,6 +114,7 @@ impl AppState {
             metrics,
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
+            production: RwLock::new(None),
         }))
     }
 
@@ -123,6 +131,25 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(ClusterHandle::snapshot)
+    }
+
+    fn attach_production(&self, production: ProductionClusterRuntime) {
+        *self
+            .production
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(production);
+    }
+
+    async fn production_diagnostics(&self) -> Option<crate::cluster::ProductionDiagnostics> {
+        let production = self
+            .production
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match production {
+            Some(production) => Some(production.diagnostics().await),
+            None => None,
+        }
     }
 
     fn attach_admin(&self, admin: AdminController) {
@@ -146,6 +173,9 @@ struct RuntimeAdminExecutor {
     standalone_model: PathBuf,
     distributed_model: PathBuf,
     production: Option<ProductionClusterRuntime>,
+    interface: String,
+    coordinator_address: IpAddr,
+    worker_address: IpAddr,
 }
 
 impl AdminExecutor for RuntimeAdminExecutor {
@@ -155,27 +185,61 @@ impl AdminExecutor for RuntimeAdminExecutor {
         let standalone_model = self.standalone_model.clone();
         let distributed_model = self.distributed_model.clone();
         let production = self.production.clone();
+        let interface = self.interface.clone();
+        let coordinator_address = self.coordinator_address;
+        let worker_address = self.worker_address;
         Box::pin(async move {
             match action {
                 AdminAction::Reconcile => {
-                    let current = runtime.snapshot();
-                    if current.state == ClusterState::ManualInterventionRequired {
-                        runtime
-                            .cluster_handle()
-                            .apply(ClusterEvent {
-                                expected_generation: current.generation,
-                                kind: ClusterEventKind::OperatorReconcile,
-                            })
-                            .await?;
-                    }
+                    // B-03: route through the coordinator runtime so the promotion tracker reset
+                    // and the OperatorReconcile state event are one atomic operation, instead of
+                    // applying the event directly to the state machine. Worker / role-unknown /
+                    // non-manual states are reported explicitly in the response.
+                    let note = if let Some(production) = &production {
+                        match production.operator_reconcile().await? {
+                            OperatorReconcileOutcome::Coordinator { manual_cleared } => {
+                                if manual_cleared {
+                                    "coordinator promotion tracker reset; manual intervention cleared"
+                                } else {
+                                    "coordinator promotion tracker reset"
+                                }
+                            }
+                            OperatorReconcileOutcome::NotCoordinator { manual_cleared } => {
+                                if manual_cleared {
+                                    "no coordinator promotion tracker; local manual state cleared"
+                                } else {
+                                    "no coordinator promotion tracker on this node"
+                                }
+                            }
+                        }
+                    } else {
+                        "cluster disabled; no coordinator promotion tracker"
+                    };
                     let snapshot = if let Some(production) = &production {
                         production.reconcile().await?
                     } else {
                         runtime.reconcile_local().await?
                     };
-                    Ok(snapshot_json(snapshot))
+                    let mut value = snapshot_json(snapshot);
+                    value["reconcile"] = json!(note);
+                    Ok(value)
                 }
                 AdminAction::Restart => {
+                    let new_role =
+                        detect_cluster_role(&interface, coordinator_address, worker_address)?;
+                    let current_role = production
+                        .as_ref()
+                        .map(ProductionClusterRuntime::role)
+                        .unwrap_or(LocalRole::Unknown);
+                    if new_role != current_role {
+                        tracing::warn!(from = ?current_role, to = ?new_role, "cluster role changed on restart; restarting process to apply new role");
+                        spawn_process_restart();
+                        return Ok(json!({
+                            "restart": "process",
+                            "role": new_role.name(),
+                            "reason": "role-change",
+                        }));
+                    }
                     anyhow::ensure!(
                         runtime.snapshot().stable_mode == StableMode::SoloStandalone,
                         "restart of a distributed profile requires its active lifecycle owner"
@@ -215,64 +279,132 @@ impl AdminExecutor for RuntimeAdminExecutor {
     }
 }
 
+fn spawn_process_restart() {
+    // LaunchAgent の KeepAlive に依存して siderostat プロセス全体を再起動する。
+    // role は起動時に一度だけ判定されるため、role 変更を適用するにはプロセスごと
+    // 再起動して起動時判定をやり直す必要がある。
+    // HTTP 応答を返す猶予を確保してから exit する。
+    tokio::task::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(0);
+    });
+}
+
+/// macOS のネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
+/// role が初期値から変化したらプロセス全体を再起動する。起動時に一度だけ判定される
+/// role を、ケーブル抜き差し後も LaunchAgent 再起動を介して更新するための配線。
+#[cfg(target_os = "macos")]
+fn spawn_role_change_monitor(
+    config: &ModeAwareConfig,
+    initial_role: LocalRole,
+) -> (
+    Option<tokio::task::JoinHandle<()>>,
+    Option<MacOsDynamicStoreWatcher>,
+) {
+    let (rescans, mut rescan_receiver) = tokio::sync::mpsc::channel(16);
+    let (handle, monitor_task) = match spawn_network_event_monitor(
+        0,
+        config.cluster.discovery.event_debounce,
+        config.cluster.discovery.reconcile_interval,
+        64,
+        rescans,
+    ) {
+        Ok(pair) => pair,
+        Err(error) => {
+            tracing::warn!(error = %error, "network event monitor unavailable");
+            return (None, None);
+        }
+    };
+    let watcher = match MacOsDynamicStoreWatcher::start(&config.cluster.interface, handle) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::warn!(error = %error, "dynamic store watcher unavailable");
+            return (Some(monitor_task), None);
+        }
+    };
+    let interface = config.cluster.interface.clone();
+    let coordinator = config.cluster.coordinator_address;
+    let worker = config.cluster.worker_address;
+    let task = tokio::spawn(async move {
+        while let Some(request) = rescan_receiver.recv().await {
+            match detect_cluster_role(&interface, coordinator, worker) {
+                Ok(new_role) if new_role != initial_role => {
+                    tracing::warn!(
+                        from = ?initial_role,
+                        to = ?new_role,
+                        reason = ?request.reason,
+                        "cluster role changed; restarting process to apply new role"
+                    );
+                    spawn_process_restart();
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "cluster role re-detection failed");
+                }
+            }
+        }
+    });
+    (Some(task), Some(watcher))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_role_change_monitor(
+    _config: &ModeAwareConfig,
+    _initial_role: LocalRole,
+) -> (Option<tokio::task::JoinHandle<()>>, Option<()>) {
+    (None, None)
+}
+
 fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
     json!({
         "generation": snapshot.generation,
-        "role": role_name(snapshot.role),
-        "mode": stable_mode_name(snapshot.stable_mode),
-        "state": cluster_state_name(snapshot.state),
+        "role": snapshot.role.name(),
+        "mode": snapshot.stable_mode.name(),
+        "state": snapshot.state.name(),
         "target": target_name(snapshot.target),
     })
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServeOptions {
+    pub decline_startup_cleanup: bool,
+}
+
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
-    // Childを起動する前にmutation認証材料を確定し、起動途中のorphanを防ぐ。
-    if config.ds4.dspark.enabled {
-        let manifest_bytes = std::fs::read(&config.ds4.standalone.model_manifest)?;
-        let manifest = serde_json::from_slice::<StandaloneManifest>(&manifest_bytes)?;
-        let support_model = config
-            .ds4
-            .dspark
-            .support_model
-            .as_deref()
-            .context("DSpark support model is unavailable")?;
-        let fingerprint = fingerprint_file(support_model).await?;
-        manifest.validate_dspark_binding(
-            &fingerprint,
-            config.ds4.dspark.confidence,
-            config.ds4.dspark.strict,
-        )?;
-    }
-    let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
-    let control_secret = if config.cluster.enabled {
-        Some(std::fs::read(&config.cluster.security.control_secret_file)?)
-    } else {
-        None
-    };
-    let distributed_manifest = if config.cluster.enabled {
-        let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
-        Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
-    } else {
-        None
-    };
-    let role = if config.cluster.enabled {
-        detect_cluster_role(
-            &config.cluster.interface,
-            config.cluster.coordinator_address,
-            config.cluster.worker_address,
-        )?
-    } else {
-        LocalRole::Unknown
-    };
-    let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
-    let persisted = match state_store.load() {
-        Ok(state) => state,
-        Err(StateStoreError::CorruptPreserved { path, reason }) => {
-            tracing::warn!(preserved = %path.display(), reason, "corrupt cluster state preserved");
-            None
+    serve_with_options(config, ServeOptions::default()).await
+}
+
+pub async fn serve_with_options(
+    config: ModeAwareConfig,
+    options: ServeOptions,
+) -> anyhow::Result<()> {
+    validate_dspark_binding(&config).await?;
+    let boot = BootInputs::load(&config).await?;
+    match crate::startup_cleanup::cleanup_startup_processes(
+        std::process::id(),
+        &config.ds4.binary,
+        &platform_process_controller(),
+        config.cluster.timeouts.stop,
+        crate::startup_cleanup::StartupCleanupOptions {
+            decline: options.decline_startup_cleanup,
+            auto_restart: config.startup_cleanup.auto_restart,
+            notifications_enabled: config.notifications.enabled,
+            notification_sound: config.notifications.sound,
+        },
+    )
+    .await?
+    {
+        crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
+        | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
+        crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
+            anyhow::bail!(
+                "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
+            );
         }
-        Err(error) => return Err(error.into()),
-    };
+    }
+    let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
+    let persisted = load_persisted_state(&state_store)?;
     let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
     let restart = reconcile_restart(
         persisted.as_ref(),
@@ -290,20 +422,174 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
         },
         false,
     );
+    let supervisor = build_standalone_supervisor(&config, &state)?;
+    let role = boot.role;
+    let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
+    let control_session_generation = persisted
+        .as_ref()
+        .map(|persisted| persisted.control_session_generation);
+    let production = attach_control_plane(
+        &config,
+        boot,
+        &state,
+        &runtime,
+        &supervisor,
+        control_session_generation,
+    )?;
+    let notifier = build_notifier(
+        config.notifications.enabled,
+        config.notifications.sound,
+        NotifyPlatform::detect(),
+    );
+    let notification_service = DesktopNotificationService::new(notifier);
+    if config.notifications.enabled {
+        notification_service.log_session_status().await;
+    }
+    let notification_service = Arc::new(std::sync::Mutex::new(notification_service));
+    let transition_monitor = spawn_transition_monitor(
+        &state,
+        &state_store,
+        &runtime,
+        &supervisor,
+        production.as_ref(),
+        &config.ds4.standalone.profile_id,
+    );
+    persist_runtime_state(
+        &state_store,
+        &runtime,
+        &supervisor,
+        production.as_ref(),
+        &config.ds4.standalone.profile_id,
+    )
+    .await?;
+    let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
+    let local_monitor = spawn_local_monitor(
+        &state,
+        &state_store,
+        &runtime,
+        &supervisor,
+        &config.ds4.standalone.profile_id,
+        notification_service.clone(),
+    );
+    // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
+    // role が起動時の初期値から変化したらプロセス全体を再起動する。
+    let (_role_change_task, _role_change_watcher) = spawn_role_change_monitor(&config, role);
+    run_servers(
+        &config,
+        state,
+        production,
+        role,
+        supervisor,
+        runtime,
+        transition_monitor,
+        local_monitor,
+        desktop_notifier,
+    )
+    .await
+}
+
+/// Child起動前にmutation認証材料を確定し、起動途中のorphanを防ぐDSparkバインド検証。
+async fn validate_dspark_binding(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    if config.ds4.dspark.enabled {
+        let manifest_bytes = std::fs::read(&config.ds4.standalone.model_manifest)?;
+        let manifest = serde_json::from_slice::<StandaloneManifest>(&manifest_bytes)?;
+        let support_model = config
+            .ds4
+            .dspark
+            .support_model
+            .as_deref()
+            .context("DSpark support model is unavailable")?;
+        let fingerprint = fingerprint_file(support_model).await?;
+        manifest.validate_dspark_binding(
+            &fingerprint,
+            config.ds4.dspark.confidence,
+            config.ds4.dspark.strict,
+        )?;
+    }
+    Ok(())
+}
+
+/// 起動前に一度だけ読み取る認証材料と役割のまとまり。
+struct BootInputs {
+    admin_token: Vec<u8>,
+    control_secret: Option<Vec<u8>>,
+    distributed_manifest: Option<DistributedManifest>,
+    role: LocalRole,
+}
+
+impl BootInputs {
+    async fn load(config: &ModeAwareConfig) -> anyhow::Result<Self> {
+        let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
+        let control_secret = if config.cluster.enabled {
+            Some(std::fs::read(&config.cluster.security.control_secret_file)?)
+        } else {
+            None
+        };
+        let distributed_manifest = if config.cluster.enabled {
+            let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
+            Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
+        } else {
+            None
+        };
+        let role = if config.cluster.enabled {
+            detect_cluster_role(
+                &config.cluster.interface,
+                config.cluster.coordinator_address,
+                config.cluster.worker_address,
+            )?
+        } else {
+            LocalRole::Unknown
+        };
+        Ok(Self {
+            admin_token,
+            control_secret,
+            distributed_manifest,
+            role,
+        })
+    }
+}
+
+fn load_persisted_state(
+    state_store: &StateStore,
+) -> anyhow::Result<Option<PersistentClusterState>> {
+    match state_store.load() {
+        Ok(state) => Ok(state),
+        Err(StateStoreError::CorruptPreserved { path, reason }) => {
+            tracing::warn!(preserved = %path.display(), reason, "corrupt cluster state preserved");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn build_standalone_supervisor(
+    config: &ModeAwareConfig,
+    state: &Arc<AppState>,
+) -> anyhow::Result<Arc<StandaloneSupervisor>> {
     let command = build_standalone_command(&config.ds4)?;
     let models_url = url::Url::parse(&format!(
         "http://{}:{}/v1/models",
         config.ds4.http_host, config.ds4.http_port
     ))?;
-    let supervisor = Arc::new(StandaloneSupervisor::new(
+    Ok(Arc::new(StandaloneSupervisor::new(
         command,
         models_url,
         config.cluster.timeouts.standalone_startup,
         std::time::Duration::from_millis(250),
         config.cluster.timeouts.stop,
         config.ds4.allow_sigkill,
-    ));
-    let runtime = Arc::new(match restart {
+        state.metrics.clone(),
+    )))
+}
+
+async fn spawn_runtime(
+    config: &ModeAwareConfig,
+    role: LocalRole,
+    state: &Arc<AppState>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    restart: RestartDecision,
+) -> anyhow::Result<Arc<ModeRuntime>> {
+    Ok(Arc::new(match restart {
         RestartDecision::StartSolo {
             baseline_generation,
         } => {
@@ -330,46 +616,161 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             )
             .await?
         }
-    });
-    let production = if config.cluster.enabled {
+    }))
+}
+
+fn attach_control_plane(
+    config: &ModeAwareConfig,
+    boot: BootInputs,
+    state: &Arc<AppState>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    control_session_generation: Option<u64>,
+) -> anyhow::Result<Option<ProductionClusterRuntime>> {
+    // detect_cluster_role は対象 interface に IPv4 が無い場合などに
+    // LocalRole::Unknown を返す。Unknown は standalone 運用として想定済み
+    // なので、production を生成せず起動を継続する。
+    let production = if config.cluster.enabled && boot.role != LocalRole::Unknown {
         Some(ProductionClusterRuntime::new(
             config.clone(),
-            role,
+            boot.role,
             runtime.clone(),
             state.proxy.clone(),
             supervisor.clone(),
-            distributed_manifest.context("distributed manifest is unavailable")?,
-            control_secret.context("control secret is unavailable")?,
+            state.metrics.clone(),
+            boot.distributed_manifest
+                .context("distributed manifest is unavailable")?,
+            boot.control_secret
+                .context("control secret is unavailable")?,
+            control_session_generation,
         )?)
     } else {
         None
     };
     state.attach_cluster(runtime.cluster_handle());
+    if let Some(production) = &production {
+        state.attach_production(production.clone());
+    }
     state.attach_admin(AdminController::new(
-        admin_token,
+        boot.admin_token,
         Arc::new(RuntimeAdminExecutor {
             runtime: runtime.clone(),
             supervisor: supervisor.clone(),
             standalone_model: config.ds4.standalone.model.clone(),
             distributed_model: config.ds4.mxfp4.model.clone(),
             production: production.clone(),
+            interface: config.cluster.interface.clone(),
+            coordinator_address: config.cluster.coordinator_address,
+            worker_address: config.cluster.worker_address,
         }),
     )?);
+    Ok(production)
+}
+
+#[cfg(feature = "test-support")]
+/// Run one admin `/cluster/reconcile` HTTP request against a production-backed
+/// `RuntimeAdminExecutor` and return the completed job result (test-support only). Builds an
+/// `AppState` from `config` (writing the peer-proxy token file the harness config omits), wires
+/// the same executor construction as `attach_control_plane`, POSTs `/cluster/reconcile` with
+/// `admin_token`, and polls the async admin job to completion. Lets an integration test drive
+/// the real admin HTTP endpoint against an already-built `ProductionClusterRuntime` from the
+/// two-node harness without needing `axum` in the integration crate.
+pub async fn admin_http_reconcile(
+    config: &ModeAwareConfig,
+    runtime: &Arc<ModeRuntime>,
+    production: Option<Arc<ProductionClusterRuntime>>,
+    admin_token: Vec<u8>,
+) -> anyhow::Result<Value> {
+    use axum::{body::to_bytes, http::Request};
+    use tower::ServiceExt;
+
+    std::fs::write(
+        &config.cluster.security.peer_proxy_token_file,
+        vec![0x42; 32],
+    )?;
+    let state = AppState::from_config(config.clone())?;
+    let supervisor = build_standalone_supervisor(config, &state)?;
+    state.attach_cluster(runtime.cluster_handle());
+    if let Some(production) = &production {
+        state.attach_production((**production).clone());
+    }
+    state.attach_admin(AdminController::new(
+        admin_token.clone(),
+        Arc::new(RuntimeAdminExecutor {
+            runtime: runtime.clone(),
+            supervisor,
+            standalone_model: config.ds4.standalone.model.clone(),
+            distributed_model: config.ds4.mxfp4.model.clone(),
+            production: production.as_ref().map(|p| (**p).clone()),
+            interface: config.cluster.interface.clone(),
+            coordinator_address: config.cluster.coordinator_address,
+            worker_address: config.cluster.worker_address,
+        }),
+    )?);
+
+    let bearer = format!("Bearer {}", crate::cluster::encode_token(&admin_token));
+    let request = Request::post("/cluster/reconcile")
+        .header("content-type", "application/json")
+        .header("authorization", bearer)
+        .body(Body::from("{}"))
+        .context("build admin reconcile request")?;
+    let response = admin_router(state.clone())
+        .oneshot(request)
+        .await
+        .context("admin reconcile HTTP request")?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let job: Value = serde_json::from_slice(&body)?;
+    let job_id = job["job_id"]
+        .as_str()
+        .context("reconcile job id")?
+        .to_string();
+
+    let admin = state.admin_controller().context("admin controller")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let job = admin.job(&job_id).context("admin job lookup")?;
+        match job.state {
+            crate::cluster::AdminJobState::Complete => {
+                return job.result.context("reconcile job result missing");
+            }
+            crate::cluster::AdminJobState::Failed => {
+                anyhow::bail!("admin reconcile failed: {:?}", job.error)
+            }
+            crate::cluster::AdminJobState::Running => {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "admin reconcile timed out"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+fn spawn_transition_monitor(
+    state: &Arc<AppState>,
+    state_store: &Arc<StateStore>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    production: Option<&ProductionClusterRuntime>,
+    profile: &str,
+) -> tokio::task::JoinHandle<()> {
     let mut transition_snapshots = runtime.cluster_handle().subscribe();
     let transition_metrics = state.metrics.clone();
     let transition_store = state_store.clone();
     let transition_runtime = runtime.clone();
     let transition_supervisor = supervisor.clone();
-    let transition_production = production.clone();
-    let transition_profile = config.ds4.standalone.profile_id.clone();
-    let transition_monitor = tokio::spawn(async move {
+    let transition_production = production.cloned();
+    let transition_profile = profile.to_string();
+    tokio::spawn(async move {
         let mut previous = *transition_snapshots.borrow_and_update();
         let mut transition_started = std::time::Instant::now();
         while transition_snapshots.changed().await.is_ok() {
             let current = *transition_snapshots.borrow_and_update();
             transition_metrics.transition(
-                cluster_state_name(previous.state),
-                cluster_state_name(current.state),
+                previous.state,
+                current.state,
                 "success",
                 "state-change",
                 transition_started.elapsed().as_secs_f64(),
@@ -388,21 +789,53 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
                 tracing::error!(error = %error, "persistent cluster transition write failed");
             }
         }
-    });
-    persist_runtime_state(
-        &state_store,
-        &runtime,
-        &supervisor,
-        production.as_ref(),
-        &config.ds4.standalone.profile_id,
-    )
-    .await?;
+    })
+}
+
+/// Subscribe to the cluster state watch channel and forward important
+/// transitions to the desktop notification service. Runs until the channel
+/// closes; failures are non-fatal and never affect the cluster.
+fn spawn_desktop_notifier(
+    runtime: &Arc<ModeRuntime>,
+    service: Arc<std::sync::Mutex<DesktopNotificationService>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut snapshots = runtime.cluster_handle().subscribe();
+    let startup_state = runtime.snapshot().state;
+    {
+        let mut service = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        service.observe_startup(startup_state);
+    }
+    tokio::spawn(async move {
+        let mut previous = *snapshots.borrow_and_update();
+        while snapshots.changed().await.is_ok() {
+            let current = *snapshots.borrow_and_update();
+            let mut service = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            service.observe_transition(previous.state, current.state);
+            drop(service);
+            previous = current;
+        }
+    })
+}
+
+fn spawn_local_monitor(
+    state: &Arc<AppState>,
+    state_store: &Arc<StateStore>,
+    runtime: &Arc<ModeRuntime>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    profile: &str,
+    notifier: Arc<std::sync::Mutex<DesktopNotificationService>>,
+) -> tokio::task::JoinHandle<()> {
     let local_monitor_runtime = runtime.clone();
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
-    let local_monitor_profile = config.ds4.standalone.profile_id.clone();
+    let local_monitor_profile = profile.to_string();
     let local_monitor_metrics = state.metrics.clone();
-    let local_monitor = tokio::spawn(async move {
+    let local_monitor_notifier = notifier;
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -411,6 +844,10 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
             match local_monitor_runtime.reconcile_local().await {
                 Ok(snapshot) if snapshot.generation != before => {
                     local_monitor_metrics.child_restart("standalone", "unexpected-exit");
+                    local_monitor_notifier
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .observe_child_restart();
                     if let Err(error) = persist_runtime_state(
                         &local_monitor_store,
                         &local_monitor_runtime,
@@ -429,7 +866,21 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
                 }
             }
         }
-    });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_servers(
+    config: &ModeAwareConfig,
+    state: Arc<AppState>,
+    production: Option<ProductionClusterRuntime>,
+    role: LocalRole,
+    supervisor: Arc<StandaloneSupervisor>,
+    runtime: Arc<ModeRuntime>,
+    transition_monitor: tokio::task::JoinHandle<()>,
+    local_monitor: tokio::task::JoinHandle<()>,
+    desktop_notifier: tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
     let public_addr = state.config.public_listen;
     let admin_addr = state.config.admin_listen;
     let public = public_router(state.clone());
@@ -508,6 +959,7 @@ pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
     shutdown_sender.send_replace(true);
     local_monitor.abort();
     transition_monitor.abort();
+    desktop_notifier.abort();
     if let Some(task) = reconcile_task {
         task.abort();
     }
@@ -584,12 +1036,17 @@ async fn persist_runtime_state(
         spawned_at_millis: identity.spawned_at_millis,
         process_start_micros: identity.process_start_micros,
     });
+    let control_session_generation = match production {
+        Some(production) => production.control_session_generation().await,
+        None => snapshot.generation,
+    };
     store.save(&PersistentClusterState {
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
+        control_session_generation,
         desired_mode: persistent_mode(snapshot.stable_mode),
         last_stable_mode: persistent_mode(snapshot.stable_mode),
-        cluster_state: cluster_state_name(snapshot.state).into(),
+        cluster_state: snapshot.state.name().into(),
         proxy_target: match snapshot.target {
             ProxyTarget::LocalStandalone => PersistentProxyTarget::LocalStandalone,
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
@@ -611,39 +1068,6 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
         StableMode::SoloStandalone => PersistentMode::SoloStandalone,
         StableMode::PairedStandalone => PersistentMode::PairedStandalone,
         StableMode::DistributedMxfp4 => PersistentMode::DistributedMxfp4,
-    }
-}
-
-fn stable_mode_name(mode: StableMode) -> &'static str {
-    match mode {
-        StableMode::SoloStandalone => "solo-standalone",
-        StableMode::PairedStandalone => "paired-standalone",
-        StableMode::DistributedMxfp4 => "distributed-mxfp4",
-    }
-}
-
-fn role_name(role: LocalRole) -> &'static str {
-    match role {
-        LocalRole::Coordinator => "coordinator",
-        LocalRole::Worker => "worker",
-        LocalRole::Unknown => "unknown",
-    }
-}
-
-fn cluster_state_name(state: ClusterState) -> &'static str {
-    match state {
-        ClusterState::Booting => "booting",
-        ClusterState::SoloStandaloneStarting => "solo-standalone-starting",
-        ClusterState::SoloStandaloneReady => "solo-standalone-ready",
-        ClusterState::Pairing => "pairing",
-        ClusterState::PairedStandaloneReady => "paired-standalone-ready",
-        ClusterState::AwaitingWorkerHello => "awaiting-worker-hello",
-        ClusterState::Promoting => "promoting",
-        ClusterState::DistributedStarting => "distributed-starting",
-        ClusterState::DistributedReady => "distributed-ready",
-        ClusterState::Demoting => "demoting",
-        ClusterState::Backoff => "backoff",
-        ClusterState::ManualInterventionRequired => "manual-intervention-required",
     }
 }
 
@@ -700,6 +1124,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/readyz", get(ready))
         .route("/cluster", get(cluster))
         .route("/metrics", get(metrics))
+        .route("/metrics/coordinator", get(coordinator_metrics))
         .route("/cluster/reconcile", post(reconcile))
         .route("/cluster/pair", post(pair))
         .route("/cluster/promote", post(promote))
@@ -830,10 +1255,16 @@ fn authorized_admin(
 
 fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
     match admin.start(action) {
-        Ok(job) => json_response(
-            StatusCode::ACCEPTED,
-            serde_json::to_value(job).expect("admin job serializes"),
-        ),
+        Ok(job) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize admin job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize admin job"}),
+                )
+            }
+        },
         Err(profile) => json_response(
             StatusCode::CONFLICT,
             json!({"error": format!("fingerprint job already running for {}", profile.as_str())}),
@@ -869,21 +1300,33 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let admission = state.proxy.admission().snapshot();
     let solo = !state.config.cluster_enabled;
     let snapshot = state.cluster_snapshot();
+    let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
+    let diagnostics = state.production_diagnostics().await;
+    let (control_session, children) = match &diagnostics {
+        Some(diagnostics) => (
+            control_session_json(&diagnostics.control_session),
+            children_json(&diagnostics.children),
+        ),
+        None => (Value::Null, Value::Null),
+    };
     Json(json!({
         "node_id": state.config.node_id,
-        "role": snapshot.map_or("unknown", |snapshot| role_name(snapshot.role)),
-        "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| stable_mode_name(snapshot.stable_mode)),
-        "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| cluster_state_name(snapshot.state)),
-        "generation": snapshot.map_or(0, |snapshot| snapshot.generation),
+        "role": snapshot.map_or("unknown", |snapshot| snapshot.role.name()),
+        "mode": snapshot.map_or(if solo { "solo-standalone" } else { "unknown" }, |snapshot| snapshot.stable_mode.name()),
+        "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| snapshot.state.name()),
+        "generation": generation,
+        "cluster_generation": generation,
         "target": target_name(target.target),
         "target_ready": target.ready,
         "admission": admission_json(admission),
+        "control_session": control_session,
+        "children": children,
         "peer_ingress_ready": false,
         "interface": state.config.interface,
         "active_standalone_profile": {
             "profile_id": state.config.standalone_profile_id,
-            "model_variant": model_variant_name(state.config.standalone_model_variant),
-            "residency": residency_name(state.config.standalone_residency),
+            "model_variant": state.config.standalone_model_variant.name(),
+            "residency": state.config.standalone_residency.name(),
         },
         "child": Value::Null,
     }))
@@ -902,21 +1345,75 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         model_variant: state.config.standalone_model_variant,
         residency: state.config.standalone_residency,
     });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/plain; version=0.0.4")
-        .body(Body::from(body))
-        .expect("valid metrics response")
+    response_with_body(
+        StatusCode::OK,
+        "text/plain; version=0.0.4",
+        Body::from(body),
+    )
+}
+
+/// Return coordinator metrics for the worker-side monitor without exposing the coordinator's
+/// loopback-only admin listener. The production runtime performs the authenticated control-plane
+/// request to the coordinator and returns the Prometheus text unchanged.
+async fn coordinator_metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let production = state
+        .production
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(production) = production else {
+        return response_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain; charset=utf-8",
+            Body::from("coordinator metrics unavailable"),
+        );
+    };
+    if production.role() != LocalRole::Worker {
+        return response_with_body(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            Body::from("coordinator metrics are only available on a worker"),
+        );
+    }
+    match production.fetch_coordinator_metrics().await {
+        Ok(body) => response_with_body(
+            StatusCode::OK,
+            "text/plain; version=0.0.4",
+            Body::from(body),
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "coordinator metrics fetch failed");
+            response_with_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/plain; charset=utf-8",
+                Body::from("coordinator metrics unavailable"),
+            )
+        }
+    }
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&value).expect("JSON value must serialize"),
-        ))
-        .expect("valid JSON response")
+    let body = match serde_json::to_vec(&value) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to serialize JSON response");
+            br#"{"error":"failed to serialize JSON response"}"#.to_vec()
+        }
+    };
+    response_with_body(status, "application/json", body)
+}
+
+fn response_with_body(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Body>,
+) -> Response<Body> {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 fn admission_json(snapshot: AdmissionSnapshot) -> Value {
@@ -936,6 +1433,71 @@ fn admission_state_name(state: AdmissionState) -> &'static str {
     }
 }
 
+fn control_session_json(session: &ControlSessionDiagnostics) -> Value {
+    json!({
+        "generation": session.generation,
+        "phase": distributed_phase_name(session.phase),
+        "role": control_role_json(session.role),
+        "lease": lease_json(&session.lease),
+    })
+}
+
+fn lease_json(lease: &LeaseDiagnostics) -> Value {
+    json!({
+        "valid": lease.valid,
+        "expires-at-millis": lease.expires_at_millis,
+        "route-scoped": lease.route_scoped,
+        "peer-present": lease.peer_present,
+        "peer": lease.peer.as_ref().map(peer_json).unwrap_or(Value::Null),
+    })
+}
+
+fn peer_json(peer: &PeerDiagnostics) -> Value {
+    json!({
+        "node-id": peer.node_id,
+        "role": control_role_json(peer.role),
+        "generation": peer.generation,
+        "mode": control_mode_json(peer.mode),
+    })
+}
+
+fn children_json(children: &ChildrenDiagnostics) -> Value {
+    json!({
+        "standalone": children.standalone.as_ref().map(child_json).unwrap_or(Value::Null),
+        "distributed-coordinator": children.distributed_coordinator.as_ref().map(child_json).unwrap_or(Value::Null),
+        "distributed-worker": children.distributed_worker.as_ref().map(child_json).unwrap_or(Value::Null),
+    })
+}
+
+fn child_json(child: &ChildDiagnostics) -> Value {
+    json!({
+        "pid": child.pid,
+        "profile": child.profile,
+        "generation": child.generation,
+        "running": child.running,
+        "ready": child.ready,
+    })
+}
+
+fn control_role_json(role: ControlRole) -> Value {
+    serde_json::to_value(role).unwrap_or(Value::Null)
+}
+
+fn control_mode_json(mode: ControlMode) -> Value {
+    serde_json::to_value(mode).unwrap_or(Value::Null)
+}
+
+fn distributed_phase_name(phase: DistributedControlPhase) -> &'static str {
+    match phase {
+        DistributedControlPhase::Unpaired => "unpaired",
+        DistributedControlPhase::Paired => "paired",
+        DistributedControlPhase::WorkerPreparing => "worker-preparing",
+        DistributedControlPhase::WorkerReady => "worker-ready",
+        DistributedControlPhase::Draining => "draining",
+        DistributedControlPhase::Drained => "drained",
+    }
+}
+
 pub(crate) fn target_name(target: ProxyTarget) -> &'static str {
     match target {
         ProxyTarget::LocalStandalone => "local-standalone",
@@ -949,21 +1511,6 @@ pub(crate) fn target_name(target: ProxyTarget) -> &'static str {
         ProxyTarget::Unavailable {
             reason: UnavailableReason::UnknownRoleWithoutLocalStandalone,
         } => "unavailable-unknown-role",
-    }
-}
-
-fn model_variant_name(value: ModelVariant) -> &'static str {
-    match value {
-        ModelVariant::Q2 => "q2",
-        ModelVariant::Q2Q4 => "q2-q4",
-        ModelVariant::Mxfp4 => "mxfp4",
-    }
-}
-
-fn residency_name(value: Residency) -> &'static str {
-    match value {
-        Residency::Resident => "resident",
-        Residency::SsdStreaming => "ssd-streaming",
     }
 }
 
@@ -1040,6 +1587,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
+            production: RwLock::new(None),
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
@@ -1132,6 +1680,81 @@ mod tests {
         assert_eq!(body["state"], "manual-intervention-required");
         assert_eq!(body["generation"], 13);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn cluster_endpoint_exposes_diagnostic_fields_without_production_runtime() {
+        let state = test_state(true);
+        let (_, body) = get(state, "/cluster").await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["generation"], body["cluster_generation"]);
+        assert_eq!(body["control_session"], Value::Null);
+        assert_eq!(body["children"], Value::Null);
+    }
+
+    #[test]
+    fn diagnostics_serialize_to_contract_shape() {
+        let diagnostics = crate::cluster::ProductionDiagnostics {
+            control_session: ControlSessionDiagnostics {
+                generation: 7,
+                phase: DistributedControlPhase::WorkerPreparing,
+                role: ControlRole::Coordinator,
+                lease: LeaseDiagnostics {
+                    valid: true,
+                    expires_at_millis: Some(1_770_000_000_000_u64),
+                    route_scoped: true,
+                    peer_present: true,
+                    peer: Some(PeerDiagnostics {
+                        node_id: "worker-node".into(),
+                        role: ControlRole::Worker,
+                        generation: 7,
+                        mode: ControlMode::DistributedMxfp4,
+                    }),
+                },
+            },
+            children: ChildrenDiagnostics {
+                standalone: Some(ChildDiagnostics {
+                    pid: Some(1234),
+                    profile: Some("standalone".into()),
+                    generation: Some(12),
+                    running: true,
+                    ready: Some(true),
+                }),
+                distributed_coordinator: Some(ChildDiagnostics {
+                    pid: Some(5678),
+                    profile: Some("distributed".into()),
+                    generation: Some(12),
+                    running: true,
+                    ready: None,
+                }),
+                distributed_worker: None,
+            },
+        };
+
+        let session = control_session_json(&diagnostics.control_session);
+        assert_eq!(session["generation"], 7);
+        assert_eq!(session["phase"], "worker-preparing");
+        assert_eq!(session["role"], "coordinator");
+        assert_eq!(session["lease"]["valid"], true);
+        assert_eq!(session["lease"]["expires-at-millis"], 1_770_000_000_000_i64);
+        assert_eq!(session["lease"]["route-scoped"], true);
+        assert_eq!(session["lease"]["peer-present"], true);
+        assert_eq!(session["lease"]["peer"]["node-id"], "worker-node");
+        assert_eq!(session["lease"]["peer"]["role"], "worker");
+        assert_eq!(session["lease"]["peer"]["generation"], 7);
+        assert_eq!(session["lease"]["peer"]["mode"], "distributed-mxfp4");
+
+        let children = children_json(&diagnostics.children);
+        assert_eq!(children["standalone"]["pid"], 1234);
+        assert_eq!(children["standalone"]["profile"], "standalone");
+        assert_eq!(children["standalone"]["generation"], 12);
+        assert_eq!(children["standalone"]["running"], true);
+        assert_eq!(children["standalone"]["ready"], true);
+        assert_eq!(children["distributed-coordinator"]["pid"], 5678);
+        assert_eq!(children["distributed-coordinator"]["running"], true);
+        // Distributed children omit the `ready` field.
+        assert!(children["distributed-coordinator"]["ready"].is_null());
+        assert_eq!(children["distributed-worker"], Value::Null);
     }
 
     #[tokio::test]

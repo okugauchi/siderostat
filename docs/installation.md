@@ -65,7 +65,16 @@ shasum -a 256 "$MODEL_PATH"
 ls -l "$MODEL_PATH"
 ```
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。
+配置したstandalone / MXFP4 / DSpark support GGUFをsiderostatのinstall用cacheへ記録する場合は、repositoryで次を一度実行する。モデルの内容を読み、digestとファイルメタデータだけを`~/Library/Application Support/siderostat/manifests/digest-cache.json`へ保存する。モデルを置換・変更した場合だけ再実行する。
+
+```sh
+cd /absolute/path/to/siderostat
+cargo xtask fingerprint-models --ds4-server "/absolute/path/to/ds4-server"
+```
+
+`cargo xtask install`はGGUFのSHA-256計算について確認を表示し、既定の`N`ではこのcacheを使う。`Y`を選ぶとinstall中に再計算する。cacheがない、またはファイルが記録時から変更されている場合、`N`のinstallは安全側に停止し、`cargo xtask fingerprint-models`の実行を案内する。非対話で再計算する場合は`cargo xtask install --hash-models`を指定する。
+
+Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`siderostat.example.toml`のplaceholder pathへ合わせる。
 
@@ -128,17 +137,21 @@ cargo test --all-targets
 git diff --check
 ```
 
-Binaryは`target/release/siderostat`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/siderostat`へinstallする。`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
+runtime binaryは`target/release/siderostat`、monitor binaryは`target/release/siderostat-monitor`である。
+LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/siderostat`と`/usr/local/bin/siderostat-monitor`へinstallする。
+`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
 
 ```sh
 sudo install -d -m 0755 /usr/local/bin
 sudo install -m 0755 target/release/siderostat /usr/local/bin/siderostat
+sudo install -m 0755 target/release/siderostat-monitor /usr/local/bin/siderostat-monitor
 /usr/local/bin/siderostat --help
+/usr/local/bin/siderostat-monitor --help
 ```
 
 ### Secret file
 
-Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。Control secretとpeer proxy tokenは、それぞれclusterの両nodeで同じ値が必要である。Admin tokenはnode-localとする。Control secret、peer proxy token、admin token間でfileまたは値を流用しない。
+Secret/token fileは各32 bytes以上の生バイト列、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。これらはSSH秘密鍵やPEMではなく、control/peer認証用のHMAC secretとadmin API用tokenである。標準名は拡張子なしの`cluster-control`、`peer-proxy`、`admin`とする。Control secretとpeer proxy tokenは、それぞれclusterの両nodeで同じ値が必要である。Admin tokenはnode-localとする。Control secret、peer proxy token、admin token間でfileまたは値を流用しない。
 
 まずcoordinator上で共有する2値とcoordinatorのadmin tokenを生成する。`umask 077`により生成時からownerだけが読み書きできる。
 
@@ -146,24 +159,28 @@ Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで�
 SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 umask 077
 mkdir -p "$SECRET_DIR"
-openssl rand -out "$SECRET_DIR/cluster-control.key" 32
-openssl rand -out "$SECRET_DIR/peer-proxy.key" 32
-openssl rand -out "$SECRET_DIR/admin.key" 32
-chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
+openssl rand -out "$SECRET_DIR/cluster-control" 32
+openssl rand -out "$SECRET_DIR/peer-proxy" 32
+openssl rand -out "$SECRET_DIR/admin" 32
+chmod 600 "$SECRET_DIR/cluster-control" "$SECRET_DIR/peer-proxy" "$SECRET_DIR/admin"
 ```
 
-`cluster-control.key`と`peer-proxy.key`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
+`cluster-control`と`peer-proxy`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
 
 ```sh
 SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 SHARED_SECRET_SOURCE="/Volumes/OPERATOR-APPROVED-ENCRYPTED-MEDIA"
 umask 077
 mkdir -p "$SECRET_DIR"
-install -m 0600 "$SHARED_SECRET_SOURCE/cluster-control.key" "$SECRET_DIR/cluster-control.key"
-install -m 0600 "$SHARED_SECRET_SOURCE/peer-proxy.key" "$SECRET_DIR/peer-proxy.key"
-openssl rand -out "$SECRET_DIR/admin.key" 32
-chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
+install -m 0600 "$SHARED_SECRET_SOURCE/cluster-control" "$SECRET_DIR/cluster-control"
+install -m 0600 "$SHARED_SECRET_SOURCE/peer-proxy" "$SECRET_DIR/peer-proxy"
+openssl rand -out "$SECRET_DIR/admin" 32
+chmod 600 "$SECRET_DIR/cluster-control" "$SECRET_DIR/peer-proxy" "$SECRET_DIR/admin"
 ```
+
+既存環境の`cluster-control.key`、`peer-proxy.key`、`admin.key`はそのまま保持できる。
+`cargo xtask install`は対応するlegacy fileを検出すると、値を拡張子なしのcanonical fileへ複製して
+新しいconfigから参照する。共有secretを手動で移行する場合も、値を再生成せずbyte-for-byteで複製する。
 
 両nodeの共有2 fileがbyte-for-byteで一致し、各node内の3 fileがそれぞれ異なることを安全な経路上で確認する。Digestやsecret値はdocumentation evidenceに保存しない。
 
@@ -180,7 +197,7 @@ cp siderostat.example.toml "$HOME/Library/Application Support/siderostat/config.
 - `ds4.binary`の`PLACEHOLDER-ds4-server`。
 - `ds4.dspark.support_model`の`PLACEHOLDER-dspark-support-0731.gguf`。
 - `ds4.standalone.model`と`ds4.mxfp4.model`の`PLACEHOLDER-*.gguf`。
-- Secret fileの`PLACEHOLDER-*-cluster-control.key`、`PLACEHOLDER-*-peer-proxy.key`、`PLACEHOLDER-*-admin.key`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
+- Secret fileの`PLACEHOLDER-cluster-control`、`PLACEHOLDER-peer-proxy`、`PLACEHOLDER-admin`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
 - Manifest pathの`PLACEHOLDER-standalone.gguf`相当のmanifest JSON。
 
 Validation要件（spec第22.3節）を満たすことを確認する。
@@ -275,20 +292,39 @@ PLIST="$HOME/Library/LaunchAgents/local.siderostat.runtime.plist"
 CONFIG="$HOME/Library/Application Support/siderostat/config.toml"
 cp contrib/launchd/local.siderostat.runtime.plist "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 $CONFIG" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/stdout.log" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/stderr.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardOutPath $HOME/Library/Logs/siderostat/ds4-siderostat.log" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :StandardErrorPath $HOME/Library/Logs/siderostat/ds4-siderostat.log" "$PLIST"
 plutil -lint "$PLIST"
 if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent placeholder" >&2; exit 1; fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
 
+メニューバーモニターも同じ `gui/<uid>` ドメインへ登録する。
+
+```sh
+MONITOR_PLIST="$HOME/Library/LaunchAgents/local.siderostat.monitor.plist"
+cp contrib/launchd/local.siderostat.monitor.plist "$MONITOR_PLIST"
+sed -i '' "s/USERNAME/$(id -un)/g" "$MONITOR_PLIST"
+mkdir -p "$HOME/Library/Logs/local.siderostat.monitor"
+plutil -lint "$MONITOR_PLIST"
+launchctl bootstrap "gui/$(id -u)" "$MONITOR_PLIST"
+launchctl kickstart -k "gui/$(id -u)/local.siderostat.monitor"
+```
+
+モニターのメニュー操作は次の LaunchAgent 操作に対応する。
+
+- `Proxy 再起動`: `local.siderostat.runtime` を `kickstart -k`
+- `Monitor 再起動`: `local.siderostat.monitor` を `kickstart -k`
+- `終了`: runtime と monitor の両方を `bootout`
+
 Verification（`contrib/launchd/README.md`）:
 
 1. Login後にproxyが1 processだけ起動する。
 2. `launchctl kickstart -k`後もproxyが1 process、DS4 childが最大1 processである。
-3. Proxyを終了すると10秒以上のthrottleを伴って再起動し、orphan DS4 childを残さない。
-4. `launchctl print-disabled "gui/$(id -u)"`と`$HOME/Library/LaunchAgents`に、同じbinary/portやDS4 childを所有する別jobがない。
+3. Login後にmonitorが1 processだけ起動し、メニューバーへ表示される。
+4. Proxyを終了すると10秒以上のthrottleを伴って再起動し、orphan DS4 childを残さない。
+5. `launchctl print-disabled "gui/$(id -u)"`と`$HOME/Library/LaunchAgents`に、同じbinary/portやDS4 childを所有する別jobがない。
 
 Login起動、proxy restart、no duplicate childはoperator gateである（GUI user session変更が必要）。
 

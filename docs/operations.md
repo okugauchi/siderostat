@@ -19,6 +19,19 @@ curl --fail --silent http://127.0.0.1:18081/cluster
 - peer lease、child情報、Thunderbolt IP/discovery状態
 - active standalone profile ID、model variant、residency
 
+再接続の診断では、`generation`（`cluster_generation`と同値）と
+`control_session.generation`を混同しない。後者はPairで再ネゴシエーションされるcontrol session
+であり、`phase`、`lease.valid`、`lease.route-scoped`、`lease.peer-present`、peer descriptorの
+generationと併せて確認する。`children` の `standalone` / `distributed-coordinator` /
+`distributed-worker`について、PID、profile、generation、running、readyを現在のstateと照合する。
+
+`POST /v1/pair` のHTTP 409（CLI/構造化logの `pair-generation-mismatch` を含む）は、古い
+generation、idempotency conflict、phase不整合などのcontrol protocol拒否である。現行pair処理は
+coordinatorが先に `/v1/node` を読み、双方のcontrol session generationの最大値をofferへ反映する。
+反復する409は旧binary、persisted sessionの不一致、またはroute/lease failureを示す可能性がある
+ため、`cluster status --json` と関連logの expected/received generationを保存し、state/model/cache
+を削除して回避しない。
+
 Human出力は次の形式を確認する。
 
 ```text
@@ -63,6 +76,12 @@ Redaction（spec第25.3節）:
 
 `GET /metrics` はPrometheus text formatで返す。Loopback `127.0.0.1:18081`（既定）にのみbindする。
 
+worker が Paired Standalone または Distributed MXFP4 で coordinator を target にしている
+場合、メニューバーモニターは worker の `/metrics/coordinator` を利用する。この endpoint
+は coordinator の loopback admin API を公開せず、worker の署名付き control request で
+coordinator の `/v1/metrics` を取得する。worker が Solo Standalone の場合は従来どおり
+worker 自身の `/metrics` を利用する。
+
 ```sh
 curl --fail --silent http://127.0.0.1:18081/metrics
 ```
@@ -101,7 +120,14 @@ siderostat cluster doctor
 siderostat cluster reconcile
 ```
 
-`cluster reconcile` はobserved stateをdesired stateへ収束させる。原因を先に特定し、deployment mismatch、manifest stale、Hello timeoutなどの原因を取り除いてから実行する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
+`cluster reconcile` はobserved stateをdesired stateへ収束させる。deployment mismatchのような自動修復できない不一致では、両nodeがSolo Standaloneへ収束し、自動pairingも停止する。原因を先に特定して取り除いてからreconcileを実行する。原因不明のままreconcileを繰り返しても、同一原因で再びSolo Standaloneへ収束する。
+
+`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱う（plan B-03）。そのため、原因除去後のreconcileでtrackerの失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する。deployment mismatchからの復旧後は `siderostat cluster status` で `state` が `solo-standalone-ready` から期待するpaired stateへ進むことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びSolo Standaloneへ収束する。
+
+PeerLost recovery中の `cluster reconcile` は、まず `PeerLossRecovery` ownerによる local recovery
+（admission block → distributed child stop → standalone start → SoloStandaloneReady）へ収束する。
+Backoff中もpeer lossがbackoff deadlineより優先される。`cluster reconcile` はpair 409を強制的に
+無視したりstate fileを初期化したりする操作ではない。
 
 ## 6. Safe restart
 
@@ -112,8 +138,8 @@ siderostat cluster restart
 ```
 
 - 通常停止はSIGTERM。Drain完了後にsignalする（spec第20.3節）。
-- Stop timeout後のSIGKILLは `allow_sigkill=true` かつidentity再確認済みchildだけ。`allow_sigkill=false` ならmanual intervention（spec第12.4節）。
-- Unknown processへsignalしない（spec第20.2節、第38節）。
+- Stop timeout後のSIGKILLは既定で許可されるが、identityを直前に再確認できたowned childだけを対象とする。`allow_sigkill=false` に変更した場合はmanual intervention（spec第12.4節）。
+- Unknown processへ無条件にsignalしない。起動時に既存の `siderostat` / `ds4-server` を検出した場合は、macOS右上の簡潔な通知と警告音を出し、既定では5秒後に各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否は `startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で指定する。拒否・identity不一致・停止失敗時は新しいsiderostatを起動しない（spec第20.2節、第38節）。
 - Restartはmodeを変えない。Paired Standalone / Distributed MXFP4中のchild再起動はmode遷移を引き起こさない。
 
 ## 7. Rollback
@@ -125,11 +151,13 @@ Rollbackは [`docs/installation.md`](installation.md) のRollback節に従う。
 - 新configは旧configと分離し、`schema_version == 2` の作業fileを保持する。
 - Binary rollbackは直前のbinaryを残し、standalone readinessを確認してから行う。Upgrade後にrollbackし、再度upgradeする（plan P7-02）。
 - 起動前に `cluster doctor` と `/readyz` でstandalone readinessを確認する。Rollback後はSolo Standalone readyを確認してからpairing/promotionへ進む。
+- candidateを継続利用する判定でも、rollback binary/config/state/plistを緊急復旧用に保持する。正規
+  名称のRelease Candidate artifactとchecksumの確定は、merge後の再生成・再検証で行う。
 
 ## 8. 安全な運用原則
 
 - Destructive cache削除を通常手順にしない。KV cache、state file、secretの削除は自動で行わず、operatorが明示的に判断する場合だけ実施する。
-- Secret/token fileは32 bytes以上、mode `0600`、相互に異なるpathで配置する。同じfileを複数roleに流用しない。
+- Secret/token fileは32 bytes以上の生バイト列、mode `0600`、相互に異なるpathで配置する。SSH秘密鍵やPEMではなく、同じfileを複数roleに流用しない。
 - Admin mutationはloopbackでもtoken必須。GETはsecretを返さない。
 - Mode切替は503の短いwindowを含む。切替中に新規requestは503 + `Retry-After`で拒否され、既存streamは完走する。
 - Workerからcoordinatorへのrequestはproxyを2 hop通る。Peer data/DS4 native trafficは暗号化されない。専用の物理Thunderbolt linkを信頼境界とする。
