@@ -12,7 +12,7 @@ mod util;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use install::InstallArgs;
+use install::{FingerprintModelsArgs, InstallArgs};
 use std::ffi::OsStr;
 
 #[derive(Parser)]
@@ -26,6 +26,8 @@ struct Cli {
 enum Command {
     /// Build, sign, and install the proxy, secrets, config, manifests, and LaunchAgent plist.
     Install(InstallArgs),
+    /// Compute and cache SHA-256 values for the GGUF model files.
+    FingerprintModels(FingerprintModelsArgs),
     /// Verify the installed LaunchAgent and admin API.
     Verify,
     /// Stop the LaunchAgent and disable its plist.
@@ -36,6 +38,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Install(args) => install::install(&args),
+        Command::FingerprintModels(args) => install::fingerprint_models(&args),
         Command::Verify => verify(),
         Command::Uninstall => uninstall(),
     }

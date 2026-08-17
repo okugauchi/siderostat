@@ -13,6 +13,8 @@ use siderostat::cluster::{
 use siderostat::config::ModeAwareConfig;
 use std::path::Path;
 
+pub const DIGEST_CACHE_FILE_NAME: &str = "digest-cache.json";
+
 /// Compute the digest inputs from the (already expanded) config and write both
 /// manifests to the paths referenced by the config.
 pub fn generate(
@@ -28,7 +30,7 @@ pub fn generate(
         .model_manifest
         .parent()
         .context("mxfp4 model_manifest has no parent directory")?
-        .join("digest-cache.json");
+        .join(DIGEST_CACHE_FILE_NAME);
     let mut digest_cache = util::load_digest_cache(&cache_path);
 
     let ds4_digest = util::sha256_cached(
@@ -40,13 +42,12 @@ pub fn generate(
     .0;
 
     // Standalone manifest.
-    let standalone_model_digest = util::sha256_cached(
+    let standalone_model_digest = model_digest(
         &config.ds4.standalone.model,
         "standalone model",
         "standalone-model",
         &mut digest_cache,
-    )?
-    .0;
+    )?;
     let standalone_command = build_standalone_command(&config.ds4)
         .map_err(|error| anyhow::anyhow!("build standalone command: {error}"))?;
     let standalone_argv_profile = util::hex(&argv_sha256(
@@ -63,13 +64,12 @@ pub fn generate(
             .as_ref()
             .context("DSpark enabled but no support model in config")?;
         (
-            util::sha256_cached(
+            model_digest(
                 support,
                 "dspark support model",
                 "dspark-support",
                 &mut digest_cache,
-            )?
-            .0,
+            )?,
             util::file_size(support)?,
         )
     } else {
@@ -118,13 +118,12 @@ pub fn generate(
     // Distributed manifest (MXFP4). The worker command argv is used for the
     // recorded argv profile; both nodes must generate from the same ds4.mxfp4
     // config so the values agree (spec: MXFP4 config is shared).
-    let mxfp4_digest = util::sha256_cached(
+    let mxfp4_digest = model_digest(
         &config.ds4.mxfp4.model,
         "mxfp4 model",
         "mxfp4-model",
         &mut digest_cache,
-    )?
-    .0;
+    )?;
     let mxfp4_size = util::file_size(&config.ds4.mxfp4.model)?;
     let worker_command = build_distributed_worker_command(
         &config.ds4,
@@ -174,6 +173,81 @@ pub fn generate(
     util::save_digest_cache(&cache_path, &digest_cache)?;
 
     Ok(())
+}
+
+/// Compute and persist the model digests used by install without generating
+/// manifests or changing the installed service.
+pub fn fingerprint_models(
+    cache_path: &Path,
+    standalone: &Path,
+    mxfp4: &Path,
+    dspark_support: Option<&Path>,
+) -> Result<()> {
+    let mut digest_cache = util::load_digest_cache(cache_path);
+    for (path, label, key) in [
+        (standalone, "standalone model", "standalone-model"),
+        (mxfp4, "mxfp4 model", "mxfp4-model"),
+    ] {
+        let (digest, _) = util::sha256_cached(path, label, key, &mut digest_cache)?;
+        util::tracing_log(&format!(
+            "{label}: sha256={digest}, size={} bytes",
+            util::file_size(path)?
+        ));
+    }
+    if let Some(path) = dspark_support {
+        let (digest, _) = util::sha256_cached(
+            path,
+            "dspark support model",
+            "dspark-support",
+            &mut digest_cache,
+        )?;
+        util::tracing_log(&format!(
+            "dspark support model: sha256={digest}, size={} bytes",
+            util::file_size(path)?
+        ));
+    }
+    util::save_digest_cache(cache_path, &digest_cache)?;
+    util::tracing_log(&format!(
+        "model SHA-256 cache saved -> {}",
+        cache_path.display()
+    ));
+    Ok(())
+}
+
+/// Check that install can reuse the model digests without reading GGUF
+/// contents. This is intentionally a separate preflight so a failed install
+/// does not build or replace binaries when the cache is missing or stale.
+pub fn verify_model_cache(
+    cache_path: &Path,
+    standalone: &Path,
+    mxfp4: &Path,
+    dspark_support: Option<&Path>,
+) -> Result<()> {
+    let digest_cache = util::load_digest_cache(cache_path);
+    for (path, label, key) in [
+        (standalone, "standalone model", "standalone-model"),
+        (mxfp4, "mxfp4 model", "mxfp4-model"),
+    ] {
+        let _ = util::sha256_from_cache(path, label, key, &digest_cache)?;
+    }
+    if let Some(path) = dspark_support {
+        let _ = util::sha256_from_cache(
+            path,
+            "dspark support model",
+            "dspark-support",
+            &digest_cache,
+        )?;
+    }
+    Ok(())
+}
+
+fn model_digest(
+    path: &Path,
+    label: &str,
+    key: &str,
+    cache: &mut util::DigestCache,
+) -> Result<String> {
+    util::sha256_from_cache(path, label, key, cache)
 }
 
 /// The approved ds4 binary digest set. If `approved` is provided, it must include

@@ -11,14 +11,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Args)]
-pub struct InstallArgs {
+#[derive(Args, Clone)]
+pub struct ModelSelectionArgs {
     /// Path to the ds4-server binary. Default: discovered under $HOME.
     #[arg(long)]
     pub ds4_server: Option<PathBuf>,
-    /// node_id written to config.toml. Default: hostname.
-    #[arg(long)]
-    pub node_id: Option<String>,
     /// Standalone model file (path or basename under DWARFSTAR_HOME/gguf).
     #[arg(long)]
     pub standalone_model: Option<PathBuf>,
@@ -28,6 +25,15 @@ pub struct InstallArgs {
     /// DSpark support model file (path or basename under DWARFSTAR_HOME/gguf).
     #[arg(long)]
     pub dspark_support: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct InstallArgs {
+    #[command(flatten)]
+    pub models: ModelSelectionArgs,
+    /// node_id written to config.toml. Default: hostname.
+    #[arg(long)]
+    pub node_id: Option<String>,
     /// Directory containing shared cluster-control.key + peer-proxy.key.
     #[arg(long)]
     pub shared_secret_dir: Option<PathBuf>,
@@ -37,6 +43,9 @@ pub struct InstallArgs {
     /// Approved ds4 binary digest(s) for the distributed manifest (repeatable).
     #[arg(long)]
     pub ds4_binary_digest: Vec<String>,
+    /// Compute/update GGUF SHA-256 values without prompting.
+    #[arg(long)]
+    pub hash_models: bool,
     /// Run the full documented CI gates (fmt/clippy/test/diff-check) first.
     #[arg(long)]
     pub ci: bool,
@@ -45,20 +54,48 @@ pub struct InstallArgs {
     pub start: bool,
 }
 
+#[derive(Args)]
+pub struct FingerprintModelsArgs {
+    #[command(flatten)]
+    pub models: ModelSelectionArgs,
+}
+
 pub fn install(args: &InstallArgs) -> Result<()> {
     if args.ci {
         run_ci_gates()?;
     }
-    build_release()?;
-    sign_and_install_proxy()?;
 
-    let (home, dwfstar_home, gguf_dir) = discover_ds4(args.ds4_server.as_deref())?;
+    let (home, dwfstar_home, gguf_dir) = discover_ds4(args.models.ds4_server.as_deref())?;
     let (standalone_model, mxfp4_model, dspark_support) = resolve_models(
         &gguf_dir,
-        args.standalone_model.as_deref(),
-        args.mxfp4_model.as_deref(),
-        args.dspark_support.as_deref(),
+        args.models.standalone_model.as_deref(),
+        args.models.mxfp4_model.as_deref(),
+        args.models.dspark_support.as_deref(),
     )?;
+
+    let hash_models = args.hash_models
+        || util::confirm_default_no("Compute SHA-256 for GGUF model weights now? [y/N] ")?;
+    let cache_path = home
+        .join("Library/Application Support/siderostat/manifests")
+        .join(manifest::DIGEST_CACHE_FILE_NAME);
+    if hash_models {
+        manifest::fingerprint_models(
+            &cache_path,
+            &standalone_model,
+            &mxfp4_model,
+            Some(&dspark_support),
+        )?;
+    } else {
+        manifest::verify_model_cache(
+            &cache_path,
+            &standalone_model,
+            &mxfp4_model,
+            Some(&dspark_support),
+        )?;
+    }
+
+    build_release()?;
+    sign_and_install_proxy()?;
 
     ensure_secrets(&home, args.shared_secret_dir.as_deref())?;
 
@@ -86,6 +123,21 @@ pub fn install(args: &InstallArgs) -> Result<()> {
 
     util::tracing_log("install complete");
     Ok(())
+}
+
+/// Compute the GGUF digests once and store them beside the generated manifests.
+pub fn fingerprint_models(args: &FingerprintModelsArgs) -> Result<()> {
+    let (home, _dwfstar_home, gguf_dir) = discover_ds4(args.models.ds4_server.as_deref())?;
+    let (standalone, mxfp4, dspark_support) = resolve_models(
+        &gguf_dir,
+        args.models.standalone_model.as_deref(),
+        args.models.mxfp4_model.as_deref(),
+        args.models.dspark_support.as_deref(),
+    )?;
+    let cache_path = home
+        .join("Library/Application Support/siderostat/manifests")
+        .join(manifest::DIGEST_CACHE_FILE_NAME);
+    manifest::fingerprint_models(&cache_path, &standalone, &mxfp4, Some(&dspark_support))
 }
 
 /// Required CI gates (docs/installation.md section 5). Only run with `--ci`.

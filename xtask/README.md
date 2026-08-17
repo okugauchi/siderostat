@@ -4,6 +4,7 @@
 
 ```sh
 cargo xtask install [options]
+cargo xtask fingerprint-models [options]
 cargo xtask verify
 cargo xtask uninstall
 ```
@@ -17,17 +18,27 @@ cargo xtask uninstall
 実行順:
 
 1. （`--ci` 指定時のみ）Required CI gate: `cargo fmt --check` / `clippy -D warnings` / `test` / `git diff --check`。
-2. `cargo build --release`。
-3. `codesign --force --sign - target/release/siderostat` で再署名（launchd の launch constraint を満たすため）。
-4. `sudo install` で `/usr/local/bin/siderostat` へコピー、署名を再検証。
-5. `~/` 配下から `ds4-server` を探し、親ディレクトリを `DWARFSTAR_HOME` とする。
-6. secret を生成（`~/Library/Application Support/siderostat/secrets/`、mode 0600、32+ bytes）。
+2. `~/` 配下から `ds4-server` と対象GGUFを探し、親ディレクトリを `DWARFSTAR_HOME` とする。
+3. GGUFのSHA-256計算を行うか確認する。既定は **行わない**。実行する場合はその場で計算し、行わない場合は事前に保存したdigest cacheだけを使う。
+4. `cargo build --release`。
+5. `codesign --force --sign - target/release/siderostat` で再署名（launchd の launch constraint を満たすため）。
+6. `sudo install` で `/usr/local/bin/siderostat` へコピー、署名を再検証。
+7. secret を生成（`~/Library/Application Support/siderostat/secrets/`、mode 0600、32+ bytes）。
    既存は上書きしない。2-node cluster では `--shared-secret-dir` で共有 secret を供給する。
-7. `siderostat.example.toml` から config を生成し、**全 placeholder**（binary / model / DSpark support / manifest / secret / node_id）を実在 path へ置換。
-8. `DWARFSTAR_HOME/gguf/` の各モデル（standalone / mxfp4 / dspark）の sha256・size を取得し、standalone/distributed manifest を生成。
-   argv profile は siderostat 本体の argv builder を再利用して算出する。
-9. LaunchAgent plist を `~/Library/LaunchAgents/` へ install（`USERNAME` を現在ユーザーへ置換、config/log path を設定、`plutil -lint`、placeholder guard）。
+8. `siderostat.example.toml` から config を生成し、**全 placeholder**（binary / model / DSpark support / manifest / secret / node_id）を実在 path へ置換。
+9. standalone/distributed manifest を生成。argv profile は siderostat 本体の argv builder を再利用して算出する。
+10. LaunchAgent plist を `~/Library/LaunchAgents/` へ install（`USERNAME` を現在ユーザーへ置換、config/log path を設定、`plutil -lint`、placeholder guard）。
    既定では **起動しない**（`--start` 指定時のみ bootstrap + kickstart。起動は ds4-server を再起動するため）。
+
+### GGUF digest
+
+モデルをダウンロードまたは置換した後、次のコマンドを一度実行する。モデルの内容を読み、`~/Library/Application Support/siderostat/manifests/digest-cache.json`へSHA-256とファイルメタデータを保存する。manifestやLaunchAgentは変更しない。
+
+```sh
+cargo xtask fingerprint-models [options]
+```
+
+以後の`cargo xtask install`では、確認プロンプトに`N`（既定）を選ぶとこのcacheを使用し、GGUFの内容を再読込しない。ファイルが置換・変更されている場合やcacheがない場合は、installは失敗して上記コマンドの再実行を案内する。install中に再計算する場合は`Y`を選ぶか、非対話実行では`--hash-models`を指定する。
 
 ### install options
 
@@ -39,6 +50,7 @@ cargo xtask uninstall
 | `--shared-secret-dir <dir>` | 共有する cluster-control.key / peer-proxy.key の供給元 |
 | `--ds4-source-commit <sha>` | distributed manifest の verified DS4 commit（初回 install で必須） |
 | `--ds4-binary-digest <sha>...` | distributed manifest の承認済み binary digest 集合（既定: 実機 digest） |
+| `--hash-models` | GGUFのSHA-256を確認せず計算・更新する（既定はプロンプト、既定選択は実行しない） |
 | `--ci` | インストール前に Required CI gate を実行 |
 | `--start` | LaunchAgent を bootstrap + kickstart する（ds4-server を再起動） |
 

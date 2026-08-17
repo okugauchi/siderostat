@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::{
     env,
     ffi::OsStr,
-    io::Read,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -200,6 +200,54 @@ pub fn sha256_cached(
     );
     Ok((digest, false))
 }
+
+/// Reuse a cached digest without reading the file contents. Fails closed when
+/// the cache entry is absent or the file metadata no longer matches it.
+pub fn sha256_from_cache(
+    path: &Path,
+    label: &str,
+    key: &str,
+    cache: &DigestCache,
+) -> Result<String> {
+    let meta = file_meta(path)?;
+    let cached = cache.entries.get(key).with_context(|| {
+        format!(
+            "{label} SHA-256 is not cached for {}; run `cargo xtask fingerprint-models` first",
+            path.display()
+        )
+    })?;
+    if cached.meta != meta {
+        anyhow::bail!(
+            "{label} changed after its SHA-256 was cached at {}; run `cargo xtask fingerprint-models` again",
+            path.display()
+        );
+    }
+    tracing_log(&format!(
+        "{label} unchanged ({size_mib} MiB) -> using cached digest",
+        size_mib = meta.size / (1024 * 1024)
+    ));
+    Ok(cached.digest.clone())
+}
+
+/// Ask whether an operation should run. Empty input, EOF, and any response
+/// other than `y`/`yes` select the default of no.
+pub fn confirm_default_no(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input)? == 0 {
+        tracing_log("no response; defaulting to no");
+        return Ok(false);
+    }
+    let confirmed = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if confirmed {
+        tracing_log("model SHA-256 calculation enabled");
+    } else {
+        tracing_log("model SHA-256 calculation skipped");
+    }
+    Ok(confirmed)
+}
+
 /// If `dst` already holds exactly `content`, leave it untouched and return
 /// false (idempotent install). Otherwise move an existing `dst` to a
 /// timestamped `.bak-<ts>` sibling and write `content`. Creates parents.
@@ -246,4 +294,54 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Print a progress line to stderr.
 pub fn tracing_log(msg: &str) {
     eprintln!("[xtask] {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cached_digest_reuses_matching_file_without_rehashing() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siderostat-xtask-util-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("model.gguf");
+        let result = (|| -> Result<()> {
+            std::fs::write(&path, b"model")?;
+            let mut cache = DigestCache::default();
+            let (expected, reused) = sha256_cached(&path, "model", "model", &mut cache)?;
+            assert!(!reused);
+            assert_eq!(
+                sha256_from_cache(&path, "model", "model", &cache)?,
+                expected
+            );
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn cached_digest_requires_an_entry() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siderostat-xtask-util-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("model.gguf");
+        let result = (|| -> Result<()> {
+            std::fs::write(&path, b"model")?;
+            let error = sha256_from_cache(&path, "model", "model", &DigestCache::default())
+                .expect_err("missing cache entry must fail");
+            assert!(error.to_string().contains("fingerprint-models"));
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
 }
