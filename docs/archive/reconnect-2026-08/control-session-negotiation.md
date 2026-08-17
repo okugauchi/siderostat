@@ -1,6 +1,6 @@
 # Control session negotiation (P0-B)
 
-本設計は `docs/reconnect-improvement-implementation-plan.md` の Phase G (P0-B control
+本設計は `docs/archive/reconnect-2026-08/reconnect-improvement-implementation-plan.md` の Phase G (P0-B control
 session generation) の正本である。対象は G-01〜G-05 で、R0-06 で観測された「方向依存の
 control generation mismatch」を解消する。詳細な観測は計画書 R0-06 Evidence を参照。
 

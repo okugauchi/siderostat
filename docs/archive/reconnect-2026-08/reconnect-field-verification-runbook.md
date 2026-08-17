@@ -1,13 +1,13 @@
 # 実機検証（Phase H）Runbook
 
-本稿は `docs/reconnect-improvement-implementation-plan.md` の Phase H（H-01〜H-05）を、2 node 実機で
+本稿は `docs/archive/reconnect-2026-08/reconnect-improvement-implementation-plan.md` の Phase H（H-01〜H-05）を、2 node 実機で
 実施するための operator 向け手順・報告・証跡の説明資料である。operator（ユーザー）が行う物理操作・
 macOS 操作のガイダンス、operator から agent への報告方法、証跡の残し方を定める。
 
 ## 1. 目的とスコープ
 
 - 対象: Thunderbolt 固定 IPv4 で接続した coordinator / worker の 2 node。
-- 検証する reconnect 動作（`docs/reconnect-improvement-proposal.md` 第1節の 5 条件に対応）:
+- 検証する reconnect 動作（`docs/archive/reconnect-2026-08/reconnect-improvement-proposal.md` 第1節の 5 条件に対応）:
   - cable detach/reconnect（H-02）
   - 片側 process 再起動（H-03）
   - macOS 再起動 片側・両側（H-04）

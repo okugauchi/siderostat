@@ -27,14 +27,14 @@ Distributed / Paired
 
 正本の優先順位は次のとおりとする。
 
-1. 製品 behavior と安全要件: [`spec.md`](spec.md)
+1. 製品 behavior と安全要件: [`spec.md`](../../spec.md)
 2. reconnect の問題分析と改善方針: [`reconnect-improvement-proposal.md`](reconnect-improvement-proposal.md)
-3. 現行実装の説明: [`connection-state-machine.md`](connection-state-machine.md)
-4. Git 運用: [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
+3. 現行実装の説明: [`connection-state-machine.md`](../../connection-state-machine.md)
+4. Git 運用: [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)
 5. 本作業の順序、状態、evidence: 本書
 
 矛盾を見つけた場合は実装を進めず、正本を確認して本書を更新する。完了済み刷新計画の
-[`archive/implementation-plan-v0.1.0.md`](archive/implementation-plan-v0.1.0.md) は履歴であり、
+[`implementation-plan-v0.1.0.md`](../implementation-plan-v0.1.0.md) は履歴であり、
 Git 運用や現行 behavior の根拠にしない。
 
 優先度の扱い:
@@ -178,7 +178,7 @@ R0-01 -> R0-02 -> R0-03 -> R0-04
 - Actions:
   1. branch、HEAD SHA、dirty file を記録する。
   2. 共通 local gate を実行する。
-  3. `docs/reconnect-improvement-proposal.md` 記載の関数・test file が現行 tree に存在することを確認する。
+  3. `docs/archive/reconnect-2026-08/reconnect-improvement-proposal.md` 記載の関数・test file が現行 tree に存在することを確認する。
   4. baseline failure があれば修正せず、最初の failure と reconnect task への影響を記録する。
 - Verification: 共通 local gate
 - 完了条件: 実装前の再現可能な SHA と test 結果が Evidence にある
@@ -191,7 +191,7 @@ Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc48
 - Actor: agent + operator review
 - Depends on: R0-01
 - 着手可能条件: baseline の `/cluster`、control response、child identity、log schema を確認済み
-- Files: `docs/reconnect-diagnostics-contract.md`（新規）
+- Files: `docs/archive/reconnect-2026-08/reconnect-diagnostics-contract.md`（新規）
 - Actions:
   1. `/cluster` に追加する read-only field を JSON 例付きで定義する。
   2. 最低限 `cluster_generation`、`control_session_generation`、`control_phase`、lease 有効性と期限、
@@ -202,7 +202,7 @@ Evidence: branch=feature/reconnect-recovery, HEAD=466debf2ba920343d18192b90bbc48
 - Verification: proposal 第 4 節 P0-0 の観測項目との対応表を作る
 - 完了条件: operator が field と redaction を承認し、実装者に追加判断が残っていない
 - 停止条件: secret または高 cardinality 値を metrics label に入れる必要がある
-Evidence: docs/reconnect-diagnostics-contract.md を新規作成し operator 承認済み (commit 46d1116); proposal P0-0 観測項目との対応表 §8 を作成、field/redaction/導出元を確定; 2026-08-14
+Evidence: docs/archive/reconnect-2026-08/reconnect-diagnostics-contract.md を新規作成し operator 承認済み (commit 46d1116); proposal P0-0 観測項目との対応表 §8 を作成、field/redaction/導出元を確定; 2026-08-14
 
 ### [x] R0-03 reconnect 診断情報を実装する
 
@@ -284,7 +284,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Actor: agent + operator review
 - Depends on: R0-05
 - 着手可能条件: lifecycle RED test の event 順と残存 child が記録済み
-- Files: `docs/reconnect-peer-loss-design.md`（新規）
+- Files: `docs/archive/reconnect-2026-08/reconnect-peer-loss-design.md`（新規）
 - Actions:
   1. control reconcile と route-loss demotion が共有する単一 recovery owner を定義する。
   2. transition generation を照合し、古い recovery が新しい state/child を操作しない規則を定義する。
@@ -297,7 +297,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: coordinator/worker/競合/途中失敗の sequence diagram と状態表
 - 完了条件: 実装者が lock 範囲、event 順、failure state を推測せず実装できる
 - 停止条件: `spec.md` 第 18.4 節と 18.5 節の変更が必要
-- Evidence: `docs/reconnect-peer-loss-design.md` を新規作成 (commit は本 Phase A 実装と一体で記録)。単一の `PeerLossRecovery` owner (lock + `completed_generation`) を定義し、control reconcile と route-loss demotion monitor が共有する。世代保護は owner の lock と state machine の `expected_generation` 照合の二重で担保。role 別順序を `admission block -> distributed stop -> standalone start -> publish SoloReady` に固定。stop は `ChildIdentity` 検証必須。failure mapping 表を固定: stop/start/readiness 失敗は `SoloStandaloneStarting + Unavailable` で retry、同一 generation 重複は冪等 no-op、古い generation は no-op、永続回復不能は `ManualInterventionRequired` (Phase B で接続)。coordinator も standalone を再起動する (R0-05 action 4 の不整合 4 を解消)。`spec.md` 18.4/18.5 は変更不要と判断。; 2026-08-14
+- Evidence: `docs/archive/reconnect-2026-08/reconnect-peer-loss-design.md` を新規作成 (commit は本 Phase A 実装と一体で記録)。単一の `PeerLossRecovery` owner (lock + `completed_generation`) を定義し、control reconcile と route-loss demotion monitor が共有する。世代保護は owner の lock と state machine の `expected_generation` 照合の二重で担保。role 別順序を `admission block -> distributed stop -> standalone start -> publish SoloReady` に固定。stop は `ChildIdentity` 検証必須。failure mapping 表を固定: stop/start/readiness 失敗は `SoloStandaloneStarting + Unavailable` で retry、同一 generation 重複は冪等 no-op、古い generation は no-op、永続回復不能は `ManualInterventionRequired` (Phase B で接続)。coordinator も standalone を再起動する (R0-05 action 4 の不整合 4 を解消)。`spec.md` 18.4/18.5 は変更不要と判断。; 2026-08-14
 
 ### [x] A-02 worker の PeerLost recovery を実装する
 
@@ -360,7 +360,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Actor: agent + operator review
 - Depends on: R0-06
 - 着手可能条件: 方向依存 mismatch の expected/received と永続 state 差が記録済み
-- Files: `docs/control-session-negotiation.md`（新規）、必要なら `docs/spec.md`
+- Files: `docs/archive/reconnect-2026-08/control-session-negotiation.md`（新規）、必要なら `docs/spec.md`
 - Actions:
   1. coordinator を唯一の session authority とする。
   2. Pair offer と Pair confirm の message、許可 role、phase、idempotency key、response を定義する。
@@ -372,7 +372,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: 正常、片側高世代、同時 retry、重複、crash、overflow の状態遷移表
 - 完了条件: wire format と atomic commit boundary が operator 承認済み
 - 停止条件: generation reset、worker authority、古い non-Pair command の許可が必要
-- Evidence: `docs/control-session-negotiation.md` を新規作成。coordinator を唯一の session authority とし、`ControlCommand::Pair` を coordinator からの offer / worker からの confirm として使い回す (新規 wire 型は追加しない)。candidate generation は `max(local, peer)` の checked 値で、`u64::MAX` 到達は明示的な exhaustion として扱い generation reset は行わない。session commit は coordinator の control Mutex 内で local generation / lease / phase / processed map を一括更新し部分更新 window を持たない。crash point (offer 前/後、confirm 前/後) と再送収束規則、永続化 field (`control_session_generation` を cluster generation と別 field) を定義。direction 別収束表で worker 高世代を方向非依存に解消。停止条件 (generation reset / worker authority / 古い non-Pair 許可) は不使用と判断。`spec.md` 第 18.4/18.5 節は変更不要と判断。; 2026-08-14
+- Evidence: `docs/archive/reconnect-2026-08/control-session-negotiation.md` を新規作成。coordinator を唯一の session authority とし、`ControlCommand::Pair` を coordinator からの offer / worker からの confirm として使い回す (新規 wire 型は追加しない)。candidate generation は `max(local, peer)` の checked 値で、`u64::MAX` 到達は明示的な exhaustion として扱い generation reset は行わない。session commit は coordinator の control Mutex 内で local generation / lease / phase / processed map を一括更新し部分更新 window を持たない。crash point (offer 前/後、confirm 前/後) と再送収束規則、永続化 field (`control_session_generation` を cluster generation と別 field) を定義。direction 別収束表で worker 高世代を方向非依存に解消。停止条件 (generation reset / worker authority / 古い non-Pair 許可) は不使用と判断。`spec.md` 第 18.4/18.5 節は変更不要と判断。; 2026-08-14
 
 ### [x] G-02 pure control session state machine を実装する
 
@@ -541,7 +541,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Actor: agent + operator review
 - Depends on: B-04
 - 着手可能条件: session negotiation が network gate から独立して安定している
-- Files: `docs/pairing-network-gate.md`（新規）、必要なら `docs/spec.md`
+- Files: `docs/archive/reconnect-2026-08/pairing-network-gate.md`（新規）、必要なら `docs/spec.md`
 - Actions:
   1. fixed source、HMAC、bridge0 scoped route、lease、stability、discovery candidate の必須条件を表にする。
   2. snapshot/candidate に generation または観測 epoch を付け、古い観測を拒否する。
@@ -552,7 +552,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - 完了条件: production handler が `route_scoped=true` を固定値で渡す必要がなくなる設計が承認済み
 - 停止条件: ICMP や Bonjour presence だけを trust する必要がある
 
-- Evidence: branch=feature/reconnect-recovery; `docs/pairing-network-gate.md` を新規作成。
+- Evidence: branch=feature/reconnect-recovery; `docs/archive/reconnect-2026-08/pairing-network-gate.md` を新規作成。
   現行 `src/cluster/production/effects.rs` の `ProductionClusterRuntime::handle()` が
   `RoleControl::Coordinator` / `RoleControl::Worker` へ `.node_descriptor(&authenticated, true, now)` /
   `.handle(endpoint, message, &authenticated, true, now)` で **固定値 `route_scoped=true`** を
@@ -648,7 +648,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Verification: security/reconnect test、共通 local gate
 - 完了条件: P2 の truth table と全 test 名が対応する
 - 停止条件: fake evidence と macOS provider の意味が一致しない
-- Evidence: branch=feature/reconnect-recovery; truth table (docs/pairing-network-gate.md §8)
+- Evidence: branch=feature/reconnect-recovery; truth table (docs/archive/reconnect-2026-08/pairing-network-gate.md §8)
   の全行と test 名が一対一で対応することを確認した。`tests/reconnect_production.rs` に
   `network_evidence_truth_table_maps_every_state_to_route_and_peer_present` (ThunderboltIpState
   8 状態をループし、`PeerCandidateFound` = (route_scoped true, peer_present false) /
@@ -761,7 +761,7 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - Depends on: N-03、Q-02 の判定完了
 - 着手可能条件: 共通 local gate と reconnect acceptance suite が GREEN
 - Files: repository 外 evidence directory、必要なら redaction 済み runbook
-  （operator 手順は `docs/reconnect-field-verification-runbook.md` に集約）
+  （operator 手順は `docs/archive/reconnect-2026-08/reconnect-field-verification-runbook.md` に集約）
 - Actions:
   1. operator が両 node の利用停止可能時間と、進行中推論 request がないことを確認する。
   2. agent が candidate の commit SHA、binary SHA-256、config checksum を記録する。

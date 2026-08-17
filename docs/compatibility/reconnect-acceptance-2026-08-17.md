@@ -68,10 +68,10 @@ cycle の最終 checkpoint では、manual pair/reconcile、state 削除、force
 ## Evidence
 
 - H-01/H-02 baseline・rollback・cable artifacts: `/Users/o/siderostat-reconnect-evidence-20260815/`
-- H-03 completion record: `docs/reconnect-field-verification-runbook.md` §8.3、
-  `docs/reconnect-improvement-implementation-plan.md` H-03 completion evidence
+- H-03 completion record: `docs/archive/reconnect-2026-08/reconnect-field-verification-runbook.md` §8.3、
+  `docs/archive/reconnect-2026-08/reconnect-improvement-implementation-plan.md` H-03 completion evidence
 - H-04 raw summary: `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-summary.md`
-- H-04 runbook record: `docs/reconnect-field-verification-runbook.md` §9.1
+- H-04 runbook record: `docs/archive/reconnect-2026-08/reconnect-field-verification-runbook.md` §9.1
 
 H-03 の一時 evidence directory は検証環境の temporary storage であり現行環境には残って
 いないため、H-03 の acceptance は repository に commit 済みの runbook/plan completion

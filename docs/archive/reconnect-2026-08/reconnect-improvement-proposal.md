@@ -1,7 +1,7 @@
 # 再pair（reconnect）改善提案
 
 > 対象: peer 接続断 → Solo Standalone → 再pair → Distributed 復帰の自動経路。
-> 本稿は現行実装の調査結果（[`connection-state-machine.md`](connection-state-machine.md)）に基づく
+> 本稿は現行実装の調査結果（[`connection-state-machine.md`](../../connection-state-machine.md)）に基づく
 > 原因候補と、優先度付きの改善案である。ユーザー報告とコード上の欠陥候補を区別し、
 > 再現テストで確認できていないものは仮説として扱う。
 > 最終更新日: 2026-08-14
@@ -261,7 +261,7 @@ watch/notify または Pair confirm 完了を await する。単なる sleep 延
 
 ## 7. 文書・仕様との関係
 
-- 現行実装の詳細と既知差分は [`connection-state-machine.md`](connection-state-machine.md) を参照する。
+- 現行実装の詳細と既知差分は [`connection-state-machine.md`](../../connection-state-machine.md) を参照する。
 - target behavior は `docs/spec.md` 13、16、18、31、32.5節を正とする。
 - 実装時は PeerLost recovery、control session generation、Backoff wiring を別の責務として扱う。
 - 実装変更後は、両文書の「現行実装」部分を新しい配線に合わせて更新する。

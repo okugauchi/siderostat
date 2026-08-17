@@ -276,11 +276,11 @@ Pair が `ControlError::GenerationMismatch` で拒否されたとき、次の fi
 本稿は次の導出を code の evidence に基づき確定提案する。operator が承認をもって確定する。
 
 1. **`admission`**: `AdmissionGate::snapshot().state` が `Serving` なら `open`、それ以外
-   （`Draining` / `Blocked`）は `blocked` とする。evidence: [`src/admission.rs`](../src/admission.rs) の
+   （`Draining` / `Blocked`）は `blocked` とする。evidence: [`src/admission.rs`](../../../src/admission.rs) の
    `AdmissionState { Serving, Draining, Blocked }`。permit 残量（in_flight/max）は `open`/`blocked`
    の判定に使わない。容量は `try_acquire` が別途制御するため。
 2. **`target_ready`**: `admission == open` かつ `ProxyTarget` が `LocalStandalone` または
-   `Coordinator`（`Unavailable` でない）のときに `true`。evidence: [`src/target.rs`](../src/target.rs) の
+   `Coordinator`（`Unavailable` でない）のときに `true`。evidence: [`src/target.rs`](../../../src/target.rs) の
    `ProxyTarget { LocalStandalone, Coordinator, Unavailable }`。`target` と独立に同じ source から導出する。
 3. **distributed child の `ready`**: distributed child は supervisor の identity に readiness 概念が
    ないため `ready` field を常に省略する（standalone のみ `ready` を持つ）。

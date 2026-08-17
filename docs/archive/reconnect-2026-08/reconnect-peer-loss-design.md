@@ -11,7 +11,7 @@ Status: **APPROVED-PENDING-REVIEW**
 する。対象は [`reconnect-improvement-implementation-plan.md`](reconnect-improvement-implementation-plan.md)
 Phase A (A-01〜A-04) の P0-A PeerLost lifecycle である。
 
-本設計の正本は [`spec.md`](spec.md) の 18.4 / 18.5 節を前提とし、本書はその実装上の所有権と
+本設計の正本は [`spec.md`](../../spec.md) の 18.4 / 18.5 節を前提とし、本書はその実装上の所有権と
 順序、failure mapping を固定する。本書が spec と矛盾する場合は実装を進めず、spec を正として
 本書を更新する。
 

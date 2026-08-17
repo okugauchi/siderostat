@@ -1,6 +1,6 @@
 # Pairing network gate (N-01)
 
-本設計は `docs/reconnect-improvement-implementation-plan.md` の **Phase N (P2 route /
+本設計は `docs/archive/reconnect-2026-08/reconnect-improvement-implementation-plan.md` の **Phase N (P2 route /
 discovery pairing gate)** の正本である。対象は N-01（pairing gate の network evidence
 contract の固定）で、現行 `production` handler が `route_scoped=true` を固定値で渡している
 問題を明記し、N-02 で `NetworkSnapshot` / `DiscoveryTracker` の実測 evidence へ置換する
