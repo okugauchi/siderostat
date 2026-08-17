@@ -157,7 +157,7 @@ Rollbackは [`docs/installation.md`](installation.md) のRollback節に従う。
 ## 8. 安全な運用原則
 
 - Destructive cache削除を通常手順にしない。KV cache、state file、secretの削除は自動で行わず、operatorが明示的に判断する場合だけ実施する。
-- Secret/token fileは32 bytes以上、mode `0600`、相互に異なるpathで配置する。同じfileを複数roleに流用しない。
+- Secret/token fileは32 bytes以上の生バイト列、mode `0600`、相互に異なるpathで配置する。SSH秘密鍵やPEMではなく、同じfileを複数roleに流用しない。
 - Admin mutationはloopbackでもtoken必須。GETはsecretを返さない。
 - Mode切替は503の短いwindowを含む。切替中に新規requestは503 + `Retry-After`で拒否され、既存streamは完走する。
 - Workerからcoordinatorへのrequestはproxyを2 hop通る。Peer data/DS4 native trafficは暗号化されない。専用の物理Thunderbolt linkを信頼境界とする。

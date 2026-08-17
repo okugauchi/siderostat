@@ -947,9 +947,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
@@ -1055,9 +1055,11 @@ auto_restart = true
             config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
             config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
             config.ds4.mxfp4.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
-            config.cluster.security.control_secret_file = self.file("control.key", &[1; 32], 0o600);
-            config.cluster.security.peer_proxy_token_file = self.file("peer.key", &[2; 32], 0o600);
-            config.cluster.security.admin_token_file = self.file("admin.key", &[3; 32], 0o600);
+            config.cluster.security.control_secret_file =
+                self.file("cluster-control", &[1; 32], 0o600);
+            config.cluster.security.peer_proxy_token_file =
+                self.file("peer-proxy", &[2; 32], 0o600);
+            config.cluster.security.admin_token_file = self.file("admin", &[3; 32], 0o600);
             config.cluster.state_path = self.root.join("cluster-state.json");
             config.cluster.manifest_cache_dir = self.root.join("manifests");
             config.ds4.standalone.kv_disk_dir = self.root.join("standalone-kv");

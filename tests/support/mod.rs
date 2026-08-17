@@ -578,9 +578,9 @@ event_debounce = "100ms"
 reconcile_interval = "200ms"
 
 [cluster.security]
-control_secret_file = "{manifest_cache}/control.key"
-peer_proxy_token_file = "{manifest_cache}/peer-proxy.key"
-admin_token_file = "{manifest_cache}/admin.key"
+control_secret_file = "{manifest_cache}/cluster-control"
+peer_proxy_token_file = "{manifest_cache}/peer-proxy"
+admin_token_file = "{manifest_cache}/admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 

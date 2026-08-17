@@ -84,7 +84,7 @@ cargo test --test reconnect_production --features test-support -- --test-threads
 3. `./siderostat.toml`
 4. platform既定path
 
-Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置します。Control secretとpeer proxy tokenはそれぞれ両nodeで同じ値を使い、admin tokenはnodeごとに生成します。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。`openssl rand`などで生成し、configにはfile pathだけを書きます。
+Secret/token fileは各32 bytes以上の生バイト列、mode `0600`、相互に異なるpathで配置します。これはSSH秘密鍵やPEMではなく、control/peer認証用のHMAC secretとadmin API用tokenです。標準名は拡張子なしの`cluster-control`、`peer-proxy`、`admin`で、control secretとpeer proxy tokenはそれぞれ両nodeで同じ値を使い、admin tokenはnodeごとに生成します。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。既存の`.key`名は移行期間中も扱えます。`openssl rand`などで生成し、configにはfile pathだけを書きます。
 
 起動形式です。Subcommandなしは`serve`と同じです。
 
@@ -127,7 +127,7 @@ Mutation（pair/promote/demote/restart/fingerprint/reconcile）はloopbackでも
 - Public/admin listenerはloopback既定。peer ingress/control/DS4 distributedはThunderbolt Bridgeだけにbindします。
 - Peer ingressはsource IP、token、hopを検証します。Control planeはHMAC、timestamp、nonce、source IPを検証します。
 - Admin mutationはtoken必須です。
-- Secret/token fileは32 bytes以上、mode `0600`。Control、peer proxy、adminの3用途の間で値またはfileを流用しません。
+- Secret/token fileは32 bytes以上の生バイト列、mode `0600`。SSH秘密鍵やPEMではなく、Control、peer proxy、adminの3用途の間で値またはfileを流用しません。
 - DS4 childをTokio process APIでspawnし、shellを介しません。Unknown processをkillしません。
 - Model fingerprint時にregular file/canonical pathを確認します。書換可能なsymlinkをmodel pathに使いません。
 - Authorization/API key、request/response body、prompt、session/conversation ID、peer proxy token、HMAC secret、完全model digest/deployment IDをlogしません。
