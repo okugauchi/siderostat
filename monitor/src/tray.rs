@@ -104,12 +104,10 @@ impl MonitorTray {
     /// state. The cluster mode is conveyed by the icon drawing (two circles and
     /// an optional connector), never by a text abbreviation.
     pub fn update(&self, display: &DisplayState) {
-        self.header.set_text(
-            display
-                .node_id
-                .clone()
-                .unwrap_or_else(|| "siderostat".into()),
-        );
+        self.header.set_text(display.node_id.as_ref().map_or_else(
+            || "node_id: siderostat".to_string(),
+            |node_id| format!("node_id: {node_id}"),
+        ));
 
         if let Ok(icon) = icon_for(
             display.cluster_mode.as_deref(),

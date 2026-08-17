@@ -173,7 +173,7 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
 ### 5.2 メニュー構成
 
 ```text
-siderostat (ヘッダー: node_id)
+node_id: macstudio (ヘッダー)
 ────────────────────────
 Mode:    solo-standalone
 State:   solo-standalone-ready
