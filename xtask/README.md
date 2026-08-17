@@ -48,7 +48,7 @@ cargo xtask fingerprint-models [options]
 | `--ds4-server <path>` | ds4-server の場所を明示（既定: `$HOME` 探索） |
 | `--node-id <name>` | config に書く `cluster.node_id`（既定: hostname） |
 | `--standalone-model` / `--mxfp4-model` / `--dspark-support` | モデルを明示（既定: gguf 配下を名前で自動判別） |
-| `--shared-secret-dir <dir>` | 共有する cluster-control.key / peer-proxy.key の供給元 |
+| `--shared-secret-dir <dir>` | 共有する cluster-control / peer-proxy の供給元（legacy `.key` も可） |
 | `--ds4-source-commit <sha>` | distributed manifest の verified DS4 commit（初回 install で必須） |
 | `--ds4-binary-digest <sha>...` | distributed manifest の承認済み binary digest 集合（既定: 実機 digest） |
 | `--hash-models` | GGUFのSHA-256を確認せず計算・更新する（既定はプロンプト、既定選択は実行しない） |

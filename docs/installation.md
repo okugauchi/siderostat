@@ -151,7 +151,7 @@ sudo install -m 0755 target/release/siderostat-monitor /usr/local/bin/siderostat
 
 ### Secret file
 
-Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。Control secretとpeer proxy tokenは、それぞれclusterの両nodeで同じ値が必要である。Admin tokenはnode-localとする。Control secret、peer proxy token、admin token間でfileまたは値を流用しない。
+Secret/token fileは各32 bytes以上の生バイト列、mode `0600`、相互に異なるpathで配置する（spec第22.3節、第32.5節）。これらはSSH秘密鍵やPEMではなく、control/peer認証用のHMAC secretとadmin API用tokenである。標準名は拡張子なしの`cluster-control`、`peer-proxy`、`admin`とする。Control secretとpeer proxy tokenは、それぞれclusterの両nodeで同じ値が必要である。Admin tokenはnode-localとする。Control secret、peer proxy token、admin token間でfileまたは値を流用しない。
 
 まずcoordinator上で共有する2値とcoordinatorのadmin tokenを生成する。`umask 077`により生成時からownerだけが読み書きできる。
 
@@ -159,24 +159,28 @@ Secret/token fileは各32 bytes以上、mode `0600`、相互に異なるpathで�
 SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 umask 077
 mkdir -p "$SECRET_DIR"
-openssl rand -out "$SECRET_DIR/cluster-control.key" 32
-openssl rand -out "$SECRET_DIR/peer-proxy.key" 32
-openssl rand -out "$SECRET_DIR/admin.key" 32
-chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
+openssl rand -out "$SECRET_DIR/cluster-control" 32
+openssl rand -out "$SECRET_DIR/peer-proxy" 32
+openssl rand -out "$SECRET_DIR/admin" 32
+chmod 600 "$SECRET_DIR/cluster-control" "$SECRET_DIR/peer-proxy" "$SECRET_DIR/admin"
 ```
 
-`cluster-control.key`と`peer-proxy.key`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
+`cluster-control`と`peer-proxy`を、operatorが承認した暗号化済み媒体または同等の安全な経路でworkerへ移す。Shell history、clipboard manager、repository、plist、command lineにsecret値そのものを記録しない。Workerでは共有2 fileを同じfilenameで`SECRET_DIR`へ配置し、admin tokenだけをworker上で新規生成する。
 
 ```sh
 SECRET_DIR="$HOME/Library/Application Support/siderostat/secrets"
 SHARED_SECRET_SOURCE="/Volumes/OPERATOR-APPROVED-ENCRYPTED-MEDIA"
 umask 077
 mkdir -p "$SECRET_DIR"
-install -m 0600 "$SHARED_SECRET_SOURCE/cluster-control.key" "$SECRET_DIR/cluster-control.key"
-install -m 0600 "$SHARED_SECRET_SOURCE/peer-proxy.key" "$SECRET_DIR/peer-proxy.key"
-openssl rand -out "$SECRET_DIR/admin.key" 32
-chmod 600 "$SECRET_DIR/cluster-control.key" "$SECRET_DIR/peer-proxy.key" "$SECRET_DIR/admin.key"
+install -m 0600 "$SHARED_SECRET_SOURCE/cluster-control" "$SECRET_DIR/cluster-control"
+install -m 0600 "$SHARED_SECRET_SOURCE/peer-proxy" "$SECRET_DIR/peer-proxy"
+openssl rand -out "$SECRET_DIR/admin" 32
+chmod 600 "$SECRET_DIR/cluster-control" "$SECRET_DIR/peer-proxy" "$SECRET_DIR/admin"
 ```
+
+既存環境の`cluster-control.key`、`peer-proxy.key`、`admin.key`はそのまま保持できる。
+`cargo xtask install`は対応するlegacy fileを検出すると、値を拡張子なしのcanonical fileへ複製して
+新しいconfigから参照する。共有secretを手動で移行する場合も、値を再生成せずbyte-for-byteで複製する。
 
 両nodeの共有2 fileがbyte-for-byteで一致し、各node内の3 fileがそれぞれ異なることを安全な経路上で確認する。Digestやsecret値はdocumentation evidenceに保存しない。
 
@@ -193,7 +197,7 @@ cp siderostat.example.toml "$HOME/Library/Application Support/siderostat/config.
 - `ds4.binary`の`PLACEHOLDER-ds4-server`。
 - `ds4.dspark.support_model`の`PLACEHOLDER-dspark-support-0731.gguf`。
 - `ds4.standalone.model`と`ds4.mxfp4.model`の`PLACEHOLDER-*.gguf`。
-- Secret fileの`PLACEHOLDER-*-cluster-control.key`、`PLACEHOLDER-*-peer-proxy.key`、`PLACEHOLDER-*-admin.key`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
+- Secret fileの`PLACEHOLDER-cluster-control`、`PLACEHOLDER-peer-proxy`、`PLACEHOLDER-admin`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
 - Manifest pathの`PLACEHOLDER-standalone.gguf`相当のmanifest JSON。
 
 Validation要件（spec第22.3節）を満たすことを確認する。

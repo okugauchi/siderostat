@@ -34,7 +34,7 @@ pub struct InstallArgs {
     /// node_id written to config.toml. Default: hostname.
     #[arg(long)]
     pub node_id: Option<String>,
-    /// Directory containing shared cluster-control.key + peer-proxy.key.
+    /// Directory containing shared cluster-control + peer-proxy secret files.
     #[arg(long)]
     pub shared_secret_dir: Option<PathBuf>,
     /// Verified DS4 source commit for the distributed manifest.
@@ -403,9 +403,9 @@ fn resolve_one(
         .with_context(|| format!("canonicalize {kind} model"))
 }
 
-/// Create secret files (cluster-control, peer-proxy, admin) at 0600 with 32+
-/// bytes. Existing secrets are preserved; a shared secret source dir supplies the
-/// two cluster-shared values.
+/// Create extensionless secret files at 0600 with 32+ bytes. Existing secrets
+/// are preserved; legacy `.key` files are copied to the new names so an
+/// existing installation can migrate without losing its configured values.
 fn ensure_secrets(home: &Path, shared_dir: Option<&Path>) -> Result<()> {
     let secret_dir = home.join("Library/Application Support/siderostat/secrets");
     std::fs::create_dir_all(&secret_dir)
@@ -413,11 +413,27 @@ fn ensure_secrets(home: &Path, shared_dir: Option<&Path>) -> Result<()> {
     // Restrict the secrets directory to the owner.
     util::run("chmod", &[OsStr::new("700"), OsStr::new(&secret_dir)])?;
 
-    let names = ["cluster-control.key", "peer-proxy.key", "admin.key"];
-    for name in names {
+    let names = [
+        ("cluster-control", "cluster-control.key"),
+        ("peer-proxy", "peer-proxy.key"),
+        ("admin", "admin.key"),
+    ];
+    for (name, legacy_name) in names {
         let path = secret_dir.join(name);
         if path.is_file() && util::file_size(&path)? >= 32 {
             util::tracing_log(&format!("preserving existing secret {}", path.display()));
+            continue;
+        }
+        let legacy_path = secret_dir.join(legacy_name);
+        if legacy_path.is_file() && util::file_size(&legacy_path)? >= 32 {
+            std::fs::copy(&legacy_path, &path)
+                .with_context(|| format!("migrate legacy secret {}", legacy_path.display()))?;
+            util::run("chmod", &[OsStr::new("600"), OsStr::new(&path)])?;
+            util::tracing_log(&format!(
+                "migrated legacy secret {} -> {}",
+                legacy_path.display(),
+                path.display()
+            ));
             continue;
         }
         util::tracing_log(&format!("creating secret {}", path.display()));
@@ -434,20 +450,33 @@ fn ensure_secrets(home: &Path, shared_dir: Option<&Path>) -> Result<()> {
     }
 
     if let Some(shared) = shared_dir {
-        for name in ["cluster-control.key", "peer-proxy.key"] {
-            let src = shared.join(name);
+        for (name, legacy_name) in [
+            ("cluster-control", "cluster-control.key"),
+            ("peer-proxy", "peer-proxy.key"),
+        ] {
+            let canonical_src = shared.join(name);
+            let legacy_src = shared.join(legacy_name);
+            let src = if canonical_src.is_file() && util::file_size(&canonical_src)? >= 32 {
+                &canonical_src
+            } else {
+                &legacy_src
+            };
             let dst = secret_dir.join(name);
             if !src.is_file() {
-                anyhow::bail!("shared secret source missing {}", src.display());
+                anyhow::bail!(
+                    "shared secret source missing {} or {}",
+                    canonical_src.display(),
+                    legacy_src.display()
+                );
             }
-            std::fs::copy(&src, &dst).with_context(|| format!("copy shared secret {}", name))?;
+            std::fs::copy(src, &dst).with_context(|| format!("copy shared secret {}", name))?;
             util::run("chmod", &[OsStr::new("600"), OsStr::new(&dst)])?;
             util::tracing_log(&format!("installed shared secret {}", name));
         }
     } else {
         util::tracing_log(
-            "NOTE: cluster-control.key and peer-proxy.key are generated locally; \
-             for a 2-node cluster copy these same files to the peer node via an approved secure path.",
+            "NOTE: cluster-control and peer-proxy are generated locally; for a 2-node cluster copy \
+             these same files to the peer node via an approved secure path.",
         );
     }
     Ok(())
@@ -508,9 +537,9 @@ fn write_config(
             "model_manifest = \"$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json\"",
             &format!("model_manifest = \"{}\"", distributed_manifest.display()),
         ),
-        ("PLACEHOLDER-cluster-control.key", "cluster-control.key"),
-        ("PLACEHOLDER-peer-proxy.key", "peer-proxy.key"),
-        ("PLACEHOLDER-admin.key", "admin.key"),
+        ("PLACEHOLDER-cluster-control", "cluster-control"),
+        ("PLACEHOLDER-peer-proxy", "peer-proxy"),
+        ("PLACEHOLDER-admin", "admin"),
         (
             "node_id = \"macstudio-coordinator\"",
             &format!("node_id = \"{node_id}\""),
@@ -705,4 +734,43 @@ fn start_launch_agent(plist: &Path, label: &str) -> Result<()> {
 fn current_uid() -> Result<u32> {
     let out = util::run("id", &[OsStr::new("-u")])?;
     Ok(String::from_utf8(out)?.trim().parse()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_secrets;
+    use std::fs;
+
+    #[test]
+    fn migrates_legacy_secret_names_and_shared_inputs() {
+        let root = std::env::temp_dir().join(format!(
+            "siderostat-xtask-secret-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let secret_dir = root.join("Library/Application Support/siderostat/secrets");
+        let shared_dir = root.join("shared");
+        fs::create_dir_all(&secret_dir).unwrap();
+        fs::create_dir_all(&shared_dir).unwrap();
+
+        fs::write(secret_dir.join("cluster-control.key"), [1u8; 32]).unwrap();
+        fs::write(secret_dir.join("peer-proxy.key"), [2u8; 32]).unwrap();
+        fs::write(secret_dir.join("admin.key"), [3u8; 32]).unwrap();
+        fs::write(shared_dir.join("cluster-control.key"), [4u8; 32]).unwrap();
+        fs::write(shared_dir.join("peer-proxy.key"), [5u8; 32]).unwrap();
+
+        ensure_secrets(&root, Some(&shared_dir)).unwrap();
+
+        assert_eq!(
+            fs::read(secret_dir.join("cluster-control")).unwrap(),
+            [4u8; 32]
+        );
+        assert_eq!(fs::read(secret_dir.join("peer-proxy")).unwrap(), [5u8; 32]);
+        assert_eq!(fs::read(secret_dir.join("admin")).unwrap(), [3u8; 32]);
+        assert!(secret_dir.join("cluster-control.key").is_file());
+        assert!(secret_dir.join("peer-proxy.key").is_file());
+        assert!(secret_dir.join("admin.key").is_file());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

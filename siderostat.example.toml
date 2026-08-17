@@ -42,9 +42,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/PLACEHOLDER-admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 

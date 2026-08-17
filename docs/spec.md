@@ -344,7 +344,7 @@ X-DS4-Peer-Proxy-Token: <secret>
 X-DS4-Proxy-Hop: 1
 ```
 
-- Tokenは32 random bytes以上、mode `0600` のfileから読む。
+- Tokenは32 random bytes以上の生バイト列をmode `0600`のfileから読む。SSH秘密鍵やPEMではない。
 - Coordinatorはconstant-timeで比較する。
 - Hopが1以外、token不正、source IP不一致を403で拒否する。
 - Peer ingressはtoken headerをlocal DS4へ転送しない。
@@ -702,7 +702,9 @@ NONCE + "\n" +
 LOWERCASE_HEX_SHA256(BODY)
 ```
 
-- Secretは32 random bytes以上、mode `0600` file。
+- Secret/token fileは32 random bytes以上の生バイト列、mode `0600`。標準のcanonical file名は
+  拡張子なしの`cluster-control`、`peer-proxy`、`admin`とする。既存の`.key` fileはinstall時の
+  移行対象として扱ってよい。
 - Constant-timeで署名比較。
 - Clock skew 30秒以内。
 - Nonceを5分保持してreplay拒否。
@@ -1019,9 +1021,9 @@ event_debounce = "500ms"
 reconcile_interval = "30s"
 
 [cluster.security]
-control_secret_file = "$HOME/Library/Application Support/siderostat/cluster-control.key"
-peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/peer-proxy.key"
-admin_token_file = "$HOME/Library/Application Support/siderostat/admin.key"
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/admin"
 max_clock_skew = "30s"
 nonce_ttl = "5m"
 
