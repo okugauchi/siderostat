@@ -232,12 +232,14 @@ impl DesktopNotificationService {
     /// subscribes after boot, so boot transitions are reported here.
     pub fn observe_startup(&mut self, state: ClusterState) {
         let notification = match state {
-            ClusterState::SoloStandaloneReady => {
-                Notification::new("siderostat 起動", "SoloStandalone 起動完了")
-            }
-            ClusterState::ManualInterventionRequired => {
-                Notification::new("siderostat 起動", "要手動対応")
-            }
+            ClusterState::SoloStandaloneReady => Notification::new(
+                "siderostat 起動",
+                "ds4-server が Standalone モードで起動しました",
+            ),
+            ClusterState::ManualInterventionRequired => Notification::new(
+                "siderostat 起動",
+                "ds4-server のモード変更に失敗しました (要手動復旧)",
+            ),
             _ => Notification::new("siderostat 起動", "起動中"),
         };
         self.maybe_notify(notification);
@@ -247,7 +249,7 @@ impl DesktopNotificationService {
     pub fn observe_child_restart(&mut self) {
         self.maybe_notify(Notification::new(
             "siderostat",
-            "Standalone が再起動されました",
+            "ds4-server を Standalone モードで再起動しました",
         ));
     }
 
@@ -290,25 +292,30 @@ fn notification_for_transition(
     match (previous, current) {
         (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => Some(Notification::new(
             "siderostat",
-            "Distributed 停止・Paired へ復帰",
+            "ds4-server を Standalone モードで再起動しました",
         )),
-        (_, ClusterState::SoloStandaloneReady) => {
-            Some(Notification::new("siderostat", "Standalone 準備完了"))
-        }
+        (_, ClusterState::SoloStandaloneReady) => Some(Notification::new(
+            "siderostat",
+            "ds4-server が Standalone モードで起動しました",
+        )),
         (_, ClusterState::PairedStandaloneReady) => Some(Notification::new(
             "siderostat",
-            "Standalone がペアリングされました",
+            "ネットワーク上の ds4-server ノードを検出しました",
         )),
         (ClusterState::DistributedStarting, ClusterState::DistributedReady) => {
-            Some(Notification::new("siderostat", "Distributed 準備完了"))
+            Some(Notification::new(
+                "siderostat",
+                "2ノードの ds4-server が Distributed Inference モードで相互接続しました",
+            ))
         }
         (_, ClusterState::Backoff) => Some(Notification::new(
             "siderostat",
-            "プロモーション失敗・バックオフ",
+            "ds4-server の Distributed 起動に失敗しました。Standalone モードで待機します",
         )),
-        (_, ClusterState::ManualInterventionRequired) => {
-            Some(Notification::new("siderostat", "要手動対応"))
-        }
+        (_, ClusterState::ManualInterventionRequired) => Some(Notification::new(
+            "siderostat",
+            "ds4-server のモード変更に失敗しました (要手動復旧)",
+        )),
         _ => None,
     }
 }
@@ -370,7 +377,7 @@ mod tests {
         let notifier = OsascriptNotifier::new(true, true);
         let command = notifier.command(&Notification::new(
             "siderostat",
-            "再起動が必要です（5秒後）",
+            "5秒後に ds4-server を再起動します",
         ));
         let args = command
             .get_args()
@@ -380,7 +387,7 @@ mod tests {
         assert_eq!(args.first().map(String::as_str), Some("-e"));
         assert!(args[1].contains("display notification"));
         assert!(args[1].contains("sound name \"Glass\""));
-        assert!(args[1].contains("再起動が必要です（5秒後）"));
+        assert!(args[1].contains("5秒後に ds4-server を再起動します"));
     }
 
     #[test]
@@ -394,7 +401,7 @@ mod tests {
             (
                 ClusterState::SoloStandaloneStarting,
                 ClusterState::SoloStandaloneReady,
-                Some("Standalone 準備完了"),
+                Some("ds4-server が Standalone モードで起動しました"),
             ),
             (
                 ClusterState::SoloStandaloneReady,
@@ -404,7 +411,7 @@ mod tests {
             (
                 ClusterState::Pairing,
                 ClusterState::PairedStandaloneReady,
-                Some("Standalone がペアリングされました"),
+                Some("ネットワーク上の ds4-server ノードを検出しました"),
             ),
             (
                 ClusterState::PairedStandaloneReady,
@@ -419,23 +426,23 @@ mod tests {
             (
                 ClusterState::DistributedStarting,
                 ClusterState::DistributedReady,
-                Some("Distributed 準備完了"),
+                Some("2ノードの ds4-server が Distributed Inference モードで相互接続しました"),
             ),
             (
                 ClusterState::PairedStandaloneReady,
                 ClusterState::Backoff,
-                Some("プロモーション失敗・バックオフ"),
+                Some("ds4-server の Distributed 起動に失敗しました。Standalone モードで待機します"),
             ),
             (
                 ClusterState::Backoff,
                 ClusterState::ManualInterventionRequired,
-                Some("要手動対応"),
+                Some("ds4-server のモード変更に失敗しました (要手動復旧)"),
             ),
             (ClusterState::DistributedReady, ClusterState::Demoting, None),
             (
                 ClusterState::Demoting,
                 ClusterState::PairedStandaloneReady,
-                Some("Distributed 停止・Paired へ復帰"),
+                Some("ds4-server を Standalone モードで再起動しました"),
             ),
         ];
         for (previous, current, expected) in rows {
@@ -475,7 +482,7 @@ mod tests {
         assert_eq!(ready_notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             ready_notifier.notifications.lock().unwrap()[0].body,
-            "SoloStandalone 起動完了"
+            "ds4-server が Standalone モードで起動しました"
         );
 
         let manual_notifier = Arc::new(RecordingNotifier::default());
@@ -486,7 +493,7 @@ mod tests {
         assert_eq!(manual_notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             manual_notifier.notifications.lock().unwrap()[0].body,
-            "要手動対応"
+            "ds4-server のモード変更に失敗しました (要手動復旧)"
         );
     }
 
@@ -574,7 +581,7 @@ mod tests {
         assert_eq!(notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             notifier.notifications.lock().unwrap()[0].body,
-            "SoloStandalone 起動完了"
+            "ds4-server が Standalone モードで起動しました"
         );
     }
 

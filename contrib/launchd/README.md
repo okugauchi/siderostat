@@ -1,6 +1,7 @@
 # macOS user service draft
 
-`siderostat`だけを1つのLaunchAgentとして登録します。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
+`siderostat` runtime と `siderostat-monitor` を、それぞれ1つのLaunchAgentとして登録します。
+DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
 
 ## Install前の準備
 
@@ -25,6 +26,15 @@ if grep -Eq 'USERNAME|PLACEHOLDER' "$PLIST"; then echo "unresolved LaunchAgent p
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
+
+`siderostat-monitor` も `local.siderostat.monitor` の LaunchAgent として登録します。
+モニターのメニューからは、次のジョブ操作を実行します。
+
+- `Proxy 再起動`: `gui/<uid>/local.siderostat.runtime` を kickstart
+- `Monitor 再起動`: `gui/<uid>/local.siderostat.monitor` を kickstart
+- `終了`: runtime と monitor の両方を bootout
+
+monitor の plist は `cargo xtask install` で同じ `LaunchAgents` ディレクトリへ配置されます。
 
 `ProgramArguments`の各要素がabsolute pathまたは固定subcommandであり、placeholderが残っていないことを登録前に確認します。
 

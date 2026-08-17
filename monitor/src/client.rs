@@ -1,5 +1,4 @@
-//! Admin API polling client for the siderostat `/metrics` endpoint and the
-//! authenticated `/cluster/restart` mutation.
+//! Admin API polling client for the siderostat `/metrics` endpoint.
 
 use crate::{
     config::MonitorConfig,
@@ -62,34 +61,12 @@ impl MetricsClient {
             .context("read metrics response body")?;
         Ok(parse_metrics(&text))
     }
-
-    /// Request a restart of the siderostat runtime through the admin API.
-    /// The admin token (hex-encoded) is required because `/cluster/restart`
-    /// is an authenticated mutation, unlike the public `/metrics` endpoint.
-    /// Returns the accepted admin job JSON on success.
-    pub async fn request_restart(&self) -> Result<serde_json::Value> {
-        let url = format!("{}/cluster/restart", self.base_url);
-        let mut request = self.http.post(&url);
-        if let Some(token) = &self.admin_token {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        if !response.status().is_success() {
-            return Err(anyhow!("restart endpoint returned {}", response.status()));
-        }
-        response.json().await.context("read restart response body")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::MonitorConfig;
-    use std::io::{Read, Write};
-
     #[test]
     fn builds_client_from_config() {
         let config = MonitorConfig::default();
@@ -105,44 +82,5 @@ mod tests {
             ..MonitorConfig::default()
         };
         assert!(MetricsClient::new(&config).is_err());
-    }
-
-    #[tokio::test]
-    async fn restart_posts_to_cluster_restart_and_parses_job() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = socket.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert!(
-                request.starts_with("POST /cluster/restart HTTP/1.1"),
-                "unexpected request: {request}"
-            );
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer deadbeef"),
-                "restart must be authenticated: {request}"
-            );
-            let body = r#"{"job_id":"abc","operation":"restart","state":"running"}"#;
-            let response = format!(
-                "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).unwrap();
-        });
-
-        let config = MonitorConfig {
-            admin_listen: format!("http://{addr}"),
-            admin_token: Some("deadbeef".into()),
-            ..MonitorConfig::default()
-        };
-        let client = MetricsClient::new(&config).unwrap();
-        let job = client.request_restart().await.unwrap();
-        assert_eq!(job["job_id"], "abc");
-        server.join().unwrap();
     }
 }

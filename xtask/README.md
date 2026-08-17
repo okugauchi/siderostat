@@ -20,14 +20,15 @@ cargo xtask uninstall
 1. （`--ci` 指定時のみ）Required CI gate: `cargo fmt --check` / `clippy -D warnings` / `test` / `git diff --check`。
 2. `~/` 配下から `ds4-server` と対象GGUFを探し、親ディレクトリを `DWARFSTAR_HOME` とする。
 3. GGUFのSHA-256計算を行うか確認する。既定は **行わない**。実行する場合はその場で計算し、行わない場合は事前に保存したdigest cacheだけを使う。
-4. `cargo build --release`。
-5. `codesign --force --sign - target/release/siderostat` で再署名（launchd の launch constraint を満たすため）。
-6. `sudo install` で `/usr/local/bin/siderostat` へコピー、署名を再検証。
+4. `cargo build --release` で runtime と monitor をbuildする。
+5. `codesign --force --sign -` で `target/release/siderostat` と
+   `target/release/siderostat-monitor` を再署名（launchd の launch constraint を満たすため）。
+6. `sudo install` で `/usr/local/bin/siderostat` と `/usr/local/bin/siderostat-monitor` へコピーし、両方の署名を再検証。
 7. secret を生成（`~/Library/Application Support/siderostat/secrets/`、mode 0600、32+ bytes）。
    既存は上書きしない。2-node cluster では `--shared-secret-dir` で共有 secret を供給する。
 8. `siderostat.example.toml` から config を生成し、**全 placeholder**（binary / model / DSpark support / manifest / secret / node_id）を実在 path へ置換。
 9. standalone/distributed manifest を生成。argv profile は siderostat 本体の argv builder を再利用して算出する。
-10. LaunchAgent plist を `~/Library/LaunchAgents/` へ install（`USERNAME` を現在ユーザーへ置換、config/log path を設定、`plutil -lint`、placeholder guard）。
+10. runtime と monitor の LaunchAgent plist を `~/Library/LaunchAgents/` へ install（`USERNAME` を現在ユーザーへ置換、config/log path を設定、`plutil -lint`、placeholder guard）。
    既定では **起動しない**（`--start` 指定時のみ bootstrap + kickstart。起動は ds4-server を再起動するため）。
 
 ### GGUF digest

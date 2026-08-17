@@ -62,7 +62,8 @@ macOS のデスクトップ通知を用いて、起動時・standalone・distrib
 
 - `app.rs` に `spawn_desktop_notifier(...)` を追加し、`spawn_transition_monitor` と**並列に**
   `runtime.cluster_handle().subscribe()` を購読する。
-- 起動時は `serve()` 側で明示的に1回通知する (`spawn_runtime` 直後に「起動完了」または「要手動対応」)。
+- 起動時は `serve()` 側で明示的に1回通知する (`spawn_runtime` 直後に「ds4-server が Standalone モードで起動しました」または
+  「ds4-server のモード変更に失敗しました (要手動復旧)」)。
   transition monitor は起動後の値から購読開始するため、起動遷移はwatchでは拾えない点に注意。
 - standalone再起動は `spawn_local_monitor` の `child_restart` 検知に合わせて通知を発火する。
 
@@ -70,9 +71,9 @@ macOS のデスクトップ通知を用いて、起動時・standalone・distrib
 
 | カテゴリ | トリガー | 通知例 |
 |---|---|---|
-| 起動時 | serve開始 / 起動完了 / 起動失敗 | 「siderostat 起動」「SoloStandalone 起動完了」「要手動対応」 |
-| standalone | `SoloStandaloneReady` / `PairedStandaloneReady` / child再起動 | 「Standalone 準備完了」「Standalone が再起動されました」 |
-| distributed | `DistributedReady` / promotion失敗 (Backoff・ManualInterventionRequired) / demote完了 | 「Distributed MXFP4 準備完了」「プロモーション失敗・バックオフ」「Distributed 停止・Paired へ復帰」 |
+| 起動時 | serve開始 / 起動完了 / 起動失敗 | 「ds4-server が Standalone モードで起動しました」「ds4-server のモード変更に失敗しました (要手動復旧)」 |
+| standalone | `SoloStandaloneReady` / `PairedStandaloneReady` / child再起動 | 「ds4-server が Standalone モードで起動しました」「ネットワーク上の ds4-server ノードを検出しました」「ds4-server を Standalone モードで再起動しました」 |
+| distributed | `DistributedReady` / promotion失敗 (Backoff・ManualInterventionRequired) / demote完了 | 「2ノードの ds4-server が Distributed Inference モードで相互接続しました」「ds4-server の Distributed 起動に失敗しました。Standalone モードで待機します」「ds4-server のモード変更に失敗しました (要手動復旧)」 |
 
 - 遷移途中の `Promoting`→`DistributedStarting` などは通知せず、安定状態 (Ready/Backoff/ManualInterventionRequired) と
   重要遷移のみに絞る。
@@ -93,7 +94,7 @@ sound = true        # osascript の sound name 使用
 ### 4.5 startup cleanup の通知
 
 起動時に既存の `siderostat` / `ds4-server` process を検出した場合は、長文の確認ダイアログを表示せず、
-`display notification` で右上バナーと `Glass` 警告音を投稿する。通知本文は「再起動が必要です（5秒後）」
+`display notification` で右上バナーと `Glass` 警告音を投稿する。通知本文は「5秒後に ds4-server を再起動します」
 という簡潔な内容とし、5秒後に既存processをidentity再確認付きで停止して新しいsiderostatを起動する。
 既定動作を拒否したい場合は `[startup_cleanup] auto_restart = false` または
 `siderostat serve --decline-startup-cleanup` を使用する。`display notification` はボタンを持たないため、拒否を

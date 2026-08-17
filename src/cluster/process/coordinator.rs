@@ -101,9 +101,15 @@ impl DistributedCoordinatorSupervisor {
                             Ds4LogEvent::KvCacheHit { tokens, load_ms } => {
                                 metrics.kv_cache_hit(tokens, load_ms);
                             }
+                            Ds4LogEvent::GenerationProgress {
+                                completion,
+                                chunk_tps,
+                                avg_tps,
+                            } => {
+                                metrics.generation_progress(completion, chunk_tps, avg_tps);
+                            }
                             Ds4LogEvent::HttpListening { .. }
-                            | Ds4LogEvent::DsparkActivated
-                            | Ds4LogEvent::GenerationProgress { .. } => {}
+                            | Ds4LogEvent::DsparkActivated => {}
                         }
                         route.send_replace(state);
                     }

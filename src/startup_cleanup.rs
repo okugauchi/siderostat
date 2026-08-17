@@ -76,7 +76,7 @@ async fn confirm_cleanup(options: StartupCleanupOptions) -> anyhow::Result<bool>
         return Ok(false);
     }
 
-    notify_startup_cleanup("再起動が必要です（5秒後）", options).await;
+    notify_startup_cleanup("5秒後に ds4-server を再起動します", options).await;
     tokio::time::sleep(STARTUP_CLEANUP_COUNTDOWN).await;
     Ok(true)
 }
