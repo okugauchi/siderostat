@@ -394,6 +394,12 @@ Evidence: `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-
 - operator が実機 PASS/FAIL と candidate の扱いを承認する。
 - 停止条件: evidence 欠落を推測で PASS にする必要がある。
 
+### 10.1 H-05 完了（2026-08-17）
+
+H-01〜H-04 の実機結果を proposal 第1節の5 acceptance criteriaへ対応付け、すべて PASS と判定した。operator は rollback を実施せず、検証済み candidate を `develop` merge 後の Release Candidate packaging へ進めることを承認した。rollback binary/config/state/plist は緊急復旧用に保持し、削除していない。
+
+Acceptance record: `docs/compatibility/reconnect-acceptance-2026-08-17.md`
+
 ## 11. operator からの報告テンプレート
 
 各操作後、次の形式で agent へ報告する。

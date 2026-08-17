@@ -19,6 +19,19 @@ curl --fail --silent http://127.0.0.1:18081/cluster
 - peer lease、child情報、Thunderbolt IP/discovery状態
 - active standalone profile ID、model variant、residency
 
+再接続の診断では、`generation`（`cluster_generation`と同値）と
+`control_session.generation`を混同しない。後者はPairで再ネゴシエーションされるcontrol session
+であり、`phase`、`lease.valid`、`lease.route-scoped`、`lease.peer-present`、peer descriptorの
+generationと併せて確認する。`children` の `standalone` / `distributed-coordinator` /
+`distributed-worker`について、PID、profile、generation、running、readyを現在のstateと照合する。
+
+`POST /v1/pair` のHTTP 409（CLI/構造化logの `pair-generation-mismatch` を含む）は、古い
+generation、idempotency conflict、phase不整合などのcontrol protocol拒否である。現行pair処理は
+coordinatorが先に `/v1/node` を読み、双方のcontrol session generationの最大値をofferへ反映する。
+反復する409は旧binary、persisted sessionの不一致、またはroute/lease failureを示す可能性がある
+ため、`cluster status --json` と関連logの expected/received generationを保存し、state/model/cache
+を削除して回避しない。
+
 Human出力は次の形式を確認する。
 
 ```text
@@ -105,6 +118,11 @@ siderostat cluster reconcile
 
 `cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱う（plan B-03）。そのため、原因除去後のreconcileでtrackerの失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する。解除後に `siderostat cluster status` で `state` が `paired-standalone-ready`（または期待するstable state）へ戻り、同一原因の失敗回数が保持されないことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
 
+PeerLost recovery中の `cluster reconcile` は、まず `PeerLossRecovery` ownerによる local recovery
+（admission block → distributed child stop → standalone start → SoloStandaloneReady）へ収束する。
+Backoff中もpeer lossがbackoff deadlineより優先される。`cluster reconcile` はpair 409を強制的に
+無視したりstate fileを初期化したりする操作ではない。
+
 ## 6. Safe restart
 
 `cluster restart` はcurrent profileのchildを再起動する。Modeを変えず、admission/drainに連動する。
@@ -127,6 +145,8 @@ Rollbackは [`docs/installation.md`](installation.md) のRollback節に従う。
 - 新configは旧configと分離し、`schema_version == 2` の作業fileを保持する。
 - Binary rollbackは直前のbinaryを残し、standalone readinessを確認してから行う。Upgrade後にrollbackし、再度upgradeする（plan P7-02）。
 - 起動前に `cluster doctor` と `/readyz` でstandalone readinessを確認する。Rollback後はSolo Standalone readyを確認してからpairing/promotionへ進む。
+- candidateを継続利用する判定でも、rollback binary/config/state/plistを緊急復旧用に保持する。正規
+  名称のRelease Candidate artifactとchecksumの確定は、merge後の再生成・再検証で行う。
 
 ## 8. 安全な運用原則
 

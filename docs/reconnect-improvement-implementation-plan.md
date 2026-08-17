@@ -1,8 +1,8 @@
 # reconnect 改善実装・検証計画
 
-Status: **PLANNED**
+Status: **COMPLETE**
 
-最終更新日: 2026-08-14
+最終更新日: 2026-08-17
 
 ## 1. 目的
 
@@ -891,7 +891,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - 停止条件: OS update、別 service、disk encryption unlock 等が検証条件を変える
 - Completion evidence (2026-08-17): coordinator-only、worker-only、両 node 同時再起動の3ケースを実施し、いずれも login/LaunchAgent 復帰後に手動 pair/reconcile や state 削除なしで両 node が `DistributedReady` へ収束した。各ケースで `cluster doctor --json` は `healthy=true`、admission serving、public `/v1/models` は HTTP 200、LaunchAgent は各 node 1件、DS4 child は各 node 最大1件だった。最終ケースの boot time は worker `2026-08-17 09:03:42`、coordinator `2026-08-17 09:03:40`、control generation `601`、worker child PID/generation `2578/449`、coordinator child PID/generation `1068/607`、cluster generation は worker `452` / coordinator `609`。boot 後の log window に 409 loop、`SIGKILL is not allowed for this child`、orphan child はなく、証跡は `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-summary.md`。
 
-### [ ] H-05 実機 evidence を判定し rollback を確認する
+### [x] H-05 実機 evidence を判定し rollback を確認する
 
 - Actor: agent + operator review
 - Depends on: H-02、H-03、H-04
@@ -906,10 +906,11 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Verification: proposal 第 1 節の 5 条件との acceptance mapping
 - 完了条件: operator が実機 PASS/FAIL と candidate の扱いを承認
 - 停止条件: evidence 欠落を推測で PASS にする必要がある
+- Completion evidence (2026-08-17): H-01〜H-04 の実機結果を proposal 第1節の5 acceptance criteria（Solo Standalone serving、stale/orphan child 不在、Paired Standalone、auto promotion/DistributedReady、state/proxy/admission/child identity 整合）へ対応付け、すべて PASS と判定した。operator は rollback を実施せず、検証済み candidate を `develop` merge 後の Release Candidate packaging へ進めることを承認した。rollback binary/config/state/plist は緊急復旧用に保持し、削除していない。acceptance record: `docs/compatibility/reconnect-acceptance-2026-08-17.md`。
 
 ## 14. Phase F: 文書同期と最終 gate
 
-### [ ] F-01 現行仕様・運用文書を同期し最終 gate を実行する
+### [x] F-01 現行仕様・運用文書を同期し最終 gate を実行する
 
 - Actor: agent
 - Depends on: H-05
@@ -925,6 +926,32 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 - Verification: 共通 local gate、文書 link/path、実機 acceptance mapping
 - 完了条件: 第 4 節の全条件を満たし、本書 Status を `COMPLETE` にできる
 - 停止条件: 実装と文書の不一致、未解決 failure、operator 未承認の実機結果がある
+- Completion evidence (2026-08-17): `docs/connection-state-machine.md` を現行実装へ同期し、
+  `PeerLossRecovery` の単一 owner、route-scoped `NetworkEvidence` と observation epoch、Pair
+  offer/confirm の candidate generation、persisted control session、Backoff の periodic recovery、
+  coordinator runtime 経由の operator reconcile を反映した。`docs/operations.md` と
+  `docs/troubleshooting.md` に `cluster_generation` / `control_session` / `children` の確認、Pair
+  HTTP 409 の診断、manual reconcile、rollback 保全手順を追記した。主要文書と acceptance record
+  の path を確認し、未完了 task heading はなく、`git diff --check` も成功した。
+
+#### P0〜P3 最終対応表
+
+| proposal | 実装 SHA | test / evidence |
+|---|---|---|
+| P0-0 診断・production harness・RED | `533b46e`, `0bcf240`, `96d5459`, `b8008fd`, `c703af8` | R0-02〜R0-06、`tests/reconnect_production.rs`、計画書の各 Evidence |
+| P0-A PeerLost lifecycle | `b9f6a90`、H-03修正 `05220cb` | `peer_lost_from_distributed_ready_orphans_distributed_children`、recovery race/failure tests、A-01〜A-04、H-02〜H-04 acceptance |
+| P0-B control session negotiation | `5f85e00` | `coordinator_adopts_higher_worker_generation_on_pair`、方向別 generation / restart / duplicate tests、G-01〜G-05 |
+| P0-C reconnect E2E | `8798b1a` | cable blip、coordinator-only / worker-only / both restart、delay/duplicate の production suite、E-01 |
+| P1 Backoff / operator reconcile | `af00d9a`, `951e08`, `cceb9b3`, `5ac5bfe` | `tests/phase5_failure.rs`、promotion failure / backoff / admin reconcile tests、B-01〜B-04 |
+| P2 route / discovery gate | `eae8ba8`, `e4e755e` | network evidence truth table、stale/non-route/static fallback tests、N-01〜N-03 |
+| P3 Pair timing | `909929f`, `7866200` | `pair_timing_one_hundred_sessions_confirm_before_stability_and_converge` 100/100、Q-01計測によりQ-02の追加通知は不要と判定 |
+
+共通 local gate の最終結果: `cargo fmt --check` 成功、`cargo clippy --all-targets --all-features -- -D warnings`
+成功、`cargo test --all-targets` 成功（unit 188、integration GREEN）、
+`cargo test --all-targets --features test-support` 成功（unit 188、production reconnect 36、全 integration GREEN）、
+`git diff --check` 成功。実機の最終判定は `docs/compatibility/reconnect-acceptance-2026-08-17.md`
+へ記録済みで、H-01〜H-04の5 acceptance criteriaはすべて PASS、operator は candidate 継続利用と
+rollback 資産の保全を承認済みである。
 
 ## 15. 共通停止・エスカレーション条件
 

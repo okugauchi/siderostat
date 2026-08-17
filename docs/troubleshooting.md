@@ -28,6 +28,7 @@ curl --fail --silent http://127.0.0.1:18081/metrics
 | Bonjourが利用不能 | discovery mode、static fallback | `bonjour-with-static-fallback`なら設定済みcounterpart addressへfallbackする |
 | Bonjour発見だけではpairingしない | peer lease、HMAC handshake | 発見結果だけをtrustせず、`bridge0` route、HMAC、leaseを確認する |
 | Control HMACが不一致/clock skew/nonce replay | control log、metrics | Secret fileとclock skewを確認する。不正HMACは拒否され、stateは進まない |
+| PairがHTTP 409で反復 | `cluster status --json`のcluster/control generation、control phase/lease、pair log | 現行coordinatorのoffer/confirmはpeerのgenerationを先に取り込む。旧binary、persisted session不一致、route/lease失敗を確認し、state/model/cacheを削除せず証跡を保存する |
 | Peer ingressがwrong source/token/hopを拒否 | peer ingress log | Peer proxy tokenとsource IPを確認する。専用の物理Thunderbolt linkを信頼境界とする |
 | Deployment mismatch | `cluster status`、deployment_mismatch_total | Paired Standaloneを維持し、promotionは拒否される。Binary/model/checkpoint/argvを一致させる |
 | Manifest stale | fingerprint job | `cluster fingerprint` で再fingerprintする。staleの間はpromotionしない |
@@ -88,7 +89,22 @@ Standalone startup timeout（既定900秒）を超えた場合、standalone prof
 
 同一原因のpromotion失敗が3回連続したらauto promotionを止める。Standalone upstreamがreadyならproxyはServingを継続し、cluster stateだけ `ManualInterventionRequired` とする。Operator reconcileまで再試行しない（spec第18.6節）。原因を取り除いてから `cluster reconcile` を実行する。`cluster reconcile` はcoordinatorのpromotion failure trackerをresetし、`ManualInterventionRequired` からの解除とを一つのatomicな操作として扱うため、解除後は同一原因の失敗回数が持ち越されず、次のpromotion試行は失敗回数0から再開する（plan B-03）。解除後に `siderostat cluster status` でstable stateへ戻り、trackerの失敗回数が保持されないことを確認する。原因不明のままreconcileを繰り返しても、同一原因で再びbackoffへ入る。
 
-### 3.10 State corrupt
+### 3.10 Pair 409 / control session
+
+`POST /v1/pair` の409は、`GenerationMismatch`、idempotency conflict、peer phase不整合などの
+control protocol拒否である。`cluster status --json`で次を同時に保存する。
+
+- `cluster_generation`（state transitionの世代）。
+- `control_session.generation`、`phase`、`lease.valid`、`lease.route-scoped`、`lease.peer-present`。
+- `children` の各 child identityとrunning/ready。
+
+現行のcoordinatorは `/v1/node` のpeer session generationを取得し、双方の既知値の最大値をPair
+offerへ反映する。したがって同じ409が周期的に続く場合は、旧candidate binaryの残存、永続sessionの
+不一致、route-scoped evidenceの失効、HMAC/source検証失敗を優先して確認する。`cluster reconcile`
+はpromotion failure trackerのresetであり、Pair 409を無条件に解消する操作ではない。state file、
+model、KV cacheを削除せず、expected/received generationを含むredacted logを保存する。
+
+### 3.11 State corrupt
 
 State fileはtemp write、file sync、atomic renameで保全する。Secret/tokenを保存しない。Single-instance file lockを取得する。Corrupt stateを保全し、安全確認可能ならSolo Standalone、不能ならManualInterventionRequired（spec第24節）。旧SQLite affinity databaseを読まない、変更しない、削除しない。
 
