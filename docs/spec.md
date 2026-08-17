@@ -995,11 +995,11 @@ schema_version = 2
 public_listen = "127.0.0.1:18080"
 admin_listen = "127.0.0.1:18081"
 request_body_limit_bytes = 33554432
-max_in_flight = 1
+max_in_flight = 2
 
 [proxy.timeouts]
 connect = "5s"
-response_headers = "60s"
+response_headers = "3600s"
 first_body_byte = "300s"
 stream_idle = "300s"
 
