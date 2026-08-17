@@ -1,6 +1,7 @@
 # macOS user service draft
 
-`siderostat`だけを1つのLaunchAgentとして登録します。DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
+`siderostat` runtime と `siderostat-monitor` を、それぞれ1つのLaunchAgentとして登録します。
+DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
 
 ## Install前の準備
 

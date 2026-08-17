@@ -137,12 +137,16 @@ cargo test --all-targets
 git diff --check
 ```
 
-Binaryは`target/release/siderostat`である。LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/siderostat`へinstallする。`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
+runtime binaryは`target/release/siderostat`、monitor binaryは`target/release/siderostat-monitor`である。
+LaunchAgentの`ProgramArguments`が参照する`/usr/local/bin/siderostat`と`/usr/local/bin/siderostat-monitor`へinstallする。
+`/usr/local/bin`への書き込みに管理者権限が必要な環境では、ownerとmodeを固定する。
 
 ```sh
 sudo install -d -m 0755 /usr/local/bin
 sudo install -m 0755 target/release/siderostat /usr/local/bin/siderostat
+sudo install -m 0755 target/release/siderostat-monitor /usr/local/bin/siderostat-monitor
 /usr/local/bin/siderostat --help
+/usr/local/bin/siderostat-monitor --help
 ```
 
 ### Secret file
@@ -292,12 +296,31 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 ```
 
+メニューバーモニターも同じ `gui/<uid>` ドメインへ登録する。
+
+```sh
+MONITOR_PLIST="$HOME/Library/LaunchAgents/local.siderostat.monitor.plist"
+cp contrib/launchd/local.siderostat.monitor.plist "$MONITOR_PLIST"
+sed -i '' "s/USERNAME/$(id -un)/g" "$MONITOR_PLIST"
+mkdir -p "$HOME/Library/Logs/local.siderostat.monitor"
+plutil -lint "$MONITOR_PLIST"
+launchctl bootstrap "gui/$(id -u)" "$MONITOR_PLIST"
+launchctl kickstart -k "gui/$(id -u)/local.siderostat.monitor"
+```
+
+モニターのメニュー操作は次の LaunchAgent 操作に対応する。
+
+- `Proxy 再起動`: `local.siderostat.runtime` を `kickstart -k`
+- `Monitor 再起動`: `local.siderostat.monitor` を `kickstart -k`
+- `終了`: runtime と monitor の両方を `bootout`
+
 Verification（`contrib/launchd/README.md`）:
 
 1. Login後にproxyが1 processだけ起動する。
 2. `launchctl kickstart -k`後もproxyが1 process、DS4 childが最大1 processである。
-3. Proxyを終了すると10秒以上のthrottleを伴って再起動し、orphan DS4 childを残さない。
-4. `launchctl print-disabled "gui/$(id -u)"`と`$HOME/Library/LaunchAgents`に、同じbinary/portやDS4 childを所有する別jobがない。
+3. Login後にmonitorが1 processだけ起動し、メニューバーへ表示される。
+4. Proxyを終了すると10秒以上のthrottleを伴って再起動し、orphan DS4 childを残さない。
+5. `launchctl print-disabled "gui/$(id -u)"`と`$HOME/Library/LaunchAgents`に、同じbinary/portやDS4 childを所有する別jobがない。
 
 Login起動、proxy restart、no duplicate childはoperator gateである（GUI user session変更が必要）。
 

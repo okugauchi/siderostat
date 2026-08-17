@@ -2,7 +2,7 @@
 
 - 文書状態: 実装済み (Phase 1〜4) / Phase 5 は実機確認待ち
 - 作成日: 2026-08-12
-- 対象baseline: `develop` (`4faf6d5` / デスクトップ通知実装後)
+- 対象baseline: `develop`（通知文言・monitor UI 実装後の `99efd5c` 系列）
 - 前提: 本仕様は siderostat 本体の `docs/spec.md` で定義する target behavior を変更しない付加レイヤである。
   モニターは本体とは別プロセス・別 crate として動作し、本体への変更は「状態を公開するメトリクス追加」に限定する。
 
@@ -276,7 +276,7 @@ siderostat/
 | 1 | workspace 化 + monitor crate skeleton | ルート `[workspace]`、`monitor/` |
 | 2 | admin API クライアント + Prometheus text パーサー | `client.rs` / `metrics.rs` |
 | 3 | tray-icon によるメニューバー UI | `tray.rs` / `main.rs` |
-| 4 | 本体側の prefill / KV cache メトリクス追加 | `parse_ds4_log_event` 拡張、`metrics.rs` |
+| 4 | 本体側の prefill / KV cache / Decode メトリクス追加 | `parse_ds4_log_event` 拡張、`metrics.rs` |
 | 5 | 統合・動作確認（実 DS4 で prefill 中の表示確認） | 受け入れ証跡 |
 
 Phase 1〜4 は 2026-08-17 に実装済みとする。
@@ -286,4 +286,4 @@ Phase 1〜4 は 2026-08-17 に実装済みとする。
 - Phase 4: 本体の prefill / KV cache / generation イベントを `Metrics` の DS4 gauge として公開し、
   モニターの Decode 表示へ接続（完了）
 - Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
-  テストとコンパイルを検証済み（本体 170 tests、monitor 13 tests、Required CI 成功）
+  テストとコンパイルを検証済み（本体 188 tests、monitor 18 tests、xtask 2 tests、Required CI 成功）
