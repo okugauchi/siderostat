@@ -86,6 +86,14 @@ impl super::ProductionClusterRuntime {
             }
             RoleControl::Worker(control) => control.lock().await.peer_lease().peer_present(now),
         };
+        if suppress_automatic_pairing(state, peer_present, self.automatic_pairing_blocked()) {
+            tracing::debug!(
+                owner = owner.name(),
+                state = ?state,
+                "automatic pairing remains blocked after deployment mismatch"
+            );
+            return Ok(self.inner.mode.snapshot());
+        }
         Ok(self
             .inner
             .mode
@@ -115,5 +123,46 @@ impl super::ProductionClusterRuntime {
             RoleControl::Coordinator(control) => control.lock().await.invalidate_route(),
             RoleControl::Worker(control) => control.lock().await.invalidate_route(),
         }
+    }
+}
+
+fn suppress_automatic_pairing(
+    state: ClusterState,
+    peer_present: bool,
+    automatic_pairing_blocked: bool,
+) -> bool {
+    state == ClusterState::SoloStandaloneReady && peer_present && automatic_pairing_blocked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_mismatch_latch_suppresses_periodic_pairing() {
+        assert!(suppress_automatic_pairing(
+            ClusterState::SoloStandaloneReady,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn pairing_remains_available_without_the_mismatch_latch() {
+        assert!(!suppress_automatic_pairing(
+            ClusterState::SoloStandaloneReady,
+            true,
+            false,
+        ));
+        assert!(!suppress_automatic_pairing(
+            ClusterState::SoloStandaloneReady,
+            false,
+            true,
+        ));
+        assert!(!suppress_automatic_pairing(
+            ClusterState::PairedStandaloneReady,
+            true,
+            true,
+        ));
     }
 }

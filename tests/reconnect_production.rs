@@ -348,6 +348,76 @@ async fn normal_first_pair_converges_over_control_http() {
 }
 
 #[tokio::test]
+async fn deployment_mismatch_latch_prevents_reconcile_pairing_and_child_restart_loop() {
+    let harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("coordinator-initiated pair");
+    let paired = harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await;
+    assert!(paired, "nodes did not pair before mismatch recovery");
+
+    harness
+        .coordinator
+        .production
+        .recover_from_deployment_mismatch()
+        .await
+        .expect("coordinator mismatch recovery");
+    harness
+        .worker
+        .production
+        .recover_from_deployment_mismatch()
+        .await
+        .expect("worker mismatch recovery");
+    assert_solo_serving(&harness.coordinator).await;
+    assert_solo_serving(&harness.worker).await;
+
+    let coordinator_generation = harness.coordinator.mode.snapshot().generation;
+    let worker_generation = harness.worker.mode.snapshot().generation;
+    let coordinator_starts = harness.coordinator.standalone.child().starts();
+    let worker_starts = harness.worker.standalone.child().starts();
+
+    for _ in 0..5 {
+        harness
+            .coordinator
+            .production
+            .reconcile()
+            .await
+            .expect("coordinator reconcile while pairing is blocked");
+        harness
+            .worker
+            .production
+            .reconcile()
+            .await
+            .expect("worker reconcile while pairing is blocked");
+    }
+
+    assert_eq!(
+        harness.coordinator.mode.snapshot().generation,
+        coordinator_generation,
+        "coordinator must not re-enter Pairing"
+    );
+    assert_eq!(
+        harness.worker.mode.snapshot().generation,
+        worker_generation,
+        "worker must not re-enter Pairing"
+    );
+    assert_eq!(
+        harness.coordinator.standalone.child().starts(),
+        coordinator_starts,
+        "coordinator standalone must not restart"
+    );
+    assert_eq!(
+        harness.worker.standalone.child().starts(),
+        worker_starts,
+        "worker standalone must not restart"
+    );
+    assert_solo_serving(&harness.coordinator).await;
+    assert_solo_serving(&harness.worker).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn pair_response_waits_for_worker_pairing_ready() {
     let harness = TwoNode::boot().await.expect("boot two-node harness");
     harness
