@@ -1130,6 +1130,10 @@ auto_restart = true
         assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
         assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
         assert!(config.ds4.dspark.enabled);
+        assert!(
+            config.ds4.allow_sigkill,
+            "install-generated configs must allow identity-verified owned DS4 children to be reaped"
+        );
     }
 
     #[test]
