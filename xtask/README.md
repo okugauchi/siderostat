@@ -39,7 +39,9 @@ cargo xtask uninstall
 cargo xtask fingerprint-models [options]
 ```
 
-以後の`cargo xtask install`では、確認プロンプトに`N`（既定）を選ぶとこのcacheを使用し、GGUFの内容を再読込しない。ファイルが置換・変更されている場合やcacheがない場合は、installは失敗して上記コマンドの再実行を案内する。install中に再計算する場合は`Y`を選ぶか、非対話実行では`--hash-models`を指定する。
+以後の`cargo xtask install`では、確認プロンプトに`N`（既定）を選ぶとこのcacheを使用し、GGUF全体を再読込しない。metadataが完全一致する場合は即時再利用する。inodeやmtimeだけが変わりsizeが同じ場合は、最大4 MiBの分散サンプル署名を確認し、一致すればcache metadataを自動更新する。size変更またはサンプル不一致ではfull SHA-256の再計算を要求する。
+
+旧形式cacheにはサンプル署名がないため、metadata driftを内容変更とは断定せず停止する。ファイルが移動・複製・`touch`されただけで内容が不変だとoperatorが確認済みの場合は、`--accept-model-metadata-change`を一度指定すると、cached full digestを維持したままmetadataとサンプル署名を更新できる。不明な場合は`cargo xtask fingerprint-models`または`--hash-models`でfull SHA-256を再計算する。サンプル署名は偶発的な変更を高速検出するためのもので、full-file SHA-256の代替ではない。
 
 ### install options
 
@@ -53,6 +55,7 @@ cargo xtask fingerprint-models [options]
 | `--ds4-binary-digest <sha>...` | distributed manifest の承認済み binary digest 集合（既定: 実機 digest） |
 | `--peer-ds4-binary-digest <sha>...` | 相手nodeの binary digest。自nodeのdigestはinstall時に計算して集合へ自動追加 |
 | `--hash-models` | GGUFのSHA-256を確認せず計算・更新する（既定はプロンプト、既定選択は実行しない） |
+| `--accept-model-metadata-change` | size不変のmetadata driftをoperator確認済みとして受理し、旧cacheを再ハッシュなしで更新する |
 | `--ci` | インストール前に Required CI gate を実行 |
 | `--start` | LaunchAgent を bootstrap + kickstart する（ds4-server を再起動） |
 

@@ -50,6 +50,10 @@ pub struct InstallArgs {
     /// Compute/update GGUF SHA-256 values without prompting.
     #[arg(long)]
     pub hash_models: bool,
+    /// Accept same-size model metadata drift using the cached full digest.
+    /// Use only when the operator knows the model content was not changed.
+    #[arg(long, conflicts_with = "hash_models")]
+    pub accept_model_metadata_change: bool,
     /// Run the full documented CI gates (fmt/clippy/test/diff-check) first.
     #[arg(long)]
     pub ci: bool,
@@ -99,6 +103,7 @@ pub fn install(args: &InstallArgs) -> Result<()> {
             &standalone_model,
             &mxfp4_model,
             Some(&dspark_support),
+            args.accept_model_metadata_change,
         )?;
     }
 

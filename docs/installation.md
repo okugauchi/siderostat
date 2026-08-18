@@ -72,7 +72,9 @@ cd /absolute/path/to/siderostat
 cargo xtask fingerprint-models --ds4-server "/absolute/path/to/ds4-server"
 ```
 
-`cargo xtask install`はGGUFのSHA-256計算について確認を表示し、既定の`N`ではこのcacheを使う。`Y`を選ぶとinstall中に再計算する。cacheがない、またはファイルが記録時から変更されている場合、`N`のinstallは安全側に停止し、`cargo xtask fingerprint-models`の実行を案内する。非対話で再計算する場合は`cargo xtask install --hash-models`を指定する。
+`cargo xtask install`はGGUFのSHA-256計算について確認を表示し、既定の`N`ではこのcacheを使う。metadataが完全一致すれば即時再利用し、inodeやmtimeだけが変わってsizeが同じ場合は最大4 MiBの分散サンプル署名を確認する。一致時はcache metadataを自動更新し、GGUF全体を再読込しない。size変更またはサンプル不一致時だけ、`cargo xtask fingerprint-models`の実行を要求する。`Y`または非対話の`cargo xtask install --hash-models`はfull SHA-256を再計算する。
+
+旧形式cacheにはサンプル署名がない。modelが移動・複製・`touch`されただけで内容不変だとoperatorが確認済みの場合は、`cargo xtask install --accept-model-metadata-change`を一度指定してcached full digestを維持したままmetadataを更新できる。この指定でもsize変更は受理しない。内容に確信がない場合はfull SHA-256を再計算する。サンプル署名はmetadata drift時の高速な偶発変更検出であり、full-file SHA-256と同等の保証ではない。
 
 Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
 
