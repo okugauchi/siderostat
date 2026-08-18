@@ -10,6 +10,7 @@ mod client;
 mod config;
 mod launchd;
 mod metrics;
+mod settings;
 mod state;
 mod tray;
 
@@ -107,6 +108,15 @@ fn main() -> Result<()> {
                 .spawn(move || {
                     if let Err(error) = launchd::kickstart(launchd::MONITOR_LABEL) {
                         tracing::warn!(error = %error, "Monitor restart failed");
+                    }
+                });
+        } else if MonitorTray::is_open_config_event(&event) {
+            tracing::info!("open configuration requested from menu");
+            let _ = thread::Builder::new()
+                .name("siderostat-open-config".into())
+                .spawn(move || {
+                    if let Err(error) = settings::open_runtime_config() {
+                        tracing::warn!(error = %error, "Open configuration failed");
                     }
                 });
         }
