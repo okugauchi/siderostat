@@ -9,7 +9,12 @@ use std::process::Command;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
+
+const LAUNCH_AGENT_UNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCH_AGENT_UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Args, Clone)]
 pub struct ModelSelectionArgs {
@@ -737,7 +742,8 @@ fn start_launch_agent(plist: &Path, label: &str) -> Result<()> {
     let loaded = util::run("launchctl", &[OsStr::new("print"), OsStr::new(&job)]).is_ok();
     if loaded {
         util::tracing_log(&format!("{job} already loaded; bootout before restart"));
-        let _ = util::run("launchctl", &[OsStr::new("bootout"), OsStr::new(&job)]);
+        util::run_live("launchctl", &[OsStr::new("bootout"), OsStr::new(&job)])?;
+        wait_for_launch_agent_unload(&job)?;
     }
     util::run_live(
         "launchctl",
@@ -755,6 +761,35 @@ fn start_launch_agent(plist: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn wait_for_launch_agent_unload(job: &str) -> Result<()> {
+    wait_for_launch_agent_unload_with(
+        job,
+        LAUNCH_AGENT_UNLOAD_TIMEOUT,
+        LAUNCH_AGENT_UNLOAD_POLL_INTERVAL,
+        || util::run("launchctl", &[OsStr::new("print"), OsStr::new(job)]).is_ok(),
+        thread::sleep,
+    )
+}
+
+fn wait_for_launch_agent_unload_with(
+    job: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut is_loaded: impl FnMut() -> bool,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if !is_loaded() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!("timed out waiting for {job} to unload after bootout");
+        }
+        sleep(poll_interval);
+    }
+}
+
 fn current_uid() -> Result<u32> {
     let out = util::run("id", &[OsStr::new("-u")])?;
     Ok(String::from_utf8(out)?.trim().parse()?)
@@ -762,8 +797,46 @@ fn current_uid() -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_secrets, resolve_compatible_digest_inputs};
-    use std::fs;
+    use super::{
+        ensure_secrets, resolve_compatible_digest_inputs, wait_for_launch_agent_unload_with,
+    };
+    use std::{cell::Cell, fs, time::Duration};
+
+    #[test]
+    fn waits_for_launch_agent_to_finish_unloading() {
+        let polls = Cell::new(0);
+        let sleeps = Cell::new(0);
+
+        wait_for_launch_agent_unload_with(
+            "gui/501/local.siderostat.runtime",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                let current = polls.get();
+                polls.set(current + 1);
+                current < 2
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )
+        .unwrap();
+
+        assert_eq!(polls.get(), 3);
+        assert_eq!(sleeps.get(), 2);
+    }
+
+    #[test]
+    fn reports_launch_agent_unload_timeout() {
+        let error = wait_for_launch_agent_unload_with(
+            "gui/501/local.siderostat.runtime",
+            Duration::ZERO,
+            Duration::ZERO,
+            || true,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out waiting"));
+    }
 
     #[test]
     fn migrates_legacy_secret_names_and_shared_inputs() {
