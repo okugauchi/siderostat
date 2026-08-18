@@ -221,6 +221,10 @@ impl super::ProductionClusterRuntime {
     }
 
     fn schedule_deployment_mismatch_recovery(&self) {
+        // Close the periodic-reconcile pairing gate before yielding to the recovery task.
+        // Otherwise a fast reconcile tick can begin another Pairing transition while the
+        // mismatch recovery is still waiting to run.
+        self.block_automatic_pairing();
         let runtime = self.clone();
         tokio::spawn(async move {
             if let Err(error) = runtime.recover_from_deployment_mismatch().await {
