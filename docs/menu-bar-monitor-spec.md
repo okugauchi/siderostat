@@ -75,6 +75,10 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
   `local.siderostat.runtime`、「Monitor 再起動」は `local.siderostat.monitor` を
   `launchctl kickstart -k` する。「終了」は両方のジョブを `launchctl bootout` する。
   操作失敗時もモニターは継続し、結果をログに記録する。
+- 「設定ファイルを開く」は runtime の主設定
+  `~/Library/Application Support/siderostat/config.toml` を macOS の既定アプリで開く。
+  ファイルが未作成の場合は最寄りの既存親フォルダを開く。UI thread を block せず、
+  操作失敗時もモニターは継続して結果をログに記録する。
 
 ## 4. データソース
 
@@ -187,12 +191,16 @@ KV cache: hit tokens=9005 load=12.3ms
 ────────────────────────
 Decode:  completion=42 chunk=32.1t/s avg=28.5t/s
 ────────────────────────
+設定ファイルを開く
 Proxy 再起動
 Monitor 再起動
 終了
 ```
 
 - セクションは状態に応じて動的に表示する（prefill 非進行中は prefill 行を出さない）。
+- 「設定ファイルを開く」は `~/Library/Application Support/siderostat/config.toml` が存在すれば
+  `/usr/bin/open` により既定アプリで開く。存在しない場合は、設定の保存場所を確認できるよう
+  最寄りの既存親フォルダを開く。この操作で設定ファイルやディレクトリを暗黙に作成しない。
 - 「Proxy 再起動」は `gui/<uid>/local.siderostat.runtime` を `launchctl kickstart -k` する。
 - 「Monitor 再起動」は `gui/<uid>/local.siderostat.monitor` を `launchctl kickstart -k` する。
 - 「終了」は `local.siderostat.runtime` と `local.siderostat.monitor` の両方を `launchctl bootout`

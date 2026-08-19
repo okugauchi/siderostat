@@ -14,6 +14,7 @@ use tray_icon::{
 const MENU_QUIT: &str = "quit";
 const MENU_PROXY_RESTART: &str = "proxy-restart";
 const MENU_MONITOR_RESTART: &str = "monitor-restart";
+const MENU_OPEN_CONFIG: &str = "open-config";
 
 /// Icon drawing colors.
 const GREEN: [u8; 4] = [0x2e, 0xcc, 0x71, 0xff]; // operating state
@@ -36,6 +37,7 @@ pub struct MonitorTray {
     show_decode_tps: bool,
     live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
+    _open_config: MenuItem,
     _proxy_restart: MenuItem,
     _monitor_restart: MenuItem,
     _quit: MenuItem,
@@ -53,6 +55,7 @@ impl MonitorTray {
         let prefill = MenuItem::new("Prefill: --", false, None);
         let kv_cache = MenuItem::new("KV cache: --", false, None);
         let decode = MenuItem::new("Decode: --", false, None);
+        let open_config = MenuItem::with_id(MENU_OPEN_CONFIG, "設定ファイルを開く", true, None);
         let proxy_restart = MenuItem::with_id(MENU_PROXY_RESTART, "Proxy 再起動", true, None);
         let monitor_restart = MenuItem::with_id(MENU_MONITOR_RESTART, "Monitor 再起動", true, None);
         let quit = MenuItem::with_id(MENU_QUIT, "終了", true, None);
@@ -70,6 +73,7 @@ impl MonitorTray {
         menu.append(&kv_cache)?;
         menu.append(&decode)?;
         menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&open_config)?;
         menu.append(&proxy_restart)?;
         menu.append(&monitor_restart)?;
         menu.append(&quit)?;
@@ -94,6 +98,7 @@ impl MonitorTray {
             show_decode_tps,
             live_metric,
             _separator: separator,
+            _open_config: open_config,
             _proxy_restart: proxy_restart,
             _monitor_restart: monitor_restart,
             _quit: quit,
@@ -211,6 +216,11 @@ impl MonitorTray {
     /// Check whether a menu event requests a monitor restart.
     pub fn is_monitor_restart_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_MONITOR_RESTART)
+    }
+
+    /// Check whether a menu event requests opening the runtime configuration.
+    pub fn is_open_config_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_OPEN_CONFIG)
     }
 }
 

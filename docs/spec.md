@@ -662,8 +662,16 @@ Standalone manifestはlocal childのidentity、設定drift、診断に使用す�
 
 - DS4 binaryをproxy process起動時にSHA-256する。
 - Modelは明示operator操作でstreaming SHA-256する。
-- Device ID、inode、size、mtime、digest、計算日時をcacheする。
-- 上記metadataが変わればstaleとし再fingerprintまでpromotionしない。
+- Runtime fingerprintはDevice ID、inode、size、mtime、digest、計算日時をcacheする。上記metadataが
+  変わればstaleとし、明示的なruntime fingerprintが完了するまでpromotionしない。
+- `cargo xtask`のinstall digest cacheはfull-file SHA-256に加え、sizeと最大4 MiBの分散サンプル
+  SHA-256を保持してよい。metadata完全一致時はfull digestを即時再利用する。
+- install時にinodeまたはmtime等だけが変わりsizeが同じ場合、分散サンプルが一致すればmetadata-only
+  driftとしてcache metadataを更新し、full-file SHA-256を再計算しなくてよい。size変更またはサンプル
+  不一致ではfull fingerprintを必須とする。
+- サンプルを持たない旧install cacheのmetadata driftは内容変更と断定しない。operatorが内容不変を
+  確認して明示的に受理した場合だけ、size不変を条件にcached full digestへmetadataとサンプルを
+  再bindingできる。サンプルは偶発変更の高速検出であり、full-file SHA-256と同等の保証ではない。
 - 数百GBを読む処理をHTTP handler内で同期実行しない。
 - Fingerprint jobは同一profileにつき1つ、job ID付き非同期処理とする。
 
@@ -1000,8 +1008,8 @@ max_in_flight = 2
 [proxy.timeouts]
 connect = "5s"
 response_headers = "3600s"
-first_body_byte = "300s"
-stream_idle = "300s"
+first_body_byte = "2400s"
+stream_idle = "2400s"
 
 [cluster]
 enabled = true

@@ -814,7 +814,7 @@ fn spawn_desktop_notifier(
             let mut service = service
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            service.observe_transition(previous.state, current.state);
+            service.observe_snapshot_transition(previous, current);
             drop(service);
             previous = current;
         }

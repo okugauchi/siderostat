@@ -222,21 +222,32 @@ pub fn verify_model_cache(
     standalone: &Path,
     mxfp4: &Path,
     dspark_support: Option<&Path>,
+    accept_metadata_change: bool,
 ) -> Result<()> {
-    let digest_cache = util::load_digest_cache(cache_path);
+    let mut digest_cache = util::load_digest_cache(cache_path);
+    let original_cache = digest_cache.clone();
     for (path, label, key) in [
         (standalone, "standalone model", "standalone-model"),
         (mxfp4, "mxfp4 model", "mxfp4-model"),
     ] {
-        let _ = util::sha256_from_cache(path, label, key, &digest_cache)?;
+        let _ =
+            util::sha256_from_cache(path, label, key, &mut digest_cache, accept_metadata_change)?;
     }
     if let Some(path) = dspark_support {
         let _ = util::sha256_from_cache(
             path,
             "dspark support model",
             "dspark-support",
-            &digest_cache,
+            &mut digest_cache,
+            accept_metadata_change,
         )?;
+    }
+    if digest_cache != original_cache {
+        util::save_digest_cache(cache_path, &digest_cache)?;
+        util::tracing_log(&format!(
+            "model SHA-256 cache metadata refreshed -> {}",
+            cache_path.display()
+        ));
     }
     Ok(())
 }
@@ -247,7 +258,7 @@ fn model_digest(
     key: &str,
     cache: &mut util::DigestCache,
 ) -> Result<String> {
-    util::sha256_from_cache(path, label, key, cache)
+    util::sha256_from_cache(path, label, key, cache, false)
 }
 
 /// The approved ds4 binary digest set. If `approved` is provided, it must include

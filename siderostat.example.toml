@@ -19,8 +19,8 @@ max_in_flight = 2
 [proxy.timeouts]
 connect = "5s"
 response_headers = "3600s"
-first_body_byte = "1200s"
-stream_idle = "1200s"
+first_body_byte = "2400s"
+stream_idle = "2400s"
 
 [cluster]
 enabled = true
@@ -74,7 +74,7 @@ binary = "$HOME/LLM/ds4/PLACEHOLDER-ds4-server"
 working_directory = "$HOME/LLM/ds4"
 http_host = "127.0.0.1"
 http_port = 8000
-allow_sigkill = false
+allow_sigkill = true
 
 # DSpark is supported for resident Standalone only with the current DS4 baseline. It is not added
 # to Distributed coordinator/worker argv after promotion.

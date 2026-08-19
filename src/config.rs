@@ -1130,6 +1130,20 @@ auto_restart = true
         assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
         assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
         assert!(config.ds4.dspark.enabled);
+        assert_eq!(
+            config.proxy.timeouts.first_body_byte,
+            Duration::from_secs(2_400),
+            "install-generated configs must outlast the Hermes 1800-second stale timeout"
+        );
+        assert_eq!(
+            config.proxy.timeouts.stream_idle,
+            Duration::from_secs(2_400),
+            "install-generated configs must outlast the Hermes 1800-second stale timeout"
+        );
+        assert!(
+            config.ds4.allow_sigkill,
+            "install-generated configs must allow identity-verified owned DS4 children to be reaped"
+        );
     }
 
     #[test]
