@@ -1,8 +1,9 @@
 # Hermes cron / DS4 分散推論スループット低下 調査報告
 
-- 文書状態: 調査時点のスナップショットおよび改善提案
+- 文書状態: 調査時点のスナップショット、暫定対応の追跡結果、および改善提案
 - 障害発生日: 2026-08-19 (JST)
 - 調査基準日: 2026-08-19 (JST)
+- 追跡更新日: 2026-08-19 (JST)
 - 対象 Siderostat: commit `259b575c2b046bc47859bc84f0b6242ea72e02a4`
 - coordinator: Mac Studio (`10.99.0.1`)
 - worker: MacBook Pro (`10.99.0.2`)
@@ -33,7 +34,14 @@ Hermes Agent の三つの cron ジョブが、ローカルの DeepSeek V4 Flash 
 5. 02:36ごろに開始された約48,000 tokenのcontextを持つ呼び出しを境に低速状態が現れ、
    その後の約29,000 tokenおよび約5,800 tokenの呼び出しでも継続した。長いcontextが
    状態劣化の契機だった可能性はあるが、根因を断定できる証跡は残っていない。
-6. 回避策として、coordinator が実推論の進捗を監視し、異常時に既存の安全な demote と
+6. 障害後、Hermesのstale timeoutを1,800秒、Siderostatの`first_body_byte`と
+   `stream_idle`を2,400秒へ延長してSiderostatを再起動したところ、従来`RuntimeError`で
+   失敗していたジョブはすべて正常完了した。この変更一式は暫定運用構成として実績があり、
+   600秒のstale境界を直接原因としたfailure chainとも整合する。
+7. ただし、三つの変更は同時に適用され、完了時のTPSと所要時間も本書には未収録である。
+   timeout延長の効果と、Siderostat再起動によるDS4/Metal/KV/session状態の初期化効果は
+   分離できず、decode低速化の根因が解消したとは判定しない。
+8. 恒久策として、coordinator が実推論の進捗を監視し、異常時に既存の安全な demote と
    auto-promote を組み合わせて distributed DS4 を両nodeで再生成し、canary推論による
    回復確認後に受付を再開する方式を推奨する。
 
@@ -54,6 +62,26 @@ RuntimeError: Provider has been unresponsive (no response received) for 5
 consecutive stale attempts — aborting this call to avoid an indefinite stall.
 Switch models or start a new session, then retry.
 ```
+
+### 3.1 暫定対応後の追跡結果
+
+障害後、次の設定変更を永続設定として適用した。
+
+| 対象 | 変更 | 目的 |
+|---|---|---|
+| `~/.hermes/.env`（適用時line 483） | `HERMES_API_CALL_STALE_TIMEOUT=1800` | `deepseek-v4-flash`の非streaming生成を最大30分待つ |
+| Siderostat `config.toml` | `first_body_byte`: 1,200秒から2,400秒 | 最初のbody byteを待つ間にproxyが先に切断しない |
+| Siderostat `config.toml` | `stream_idle`: 1,200秒から2,400秒 | body streamのchunk間隔が長い場合にproxyが先に切断しない |
+
+Siderostat設定の適用前backupは`config.toml.bak-20260819-141707`として保存した。設定反映のため
+Siderostatを再起動し、再起動後に`distributed-mxfp4 ready`へ戻ったことを確認した。この構成で、
+従来`RuntimeError`により失敗していた対象ジョブはすべて正常完了した。
+
+timeoutの順序はHermes 1,800秒、Siderostat 2,400秒となり、proxy側に600秒の余裕がある。
+観測結果はこの順序が実運用上成立することを示す。一方、変更と再起動を同時に行ったため、
+成功が待機時間の延長、再起動による低速状態の解消、またはその両方によるものかは分離できない。
+また、「正常完了」はジョブ結果を表し、通常の約26--28 tokens/sへ性能が回復したことまでは
+意味しない。
 
 ## 4. 確認した因果関係
 
@@ -215,7 +243,15 @@ generation、KV/session状態の不整合を避けやすい。
 
 ### 8.3 Hermes側のretry方針
 
-同じ低速backendへ600秒単位で5回retryするのではなく、次の順序へ変更する。
+追跡結果から、`HERMES_API_CALL_STALE_TIMEOUT=1800`とSiderostatの
+`first_body_byte = "2400s"`、`stream_idle = "2400s"`の組み合わせは、対象ジョブの
+失敗を回避した変更一式の一部であり、暫定設定として維持できる。この構成では、600秒で
+同じbackendへの試行を繰り返す代わりに、一回の呼び出しへ最大1,800秒の完了猶予を与える。
+
+ただし、1,800秒を恒久的な正常性基準とはしない。0.17 tokens/sで数千tokenを生成する場合は
+30分でも完了せず、異常検知とfallbackが遅れる可能性がある。cron前canaryと実行中のprogress
+監視を併用し、明確な低TPSまたはprogress停止を検知した場合は、上限まで無条件に待たず次の
+順序へ移行する。
 
 ```text
 最初のstaleまたは事前canary失敗
@@ -225,8 +261,11 @@ generation、KV/session状態の不整合を避けやすい。
   -> 回復しなければ代替modelまたは次回実行へ退避
 ```
 
-`HERMES_API_CALL_STALE_TIMEOUT`を1800秒などへ延長するだけの対策は推奨しない。0.17 tokens/sで
-数千tokenを生成すると数時間を要し、失敗判定が遅れるだけになる可能性が高い。
+timeoutは常に呼び出し元よりproxy側を長くし、どのlayerが先に切断するかを予測可能にする。
+現在の600秒差は暫定marginとして記録し、変更時にはHermes、Siderostat、cron schedulerの
+各deadlineとretry回数を一組で検証する。単純なさらなる延長は行わず、正常完了した各jobの
+request所要時間、TTFB、prefill/decode chunk TPS、生成token数を蓄積して1,800秒と2,400秒の
+妥当性を再評価する。
 
 ## 9. Siderostat改善提案
 
@@ -360,6 +399,10 @@ Siderostat本体のstate machineを変更せず、閾値の妥当性と復旧成
    維持する。
 10. monitorがprefill/decodeの進行中に直近chunk TPSを代表値として表示し、進捗停止後の古い値を
     現在値として表示し続けない。
+11. Hermes 1,800秒、Siderostat 2,400秒のtimeout順序で、長時間の正常requestをproxyが先に
+    切断せず、Hermes側のdeadline超過時には有限時間で失敗する。
+12. 暫定設定で正常完了した各jobについて、総所要時間、TTFB、prefill/decode chunk TPS、
+    prompt/completion token数、retry回数を記録し、単なる完了と性能回復を区別できる。
 
 ## 12. 次回再発時の切り分け
 
@@ -388,6 +431,11 @@ Siderostat、OS/Metalのいずれかへ絞り込める。
 ## 14. 判定
 
 本障害のfailure chainは説明できるが、DS4/Metal/KV/sessionのどこで低速状態が発生したかは
-確定していない。現時点では原因断定を待って長時間retryするより、実推論による早期検知、
-既存lifecycleを使ったcoordinator主導のdistributed再構築、回復確認、回数制限付きfallbackを
-導入することが妥当である。
+確定していない。Hermes 1,800秒、Siderostat 2,400秒へのtimeout延長後に対象jobがすべて
+正常完了したため、この構成は暫定回避策として実績がある。一方、同時に実施したSiderostat再起動の
+効果を分離できず、性能回復を示す測定値も不足しているため、根因解消または恒久復旧とは扱わない。
+
+暫定timeoutを維持しつつ、実推論による早期検知、既存lifecycleを使ったcoordinator主導の
+distributed再構築、回復確認、回数制限付きfallbackを導入することが妥当である。これにより、
+正常だが長いrequestには完了猶予を与え、明確に低速化したrequestには30分待機だけに依存せず
+復旧または退避できる。
