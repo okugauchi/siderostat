@@ -19,8 +19,8 @@ max_in_flight = 2
 [proxy.timeouts]
 connect = "5s"
 response_headers = "3600s"
-first_body_byte = "1200s"
-stream_idle = "1200s"
+first_body_byte = "2400s"
+stream_idle = "2400s"
 
 [cluster]
 enabled = true

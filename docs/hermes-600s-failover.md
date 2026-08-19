@@ -26,22 +26,16 @@ backend状態機械は実装済み。
 既定値：
 
 ```toml
-[timeouts]
+[proxy.timeouts]
 connect = "5s"
-response_headers = "60s"
-first_body_byte = "300s"
-stream_idle = "300s"
-
-[routing]
-max_attempts = 2
-
-[cooldown]
-duration = "300s"
-consecutive_failure_threshold = 2
+response_headers = "3600s"
+first_body_byte = "2400s"
+stream_idle = "2400s"
 ```
 
-長いuncached prefillでは正常でもTTFTが長くなるため、first body byte timeoutは
-実測に合わせて調整する。
+Hermesの`HERMES_API_CALL_STALE_TIMEOUT=1800`よりproxy側を600秒長くし、callerが先に
+timeoutする順序を維持する。長いuncached prefillでは正常でもTTFTが長くなるため、
+first body byte timeoutは実測に合わせて調整する。
 
 ## 重要な制約
 
