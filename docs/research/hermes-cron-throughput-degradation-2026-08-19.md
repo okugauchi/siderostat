@@ -269,7 +269,24 @@ DistributedReady
 後者のため、現在値だけでなく、最後にprogress eventを観測したmonotonic timestampとtoken countを
 保持する。idle時の0 tokens/sを異常判定してはならない。
 
-### 9.3 安全弁
+### 9.3 monitorのメニューバー表示
+
+monitorのメニューバーでprefillまたはdecodeの進行中に表示する代表TPSは、現在の平均値
+（prefillの`avg_tps`およびdecodeの`avg_tps`）から、直近chunkの値
+（prefillの`chunk_tps`およびdecodeの`chunk_tps`）へ変更することを提案する。
+
+累積平均はrequest開始からの正常な区間を含むため、途中で急激に低速化した場合に表示値への
+反映が遅れる。直近chunkのTPSであれば現在の処理速度をより直接的に示し、本障害のような
+throughput degradationをメニューバーから早期に認識しやすい。具体的には既定の
+`live_metric`を`prefill-chunk-tps`とし、prefillが進行中でない場合のdecode fallbackにも
+`generation_chunk_tps`を採用する。
+
+chunk値は平均値より変動しやすいため、`avg_tps` metricとメニュー内の詳細表示は診断用として
+残す。また、表示値の更新時刻またはlast progress ageを併記できるようにし、最後に観測した
+chunk値が進捗停止後も現在値に見えることを避ける。自動復旧の判定はメニューバー表示値そのもの
+ではなく、9.2の継続時間、複数sample、last progress timestampを用いる。
+
+### 9.4 安全弁
 
 自動復旧には少なくとも次の制約を設ける。
 
@@ -282,7 +299,7 @@ DistributedReady
 - 復旧開始前にdiagnostic snapshotを保存する。
 - active requestのdrain timeout時に何を中断できるかを明文化し、無条件のprocess killを行わない。
 
-### 9.4 診断snapshot
+### 9.5 診断snapshot
 
 状態を初期化する前に、少なくとも次を同一recovery IDで保存する。
 
@@ -311,6 +328,7 @@ Siderostat本体のstate machineを変更せず、閾値の妥当性と復旧成
 ### Phase 1: 観測強化
 
 - last progress timestampとtoken deltaをmetricsへ追加する。
+- monitorのprefill/decode代表TPSを直近chunk値へ変更し、平均値は詳細表示に残す。
 - throughput degraded、recovery started/completed/failedをstructured event化する。
 - recovery前snapshotを自動保存する。
 
@@ -340,6 +358,8 @@ Siderostat本体のstate machineを変更せず、閾値の妥当性と復旧成
 8. recovery前後のdiagnostic snapshotからPID、generation、TPSの変化を追跡できる。
 9. worker-only process restart、coordinator-only process restart、両node restartの既存再接続試験を
    維持する。
+10. monitorがprefill/decodeの進行中に直近chunk TPSを代表値として表示し、進捗停止後の古い値を
+    現在値として表示し続けない。
 
 ## 12. 次回再発時の切り分け
 
