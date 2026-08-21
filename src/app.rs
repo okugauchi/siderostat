@@ -1,17 +1,17 @@
 #[cfg(target_os = "macos")]
 use crate::cluster::MacOsDynamicStoreWatcher;
 use crate::{
-    admission::{AdmissionSnapshot, AdmissionState},
+    admission::{AdmissionSnapshot, AdmissionState, DrainError},
     cluster::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
         ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
         DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
         ModeRuntime, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION, PeerDiagnostics,
         PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
-        ProductionClusterRuntime, RestartDecision, StandaloneManifest, StandaloneSupervisor,
-        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
-        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
-        spawn_network_event_monitor,
+        ProcessControlError, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
+        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
+        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
+        required_port_available, spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, ModelVariant, Residency},
     metrics::{MetricSnapshot, Metrics},
@@ -59,6 +59,11 @@ pub struct AppState {
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
+    supervisor: RwLock<Option<Arc<StandaloneSupervisor>>>,
+    graceful_restart_in_progress: std::sync::atomic::AtomicBool,
+    /// Default in-flight drain timeout for `/admin/restart` when the request
+    /// omits `drain_timeout_ms` (C-04a). Taken from the cluster stop timeout.
+    default_drain_timeout: std::time::Duration,
 }
 
 impl AppState {
@@ -115,6 +120,9 @@ impl AppState {
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
+            supervisor: RwLock::new(None),
+            graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
+            default_drain_timeout: config.cluster.timeouts.stop,
         }))
     }
 
@@ -164,6 +172,36 @@ impl AppState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn attach_supervisor(&self, supervisor: Arc<StandaloneSupervisor>) {
+        *self
+            .supervisor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supervisor);
+    }
+
+    fn supervisor(&self) -> Option<Arc<StandaloneSupervisor>> {
+        self.supervisor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Try to claim the single in-flight graceful restart slot. Returns `true`
+    /// when this caller is the first to claim it (C-04a duplicate guard).
+    fn try_claim_graceful_restart(&self) -> bool {
+        !self
+            .graceful_restart_in_progress
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the graceful restart slot. The process usually exits right after
+    /// a successful restart, but a drain-timeout or identity-mismatch failure
+    /// must release it so an operator can retry (C-04b).
+    fn release_graceful_restart(&self) {
+        self.graceful_restart_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -423,6 +461,10 @@ pub async fn serve_with_options(
         false,
     );
     let supervisor = build_standalone_supervisor(&config, &state)?;
+    // C-04a: graceful restart は solo-standalone の owned DS4 child を停止するため、
+    // supervisor への参照を AppState に保持する。cluster 有効時は lifecycle owner
+    // (ProductionClusterRuntime) が child を所有するため graceful restart は拒否される。
+    state.attach_supervisor(supervisor.clone());
     let role = boot.role;
     let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
     let control_session_generation = persisted
@@ -1131,6 +1173,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/cluster/demote", post(demote))
         .route("/cluster/restart", post(restart))
         .route("/cluster/fingerprint", post(fingerprint))
+        .route("/admin/restart", post(graceful_restart))
         .with_state(state)
 }
 
@@ -1223,6 +1266,205 @@ async fn fingerprint(
     start_job(admin, AdminAction::Fingerprint { profile })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GracefulRestartRequest {
+    /// Optional in-flight drain timeout in milliseconds (C-04a). When omitted,
+    /// the cluster stop timeout is used as the default.
+    drain_timeout_ms: Option<u64>,
+}
+
+/// `/admin/restart` — authenticated graceful runtime restart (A-01 contract).
+///
+/// The handler authenticates with the shared admin bearer token, parses the
+/// optional `drain_timeout_ms`, rejects overlapping requests, and then hands
+/// the validated request to `perform_graceful_restart`. The actual
+/// admission-block → drain → child-stop → process-exit sequence is
+/// implemented in C-04b.
+async fn graceful_restart(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    let drain_timeout = match resolve_drain_timeout(&body, state.default_drain_timeout) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid restart request: {error}")}),
+            );
+        }
+    };
+
+    // 進行中の graceful restart と重複しない。drain timeout / identity
+    // mismatch で失敗した場合は C-04b がフラグを解放する。
+    if !state.try_claim_graceful_restart() {
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "restart_in_progress"}),
+        );
+    }
+
+    // cluster 有効・distributed 等で supervisor 不在の場合は graceful restart を拒否する。
+    let Some(supervisor) = state.supervisor() else {
+        state.release_graceful_restart();
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "graceful_restart_unavailable"}),
+        );
+    };
+    let _ = admin;
+    perform_graceful_restart(&state, &supervisor, drain_timeout).await
+}
+
+/// Resolve the drain timeout for `/admin/restart`: use the request's
+/// `drain_timeout_ms` when present, otherwise the cluster stop timeout default.
+/// Empty body uses the default. Malformed JSON is an error. Pure so it can be
+/// unit-tested without HTTP / exit side effects (C-04a/C-04b).
+fn resolve_drain_timeout(
+    body: &Bytes,
+    default: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    if body.is_empty() {
+        return Ok(default);
+    }
+    let request = serde_json::from_slice::<GracefulRestartRequest>(body)
+        .map_err(|error| error.to_string())?;
+    Ok(request
+        .drain_timeout_ms
+        .map_or(default, std::time::Duration::from_millis))
+}
+
+/// Outcome of the graceful restart sequence. Deliberately free of HTTP / exit
+/// side effects so the sequence is unit-testable without killing the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GracefulRestartOutcome {
+    /// Drain completed and the owned DS4 child was stopped.
+    Ready { drain_timeout_ms: u128 },
+    /// In-flight requests did not drain within the timeout.
+    DrainTimeout {
+        in_flight: usize,
+        drain_timeout_ms: u128,
+    },
+    /// The owned child's identity no longer matches; do not force-kill.
+    ChildIdentityMismatch,
+    /// The owned child could not be stopped.
+    ChildStopFailed,
+}
+
+/// C-04b: admission block → in-flight drain → owned DS4 child stop を実行する。
+///
+/// - drain timeout 時は強制 kill せず `DrainTimeout` を返す。
+/// - owned child identity mismatch 時は強制 kill せず `ChildIdentityMismatch` を返す。
+/// - process exit は行わない（`perform_graceful_restart` が成功時に exit を予約する）。
+///
+/// テストはこの sequence を直接呼び、exit 副作用なしで drain / timeout /
+/// identity mismatch を検証できる。
+async fn graceful_restart_sequence(
+    state: &Arc<AppState>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    drain_timeout: std::time::Duration,
+) -> GracefulRestartOutcome {
+    // 1. admission block: 新規リクエストを受け付けない。
+    state.proxy.admission().block();
+
+    // 2. in-flight drain: 進行中のリクエストが 0 になるまで待つ。timeout 時は
+    //    強制 kill せず、進行中フラグを解放して再試行可能にする（呼び出し側）。
+    if matches!(
+        state.proxy.admission().drain(0, drain_timeout).await,
+        Err(DrainError::Timeout)
+    ) {
+        let in_flight = state.proxy.admission().snapshot().in_flight;
+        return GracefulRestartOutcome::DrainTimeout {
+            in_flight,
+            drain_timeout_ms: drain_timeout.as_millis(),
+        };
+    }
+
+    // 3. owned DS4 child stop: supervisor が所有する child のみを停止する。
+    //    identity mismatch 時は強制 kill せず error を返す。cluster lifecycle
+    //    owner を迂回した signal や unknown PID の kill は行わない。
+    match crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await {
+        Ok(()) => GracefulRestartOutcome::Ready {
+            drain_timeout_ms: drain_timeout.as_millis(),
+        },
+        Err(error) if is_graceful_identity_mismatch(&error) => {
+            GracefulRestartOutcome::ChildIdentityMismatch
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "graceful restart child stop failed");
+            GracefulRestartOutcome::ChildStopFailed
+        }
+    }
+}
+
+/// `ProcessControlError::IdentityMismatch` を検出する。強制 kill を避け、
+/// unknown PID の kill を行わないため、owned child の identity が期待と
+/// 一致しない場合は `ChildIdentityMismatch` へ写像する。
+fn is_graceful_identity_mismatch(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ProcessControlError>(),
+        Some(ProcessControlError::IdentityMismatch)
+    )
+}
+
+/// `/admin/restart` の graceful restart 処理。`graceful_restart_sequence` の
+/// 結果を HTTP response へ写像し、`Ready` 時のみ exit を予約する。exit は
+/// `spawn_process_restart` が 100ms 後に launchd KeepAlive 経由で新 binary を
+/// 起動する。response 返却前に exit しないことで、client へ曖昧な
+/// transport error を見せない。失敗時は進行中フラグを解放して再試行可能にする。
+async fn perform_graceful_restart(
+    state: &Arc<AppState>,
+    supervisor: &Arc<StandaloneSupervisor>,
+    drain_timeout: std::time::Duration,
+) -> Response<Body> {
+    match graceful_restart_sequence(state, supervisor, drain_timeout).await {
+        GracefulRestartOutcome::Ready { drain_timeout_ms } => {
+            let response = json_response(
+                StatusCode::ACCEPTED,
+                json!({
+                    "restart": "accepted",
+                    "drain_timeout_ms": drain_timeout_ms,
+                }),
+            );
+            spawn_process_restart();
+            response
+        }
+        GracefulRestartOutcome::DrainTimeout {
+            in_flight,
+            drain_timeout_ms,
+        } => {
+            state.release_graceful_restart();
+            json_response(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "drain_timeout",
+                    "in_flight": in_flight,
+                    "drain_timeout_ms": drain_timeout_ms,
+                }),
+            )
+        }
+        GracefulRestartOutcome::ChildIdentityMismatch => {
+            state.release_graceful_restart();
+            json_response(
+                StatusCode::CONFLICT,
+                json!({"error": "child_identity_mismatch"}),
+            )
+        }
+        GracefulRestartOutcome::ChildStopFailed => {
+            state.release_graceful_restart();
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "child_stop_failed"}),
+            )
+        }
+    }
+}
+
 fn start_admin_job(headers: &HeaderMap, state: &AppState, action: AdminAction) -> Response<Body> {
     let admin = match authorized_admin(headers, state) {
         Ok(admin) => admin,
@@ -1273,7 +1515,27 @@ fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+    Json(json!({
+        "status": "ok",
+        "version": runtime_version(),
+        "git_commit": runtime_git_commit(),
+        "build_number": runtime_build_number(),
+    }))
+}
+
+/// runtime crate version。ビルド時 metadata は配布 bundle の Info.plist と比較するために
+/// read-only admin response から取得できるようにする（B-01）。git commit と build number は
+/// ビルド時に環境変数から注入され、未設定時は "unknown" を返す。user data を作成しない。
+fn runtime_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn runtime_git_commit() -> &'static str {
+    option_env!("SIDEROSTAT_GIT_COMMIT").unwrap_or("unknown")
+}
+
+fn runtime_build_number() -> &'static str {
+    option_env!("SIDEROSTAT_BUILD_NUMBER").unwrap_or("unknown")
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> Response<Body> {
@@ -1588,9 +1850,41 @@ mod tests {
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
+            supervisor: RwLock::new(None),
+            graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
+            default_drain_timeout: std::time::Duration::from_millis(5000),
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
+    }
+
+    /// Attach a standalone supervisor so `/admin/restart` sees an owned DS4
+    /// child owner (C-04a). The command is never spawned by these tests; it
+    /// only needs to satisfy `StandaloneSupervisor::new`'s construction.
+    fn attach_test_supervisor(state: &Arc<AppState>) {
+        use crate::cluster::Ds4Command;
+        use std::ffi::OsString;
+        let command = Ds4Command {
+            executable: std::path::PathBuf::from("/bin/sleep"),
+            working_directory: std::path::PathBuf::from("/"),
+            argv: vec![OsString::from("3600")],
+            profile: crate::cluster::Ds4Profile {
+                profile_id: "test-profile".into(),
+                model_variant: ModelVariant::Q2Q4,
+                residency: Residency::SsdStreaming,
+                dspark_required: false,
+            },
+        };
+        let supervisor = Arc::new(StandaloneSupervisor::new(
+            command,
+            url::Url::parse("http://127.0.0.1:8000/v1/models").unwrap(),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
+            false,
+            Arc::new(Metrics::default()),
+        ));
+        state.attach_supervisor(supervisor);
     }
 
     async fn get(state: Arc<AppState>, path: &'static str) -> (StatusCode, String) {
@@ -1631,10 +1925,12 @@ mod tests {
         let (metrics_status, metrics_body) = get(state, "/metrics").await;
 
         assert_eq!(health_status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_str::<Value>(&health_body).unwrap()["status"],
-            "ok"
-        );
+        let health: Value = serde_json::from_str(&health_body).unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["version"], runtime_version());
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        assert!(health["git_commit"].is_string());
+        assert!(health["build_number"].is_string());
         assert_eq!(ready_status, StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<Value>(&ready_body).unwrap()["target"],
@@ -1826,5 +2122,149 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- C-04a: `/admin/restart` route, auth, body parse, duplicate guard ----
+
+    async fn post_admin_restart(
+        state: Arc<AppState>,
+        token: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut request =
+            Request::post("/admin/restart").header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", token);
+        }
+        let response = admin_router(state)
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn graceful_restart_requires_bearer_token() {
+        let state = test_state(true);
+        attach_test_supervisor(&state);
+        let (missing, missing_body) = post_admin_restart(state.clone(), None, "").await;
+        let (wrong, _) = post_admin_restart(state.clone(), Some("Bearer deadbeef"), "").await;
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        assert!(missing_body.contains("unauthorized"));
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn resolve_drain_timeout_uses_default_when_body_omitted() {
+        let default = std::time::Duration::from_millis(5000);
+        // body 省略時は cluster stop timeout (test では 5000ms) を既定値にする。
+        let timeout = resolve_drain_timeout(&Bytes::new(), default).unwrap();
+        assert_eq!(timeout, default);
+    }
+
+    #[test]
+    fn resolve_drain_timeout_uses_requested_value_when_present() {
+        let default = std::time::Duration::from_millis(5000);
+        let body = Bytes::from(r#"{"drain_timeout_ms": 12000}"#);
+        let timeout = resolve_drain_timeout(&body, default).unwrap();
+        assert_eq!(timeout, std::time::Duration::from_millis(12000));
+    }
+
+    #[test]
+    fn resolve_drain_timeout_rejects_malformed_or_unknown_body_fields() {
+        let default = std::time::Duration::from_millis(5000);
+        let malformed = resolve_drain_timeout(&Bytes::from("not-json"), default);
+        let unknown = resolve_drain_timeout(
+            &Bytes::from(r#"{"drain_timeout_ms": 1000, "surprise": true}"#),
+            default,
+        );
+        assert!(malformed.is_err());
+        assert!(unknown.is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_graceful_restart_is_rejected_while_one_is_in_progress() {
+        let state = test_state(true);
+        attach_test_supervisor(&state);
+        // 進行中フラグを直接立てて、handler が重複を 409 で拒否することを確認する。
+        // （成功 path は exit を伴うため handler 経由では実行しない。）
+        assert!(state.try_claim_graceful_restart());
+        let token = format!("Bearer {}", crate::cluster::encode_token(&[3; 32]));
+        let (duplicate, body) = post_admin_restart(state.clone(), Some(&token), "").await;
+        assert_eq!(duplicate, StatusCode::CONFLICT);
+        assert!(body.contains("restart_in_progress"));
+    }
+
+    #[tokio::test]
+    async fn graceful_restart_rejected_without_standalone_supervisor() {
+        // cluster 有効・distributed 等で supervisor 不在の場合は graceful restart を拒否する。
+        let state = test_state(true);
+        let token = format!("Bearer {}", crate::cluster::encode_token(&[3; 32]));
+        let (status, body) = post_admin_restart(state, Some(&token), "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("graceful_restart_unavailable"));
+    }
+
+    // ---- C-04b: graceful restart sequence (block → drain → child stop) ----
+    // 成功 path は exit を伴うため、HTTP 応答を直接検証せず、exit 副作用のない
+    // `graceful_restart_sequence` で drain / timeout / identity mismatch を検証する。
+
+    #[tokio::test]
+    async fn graceful_restart_sequence_blocks_admission_and_readies_without_child() {
+        let state = test_state(true);
+        attach_test_supervisor(&state);
+        let supervisor = state.supervisor().unwrap();
+        let outcome =
+            graceful_restart_sequence(&state, &supervisor, std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            GracefulRestartOutcome::Ready {
+                drain_timeout_ms: 5000
+            }
+        );
+        // admission は drain 完了後に Blocked になる。
+        assert_eq!(
+            state.proxy.admission().snapshot().state,
+            AdmissionState::Blocked
+        );
+        assert_eq!(state.proxy.admission().snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_restart_sequence_returns_drain_timeout_with_in_flight() {
+        let state = test_state(true);
+        attach_test_supervisor(&state);
+        // 進行中リクエストを 1 つ保持し、drain を timeout させる。
+        state.proxy.admission().start_serving();
+        let _permit = state
+            .proxy
+            .admission()
+            .try_acquire(true)
+            .expect("permit should be acquirable");
+        let supervisor = state.supervisor().unwrap();
+        let outcome =
+            graceful_restart_sequence(&state, &supervisor, std::time::Duration::from_millis(10))
+                .await;
+        assert_eq!(
+            outcome,
+            GracefulRestartOutcome::DrainTimeout {
+                in_flight: 1,
+                drain_timeout_ms: 10,
+            }
+        );
+        // timeout 時は in-flight permit を drop せず、強制 kill しない。
+        assert_eq!(state.proxy.admission().snapshot().in_flight, 1);
+    }
+
+    #[test]
+    fn graceful_identity_mismatch_is_detected_without_force_kill() {
+        // owned child の identity が期待と一致しない場合、ChildIdentityMismatch
+        // へ写像され、強制 kill や unknown PID の kill を行わない。
+        let error = anyhow::anyhow!(crate::cluster::ProcessControlError::IdentityMismatch);
+        assert!(is_graceful_identity_mismatch(&error));
+        let other = anyhow::anyhow!("generic failure");
+        assert!(!is_graceful_identity_mismatch(&other));
     }
 }

@@ -54,6 +54,10 @@ enum ClusterCommand {
         reason: Option<String>,
     },
     Restart,
+    /// Graceful runtime restart via `/admin/restart` (C-04c). Unlike the
+    /// cluster `Restart` above, this drains in-flight requests and relaunches
+    /// the whole runtime process through launchd.
+    GracefulRestart,
     Fingerprint {
         #[arg(long, value_enum)]
         profile: Profile,
@@ -109,10 +113,14 @@ async fn run_with(args: Args) -> anyhow::Result<()> {
     }
 }
 
-async fn run_cluster(config: &ModeAwareConfig, command: ClusterCommand) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let base = format!("http://{}", config.proxy.admin_listen);
-    let (method, path, body, output) = match command {
+/// Resolve the admin API request (method, path, body, output) for a cluster
+/// subcommand. Pure so tests can verify route selection (e.g. the graceful
+/// runtime restart uses `/admin/restart`, distinct from the cluster restart's
+/// `/cluster/restart`).
+fn cluster_request(
+    command: ClusterCommand,
+) -> (reqwest::Method, &'static str, Option<Value>, Output) {
+    match command {
         ClusterCommand::Status { json } => (
             reqwest::Method::GET,
             "/cluster",
@@ -150,6 +158,9 @@ async fn run_cluster(config: &ModeAwareConfig, command: ClusterCommand) -> anyho
             None,
             Output::Json,
         ),
+        ClusterCommand::GracefulRestart => {
+            (reqwest::Method::POST, "/admin/restart", None, Output::Json)
+        }
         ClusterCommand::Fingerprint { profile } => (
             reqwest::Method::POST,
             "/cluster/fingerprint",
@@ -159,7 +170,13 @@ async fn run_cluster(config: &ModeAwareConfig, command: ClusterCommand) -> anyho
             }})),
             Output::Json,
         ),
-    };
+    }
+}
+
+async fn run_cluster(config: &ModeAwareConfig, command: ClusterCommand) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", config.proxy.admin_listen);
+    let (method, path, body, output) = cluster_request(command);
     let mutation = method == reqwest::Method::POST;
     let mut request = client.request(method, format!("{base}{path}"));
     if mutation {
@@ -299,6 +316,7 @@ mod tests {
             vec!["siderostat", "cluster", "promote"],
             vec!["siderostat", "cluster", "demote"],
             vec!["siderostat", "cluster", "restart"],
+            vec!["siderostat", "cluster", "graceful-restart"],
             vec![
                 "siderostat",
                 "cluster",
@@ -310,6 +328,34 @@ mod tests {
             let parsed = Args::try_parse_from(args).unwrap();
             assert!(matches!(parsed.command, Some(Command::Cluster { .. })));
         }
+    }
+
+    #[test]
+    fn graceful_restart_selects_admin_restart_route_distinct_from_cluster_restart() {
+        // C-04c: graceful runtime restart は `/admin/restart` を選び、
+        // cluster 再構成用の `/cluster/restart` と区別される。
+        let (method, path, body, output) = cluster_request(ClusterCommand::GracefulRestart);
+        assert_eq!(method, reqwest::Method::POST);
+        assert_eq!(path, "/admin/restart");
+        assert!(body.is_none());
+        assert!(matches!(output, Output::Json));
+
+        let (cluster_method, cluster_path, _, _) = cluster_request(ClusterCommand::Restart);
+        assert_eq!(cluster_method, reqwest::Method::POST);
+        assert_eq!(cluster_path, "/cluster/restart");
+        assert_ne!(path, cluster_path);
+    }
+
+    #[test]
+    fn graceful_restart_is_a_mutating_admin_route_thus_bearer_authenticated() {
+        // mutation (POST) なので `run_cluster` は admin token を読み、
+        // bearer auth を付与する。unauthenticated endpoint は使われない。
+        let (method, path, _, _) = cluster_request(ClusterCommand::GracefulRestart);
+        assert_eq!(method, reqwest::Method::POST);
+        assert!(path.starts_with("/admin/") || path.starts_with("/cluster/"));
+        // POST は全て mutation 扱い。GET の status/doctor と区別される。
+        let (status_method, _, _, _) = cluster_request(ClusterCommand::Status { json: true });
+        assert_eq!(status_method, reqwest::Method::GET);
     }
 
     #[test]
