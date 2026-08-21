@@ -59,7 +59,7 @@ pub struct PkgDevArgs {
 /// Build the application bundle at `staging/Siderostat.app`.
 pub fn app_dev(args: &AppDevArgs) -> Result<()> {
     if !cfg!(target_os = "macos") {
-        anyhow::bail!("app-dev requires macOS (codesign/plutil/sips/iconutil)");
+        anyhow::bail!("app-dev requires macOS (codesign/plutil/sips)");
     }
     let root = repo_root()?;
     let staging = args
@@ -194,17 +194,43 @@ fn generate_placeholder_icon(staging: &Path, dest: &Path) -> Result<()> {
             ],
         )?;
     }
-    util::run_live(
-        "iconutil",
-        &[
-            OsStr::new("-c"),
-            OsStr::new("icns"),
-            OsStr::new(&iconset),
-            OsStr::new("-o"),
-            OsStr::new(dest),
-        ],
-    )?;
+    write_deterministic_icns(&iconset, dest)?;
     util::tracing_log(&format!("generated placeholder icon {}", dest.display()));
+    Ok(())
+}
+
+/// Write a deterministic legacy `.icns` container from PNG iconset members.
+///
+/// macOS 26's `iconutil` can reject otherwise valid iconsets, so the generated
+/// placeholder must not make certificate-free CI depend on that tool. PNG
+/// chunks are a supported ICNS representation and are sufficient for the
+/// placeholder; a user-provided production `.icns` remains untouched.
+fn write_deterministic_icns(iconset: &Path, dest: &Path) -> Result<()> {
+    let variants = [
+        (b"icp4".as_slice(), "icon_16x16.png"),
+        (b"icp5".as_slice(), "icon_32x32.png"),
+        (b"ic07".as_slice(), "icon_128x128.png"),
+        (b"ic08".as_slice(), "icon_256x256.png"),
+        (b"ic09".as_slice(), "icon_512x512.png"),
+        (b"ic10".as_slice(), "icon_512x512@2x.png"),
+    ];
+    let mut icns = Vec::new();
+    icns.extend_from_slice(b"icns");
+    icns.extend_from_slice(&0_u32.to_be_bytes());
+
+    for (kind, name) in variants {
+        let png = std::fs::read(iconset.join(name))
+            .with_context(|| format!("read placeholder icon member {name}"))?;
+        let chunk_length = u32::try_from(png.len() + 8).context("ICNS chunk is too large")?;
+        icns.extend_from_slice(kind);
+        icns.extend_from_slice(&chunk_length.to_be_bytes());
+        icns.extend_from_slice(&png);
+    }
+
+    let total_length = u32::try_from(icns.len()).context("ICNS file is too large")?;
+    icns[4..8].copy_from_slice(&total_length.to_be_bytes());
+    std::fs::write(dest, icns)
+        .with_context(|| format!("write placeholder icon {}", dest.display()))?;
     Ok(())
 }
 
@@ -315,6 +341,42 @@ mod tests {
             .unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(png.len() < 100_000);
+    }
+
+    #[test]
+    fn deterministic_icns_contains_png_icon_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "siderostat-icns-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let iconset = root.join("AppIcon.iconset");
+        let dest = root.join("AppIcon.icns");
+        std::fs::create_dir_all(&iconset).unwrap();
+        let png = b"\x89PNG\r\n\x1a\nplaceholder";
+        for name in [
+            "icon_16x16.png",
+            "icon_32x32.png",
+            "icon_128x128.png",
+            "icon_256x256.png",
+            "icon_512x512.png",
+            "icon_512x512@2x.png",
+        ] {
+            std::fs::write(iconset.join(name), png).unwrap();
+        }
+
+        write_deterministic_icns(&iconset, &dest).unwrap();
+        let icns = std::fs::read(&dest).unwrap();
+        assert!(icns.starts_with(b"icns"));
+        assert_eq!(
+            u32::from_be_bytes(icns[4..8].try_into().unwrap()) as usize,
+            icns.len()
+        );
+        assert!(icns.windows(4).any(|chunk| chunk == b"ic10"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

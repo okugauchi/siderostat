@@ -7,11 +7,13 @@
 //! - uninstall: stop the LaunchAgent and disable its plist.
 //! - app-dev: build a deterministic ad-hoc signed `Siderostat.app` bundle.
 //! - pkg-dev: build a scriptless flat `.pkg` from an `app-dev` bundle.
+//! - sign: sign, notarize, staple, and verify a release package.
 
 mod bundle;
 mod install;
 mod manifest;
 mod package;
+mod signing;
 mod util;
 
 use anyhow::{Context, Result};
@@ -40,6 +42,8 @@ enum Command {
     AppDev(bundle::AppDevArgs),
     /// Build a scriptless flat .pkg from an app-dev bundle (E-01).
     PkgDev(bundle::PkgDevArgs),
+    /// Build, sign, notarize, staple, and verify a release package (E-02).
+    Sign(signing::SignArgs),
 }
 
 fn main() -> Result<()> {
@@ -51,6 +55,7 @@ fn main() -> Result<()> {
         Command::Uninstall => uninstall(),
         Command::AppDev(args) => bundle::app_dev(&args),
         Command::PkgDev(args) => package::pkg_dev(&args),
+        Command::Sign(args) => signing::sign(&args),
     }
 }
 

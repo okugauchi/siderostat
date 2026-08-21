@@ -240,7 +240,7 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: 最低 OS、表示名、icon、Team ID、certificate 表示名、UX 文言を承認する
 - 停止条件: Team ID が未取得でも B〜D は進められるが、`E-02` 以降は開始しない
 
-Evidence: docs/distribution/v0.3.0-release-decisions.md; 最低OS 26.0、identifier は仕様5.2採用、Team ID 未取得(E-02停止)、structured file logging、placeholder icon、POST /admin/restart contract と日本語UX文言をユーザー承認(2026-08-19); 2026-08-19
+Evidence: docs/distribution/v0.3.0-release-decisions.md; 最低OS 26.0、identifier は仕様5.2採用、Team ID `N27G6TC25R`、Developer ID Application / Installer の表示名、structured file logging、placeholder icon、POST /admin/restart contract と日本語UX文言を記録・承認。Team ID と証明書表示名は `security find-identity -v` の確認結果を反映（2026-08-21）。
 
 ### [x] A-02 v0.2.1 の移行 baseline を保存する
 
@@ -389,7 +389,7 @@ Evidence: monitor/src/service_management.rs に RegisterOutcome / UnregisterOutc
 
 Evidence: monitor/src/service_management.rs の MainAppLoginItem（status/register/unregister）は C-01/C-02 で実装済み。monitor/src/tray.rs に runtime/login の登録状態表示 menu item 2つ（Runtime: / Login start:）と update_registration、registration_status_text 純粋関数を追加。unit test 2件（status 文言 5値、2x2 matrix 独立性=4 distinct pairs）。monitor 40 test OK、全 208 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
-### [ ] C-04 authenticated graceful runtime restart を実装する
+### [x] C-04 authenticated graceful runtime restart を実装する
 
 - Actor: agent
 - Depends on: C-03
@@ -406,6 +406,8 @@ Evidence: monitor/src/service_management.rs の MainAppLoginItem（status/regist
 - Verification: handler/lifecycle test、共通 local gate
 - ユーザーレビュー・手作業: なし
 - 停止条件: cluster lifecycle owner を迂回した signal、unknown PID の kill、unauthenticated endpoint が必要になる
+
+Evidence（親タスク集約）: C-04a の route/auth/body parse/重複要求、C-04b の admission block → drain → owned child stop → response → exit 処理、C-04c の CLI と受入基準対応を確認。auth 失敗、正常 drain、drain timeout、identity mismatch、重複要求の5受入基準は子タスクの test で網羅され、停止条件にも該当なし（2026-08-21）。
 
 #### [x] C-04a graceful restart 専用 route・認証・body parse・重複要求を実装する
 
@@ -516,7 +518,7 @@ Evidence: monitor/src/launchd.rs に is_bundle_mode/is_bundle_path（`.app/Conte
 - 事後条件: first-launch の各段階が UI state として区別できる
 - 受入基準: first-launch state reducer test が全順序・失敗分岐を覆う
 - Verification: monitor test、共通 local gate
-- ユーザーレビュー・手作業: UI 文言を画面で承認する
+- ユーザーレビュー・手作業: なし（UI 文言は C-05 本体で承認）
 
 Evidence: monitor/src/state.rs に first-launch reducer（C-05b）を追加。FirstLaunchState（VersionShown/InventoryChecked/ConfigValidated/RuntimeStatusChecked/Registering/Registered/RequiresApproval/RegisterFailed/MonitorLoginChecked/RuntimeAdminReady/ModelReady）と FirstLaunchEvent、純粋な first_launch_reducer を実装。配布仕様 11 節の順序（version→inventory→config→runtime status→register→login→admin ready→model ready）を反映し、registration progress と model-startup progress を別段階で表現。config invalid / requires approval / register failed の失敗分岐と、順序外 event を無視する挙動。first_launch_needs_approval（RequiresApproval 時のみ Login Items 導線表示）、first_launch_complete（ModelReady）。legacy inventory は interface のみ（D-01 で接続）。unit test 6件（happy path、legacy present/absent、config invalid で register 前停止、approval 導線ゲート、register failed を enabled と表示しない、順序外無視）。monitor 50 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
@@ -584,7 +586,7 @@ Evidence: monitor/src/migration.rs を新規作成。LegacyInventory（binaries/
 
 Evidence: monitor/src/migration.rs に cutover state machine（D-02）を追加。CutoverState（Idle/Draining/LegacyStopped/NewRegistered/Migrated/RollingBack/RolledBack/RollbackFailed）と CutoverEvent（DrainFinished/LegacyStopped/NewRegistered/ReadinessChecked/PortConflict/RolledBack、各 Result で failure injection）と純粋な cutover_reducer。各 action の失敗は rollback へ、port conflict は即 rollback。CutoverDriver trait（drain_legacy/stop_legacy/register_new/check_readiness/port_conflict/rollback）と run_cutover ドライバ（spec 12.2 手順 2-7 の順で呼び、Err/conflict で finish_rollback）。state-machine test 8件（happy path、各 action failure、port conflict、rollback ok/fail、有限収束、user data 不変、job 最大一組）+ fake driver integration test 6件（呼び出し順、drain 失敗で即 rollback、readiness 失敗、port conflict 即 rollback、rollback 失敗=RollbackFailed、収束後 op 呼び出しなし）。monitor 74 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。実機 migration は E-05 まで実行しない。実 driver は E-05 で main.rs に接続。
 
-### [x] D-03 app/runtime version handshake と upgrade 提案を実装する
+### [-] D-03 app/runtime version handshake と upgrade 提案を実装する
 
 - Actor: agent
 - Depends on: D-02
@@ -621,13 +623,13 @@ Evidence（自動 part 完了、UI 文言レビュー待ち 2026-08-19）: monit
   5. package expand 結果を検査し、禁止 path と installer script があれば失敗する。
 - 事後条件: certificate なしで final と同形の installable package を作れる
 - 受入基準: package payload manifest が一項目、script directory なし、同一入力で receipt/version 一致
-- Verification: package builder test、`pkgutil --expand` の静的検査、共通 local gate
+- Verification: package builder test、`pkgutil --expand-full` の静的検査、共通 local gate
 - ユーザーレビュー・手作業: なし
 - 停止条件: package script から user session、LaunchAgent、config を操作する必要が生じる
 
-Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 identifier（COMPONENT_IDENTIFIER=dev.siderostat-ds4-proxy.pkg、PRODUCT_IDENTIFIER=dev.siderostat-ds4-proxy.product、INSTALL_LOCATION=/Applications、PAYLOAD_PATH=/Applications/Siderostat.app）と PKG_STAGING_DIR=build/pkg-dev。pkg_dev() が pkgbuild（--component app --install-location --identifier --version）→ productbuild（--package --identifier --version）→ pkgutil --expand → inspect_expanded の順で実行し、payload 一項目・script なし・禁止 path を検査。preinstall/postinstall script を生成しない。inspect_expanded() は Payload 直下 entry を payload_dir に対して相対化し、Applications（ディレクトリ）と Applications/ 配下のみ許容、他は forbidden。unit test 5件（identifier 固定、forbidden 検出、single payload+no scripts、installer script 検出、forbidden path 検出）。xtask 21 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。certificate なしで final と同形の installable package を作れる。実際の pkgutil --expand 静的検査は macOS 上で pkg-dev 実行時に行われる。`pkg-dev` CLI は B-03 から安定。
+Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 identifier（COMPONENT_IDENTIFIER=dev.siderostat-ds4-proxy.pkg、PRODUCT_IDENTIFIER=dev.siderostat-ds4-proxy.product、INSTALL_LOCATION=/Applications、PAYLOAD_PATH=/Applications/Siderostat.app）と PKG_STAGING_DIR=build/pkg-dev。pkg_dev() が pkgbuild（--component app --install-location --identifier --version）→ productbuild（--package --identifier --version）→ pkgutil --expand-full → inspect_expanded の順で実行し、`Siderostat.app` 一項目・script なし・禁止 path を検査し、違反時は fail-closed する。preinstall/postinstall script を生成しない。inspect_expanded() は展開結果を再帰的に探索し、payload/script/禁止 path を検査する。unit test 5件、xtask 25 test OK、`bash scripts/verify-macos-dev-artifacts.sh` で実 package payload `Siderostat.app` と script なしを確認（2026-08-21）。certificate なしで final と同形の installable package を作れる。`pkg-dev` CLI は B-03 から安定。
 
-### [ ] E-02 Developer ID signing / notarization pipeline を実装する
+### [x] E-02 Developer ID signing / notarization pipeline を実装する
 
 - Actor: agent + user review
 - Depends on: E-01
@@ -647,13 +649,35 @@ Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 id
 - ユーザーレビュー・手作業: Keychain profile 名、certificate 選択、notary log 保存先を承認する
 - 停止条件: password、private key、App Store Connect key 本文を引数または repository file に要求する
 
-### [ ] E-03 macOS CI に ad-hoc app/pkg verification を追加する
+Unblocked: `security find-identity -v` で Apple Development、Developer ID Application、
+Developer ID Installer の3 identityを確認。Developer ID Application / Installer ともに
+Team ID `N27G6TC25R` が一致し、E-02 実装を再開した。`-p codesigning` は Installer identity
+を除外するため使用しない。private key と notary credential 本文は repository やログへ保存しない
+(2026-08-21)。
+
+Evidence（自動 part）: `xtask/src/signing.rs` と `cargo xtask sign` を追加。helper → main app の
+inside-out Developer ID Application signing、Hardened Runtime、secure timestamp、明示 identifier、
+Developer ID Installer 付き productbuild、notarytool submit/wait、log 保存、staple、validate、
+Gatekeeper 検証、checksum/build metadata 出力を実装。`--dry-run` で profile 実値を redaction し、
+固定 command 順・identifier・payload・出力 path を確認。unit test 24件、`cargo fmt --all -- --check`、
+`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`、
+`cargo test --all-targets --features test-support`、`git diff --check` が PASS。実署名・公証は E-04
+で実行する(2026-08-21)。
+
+User review: `siderostat-notary` を Keychain profile として登録し、`xcrun notarytool history
+--keychain-profile siderostat-notary` が credential エラーではなく `No submission history.` を返す
+ことを確認。profile は有効で未提出状態。notary log 保存先 `dist/notary/` を採用する(2026-08-21)。
+
+Evidence: `cargo xtask sign --dry-run`、`xcrun notarytool history --keychain-profile
+siderostat-notary`、自動 gate は PASS。実署名・公証 artifact は E-04 で実行する。
+
+### [x] E-03 macOS CI に ad-hoc app/pkg verification を追加する
 
 - Actor: agent
 - Depends on: E-02
 - 参照: 配布仕様 16.1 節
 - 事前条件: `app-dev` と `pkg-dev` が clean worktree で成功する
-- Files: `.github/workflows/ci.yml`、必要な test script または xtask test
+- Files: `.github/workflows/ci.yml`、`scripts/verify-macos-dev-artifacts.sh`、必要な xtask test
 - Actions:
   1. certificate と network を使わない ad-hoc app build job を追加する。
   2. plist、layout、nested signature、package payload、禁止 script/path を検査する。
@@ -664,6 +688,8 @@ Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 id
 - Verification: workflow syntax、local 相当 command、共通 local gate
 - ユーザーレビュー・手作業: GitHub required check に追加する場合はユーザーが repository 設定を変更する
 - 停止条件: CI secret を pull request job へ公開する必要がある
+
+Evidence: `.github/workflows/ci.yml` に certificate/network/secret を使わない `macos-dev-artifacts` job、`scripts/verify-macos-dev-artifacts.sh` に fixture と実 artifact 検査を追加。壊れた plist、余分な payload、unsigned helper の3 fixture が個別に失敗すること、`app-dev --verify` の plist/layout/nested signature、`pkg-dev` の `/Applications` install location・`Siderostat.app` 一項目・script/禁止 path、secret・user data・model の不在を確認。`bash -n scripts/verify-macos-dev-artifacts.sh`、`cargo build --release --workspace`、`cargo test -p xtask`（25件）、local 相当 `bash scripts/verify-macos-dev-artifacts.sh`、`git diff --check` が PASS（2026-08-21）。Developer ID / notarization は CI job に含めない。次に着手可能: `E-04`。
 
 ### [ ] E-04 signed/notarized package の clean install を実機検証する
 

@@ -13,7 +13,7 @@
 use crate::bundle::PkgDevArgs;
 use crate::util;
 use anyhow::{Context, Result, bail};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 /// Component package receipt identifier (spec §9.1).
@@ -50,7 +50,7 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
     build_component(&app, &component_pkg, &args.version)?;
 
     // 2. product archive wrapping the component.
-    build_product(&component_pkg, &product_pkg, &args.version)?;
+    build_product(&component_pkg, &product_pkg, &args.version, None)?;
 
     // 3. expand and inspect: one payload item, no scripts, no forbidden paths.
     let expand_dir = staging.join("expand");
@@ -61,12 +61,27 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
     util::run(
         "pkgutil",
         &[
-            OsStr::new("--expand"),
+            OsStr::new("--expand-full"),
             OsStr::new(&product_pkg),
             OsStr::new(&expand_dir),
         ],
     )?;
     let report = inspect_expanded(&expand_dir)?;
+    anyhow::ensure!(
+        report.payload == ["Siderostat.app"],
+        "expected one Siderostat.app payload, found {:?}",
+        report.payload
+    );
+    anyhow::ensure!(
+        report.scripts.is_empty(),
+        "installer scripts are forbidden: {:?}",
+        report.scripts
+    );
+    anyhow::ensure!(
+        report.forbidden.is_empty(),
+        "forbidden package paths: {:?}",
+        report.forbidden
+    );
     util::tracing_log(&format!("package payload: {}", report.payload.join(", ")));
     util::tracing_log(&format!("package scripts: {:?}", report.scripts));
     util::tracing_log(&format!("wrote {}", product_pkg.display()));
@@ -74,7 +89,7 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
 }
 
 /// Run `pkgbuild` to create the component package with one app payload.
-fn build_component(app: &Path, component_pkg: &Path, version: &str) -> Result<()> {
+pub(crate) fn build_component(app: &Path, component_pkg: &Path, version: &str) -> Result<()> {
     util::run(
         "pkgbuild",
         &[
@@ -94,20 +109,31 @@ fn build_component(app: &Path, component_pkg: &Path, version: &str) -> Result<()
 }
 
 /// Run `productbuild` to wrap the component into the final product archive.
-fn build_product(component_pkg: &Path, product_pkg: &Path, version: &str) -> Result<()> {
-    util::run(
-        "productbuild",
-        &[
-            OsStr::new("--package"),
-            OsStr::new(component_pkg),
-            OsStr::new("--identifier"),
-            OsStr::new(PRODUCT_IDENTIFIER),
-            OsStr::new("--version"),
-            OsStr::new(version),
-            OsStr::new(product_pkg),
-        ],
-    )
-    .with_context(|| format!("productbuild {}", product_pkg.display()))?;
+pub(crate) fn build_product(
+    component_pkg: &Path,
+    product_pkg: &Path,
+    version: &str,
+    installer_identity: Option<&str>,
+) -> Result<()> {
+    let mut args = vec![
+        OsString::from("--package"),
+        component_pkg.as_os_str().to_os_string(),
+        OsString::from("--identifier"),
+        OsString::from(PRODUCT_IDENTIFIER),
+        OsString::from("--version"),
+        OsString::from(version),
+    ];
+    if let Some(identity) = installer_identity {
+        args.extend([
+            OsString::from("--sign"),
+            OsString::from(identity),
+            OsString::from("--timestamp"),
+        ]);
+    }
+    args.push(product_pkg.as_os_str().to_os_string());
+    let arg_refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+    util::run("productbuild", &arg_refs)
+        .with_context(|| format!("productbuild {}", product_pkg.display()))?;
     Ok(())
 }
 
@@ -134,8 +160,9 @@ pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
         forbidden: Vec::new(),
     };
 
-    let payload_dir = expand_dir.join("Payload");
-    if payload_dir.is_dir() {
+    let mut payload_dirs = Vec::new();
+    collect_dirs_named(expand_dir, "Payload", &mut payload_dirs)?;
+    if let [payload_dir] = payload_dirs.as_slice() {
         for entry in std::fs::read_dir(&payload_dir)
             .with_context(|| format!("read Payload {}", payload_dir.display()))?
         {
@@ -152,26 +179,88 @@ pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
                 report.forbidden.push(rel_str);
             }
         }
+    } else {
+        report.forbidden.push(format!(
+            "expected one Payload directory, found {}",
+            payload_dirs.len()
+        ));
     }
 
-    // Installer scripts: a Scripts directory or any pre/postinstall file.
-    let scripts_dir = expand_dir.join("Scripts");
-    if scripts_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
-            for entry in entries.flatten() {
-                report
-                    .scripts
-                    .push(entry.file_name().to_string_lossy().into_owned());
-            }
+    // Installer scripts: any Scripts directory or pre/postinstall file.
+    let mut scripts_dirs = Vec::new();
+    collect_dirs_named(expand_dir, "Scripts", &mut scripts_dirs)?;
+    for scripts_dir in scripts_dirs {
+        for entry in std::fs::read_dir(&scripts_dir)
+            .with_context(|| format!("read Scripts {}", scripts_dir.display()))?
+        {
+            let entry = entry.context("read installer script entry")?;
+            report
+                .scripts
+                .push(entry.file_name().to_string_lossy().into_owned());
         }
     }
-    for name in [".preinstall", ".postinstall"] {
-        if expand_dir.join(name).exists() {
-            report.scripts.push(name.into());
-        }
+    let mut script_files = Vec::new();
+    collect_files_named(
+        expand_dir,
+        &[".preinstall", ".postinstall"],
+        &mut script_files,
+    )?;
+    for script in script_files {
+        report.scripts.push(
+            script
+                .strip_prefix(expand_dir)
+                .unwrap_or(&script)
+                .display()
+                .to_string(),
+        );
     }
 
     Ok(report)
+}
+
+fn collect_dirs_named(root: &Path, name: &str, found: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))?
+    {
+        let entry = entry.context("read directory entry")?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+                found.push(path.clone());
+            }
+            collect_dirs_named(&path, name, found)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_files_named(
+    root: &Path,
+    names: &[&str],
+    found: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))?
+    {
+        let entry = entry.context("read directory entry")?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_named(&path, names, found)?;
+        } else if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| names.contains(&value))
+        {
+            found.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Whether a payload entry path lands on a forbidden install destination.
@@ -181,7 +270,10 @@ pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
 /// is forbidden.
 fn is_forbidden_payload(rel: &str) -> bool {
     let rel = rel.trim_start_matches('/');
-    !(rel == "Applications" || rel.starts_with("Applications/"))
+    !(rel == "Siderostat.app"
+        || rel.starts_with("Siderostat.app/")
+        || rel == "Applications"
+        || rel.starts_with("Applications/"))
 }
 
 #[cfg(test)]
