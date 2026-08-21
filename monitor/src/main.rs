@@ -10,6 +10,8 @@ mod client;
 mod config;
 mod launchd;
 mod metrics;
+mod migration;
+mod service_management;
 mod settings;
 mod state;
 mod tray;
@@ -50,6 +52,8 @@ fn main() -> Result<()> {
 
     // Polling runs on a separate thread with its own Tokio runtime so the
     // main thread stays free for the AppKit menu bar event loop.
+    // The menu-bar graceful-restart path needs its own handle to the client.
+    let menu_client = Arc::new(client.clone());
     let poll_client = client;
     let poll_state = shared.clone();
     thread::Builder::new()
@@ -80,36 +84,65 @@ fn main() -> Result<()> {
     }
 
     // LaunchAgent operations run on dedicated threads so the AppKit main loop is
-    // never blocked. Stopping this monitor is delegated to launchd, which also
-    // keeps the runtime and monitor job lifecycle consistent.
+    // never blocked. In bundle mode (C-05a) the runtime and monitor are managed
+    // through Service Management and the graceful-restart admin endpoint, never
+    // through launchctl.
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if MonitorTray::is_quit_event(&event) {
             tracing::info!("quit requested from menu");
             let _ = thread::Builder::new()
                 .name("siderostat-monitor-stop".into())
-                .spawn(|| {
-                    if let Err(error) = launchd::bootout_runtime_and_monitor() {
+                .spawn(move || {
+                    if launchd::is_bundle_mode() {
+                        // bundle mode: stop only this monitor process; the runtime
+                        // keeps running. launchctl bootout is not used (C-05a).
+                        tracing::info!("exiting monitor process (bundle mode)");
+                        std::process::exit(0);
+                    } else if let Err(error) = launchd::bootout_runtime_and_monitor() {
                         tracing::warn!(error = %error, "LaunchAgent stop failed");
                     }
                 });
-        } else if MonitorTray::is_proxy_restart_event(&event) {
-            tracing::info!("proxy restart requested from menu");
+        } else if MonitorTray::is_runtime_restart_event(&event) {
+            tracing::info!("runtime restart requested from menu");
+            let client = menu_client.clone();
             let _ = thread::Builder::new()
-                .name("siderostat-proxy-restart".into())
+                .name("siderostat-runtime-restart".into())
                 .spawn(move || {
-                    if let Err(error) = launchd::kickstart(launchd::RUNTIME_LABEL) {
-                        tracing::warn!(error = %error, "Proxy restart failed");
+                    if launchd::is_bundle_mode() {
+                        // bundle mode: graceful restart via the authenticated
+                        // /admin/restart endpoint (C-04). launchctl kickstart
+                        // is not used (C-05a).
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime.block_on(async {
+                            match client.graceful_restart().await {
+                                Ok((status, body)) => tracing::info!(
+                                    status = %status,
+                                    response = %body,
+                                    "graceful restart requested"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    error = %error,
+                                    "graceful restart request failed"
+                                ),
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })?;
+                        Ok::<(), anyhow::Error>(())
+                    } else {
+                        if let Err(error) = launchd::kickstart(launchd::RUNTIME_LABEL) {
+                            tracing::warn!(error = %error, "Runtime restart failed");
+                        }
+                        Ok::<(), anyhow::Error>(())
                     }
                 });
-        } else if MonitorTray::is_monitor_restart_event(&event) {
-            tracing::info!("monitor restart requested from menu");
-            let _ = thread::Builder::new()
-                .name("siderostat-monitor-restart".into())
-                .spawn(move || {
-                    if let Err(error) = launchd::kickstart(launchd::MONITOR_LABEL) {
-                        tracing::warn!(error = %error, "Monitor restart failed");
-                    }
-                });
+        } else if MonitorTray::is_bg_start_event(&event) {
+            tracing::info!("background start requested from menu");
+            register_runtime(true);
+        } else if MonitorTray::is_bg_stop_event(&event) {
+            tracing::info!("background stop requested from menu");
+            register_runtime(false);
         } else if MonitorTray::is_open_config_event(&event) {
             tracing::info!("open configuration requested from menu");
             let _ = thread::Builder::new()
@@ -117,6 +150,15 @@ fn main() -> Result<()> {
                 .spawn(move || {
                     if let Err(error) = settings::open_runtime_config() {
                         tracing::warn!(error = %error, "Open configuration failed");
+                    }
+                });
+        } else if MonitorTray::is_open_login_items_event(&event) {
+            tracing::info!("open login items requested from menu");
+            let _ = thread::Builder::new()
+                .name("siderostat-open-login-items".into())
+                .spawn(move || {
+                    if let Err(error) = settings::open_login_items() {
+                        tracing::warn!(error = %error, "Open Login Items failed");
                     }
                 });
         }
@@ -200,6 +242,45 @@ async fn poll_loop(client: MetricsClient, shared: Arc<Mutex<DisplayState>>) {
             client.poll_interval()
         };
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Register (`start = true`) or unregister (`start = false`) the runtime
+/// background service through Service Management (C-02/C-05a). This runs on
+/// the main thread (AppKit requirement) so it must be called from the menu
+/// event handler directly, not from a background thread.
+#[cfg(target_os = "macos")]
+fn register_runtime(start: bool) {
+    use crate::service_management::{ServiceKind, ServiceManagement, ServiceManagementAdapter};
+    let adapter = ServiceManagement::new();
+    let outcome = if start {
+        adapter.register(ServiceKind::RuntimeAgent)
+    } else {
+        match adapter.unregister(ServiceKind::RuntimeAgent) {
+            crate::service_management::UnregisterOutcome::Unregistered
+            | crate::service_management::UnregisterOutcome::AlreadyNotRegistered => {
+                tracing::info!("runtime background service unregistered");
+                return;
+            }
+            crate::service_management::UnregisterOutcome::Error(message) => {
+                tracing::warn!(message = %message, "runtime background unregister failed");
+                return;
+            }
+        }
+    };
+    match outcome {
+        crate::service_management::RegisterOutcome::Registered => {
+            tracing::info!("runtime background service registered");
+        }
+        crate::service_management::RegisterOutcome::RequiresApproval => {
+            tracing::warn!("runtime background service requires approval in System Settings");
+        }
+        crate::service_management::RegisterOutcome::DeniedByUser => {
+            tracing::warn!("runtime background service registration denied by user");
+        }
+        crate::service_management::RegisterOutcome::Error(message) => {
+            tracing::warn!(message = %message, "runtime background register failed");
+        }
     }
 }
 
