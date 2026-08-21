@@ -229,7 +229,7 @@ R-01 -> R-02 -> R-03
 - Actions:
   1. 最低 macOS version を、`SMAppService` を利用できる 13.0 以上の具体値で一つに固定する。
   2. bundle / runtime / pkg identifier は配布仕様 5.2 節の値をそのまま採用する。
-  3. Team ID、Developer ID Application / Installer certificate の表示名を記録し、秘密鍵や
+  3. Developer ID Application / Installer certificate の表示名を記録し、秘密鍵や
      credential は記録しない。
   4. `Siderostat` 表示名、正式 icon asset、file logging または Unified Logging を決める。
   5. runtime graceful restart endpoint の method、path、認証、成功・失敗 JSON を固定する。
@@ -237,10 +237,10 @@ R-01 -> R-02 -> R-03
 - 事後条件: 後続 task に build を止める `TBD` がない
 - 受入基準: 決定表の全行に「値、理由、変更時の影響、承認日」がある
 - Verification: 文書 link と identifier の配布仕様一致を目視確認
-- ユーザーレビュー・手作業: 最低 OS、表示名、icon、Team ID、certificate 表示名、UX 文言を承認する
-- 停止条件: Team ID が未取得でも B〜D は進められるが、`E-02` 以降は開始しない
+- ユーザーレビュー・手作業: 最低 OS、表示名、icon、certificate 表示名、UX 文言を承認する
+- 停止条件: Developer ID certificate identity が未取得でも B〜D は進められるが、`E-02` 以降は開始しない
 
-Evidence: docs/distribution/v0.3.0-release-decisions.md; 最低OS 26.0、identifier は仕様5.2採用、Team ID `N27G6TC25R`、Developer ID Application / Installer の表示名、structured file logging、placeholder icon、POST /admin/restart contract と日本語UX文言を記録・承認。Team ID と証明書表示名は `security find-identity -v` の確認結果を反映（2026-08-21）。
+Evidence: docs/distribution/v0.3.0-release-decisions.md; 最低OS 26.0、identifier は仕様5.2採用、Developer ID Application / Installer の表示名、structured file logging、placeholder icon、POST /admin/restart contract と日本語UX文言を記録・承認。証明書 identity の確認結果を反映（2026-08-21）。
 
 ### [x] A-02 v0.2.1 の移行 baseline を保存する
 
@@ -650,10 +650,9 @@ Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 id
 - 停止条件: password、private key、App Store Connect key 本文を引数または repository file に要求する
 
 Unblocked: `security find-identity -v` で Apple Development、Developer ID Application、
-Developer ID Installer の3 identityを確認。Developer ID Application / Installer ともに
-Team ID `N27G6TC25R` が一致し、E-02 実装を再開した。`-p codesigning` は Installer identity
-を除外するため使用しない。private key と notary credential 本文は repository やログへ保存しない
-(2026-08-21)。
+Developer ID Installer の3 identityを確認し、E-02 実装を再開した。`-p codesigning` は
+Installer identity を除外するため使用しない。private key と notary credential 本文は repository
+やログへ保存しない(2026-08-21)。
 
 Evidence（自動 part）: `xtask/src/signing.rs` と `cargo xtask sign` を追加。helper → main app の
 inside-out Developer ID Application signing、Hardened Runtime、secure timestamp、明示 identifier、
