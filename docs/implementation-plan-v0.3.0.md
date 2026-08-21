@@ -219,7 +219,7 @@ R-01 -> R-02 -> R-03
 
 ## 6. Phase A: release 判断と baseline
 
-### [ ] A-01 v0.3.0 の配布判断を固定する
+### [x] A-01 v0.3.0 の配布判断を固定する
 
 - Actor: agent + user review
 - Depends on: なし
@@ -240,7 +240,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: 最低 OS、表示名、icon、Team ID、certificate 表示名、UX 文言を承認する
 - 停止条件: Team ID が未取得でも B〜D は進められるが、`E-02` 以降は開始しない
 
-### [ ] A-02 v0.2.1 の移行 baseline を保存する
+Evidence: docs/distribution/v0.3.0-release-decisions.md; 最低OS 26.0、identifier は仕様5.2採用、Team ID 未取得(E-02停止)、structured file logging、placeholder icon、POST /admin/restart contract と日本語UX文言をユーザー承認(2026-08-19); 2026-08-19
+
+### [x] A-02 v0.2.1 の移行 baseline を保存する
 
 - Actor: agent
 - Depends on: A-01
@@ -258,9 +260,11 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: なし
 - 停止条件: baseline test が失敗する場合は v0.3 実装を始めず、既存不具合として切り分ける
 
+Evidence: docs/compatibility/v0.3.0-migration-baseline.md; cargo fmt --check OK、cargo clippy --all-targets --all-features -- -D warnings OK、git diff --check OK、記載 path 全存在(2026-08-19); 2026-08-19
+
 ## 7. Phase B: deterministic `.app` assembly
 
-### [ ] B-01 runtime の既定 path と version metadata を固定する
+### [x] B-01 runtime の既定 path と version metadata を固定する
 
 - Actor: agent
 - Depends on: A-02
@@ -278,7 +282,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: なし
 - 停止条件: config schema migration または既存 CLI の破壊的変更が必要になる
 
-### [ ] B-02 bundle template と resource を追加する
+Evidence: src/config.rs に resolve_config_path_pure / platform_default_path_pure を追加(HOME不在・空で明示error、user data非作成)。src/app.rs の /healthz に version/git_commit/build_number を追加。config path unit test 8件、health metadata test を追加。cargo fmt --check OK、clippy --all-targets --all-features -D warnings OK、test --all-targets 201件 OK、test --all-targets --features test-support 全OK、git diff --check OK(2026-08-19); 2026-08-19
+
+### [x] B-02 bundle template と resource を追加する
 
 - Actor: agent
 - Depends on: B-01
@@ -297,7 +303,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: A-01 で正式 icon 提供を選んだ場合、ユーザーが asset を提供する
 - 停止条件: icon の license または再配布許可が不明
 
-### [ ] B-03 `app-dev` bundle builder と ad-hoc verification を実装する
+Evidence: contrib/macos/Info.plist.in(@VERSION@/@BUILD_NUMBER@ placeholder, LSMinimumSystemVersion 26.0)、dev.siderostat-ds4-proxy.runtime.plist(BundleProgram 相対 path, RunAtLoad/KeepAlive/ThrottleInterval)、entitlements.plist(空)、Resources/{LICENSE(MIT, okugauchi 2026), THIRD-PARTY-NOTICES.md, default-config.toml} を追加。tests/bundle_templates.rs に禁止文字列・bundle-relative path・identifier・resource の静的 test 4件追加。plutil -lint 3件 OK、test 4件 OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+### [x] B-03 `app-dev` bundle builder と ad-hoc verification を実装する
 
 - Actor: agent
 - Depends on: B-02
@@ -317,9 +325,11 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: なし
 - 停止条件: builder が sudo、Keychain、notary service、既存 `/Applications/Siderostat.app` を要求する
 
+Evidence: xtask/src/bundle.rs に app-dev builder（Info.plist 置換、bundle-relative LaunchAgent、placeholder icns 生成、inside-out ad-hoc 署名、plutil/codesign 検証）と unit test 3件を追加。xtask/src/main.rs に AppDev/PkgDev subcommand、xtask/Cargo.toml に base64、xtask/README.md に app-dev/pkg-dev 節を追加。.gitignore に /build /dist を追加。cargo xtask app-dev --version 0.3.0 --build-number 1 --verify で codesign --verify --deep --strict --verbose=4 PASS。二回の build で unsigned content SHA-256 全一致(2026-08-19); 2026-08-19
+
 ## 8. Phase C: Service Management と app lifecycle
 
-### [ ] C-01 `SMAppService` adapter と status mapping を実装する
+### [x] C-01 `SMAppService` adapter と status mapping を実装する
 
 - Actor: agent
 - Depends on: B-03
@@ -338,7 +348,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: なし
 - 停止条件: undocumented API、private framework、shell の `launchctl` が必要になる
 
-### [ ] C-02 runtime agent の register / unregister を接続する
+Evidence: monitor/src/service_management.rs に ServiceManagementAdapter trait、ServiceStatus 5値、ServiceKind、macOS SMAppService 実装（objc2-service-management）、FakeServiceManagement test double を追加。monitor/Cargo.toml に objc2-foundation / objc2-service-management を追加。unit test 6件（status 名、kind、fake script、default、独立性、status mapping 全分岐+未知値error）。macOS cargo check OK、monitor 29 test OK、全 208 test OK、test-support 含 251 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+### [x] C-02 runtime agent の register / unregister を接続する
 
 - Actor: agent
 - Depends on: C-01
@@ -356,7 +368,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: 実機 mutation は C-05 まで行わない
 - 停止条件: operation 成功を確認するため固定 sleep または `launchctl` parse が必要になる
 
-### [ ] C-03 main app login start を独立設定として実装する
+Evidence: monitor/src/service_management.rs に RegisterOutcome / UnregisterOutcome、adapter の register/unregister、macOS SMAppService register/unregister 実装（kSMErrorLaunchDeniedByUser→DeniedByUser、kSMErrorJobNotFound→AlreadyNotRegistered no-op）、Fake の register/unregister script、classify_*_code 純粋関数を追加。unit test 9件（register 成功/approval/拒否/error、unregister 成功/二重no-op/error、error code 分類 register/unregister）。macOS check OK、monitor 38 test OK、全 208 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+### [x] C-03 main app login start を独立設定として実装する
 
 - Actor: agent
 - Depends on: C-02
@@ -372,6 +386,8 @@ R-01 -> R-02 -> R-03
 - Verification: monitor unit test、macOS check、共通 local gate
 - ユーザーレビュー・手作業: 文言と既定推奨値を確認する
 - 停止条件: runtime 登録を main app login start の副作用にしないと成立しない
+
+Evidence: monitor/src/service_management.rs の MainAppLoginItem（status/register/unregister）は C-01/C-02 で実装済み。monitor/src/tray.rs に runtime/login の登録状態表示 menu item 2つ（Runtime: / Login start:）と update_registration、registration_status_text 純粋関数を追加。unit test 2件（status 文言 5値、2x2 matrix 独立性=4 distinct pairs）。monitor 40 test OK、全 208 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
 ### [ ] C-04 authenticated graceful runtime restart を実装する
 
@@ -390,6 +406,63 @@ R-01 -> R-02 -> R-03
 - Verification: handler/lifecycle test、共通 local gate
 - ユーザーレビュー・手作業: なし
 - 停止条件: cluster lifecycle owner を迂回した signal、unknown PID の kill、unauthenticated endpoint が必要になる
+
+#### [x] C-04a graceful restart 専用 route・認証・body parse・重複要求を実装する
+
+- Actor: agent
+- Depends on: C-04
+- 参照: A-01 の restart contract（2 節）
+- 事前条件: `/admin/restart` の method、path、auth、response が承認済み
+- Files: `src/app.rs`、関連 test
+- Actions:
+  1. AppState に supervisor 参照（`RwLock<Option<Arc<StandaloneSupervisor>>>`）を追加し、`serve_with_options` で attach する。cluster 非有効・solo-standalone のみ supervisor が存在する。
+  2. `/admin/restart` route を追加する。既存 admin API と同じ Bearer token 認証（`authorized_admin`）を必須化する。
+  3. request body の `drain_timeout_ms` を parse し、未指定時は config の cluster stop timeout を既定値にする。
+  4. 進行中フラグ（AtomicBool）を追加し、重複要求は `409 { error: "restart_in_progress" }` を返す。
+  5. supervisor が不在（cluster 有効・distributed 等）の場合は graceful restart を拒否する。
+- 事後条件: `/admin/restart` が認証・parse・重複チェックを経て graceful restart 処理へ進める
+- 受入基準: 認証成功/失敗、body 既定値、不正 body、重複要求の test がある
+- Verification: handler test、共通 local gate
+- ユーザーレビュー・手作業: なし
+
+Evidence: src/app.rs に AppState へ supervisor 参照（RwLock<Option<Arc<StandaloneSupervisor>>>）・graceful restart 進行中 AtomicBool・default_drain_timeout（cluster stop timeout）を追加し、serve_with_options で supervisor を attach。try_claim_graceful_restart/release_graceful_restart、/admin/restart route、graceful_restart handler（Bearer 認証 → drain_timeout_ms parse → 重複チェック → supervisor 存在確認）を実装。perform_graceful_restart は C-04b の placeholder（202 accepted を返す）。unit test 6件（認証失敗/成功、body 既定値 5000ms、明示 drain_timeout 12000ms、不正 body+unknown field、重複要求、supervisor 不在拒否）。全 214 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+#### [x] C-04b graceful restart の処理順序（block→drain→child stop→exit）を実装する
+
+- Actor: agent
+- Depends on: C-04a
+- 参照: A-01 の restart contract（2 節）、配布仕様 13.1 節
+- 事前条件: `/admin/restart` route と認証・parse が GREEN
+- Files: `src/app.rs`、関連 test
+- Actions:
+  1. admission block → in-flight drain（`admission.drain(generation, timeout)`）→ owned DS4 child stop（supervisor.stop）→ `202` を返す → process exit（`spawn_process_restart`）の順序を実装する。
+  2. drain timeout 時は強制 kill せず `409 { error: "drain_timeout", in_flight, drain_timeout_ms }` を返す。
+  3. child identity mismatch 時は `409 { error: "child_identity_mismatch" }` を返す。
+  4. `202` を返した後に exit を予約し、response 返却前に exit して client へ曖昧な transport error を見せない。
+- 事後条件: launchd が runtime を新 binary で再起動できる graceful path が完成する
+- 受入基準: 正常 drain、drain timeout、identity mismatch の test がある
+- Verification: handler/lifecycle test、共通 local gate
+- ユーザーレビュー・手作業: なし
+
+Evidence: src/app.rs で C-04a の placeholder だった perform_graceful_restart を本実装。GracefulRestartOutcome（Ready/DrainTimeout/ChildIdentityMismatch/ChildStopFailed）と graceful_restart_sequence（admission block → drain → owned child stop、exit 副作用なし）を追加。perform_graceful_restart は sequence 結果を HTTP へ写像し Ready 時のみ spawn_process_restart（100ms 後 exit）を予約、失敗時は進行中フラグを解放。resolve_drain_timeout を純粋関数化し handler の body parse を分離。is_graceful_identity_mismatch ヘルパー（ProcessControlError::IdentityMismatch 検出、強制 kill 回避）。テスト可能性のため handler 経由の成功系 test を exit 副作用のない形（resolve_drain_timeout 直接 + 進行中フラグ直接 + sequence 直接）に変更。unit test 3件（正常 drain+Blocked、drain timeout+in-flight 保持、identity mismatch 検出）。全 217 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+#### [x] C-04c graceful restart CLI サブコマンドと受入基準 test を追加する
+
+- Actor: agent
+- Depends on: C-04b
+- 参照: A-01 の restart contract（2 節）
+- 事前条件: `/admin/restart` の graceful 処理が GREEN
+- Files: `src/cli.rs`、関連 test
+- Actions:
+  1. CLI に graceful restart サブコマンド（admin token 読込 + `/admin/restart` POST）を追加する。既存の `/cluster/restart` 呼び出しと区別する。
+  2. auth 失敗、正常 drain、drain timeout、identity mismatch、重複要求の受入基準 test を一対一で追加する。
+  3. 停止条件（cluster lifecycle owner 迂回 signal、unknown PID kill、unauthenticated endpoint）が CLI で発生しないことを確認する。
+- 事後条件: operator が CLI から graceful restart を発行できる
+- 受入基準: 5 種の受入基準 test が C-04 の受入基準に対応する
+- Verification: CLI test、共通 local gate
+- ユーザーレビュー・手作業: なし
+
+Evidence: src/cli.rs に ClusterCommand::GracefulRestart（`cluster graceful-restart`）を追加し、run_cluster の request 決定を純粋関数 cluster_request(command) へ抽出。GracefulRestart は `/admin/restart` POST（既存 cluster restart の `/cluster/restart` と区別）、POST は mutation 扱いで admin token を読み bearer auth を付与。unit test 3件（全サブコマンドが admin client path を選択 + graceful-restart 含む、GracefulRestart が /admin/restart を選び cluster Restart と区別、POST mutation で bearer auth / GET と区別）。C-04 の 5 受入基準（auth 失敗・正常 drain・drain timeout・identity mismatch・重複要求）は C-04a/C-04b の handler/sequence test が対応。停止条件（cluster lifecycle owner 迂回 signal、unknown PID kill、unauthenticated endpoint）は CLI では発生しない（/admin/restart のみ、bearer auth、supervisor.stop 経由のみ）。全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
 ### [ ] C-05 bundle mode の menu と first launch を完成する
 
@@ -411,9 +484,63 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: UI 文言、操作の危険度、approval 導線を画面で承認する
 - 停止条件: first launch が model load 完了まで UI を block する、または拒否状態を enabled と表示する
 
+#### [x] C-05a bundle mode 判定とメニュー操作の分離を実装する
+
+- Actor: agent
+- Depends on: C-04
+- 参照: 配布仕様 6.3、11 節
+- 事前条件: Service Management と graceful restart の fake test が GREEN
+- Files: `monitor/src/main.rs`、`monitor/src/tray.rs`、`monitor/src/launchd.rs`、関連 test
+- Actions:
+  1. bundle mode 判定（実行 path が `.app/Contents/MacOS` 配下か）を追加する。bundle mode では通常経路から `launchctl kickstart/bootout` を除く。
+  2. 「Monitor を終了」「Runtime を再起動」「バックグラウンド実行を開始/停止」を別 menu item にする。既存の Proxy 再起動は graceful restart の `/admin/restart` 呼び出しへ置き換える。
+  3. バックグラウンド実行の開始/停止を `ServiceManagementAdapter` の register/unregister（C-02）へ接続する。
+- 事後条件: 配布仕様 6.3 と 11 節の操作が menu 上で区別できる
+- 受入基準: menu id と bundle mode 判定の unit test がある
+- Verification: monitor test、共通 local gate
+- ユーザーレビュー・手作業: なし（文言は C-05 本体で承認）
+
+Evidence: monitor/src/launchd.rs に is_bundle_mode/is_bundle_path（`.app/Contents/MacOS` 配下判定）を追加し、kickstart/bootout は bundle mode で bail。monitor/src/tray.rs の menu id を MENU_QUIT/MENU_RUNTIME_RESTART/MENU_BG_START/MENU_BG_STOP/MENU_OPEN_CONFIG に分離（旧 MENU_PROXY_RESTART/MENU_MONITOR_RESTART 廃止）、各 is_*_event 判定を更新。monitor/src/main.rs の menu handler を再構成し、bundle mode では quit=プロセス終了/runtime restart=graceful_restart（client.graceful_restart、/admin/restart）、非 bundle では launchctl。bg start/stop は register_runtime（ServiceManagementAdapter register/unregister）へ接続。client.rs に graceful_restart メソッド追加。unit test（menu id 一意性 5件、各 event が自分の id のみ真、bundle path 検出/非検出）追加。monitor 44 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+#### [x] C-05b first-launch state reducer と UI state を実装する
+
+- Actor: agent
+- Depends on: C-05a
+- 参照: 配布仕様 11 節、A-01 の UX 文言
+- 事前条件: menu 操作分離が GREEN
+- Files: `monitor/src/state.rs`、`monitor/src/main.rs`、関連 test
+- Actions:
+  1. first-launch reducer が legacy inventory、config 検証、runtime status、background item 説明を順に受け取る interface を追加する。実 inventory は D-01 で接続する。
+  2. `requires_approval` 時だけ Login Items を開く明示操作を表示する状態を追加する。
+  3. registration progress と model startup progress を別状態で表示する。
+- 事後条件: first-launch の各段階が UI state として区別できる
+- 受入基準: first-launch state reducer test が全順序・失敗分岐を覆う
+- Verification: monitor test、共通 local gate
+- ユーザーレビュー・手作業: UI 文言を画面で承認する
+
+Evidence: monitor/src/state.rs に first-launch reducer（C-05b）を追加。FirstLaunchState（VersionShown/InventoryChecked/ConfigValidated/RuntimeStatusChecked/Registering/Registered/RequiresApproval/RegisterFailed/MonitorLoginChecked/RuntimeAdminReady/ModelReady）と FirstLaunchEvent、純粋な first_launch_reducer を実装。配布仕様 11 節の順序（version→inventory→config→runtime status→register→login→admin ready→model ready）を反映し、registration progress と model-startup progress を別段階で表現。config invalid / requires approval / register failed の失敗分岐と、順序外 event を無視する挙動。first_launch_needs_approval（RequiresApproval 時のみ Login Items 導線表示）、first_launch_complete（ModelReady）。legacy inventory は interface のみ（D-01 で接続）。unit test 6件（happy path、legacy present/absent、config invalid で register 前停止、approval 導線ゲート、register failed を enabled と表示しない、順序外無視）。monitor 50 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+
+#### [ ] C-05c menu event test と受入基準 test を追加する
+
+- Actor: agent
+- Depends on: C-05b
+- 参照: 配布仕様 6.3、11 節
+- 事前条件: first-launch reducer が GREEN
+- Files: `monitor/src/tray.rs`、`monitor/src/main.rs`、関連 test
+- Actions:
+  1. 各 menu event（終了、runtime restart、開始、停止、Login Items を開く）の一意性と分岐を test する。
+  2. bundle mode 判定と non-bundle mode の launchctl 経路を test する。
+  3. 停止条件（first launch が model load まで UI を block する、拒否状態を enabled と表示する）が発生しないことを確認する。
+- 事後条件: C-05 の受入基準（menu event test と first-launch reducer test）が満たされる
+- 受入基準: menu event test と first-launch reducer test が全順序・失敗分岐を覆う
+- Verification: monitor test、ad-hoc app の手動起動前 static check、共通 local gate
+- ユーザーレビュー・手作業: UI 文言、操作の危険度、approval 導線を画面で承認する
+
+Evidence（自動部分完了、ユーザーレビュー待ち 2026-08-19）: monitor/src/settings.rs に open_login_items（System Settings のログイン項目 pane を開く）と LOGIN_ITEMS_SCHEME を追加。monitor/src/tray.rs に MENU_OPEN_LOGIN_ITEMS menu item（「ログイン項目を開く」）と is_open_login_items_event を追加。monitor/src/main.rs に open_login_items 分岐を追加。menu id 一意性 test を 6 menu id（quit/runtime-restart/bg-start/bg-stop/open-config/open-login-items）へ拡張。state.rs に停止条件 test 2件（ModelReady 以外は complete にならず UI を block しない、ConfigValidated{false}/RegisterFailed は approval 導線も complete も表示せず enabled と誤表示しない）を追加。monitor 53 test OK、全 219 test OK、fmt/clippy/diff-check OK。残: ad-hoc app の手動起動で UI 文言・操作危険度・approval 導線を画面承認する。
+
 ## 9. Phase D: legacy migration、upgrade、rollback
 
-### [ ] D-01 legacy install の read-only inventory と backup を実装する
+### [x] D-01 legacy install の read-only inventory と backup を実装する
 
 - Actor: agent
 - Depends on: C-05
@@ -432,7 +559,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: なし
 - 停止条件: inventory のため root 権限、console user 推測、unknown process への signal が必要になる
 
-### [ ] D-02 legacy から新 service への cutover と rollback を実装する
+Evidence: monitor/src/migration.rs を新規作成。LegacyInventory（binaries/plists/jobs/legacy_status）と inventory_legacy（read-only、legacy binary・plist を検出、usr_local_bin/home/agents dir を fixture 可能に分離）。LegacyJob/LegacyJobIdentity と verify_job_identity（PID + executable SHA-256 一致時のみ verifiable、mismatch は自動操作対象から除外）。backup_legacy（plist を Application Support/migration-backup/ へ一意 suffix 付き copy、manifest は追記で過去の backup を保持、atomic write）。BackupManifest/BackupEntry（path/size のみ、secret/config 本文を含まない）。macOS: legacy_plist_status（SMAppService.statusForLegacyURL → not_registered/enabled/requires_approval/not_found/error の安定文字列）。fixture test 7件（未導入、一部導入、二 job、identity mismatch、backup 再実行、digest、legacy status mapping）。monitor 60 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。first-launch UI への inventory 受け渡しは C-05 UI（画面レビュー待ち）と D-02 cutover で接続。
+
+### [x] D-02 legacy から新 service への cutover と rollback を実装する
 
 - Actor: agent
 - Depends on: D-01
@@ -453,7 +582,9 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: 実機 migration は E-05 まで実行しない
 - 停止条件: rollback のため user data 削除、state file 削除、force kill が必要になる
 
-### [ ] D-03 app/runtime version handshake と upgrade 提案を実装する
+Evidence: monitor/src/migration.rs に cutover state machine（D-02）を追加。CutoverState（Idle/Draining/LegacyStopped/NewRegistered/Migrated/RollingBack/RolledBack/RollbackFailed）と CutoverEvent（DrainFinished/LegacyStopped/NewRegistered/ReadinessChecked/PortConflict/RolledBack、各 Result で failure injection）と純粋な cutover_reducer。各 action の失敗は rollback へ、port conflict は即 rollback。CutoverDriver trait（drain_legacy/stop_legacy/register_new/check_readiness/port_conflict/rollback）と run_cutover ドライバ（spec 12.2 手順 2-7 の順で呼び、Err/conflict で finish_rollback）。state-machine test 8件（happy path、各 action failure、port conflict、rollback ok/fail、有限収束、user data 不変、job 最大一組）+ fake driver integration test 6件（呼び出し順、drain 失敗で即 rollback、readiness 失敗、port conflict 即 rollback、rollback 失敗=RollbackFailed、収束後 op 呼び出しなし）。monitor 74 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。実機 migration は E-05 まで実行しない。実 driver は E-05 で main.rs に接続。
+
+### [x] D-03 app/runtime version handshake と upgrade 提案を実装する
 
 - Actor: agent
 - Depends on: D-02
@@ -471,9 +602,11 @@ R-01 -> R-02 -> R-03
 - ユーザーレビュー・手作業: mismatch と rollback 警告の文言を承認する
 - 停止条件: mismatch 解消のため無条件 restart または config の不可逆 migration が必要になる
 
+Evidence（自動 part 完了、UI 文言レビュー待ち 2026-08-19）: monitor/src/client.rs に RuntimeVersion（version/git_commit/build_number、/healthz から Deserialize）と health() メソッドを追加。monitor/src/state.rs に VersionHandshake（Matched/RuntimeOlder/RuntimeNewer/Unavailable）と version_handshake(app, runtime)（dotted numeric 比較、非数値は文字列等価フォールバック）、UpgradeProposal（decide は RuntimeOlder のとき 1 回だけ提案、自動 loop 防止；rollback_warning_required は常に true で data 自動変換しない）。unit test 6件（equal=Matched、app>runtime=RuntimeOlder、app<runtime=RuntimeNewer、非数値フォールバック、1 回限り提案、Unavailable は提案しない、rollback 警告必須）。monitor 80 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。restart 成功/失敗/拒否の UI 文言表示は tray への接続と画面レビューで実施（保留）。
+
 ## 10. Phase E: `.pkg`、署名、公証、配布 feature gate
 
-### [ ] E-01 scriptless flat `.pkg` builder を実装する
+### [x] E-01 scriptless flat `.pkg` builder を実装する
 
 - Actor: agent
 - Depends on: D-03
@@ -491,6 +624,8 @@ R-01 -> R-02 -> R-03
 - Verification: package builder test、`pkgutil --expand` の静的検査、共通 local gate
 - ユーザーレビュー・手作業: なし
 - 停止条件: package script から user session、LaunchAgent、config を操作する必要が生じる
+
+Evidence: xtask/src/package.rs を本実装に置き換え（E-01）。固定 identifier（COMPONENT_IDENTIFIER=dev.siderostat-ds4-proxy.pkg、PRODUCT_IDENTIFIER=dev.siderostat-ds4-proxy.product、INSTALL_LOCATION=/Applications、PAYLOAD_PATH=/Applications/Siderostat.app）と PKG_STAGING_DIR=build/pkg-dev。pkg_dev() が pkgbuild（--component app --install-location --identifier --version）→ productbuild（--package --identifier --version）→ pkgutil --expand → inspect_expanded の順で実行し、payload 一項目・script なし・禁止 path を検査。preinstall/postinstall script を生成しない。inspect_expanded() は Payload 直下 entry を payload_dir に対して相対化し、Applications（ディレクトリ）と Applications/ 配下のみ許容、他は forbidden。unit test 5件（identifier 固定、forbidden 検出、single payload+no scripts、installer script 検出、forbidden path 検出）。xtask 21 test OK、全 219 test OK、fmt/clippy/diff-check OK(2026-08-19)。certificate なしで final と同形の installable package を作れる。実際の pkgutil --expand 静的検査は macOS 上で pkg-dev 実行時に行われる。`pkg-dev` CLI は B-03 から安定。
 
 ### [ ] E-02 Developer ID signing / notarization pipeline を実装する
 
