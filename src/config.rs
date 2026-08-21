@@ -3,7 +3,9 @@ use serde::Deserialize;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -804,20 +806,42 @@ fn environment_config_path(name: &str, suffix: &str) -> anyhow::Result<PathBuf> 
     Ok(path)
 }
 
+/// `serve --config` 未指定時、または `SIDEROSTAT_CONFIG` も cwd の `siderostat.toml` も
+/// 使えない場合に、Application Support 配下の既定 `config.toml` を解決する純粋関数。
+/// caller から明示 path が渡された場合は従来どおり優先する。
 fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    resolve_config_path_pure(
+        explicit,
+        env::var_os("SIDEROSTAT_CONFIG").as_deref(),
+        env::var_os("HOME").as_deref(),
+        &|path| path.exists(),
+    )
+}
+
+/// env と file 存在判定を引数化した純粋な path 解決。`HOME` の不在・空は明示 error とし、
+/// user data を作成しない。並列 test で global env を汚さずに検証できる。
+fn resolve_config_path_pure(
+    explicit: Option<&Path>,
+    config_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = env::var_os("SIDEROSTAT_CONFIG") {
+    if let Some(path) = config_env {
+        if path.is_empty() {
+            anyhow::bail!("SIDEROSTAT_CONFIG is set but empty");
+        }
         return Ok(PathBuf::from(path));
     }
     let current = PathBuf::from(DEFAULT_CONFIG_FILE);
-    if current.exists() {
+    if exists(&current) {
         return Ok(current);
     }
-    let platform = platform_default_path();
+    let platform = platform_default_path_pure(home)?;
     anyhow::ensure!(
-        platform.exists(),
+        exists(&platform),
         "configuration not found; tried {}, SIDEROSTAT_CONFIG, {}, and {}",
         "--config",
         current.display(),
@@ -826,14 +850,20 @@ fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(platform)
 }
 
-fn platform_default_path() -> PathBuf {
+/// プラットフォーム既定の config path。macOS では Application Support 配下の
+/// `config.toml` を `HOME` から解決する。`HOME` が存在しない、または空の場合は
+/// 明示 error を返す（user data を作成しない）。
+fn platform_default_path_pure(home: Option<&OsStr>) -> anyhow::Result<PathBuf> {
     if cfg!(target_os = "macos") {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("Library/Application Support/siderostat/config.toml")
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!("HOME is not set; cannot resolve default config path")
+        })?;
+        if home.is_empty() {
+            anyhow::bail!("HOME is set but empty; cannot resolve default config path");
+        }
+        Ok(PathBuf::from(home).join("Library/Application Support/siderostat/config.toml"))
     } else {
-        PathBuf::from("/etc/siderostat/config.toml")
+        Ok(PathBuf::from("/etc/siderostat/config.toml"))
     }
 }
 
@@ -1496,5 +1526,105 @@ auto_restart = true
 
         assert_eq!(Residency::Resident.name(), "resident");
         assert_eq!(Residency::SsdStreaming.name(), "ssd-streaming");
+    }
+
+    // ---- B-01: runtime default config path resolution ----
+
+    fn never_exists(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn config_path_explicit_argument_wins_over_env_and_default() {
+        let explicit = Path::new("/tmp/explicit/siderostat.toml");
+        let resolved = resolve_config_path_pure(
+            Some(explicit),
+            Some(OsStr::new("/tmp/env/siderostat.toml")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap();
+        assert_eq!(resolved, explicit);
+        // user data を作成しない（path 解決は file を touch しない）
+        assert!(!explicit.exists());
+    }
+
+    #[test]
+    fn config_path_uses_siderostat_config_env_when_no_explicit() {
+        let resolved = resolve_config_path_pure(
+            None,
+            Some(OsStr::new("/tmp/env/siderostat.toml")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/env/siderostat.toml"));
+    }
+
+    #[test]
+    fn config_path_rejects_empty_siderostat_config() {
+        let error = resolve_config_path_pure(
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("SIDEROSTAT_CONFIG is set but empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_path_uses_cwd_default_when_present() {
+        let current = PathBuf::from(DEFAULT_CONFIG_FILE);
+        let resolved =
+            resolve_config_path_pure(None, None, Some(OsStr::new("/tmp/home")), &|path| {
+                path == current
+            })
+            .unwrap();
+        assert_eq!(resolved, current);
+    }
+
+    #[test]
+    fn config_path_falls_back_to_application_support_when_home_present() {
+        let resolved =
+            resolve_config_path_pure(None, None, Some(OsStr::new("/tmp/home")), &|path| {
+                path == Path::new("/tmp/home/Library/Application Support/siderostat/config.toml")
+            })
+            .unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/home/Library/Application Support/siderostat/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_path_errors_when_home_missing() {
+        let error = resolve_config_path_pure(None, None, None, &never_exists)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HOME is not set"), "{error}");
+    }
+
+    #[test]
+    fn config_path_errors_when_home_empty() {
+        let error = resolve_config_path_pure(None, None, Some(OsStr::new("")), &never_exists)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HOME is set but empty"), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_path_resolves_under_application_support() {
+        let path = platform_default_path_pure(Some(OsStr::new("/Users/tester"))).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/tester/Library/Application Support/siderostat/config.toml")
+        );
+        assert_eq!(path.file_name().unwrap(), OsStr::new("config.toml"));
     }
 }

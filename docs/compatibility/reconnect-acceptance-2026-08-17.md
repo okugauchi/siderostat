@@ -18,7 +18,7 @@ binary/config/state/plist は削除せず、緊急時の復旧手段として保
 |---|---|
 | verification source implementation | commit `05220cb`（H-03 reconnect recovery / owned child cleanup） |
 | documentation/current branch | `feature/reconnect-recovery`、commit `5717922` |
-| candidate binary | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260816-auto-repair-sigkill/siderostat` |
+| candidate binary | `$HOME/Library/Application Support/siderostat/candidate-reconnect-20260816-auto-repair-sigkill/siderostat` |
 | candidate binary SHA-256 | `1952cd7bb2db07ffcb4e5487fed3a52949f3d2d7f85b4c35a57f7391fc4f3cb0`（両 node 共通） |
 | worker config SHA-256 | `74032583b901aa67c02d3c3e51c2446e089971ee427f3dbbc640970fada53daa` |
 | coordinator config SHA-256 | `e480260f3c352e227d1f71014877c7766b562c7eee794606619ad85e4d0d0a78` |
@@ -67,7 +67,7 @@ cycle の最終 checkpoint では、manual pair/reconcile、state 削除、force
 
 ## Evidence
 
-- H-01/H-02 baseline・rollback・cable artifacts: `/Users/o/siderostat-reconnect-evidence-20260815/`
+- H-01/H-02 baseline・rollback・cable artifacts: `$HOME/siderostat-reconnect-evidence-20260815/`
 - H-03 completion record: `docs/archive/reconnect-2026-08/reconnect-field-verification-runbook.md` §8.3、
   `docs/archive/reconnect-2026-08/reconnect-improvement-implementation-plan.md` H-03 completion evidence
 - H-04 raw summary: `/private/tmp/siderostat-reconnect-evidence-20260817/h04/20260817-h04-summary.md`

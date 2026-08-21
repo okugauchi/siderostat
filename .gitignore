@@ -26,3 +26,7 @@ target
 # Added by cargo
 
 /target
+
+# Generated bundle / package staging (app-dev, pkg-dev)
+/build
+/dist

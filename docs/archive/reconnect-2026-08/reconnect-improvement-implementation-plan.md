@@ -778,9 +778,9 @@ Evidence: branch=feature/reconnect-recovery; 実装を追加。`Node::build` に
 - 停止条件: active workload、cleanup拒否指定またはidentity確認できない unknown DS4 child、重複 supervisor、backup 不在、node 時刻の大幅ずれ
 
 Progress evidence: candidate commit `6d6164922ca90aac2372a4407b77b659f19059b1` を固定し、worker candidate
-`/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat` の SHA-256 は
+`target/release/siderostat` の SHA-256 は
 `6798f005fc39413988b2c762fc676f625107279d491eaf690ab818dfc2b47037`、coordinator candidate
-`/Users/o/LLM/siderostat/target/release/siderostat` の SHA-256 は
+`target/release/siderostat` の SHA-256 は
 `fd07857125e1ae6f3849c21cd7bd807c66c9c1baa8e2066c5a0f9a662546e133`; `cargo fmt --check`、
 `cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`（181 passed）、
 `cargo test --all-targets --features test-support`（181 unit + integration、reconnect production 33 passed）、
@@ -792,7 +792,7 @@ SoloStandaloneReady、worker が admin API 接続拒否かつ standalone DS4 chi
 2026-08-15
 
 Blocked evidence: operator 承認後、現行 binary/config/state/plist/log を rollback backup へ保全し、candidate を両 node の
-user-owned path `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat` へ配置した。
+user-owned path `$HOME/Library/Application Support/siderostat/candidate-reconnect-20260815/siderostat` へ配置した。
 `/usr/local/bin` は root 所有で非対話 sudo が使えないため上書きしていない。両 plist の lint と candidate SHA-256 は一致し、
 coordinator は candidate で `SoloStandaloneReady`（generation 332、health/ready PASS）へ復帰した。一方 worker は candidate 起動後も
 standalone DS4 child が HTTP readiness 前に exit status 2 で終了し、LaunchAgent を bootout して再試行ループを停止した。
@@ -833,7 +833,7 @@ Completion evidence (2026-08-16): candidate commit `6bde9c10c148b3a85da6c015a595
 
 最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator
-`/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
+`$HOME/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256
 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。両 node の LaunchAgent は同一 candidate path を実行し、operator 承認済み startup cleanup は各 node 1 件の stale DS4 process に対して成功した。両 node の最終状態は `SoloStandaloneReady`、health/ready PASS、doctor `healthy=true`、admission serving、active request 0、node ごとの standalone DS4 child 1 件であり、H-01 の checksum / rollback / 健全 baseline 条件を満たした。これは H-01 完了時点の記録であり、その時点では H-02 は DistributedReady を着手条件とするため未着手だった。H-02 の実施結果は後述する。
 
 ### [x] H-02 DistributedReady から cable detach/reconnect を検証する

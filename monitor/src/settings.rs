@@ -8,6 +8,8 @@ use std::{
 };
 
 const RUNTIME_CONFIG_RELATIVE_PATH: &str = "Library/Application Support/siderostat/config.toml";
+const LOGIN_ITEMS_SCHEME: &str =
+    "x-apple.systempreferences:com.apple.LoginItems-Settings.extension";
 
 /// Open the runtime configuration in its default application. If installation
 /// has not created the file yet, open the nearest existing parent directory so
@@ -61,6 +63,22 @@ fn open_target(config_path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Open System Settings at the Login Items pane so the user can approve the
+/// Siderostat background service. Shown only when the runtime registration
+/// reports `requiresApproval` (C-05b/C-05c).
+pub fn open_login_items() -> Result<()> {
+    let status = Command::new("/usr/bin/open")
+        .arg(LOGIN_ITEMS_SCHEME)
+        .status()
+        .context("open Login Items settings")?;
+    anyhow::ensure!(
+        status.success(),
+        "open Login Items exited with status {:?}",
+        status.code()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +104,14 @@ mod tests {
         assert_eq!(open_target(&config_path), Some(config_dir.clone()));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn login_items_scheme_targets_the_system_settings_login_items_pane() {
+        // C-05c: approval 導線は System Settings のログイン項目 pane を開く。
+        assert_eq!(
+            LOGIN_ITEMS_SCHEME,
+            "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+        );
     }
 }

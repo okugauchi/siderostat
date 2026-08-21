@@ -7,6 +7,9 @@ cargo xtask install [options]
 cargo xtask fingerprint-models [options]
 cargo xtask verify
 cargo xtask uninstall
+cargo xtask app-dev [options]
+cargo xtask pkg-dev [options]
+cargo xtask sign [options]
 ```
 
 `cargo xtask` は `.cargo/config.toml` の alias で `cargo run --package xtask --` に解決される。
@@ -90,3 +93,66 @@ cargo xtask install --peer-ds4-binary-digest "<coordinator-ds4-sha256>"
 ## uninstall
 
 `launchctl bootout` して plist を `.disabled` へ退避する。model / KV cache / secret / runtime state は削除しない。
+
+## app-dev
+
+`contrib/macos/` の bundle template と `target/release` の runtime / monitor binary から、
+production と同じ layout の `Siderostat.app` を ad-hoc 署名で生成する（B-03）。
+
+```sh
+cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
+```
+
+- staging は既定で `build/app-dev/`。毎回空の状態から再構築するため、同一入力なら
+  file 一覧・plist 値・unsigned content digest が一致する。
+- `Contents/MacOS/Siderostat` は monitor、`Contents/Helpers/siderostat-runtime` は runtime。
+- bundle 内 LaunchAgent plist は `BundleProgram` 相対 path を使い、user home の絶対 pathを書かない。
+- helper → main app の順に ad-hoc 署名する。signing に `--deep` は使わない。
+- `AppIcon.icns` は既定で placeholder を自動生成する。`--icon <path>` で正式 icon を指定できる。
+- `--verify` 指定時は `plutil -lint`、`codesign --verify --deep --strict --verbose=4` を実行する。
+- user data と `/Applications` は変更しない。certificate / notary は不要。
+
+## pkg-dev
+
+`app-dev` で生成した bundle を scriptless flat `.pkg` にする（E-01）。
+
+```sh
+cargo xtask pkg-dev --app-dir <staging> --version <semver> [--output-dir dist]
+```
+
+payload は `/Applications/Siderostat.app` 一項目のみ。`preinstall` / `postinstall`
+script は生成しない。E-01 で実装される。
+
+## macOS CI の ad-hoc artifact verification
+
+証明書、Keychain、notarization credential、network を使わず、macOS CI で bundle/package の構造を検査する。
+`app-dev` と `pkg-dev` を実行した後、plist、layout、nested signature、package payload、installer script、
+禁止 path、secret・user data・model の混入を確認する。壊れた plist、余分な payload、unsigned helper の
+fixture も個別に失敗することを確認する。
+
+```sh
+bash scripts/verify-macos-dev-artifacts.sh
+```
+
+## sign
+
+Developer ID Application / Installer 署名、公証、stapling、最終検証を一つの順序で実行する。
+証明書の private key や notarization credential 本文は受け取らず、Keychain の identity 名と
+`notarytool` の Keychain profile 名だけを受け取る。
+
+```sh
+cargo xtask sign \
+  --app-dir build/app-dev \
+  --version 0.3.0 \
+  --build-number 7 \
+  --application-identity "Developer ID Application: Example (TEAMID)" \
+  --installer-identity "Developer ID Installer: Example (TEAMID)" \
+  --notary-profile siderostat-notary \
+  --output-dir dist
+```
+
+実行前は `--dry-run` を付ける。dry-run は helper → app → package → notary submit/wait →
+log → staple → validate → Gatekeeper の順序、固定 identifier、出力 path を表示するが、
+Keychain profile の実値、Keychain、ネットワーク、artifact は使用・変更しない。
+notary log は既定で `dist/notary/`、build metadata は `dist/Siderostat-<version>.metadata.json`
+へ保存される。metadata に credential、profile 名、private key は含めない。

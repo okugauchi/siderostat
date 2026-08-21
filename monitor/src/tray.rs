@@ -2,9 +2,15 @@
 //!
 //! The tray icon is created and updated on the main thread (macOS AppKit
 //! requirement). The menu reflects the current `DisplayState`; the polling
-//! task shares state through the mutex passed to `update`.
+//! task shares state through the mutex passed to `update`. The registration
+//! status display (`update_registration`) is wired from the first-launch /
+//! menu UI in C-05; until then it is dead from the bin crate's perspective.
+#![allow(dead_code)]
 
-use crate::{config::LiveMetric, metrics::MonitorStatus, state::DisplayState};
+use crate::{
+    config::LiveMetric, metrics::MonitorStatus, service_management::ServiceStatus,
+    state::DisplayState,
+};
 use anyhow::{Context, Result};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -12,9 +18,11 @@ use tray_icon::{
 };
 
 const MENU_QUIT: &str = "quit";
-const MENU_PROXY_RESTART: &str = "proxy-restart";
-const MENU_MONITOR_RESTART: &str = "monitor-restart";
+const MENU_RUNTIME_RESTART: &str = "runtime-restart";
+const MENU_BG_START: &str = "bg-start";
+const MENU_BG_STOP: &str = "bg-stop";
 const MENU_OPEN_CONFIG: &str = "open-config";
+const MENU_OPEN_LOGIN_ITEMS: &str = "open-login-items";
 
 /// Icon drawing colors.
 const GREEN: [u8; 4] = [0x2e, 0xcc, 0x71, 0xff]; // operating state
@@ -34,12 +42,16 @@ pub struct MonitorTray {
     prefill: MenuItem,
     kv_cache: MenuItem,
     decode: MenuItem,
+    runtime_status: MenuItem,
+    login_status: MenuItem,
     show_decode_tps: bool,
     live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
     _open_config: MenuItem,
-    _proxy_restart: MenuItem,
-    _monitor_restart: MenuItem,
+    _open_login_items: MenuItem,
+    _runtime_restart: MenuItem,
+    _bg_start: MenuItem,
+    _bg_stop: MenuItem,
     _quit: MenuItem,
 }
 
@@ -55,9 +67,15 @@ impl MonitorTray {
         let prefill = MenuItem::new("Prefill: --", false, None);
         let kv_cache = MenuItem::new("KV cache: --", false, None);
         let decode = MenuItem::new("Decode: --", false, None);
+        let runtime_status = MenuItem::new("Runtime: --", false, None);
+        let login_status = MenuItem::new("Login start: --", false, None);
         let open_config = MenuItem::with_id(MENU_OPEN_CONFIG, "設定ファイルを開く", true, None);
-        let proxy_restart = MenuItem::with_id(MENU_PROXY_RESTART, "Proxy 再起動", true, None);
-        let monitor_restart = MenuItem::with_id(MENU_MONITOR_RESTART, "Monitor 再起動", true, None);
+        let open_login_items =
+            MenuItem::with_id(MENU_OPEN_LOGIN_ITEMS, "ログイン項目を開く", true, None);
+        let runtime_restart =
+            MenuItem::with_id(MENU_RUNTIME_RESTART, "Runtime を再起動", true, None);
+        let bg_start = MenuItem::with_id(MENU_BG_START, "バックグラウンド実行を開始", true, None);
+        let bg_stop = MenuItem::with_id(MENU_BG_STOP, "バックグラウンド実行を停止", true, None);
         let quit = MenuItem::with_id(MENU_QUIT, "終了", true, None);
 
         let menu = Menu::new();
@@ -73,9 +91,14 @@ impl MonitorTray {
         menu.append(&kv_cache)?;
         menu.append(&decode)?;
         menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&runtime_status)?;
+        menu.append(&login_status)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&open_config)?;
-        menu.append(&proxy_restart)?;
-        menu.append(&monitor_restart)?;
+        menu.append(&runtime_restart)?;
+        menu.append(&bg_start)?;
+        menu.append(&bg_stop)?;
+        menu.append(&open_login_items)?;
         menu.append(&quit)?;
 
         let tray = TrayIconBuilder::new()
@@ -95,12 +118,16 @@ impl MonitorTray {
             prefill,
             kv_cache,
             decode,
+            runtime_status,
+            login_status,
             show_decode_tps,
             live_metric,
             _separator: separator,
             _open_config: open_config,
-            _proxy_restart: proxy_restart,
-            _monitor_restart: monitor_restart,
+            _open_login_items: open_login_items,
+            _runtime_restart: runtime_restart,
+            _bg_start: bg_start,
+            _bg_stop: bg_stop,
             _quit: quit,
         })
     }
@@ -209,19 +236,53 @@ impl MonitorTray {
     }
 
     /// Check whether a menu event requests a siderostat runtime restart.
-    pub fn is_proxy_restart_event(event: &MenuEvent) -> bool {
-        *event.id() == MenuId::new(MENU_PROXY_RESTART)
+    pub fn is_runtime_restart_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_RUNTIME_RESTART)
     }
 
-    /// Check whether a menu event requests a monitor restart.
-    pub fn is_monitor_restart_event(event: &MenuEvent) -> bool {
-        *event.id() == MenuId::new(MENU_MONITOR_RESTART)
+    /// Check whether a menu event requests starting background execution.
+    pub fn is_bg_start_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_BG_START)
+    }
+
+    /// Check whether a menu event requests stopping background execution.
+    pub fn is_bg_stop_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_BG_STOP)
     }
 
     /// Check whether a menu event requests opening the runtime configuration.
     pub fn is_open_config_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_OPEN_CONFIG)
     }
+
+    /// Check whether a menu event requests opening System Settings Login Items
+    /// (approval affordance, C-05c).
+    pub fn is_open_login_items_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_OPEN_LOGIN_ITEMS)
+    }
+
+    /// Update the background-service registration status display. The runtime
+    /// LaunchAgent helper and the main-app login item are independent settings
+    /// (C-03): updating one must never change the other.
+    pub fn update_registration(&self, runtime: ServiceStatus, login_item: ServiceStatus) {
+        self.runtime_status
+            .set_text(registration_status_text("Runtime", runtime));
+        self.login_status
+            .set_text(registration_status_text("Login start", login_item));
+    }
+}
+
+/// Human-readable menu text for a registration status. The status name is
+/// stable snake_case; the label prefix is a fixed UI noun.
+fn registration_status_text(label: &str, status: ServiceStatus) -> String {
+    let value = match status {
+        ServiceStatus::Enabled => "enabled",
+        ServiceStatus::NotRegistered => "off",
+        ServiceStatus::RequiresApproval => "approval needed",
+        ServiceStatus::NotFound => "not found",
+        ServiceStatus::Error => "error",
+    };
+    format!("{label}: {value}")
 }
 
 fn selected_metric_title(
@@ -537,5 +598,131 @@ mod tests {
             menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
             ""
         );
+    }
+
+    // ---- C-03: independent login-start registration display ----
+
+    #[test]
+    fn registration_status_text_is_stable_per_status() {
+        assert_eq!(
+            registration_status_text("Runtime", ServiceStatus::Enabled),
+            "Runtime: enabled"
+        );
+        assert_eq!(
+            registration_status_text("Runtime", ServiceStatus::NotRegistered),
+            "Runtime: off"
+        );
+        assert_eq!(
+            registration_status_text("Runtime", ServiceStatus::RequiresApproval),
+            "Runtime: approval needed"
+        );
+        assert_eq!(
+            registration_status_text("Runtime", ServiceStatus::NotFound),
+            "Runtime: not found"
+        );
+        assert_eq!(
+            registration_status_text("Runtime", ServiceStatus::Error),
+            "Runtime: error"
+        );
+    }
+
+    #[test]
+    fn registration_2x2_matrix_is_independent() {
+        // runtime background service と main app login start は独立設定。
+        // 2 x 2 の登録状態 matrix が、label と状態の組み合わせで区別される。
+        let cases = [
+            (ServiceStatus::Enabled, ServiceStatus::Enabled),
+            (ServiceStatus::Enabled, ServiceStatus::NotRegistered),
+            (ServiceStatus::NotRegistered, ServiceStatus::Enabled),
+            (ServiceStatus::NotRegistered, ServiceStatus::NotRegistered),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (runtime, login) in cases {
+            let runtime_text = registration_status_text("Runtime", runtime);
+            let login_text = registration_status_text("Login start", login);
+            // runtime の文言は login の文言と区別され、逆も同様。
+            assert_ne!(runtime_text, login_text);
+            // 各組み合わせの (runtime, login) 表示対が一意。
+            let pair = (runtime_text.clone(), login_text.clone());
+            assert!(seen.insert(pair), "duplicate 2x2 matrix entry");
+        }
+        assert_eq!(seen.len(), 4, "2x2 matrix must yield 4 distinct pairs");
+    }
+
+    // ---- C-05a: menu ids are distinct and each dispatch helper matches only
+    // its own id ----
+
+    fn event(id: &str) -> MenuEvent {
+        MenuEvent {
+            id: MenuId::new(id),
+        }
+    }
+
+    #[test]
+    fn menu_ids_are_distinct() {
+        let ids = [
+            MENU_QUIT,
+            MENU_RUNTIME_RESTART,
+            MENU_BG_START,
+            MENU_BG_STOP,
+            MENU_OPEN_CONFIG,
+            MENU_OPEN_LOGIN_ITEMS,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            assert!(seen.insert(id), "duplicate menu id: {id}");
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn each_menu_event_matches_only_its_own_dispatch_helper() {
+        let cases = [
+            (
+                MENU_QUIT,
+                MonitorTray::is_quit_event as fn(&MenuEvent) -> bool,
+            ),
+            (
+                MENU_RUNTIME_RESTART,
+                MonitorTray::is_runtime_restart_event as fn(&MenuEvent) -> bool,
+            ),
+            (
+                MENU_BG_START,
+                MonitorTray::is_bg_start_event as fn(&MenuEvent) -> bool,
+            ),
+            (
+                MENU_BG_STOP,
+                MonitorTray::is_bg_stop_event as fn(&MenuEvent) -> bool,
+            ),
+            (
+                MENU_OPEN_CONFIG,
+                MonitorTray::is_open_config_event as fn(&MenuEvent) -> bool,
+            ),
+            (
+                MENU_OPEN_LOGIN_ITEMS,
+                MonitorTray::is_open_login_items_event as fn(&MenuEvent) -> bool,
+            ),
+        ];
+        let all_ids = [
+            MENU_QUIT,
+            MENU_RUNTIME_RESTART,
+            MENU_BG_START,
+            MENU_BG_STOP,
+            MENU_OPEN_CONFIG,
+            MENU_OPEN_LOGIN_ITEMS,
+        ];
+        for (target_id, helper) in cases {
+            // 自分の id には真を返す。
+            assert!(helper(&event(target_id)), "helper must match {target_id}");
+            // 他方の id には偽を返す（一意性）。
+            for other in all_ids {
+                if other != target_id {
+                    assert!(
+                        !helper(&event(other)),
+                        "helper for {target_id} must not match {other}"
+                    );
+                }
+            }
+        }
     }
 }
