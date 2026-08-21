@@ -14,6 +14,15 @@ struct ClusterRoutingState {
     target: String,
 }
 
+/// Runtime build metadata from the read-only `/healthz` admin endpoint
+/// (B-01 / D-03).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RuntimeVersion {
+    pub version: String,
+    pub git_commit: String,
+    pub build_number: String,
+}
+
 #[derive(Clone)]
 pub struct MetricsClient {
     http: reqwest::Client,
@@ -90,6 +99,43 @@ impl MetricsClient {
             .await
             .context("read metrics response body")?;
         Ok(parse_metrics(&text))
+    }
+
+    /// Request a graceful runtime restart via the authenticated `/admin/restart`
+    /// endpoint (C-04). Returns the HTTP status and the JSON response body.
+    pub async fn graceful_restart(&self) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let url = format!("{}/admin/restart", self.base_url);
+        let mut request = self.http.post(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .context("parse graceful restart response")?;
+        Ok((status, value))
+    }
+
+    /// Fetch the runtime build metadata from the read-only `/healthz` endpoint
+    /// (B-01 / D-03). This is a non-mutating read and is used to compare the
+    /// app version against the running runtime's version.
+    pub async fn health(&self) -> Result<RuntimeVersion> {
+        let url = format!("{}/healthz", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("healthz endpoint returned {}", response.status()));
+        }
+        let version: RuntimeVersion = response.json().await.context("parse healthz response")?;
+        Ok(version)
     }
 }
 
