@@ -76,7 +76,7 @@ Redaction（spec第25.3節）:
 
 `GET /metrics` はPrometheus text formatで返す。Loopback `127.0.0.1:18081`（既定）にのみbindする。
 
-worker が Paired Standalone または Distributed MXFP4 で coordinator を target にしている
+worker が Paired Standalone または Distributed (layer-parallel) で coordinator を target にしている
 場合、メニューバーモニターは worker の `/metrics/coordinator` を利用する。この endpoint
 は coordinator の loopback admin API を公開せず、worker の署名付き control request で
 coordinator の `/v1/metrics` を取得する。worker が Solo Standalone の場合は従来どおり
@@ -104,11 +104,11 @@ Spec第26節のfamilyを確認する。
 - `ds4_proxy_cluster_transitions_total{from,to,result,reason}`
 - `ds4_proxy_cluster_transition_duration_seconds{transition}`
 - `ds4_proxy_cluster_child_restarts_total{profile,reason}`
-- `ds4_proxy_standalone_profile_info{node_id,model_variant,residency}`
+- `ds4_proxy_standalone_profile_info{node_id,quantization,speculative_support,residency}`
 - `ds4_proxy_cluster_hello_total{result,reason}`
 - `ds4_proxy_cluster_deployment_mismatch_total{field}`
 
-`model_variant` と `residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない（spec第26節）。
+`quantization`、`speculative_support`、`residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない（spec第26節）。
 
 ## 5. Manual state
 
@@ -140,7 +140,7 @@ siderostat cluster restart
 - 通常停止はSIGTERM。Drain完了後にsignalする（spec第20.3節）。
 - Stop timeout後のSIGKILLは既定で許可されるが、identityを直前に再確認できたowned childだけを対象とする。`allow_sigkill=false` に変更した場合はmanual intervention（spec第12.4節）。
 - Unknown processへ無条件にsignalしない。起動時に既存の `siderostat` / `ds4-server` を検出した場合は、macOS右上の簡潔な通知と警告音を出し、既定では5秒後に各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否は `startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で指定する。拒否・identity不一致・停止失敗時は新しいsiderostatを起動しない（spec第20.2節、第38節）。
-- Restartはmodeを変えない。Paired Standalone / Distributed MXFP4中のchild再起動はmode遷移を引き起こさない。
+- Restartはmodeを変えない。Paired Standalone / Distributed (layer-parallel) 中のchild再起動はmode遷移を引き起こさない。
 
 ## 7. Rollback
 

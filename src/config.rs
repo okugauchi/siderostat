@@ -215,7 +215,8 @@ pub struct Ds4Config {
     #[serde(default)]
     pub dspark: Ds4DsparkConfig,
     pub standalone: Ds4StandaloneConfig,
-    pub mxfp4: Ds4Mxfp4Config,
+    #[serde(alias = "mxfp4")]
+    pub distributed: Ds4DistributedConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -234,7 +235,8 @@ pub struct Ds4StandaloneConfig {
     pub model: PathBuf,
     pub model_manifest: PathBuf,
     pub checkpoint: String,
-    pub model_variant: ModelVariant,
+    #[serde(alias = "model_variant")]
+    pub quantization: Quantization,
     pub residency: Residency,
     pub context_size: u32,
     pub kv_disk_dir: PathBuf,
@@ -253,18 +255,62 @@ pub struct Ds4StandaloneConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ModelVariant {
+pub enum Quantization {
     Q2,
     Q2Q4,
     Mxfp4,
 }
 
-impl ModelVariant {
+fn default_mxfp4() -> Quantization {
+    Quantization::Mxfp4
+}
+
+/// The distributed execution topology is independent of the model's
+/// quantization. Only layer-parallel is wired to ds4-server in this release;
+/// tensor-parallel remains a future topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DistributedTopology {
+    LayerParallel,
+    TensorParallel,
+}
+
+impl DistributedTopology {
     pub fn name(self) -> &'static str {
         match self {
-            ModelVariant::Q2 => "q2",
-            ModelVariant::Q2Q4 => "q2-q4",
-            ModelVariant::Mxfp4 => "mxfp4",
+            DistributedTopology::LayerParallel => "layer-parallel",
+            DistributedTopology::TensorParallel => "tensor-parallel",
+        }
+    }
+}
+
+fn default_layer_parallel() -> DistributedTopology {
+    DistributedTopology::LayerParallel
+}
+
+/// Speculative execution support is model/profile metadata, not a cluster
+/// mode. DSpark is the only supported strategy in the current integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeSupport {
+    None,
+    Dspark,
+}
+
+impl SpeculativeSupport {
+    pub fn name(self) -> &'static str {
+        match self {
+            SpeculativeSupport::None => "none",
+            SpeculativeSupport::Dspark => "dspark",
+        }
+    }
+}
+
+impl Quantization {
+    pub fn name(self) -> &'static str {
+        match self {
+            Quantization::Q2 => "q2",
+            Quantization::Q2Q4 => "q2-q4",
+            Quantization::Mxfp4 => "mxfp4",
         }
     }
 }
@@ -287,7 +333,11 @@ impl Residency {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Ds4Mxfp4Config {
+pub struct Ds4DistributedConfig {
+    #[serde(default = "default_layer_parallel")]
+    pub topology: DistributedTopology,
+    #[serde(default = "default_mxfp4")]
+    pub quantization: Quantization,
     pub model: PathBuf,
     pub model_manifest: PathBuf,
     pub checkpoint: String,
@@ -351,9 +401,10 @@ impl ModeAwareConfig {
         self.ds4.standalone.model_manifest =
             expand_config_path(&self.ds4.standalone.model_manifest)?;
         self.ds4.standalone.kv_disk_dir = expand_config_path(&self.ds4.standalone.kv_disk_dir)?;
-        self.ds4.mxfp4.model = expand_config_path(&self.ds4.mxfp4.model)?;
-        self.ds4.mxfp4.model_manifest = expand_config_path(&self.ds4.mxfp4.model_manifest)?;
-        self.ds4.mxfp4.kv_disk_dir = expand_config_path(&self.ds4.mxfp4.kv_disk_dir)?;
+        self.ds4.distributed.model = expand_config_path(&self.ds4.distributed.model)?;
+        self.ds4.distributed.model_manifest =
+            expand_config_path(&self.ds4.distributed.model_manifest)?;
+        self.ds4.distributed.kv_disk_dir = expand_config_path(&self.ds4.distributed.kv_disk_dir)?;
         Ok(())
     }
 
@@ -382,16 +433,23 @@ impl ModeAwareConfig {
         validate_dspark(self)?;
         validate_ssd_streaming(&self.ds4.standalone)?;
         anyhow::ensure!(
-            self.ds4.standalone.kv_disk_dir != self.ds4.mxfp4.kv_disk_dir,
+            self.ds4.distributed.topology == DistributedTopology::LayerParallel,
+            "ds4.distributed.topology is not supported yet; only 'layer-parallel' is available"
+        );
+        anyhow::ensure!(
+            self.ds4.standalone.kv_disk_dir != self.ds4.distributed.kv_disk_dir,
             "standalone and distributed kv_disk_dir must be different"
         );
         validate_layer_split(
-            &self.ds4.mxfp4.coordinator_layers,
-            &self.ds4.mxfp4.worker_layers,
+            &self.ds4.distributed.coordinator_layers,
+            &self.ds4.distributed.worker_layers,
         )?;
         validate_secret_files(&self.cluster.security)?;
         validate_extra_args("ds4.standalone.extra_args", &self.ds4.standalone.extra_args)?;
-        validate_extra_args("ds4.mxfp4.extra_args", &self.ds4.mxfp4.extra_args)?;
+        validate_extra_args(
+            "ds4.distributed.extra_args",
+            &self.ds4.distributed.extra_args,
+        )?;
         Ok(())
     }
 }
@@ -518,10 +576,14 @@ fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
         &config.ds4.standalone.model_manifest,
         false,
     )?;
-    validate_regular_file("ds4.mxfp4.model", &config.ds4.mxfp4.model, false)?;
     validate_regular_file(
-        "ds4.mxfp4.model_manifest",
-        &config.ds4.mxfp4.model_manifest,
+        "ds4.distributed.model",
+        &config.ds4.distributed.model,
+        false,
+    )?;
+    validate_regular_file(
+        "ds4.distributed.model_manifest",
+        &config.ds4.distributed.model_manifest,
         false,
     )?;
     for (name, path) in [
@@ -534,7 +596,10 @@ fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
             "ds4.standalone.kv_disk_dir",
             &config.ds4.standalone.kv_disk_dir,
         ),
-        ("ds4.mxfp4.kv_disk_dir", &config.ds4.mxfp4.kv_disk_dir),
+        (
+            "ds4.distributed.kv_disk_dir",
+            &config.ds4.distributed.kv_disk_dir,
+        ),
     ] {
         validate_absolute_normalized(name, path)?;
     }
@@ -1022,14 +1087,16 @@ profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-ssd.json"
 checkpoint = "flash-0731"
-model_variant = "q2-q4"
+quantization = "q2-q4"
 residency = "resident"
 context_size = 262144
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 262144
 extra_args = []
 
-[ds4.mxfp4]
+[ds4.distributed]
+topology = "layer-parallel"
+quantization = "mxfp4"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
@@ -1083,8 +1150,8 @@ auto_restart = true
                 Some(self.file("dspark-support.gguf", b"support", 0o600));
             config.ds4.standalone.model = self.file("standalone.gguf", b"model", 0o600);
             config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
-            config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
-            config.ds4.mxfp4.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
+            config.ds4.distributed.model = self.file("mxfp4.gguf", b"model", 0o600);
+            config.ds4.distributed.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
             config.cluster.security.control_secret_file =
                 self.file("cluster-control", &[1; 32], 0o600);
             config.cluster.security.peer_proxy_token_file =
@@ -1093,7 +1160,7 @@ auto_restart = true
             config.cluster.state_path = self.root.join("cluster-state.json");
             config.cluster.manifest_cache_dir = self.root.join("manifests");
             config.ds4.standalone.kv_disk_dir = self.root.join("standalone-kv");
-            config.ds4.mxfp4.kv_disk_dir = self.root.join("distributed-kv");
+            config.ds4.distributed.kv_disk_dir = self.root.join("distributed-kv");
             config
         }
     }
@@ -1123,7 +1190,7 @@ auto_restart = true
             config.cluster.discovery.mode,
             DiscoveryMode::BonjourWithStaticFallback
         );
-        assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
         assert_eq!(config.ds4.standalone.residency, Residency::Resident);
         assert!(config.ds4.dspark.enabled);
         assert_eq!(config.ds4.dspark.confidence, Some(0.7));
@@ -1157,8 +1224,8 @@ auto_restart = true
         let config = ModeAwareConfig::parse(include_str!("../siderostat.example.toml"))
             .expect("repository example must remain parseable");
         assert_eq!(config.schema_version, 2);
-        assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
-        assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
+        assert_eq!(config.ds4.distributed.coordinator_layers, "0:19");
         assert!(config.ds4.dspark.enabled);
         assert_eq!(
             config.proxy.timeouts.first_body_byte,
@@ -1174,6 +1241,23 @@ auto_restart = true
             config.ds4.allow_sigkill,
             "install-generated configs must allow identity-verified owned DS4 children to be reaped"
         );
+    }
+
+    #[test]
+    fn accepts_legacy_model_variant_and_mxfp4_section_names() {
+        let legacy = mode_aware_config()
+            .replace(
+                "[ds4.distributed]\ntopology = \"layer-parallel\"\nquantization = \"mxfp4\"",
+                "[ds4.mxfp4]",
+            )
+            .replace("quantization = \"q2-q4\"", "model_variant = \"q2-q4\"");
+        let config = ModeAwareConfig::parse(&legacy).expect("legacy config should still load");
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
+        assert_eq!(
+            config.ds4.distributed.topology,
+            DistributedTopology::LayerParallel
+        );
+        assert_eq!(config.ds4.distributed.quantization, Quantization::Mxfp4);
     }
 
     #[test]
@@ -1300,9 +1384,9 @@ auto_restart = true
     }
 
     #[test]
-    fn rejects_unknown_model_variant_and_residency() {
+    fn rejects_unknown_quantization_and_residency() {
         let bad_variant =
-            mode_aware_config().replace("model_variant = \"q2-q4\"", "model_variant = \"q8\"");
+            mode_aware_config().replace("quantization = \"q2-q4\"", "quantization = \"q8\"");
         assert!(toml::from_str::<ModeAwareConfig>(&bad_variant).is_err());
         let bad_residency =
             mode_aware_config().replace("residency = \"resident\"", "residency = \"automatic\"");
@@ -1328,7 +1412,7 @@ auto_restart = true
     fn rejects_shared_standalone_and_distributed_kv_path() {
         let files = ConfigTestFiles::new();
         let mut config = files.config();
-        config.ds4.mxfp4.kv_disk_dir = config.ds4.standalone.kv_disk_dir.clone();
+        config.ds4.distributed.kv_disk_dir = config.ds4.standalone.kv_disk_dir.clone();
         assert!(
             config
                 .validate()
@@ -1342,7 +1426,7 @@ auto_restart = true
     fn rejects_layer_gap_overlap_or_missing_output() {
         let files = ConfigTestFiles::new();
         let mut gap = files.config();
-        gap.ds4.mxfp4.worker_layers = "21:output".into();
+        gap.ds4.distributed.worker_layers = "21:output".into();
         assert!(
             gap.validate()
                 .unwrap_err()
@@ -1351,7 +1435,7 @@ auto_restart = true
         );
 
         let mut missing_output = files.config();
-        missing_output.ds4.mxfp4.worker_layers = "20:42".into();
+        missing_output.ds4.distributed.worker_layers = "20:42".into();
         assert!(
             missing_output
                 .validate()
@@ -1520,9 +1604,9 @@ auto_restart = true
 
     #[test]
     fn enum_names_are_stable_metric_labels() {
-        assert_eq!(ModelVariant::Q2.name(), "q2");
-        assert_eq!(ModelVariant::Q2Q4.name(), "q2-q4");
-        assert_eq!(ModelVariant::Mxfp4.name(), "mxfp4");
+        assert_eq!(Quantization::Q2.name(), "q2");
+        assert_eq!(Quantization::Q2Q4.name(), "q2-q4");
+        assert_eq!(Quantization::Mxfp4.name(), "mxfp4");
 
         assert_eq!(Residency::Resident.name(), "resident");
         assert_eq!(Residency::SsdStreaming.name(), "ssd-streaming");

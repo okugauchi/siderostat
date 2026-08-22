@@ -2,7 +2,7 @@ use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
     app::target_name,
     cluster::{ClusterSnapshot, transition_name},
-    config::{ModelVariant, Residency},
+    config::{Quantization, Residency, SpeculativeSupport},
     proxy::ModeAwareTargetSnapshot,
     target::ClusterState,
 };
@@ -314,8 +314,9 @@ impl Metrics {
         output.push_str("# TYPE ds4_proxy_standalone_profile_info gauge\n");
         let _ = writeln!(
             output,
-            "ds4_proxy_standalone_profile_info{{node_id=\"{node_id}\",model_variant=\"{}\",residency=\"{}\"}} 1",
-            snapshot.model_variant.name(),
+            "ds4_proxy_standalone_profile_info{{node_id=\"{node_id}\",quantization=\"{}\",speculative_support=\"{}\",residency=\"{}\"}} 1",
+            snapshot.quantization.name(),
+            snapshot.speculative_support.name(),
             snapshot.residency.name(),
         );
         let generation_active = *self
@@ -551,7 +552,8 @@ pub struct MetricSnapshot<'a> {
     pub peer_lease_seconds: f64,
     pub thunderbolt_ip_state: &'static str,
     pub discovery_results: u64,
-    pub model_variant: ModelVariant,
+    pub quantization: Quantization,
+    pub speculative_support: SpeculativeSupport,
     pub residency: Residency,
 }
 
@@ -672,7 +674,8 @@ mod tests {
             peer_lease_seconds: 0.0,
             thunderbolt_ip_state: "unknown",
             discovery_results: 0,
-            model_variant: ModelVariant::Q2Q4,
+            quantization: Quantization::Q2Q4,
+            speculative_support: SpeculativeSupport::Dspark,
             residency: Residency::SsdStreaming,
         }
     }
@@ -706,7 +709,7 @@ mod tests {
         }
         assert!(rendered.contains("ds4_proxy_cluster_generation{node_id=\"node-a\"} 7"));
         assert!(rendered.contains(
-            "ds4_proxy_standalone_profile_info{node_id=\"node-a\",model_variant=\"q2-q4\",residency=\"ssd-streaming\"} 1"
+            "ds4_proxy_standalone_profile_info{node_id=\"node-a\",quantization=\"q2-q4\",speculative_support=\"dspark\",residency=\"ssd-streaming\"} 1"
         ));
         for forbidden in ["profile_id", "session", "request_id", "pid", "digest"] {
             assert!(!rendered.contains(forbidden));

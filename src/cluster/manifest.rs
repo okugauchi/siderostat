@@ -25,6 +25,13 @@ pub struct DistributedManifest {
     pub checkpoint: String,
     pub model_family: String,
     pub quantization: String,
+    /// Execution topology; deliberately separate from model quantization.
+    #[serde(default = "default_layer_parallel_name")]
+    pub topology: String,
+    /// Speculative decoding support bound to this deployment. The current
+    /// distributed path is plain decode; DSpark is independently represented.
+    #[serde(default = "default_none_name")]
+    pub speculative_support: String,
     pub context_size: u64,
     pub coordinator_layers: String,
     pub worker_layers: String,
@@ -70,6 +77,8 @@ impl DistributedManifest {
             &self.checkpoint,
             &self.model_family,
             &self.quantization,
+            &self.topology,
+            &self.speculative_support,
             &self.coordinator_layers,
             &self.worker_layers,
             &self.ds4_wire_schema,
@@ -101,6 +110,8 @@ impl DistributedManifest {
             checkpoint: &self.checkpoint,
             model_family: &self.model_family,
             quantization: &self.quantization,
+            topology: &self.topology,
+            speculative_support: &self.speculative_support,
             context_size: self.context_size,
             coordinator_layers: &self.coordinator_layers,
             worker_layers: &self.worker_layers,
@@ -121,6 +132,8 @@ impl DistributedManifest {
             && self.checkpoint == other.checkpoint
             && self.model_family == other.model_family
             && self.quantization == other.quantization
+            && self.topology == other.topology
+            && self.speculative_support == other.speculative_support
             && self.context_size == other.context_size
             && self.coordinator_layers == other.coordinator_layers
             && self.worker_layers == other.worker_layers
@@ -140,6 +153,8 @@ struct DistributedCompatibilityManifest<'a> {
     checkpoint: &'a str,
     model_family: &'a str,
     quantization: &'a str,
+    topology: &'a str,
+    speculative_support: &'a str,
     context_size: u64,
     coordinator_layers: &'a str,
     worker_layers: &'a str,
@@ -156,10 +171,15 @@ pub struct StandaloneManifest {
     pub ds4_binary_sha256: String,
     pub model_sha256: String,
     pub checkpoint: String,
-    pub model_variant: String,
+    #[serde(alias = "model_variant")]
+    pub quantization: String,
     pub residency: String,
     pub context_size: u64,
     pub argv_profile_sha256: String,
+    /// Optional for backward compatibility with schema-v2 manifests created
+    /// before speculative support was modeled as an independent field.
+    #[serde(default)]
+    pub speculative_support: Option<String>,
     #[serde(default)]
     pub dspark_enabled: bool,
     #[serde(default)]
@@ -188,7 +208,7 @@ impl StandaloneManifest {
             &self.profile,
             &self.profile_id,
             &self.checkpoint,
-            &self.model_variant,
+            &self.quantization,
             &self.residency,
         ] {
             if value.trim().is_empty() {
@@ -219,6 +239,23 @@ impl StandaloneManifest {
             || self.dspark_strict
         {
             return Err(ManifestError::IncompleteDspark);
+        }
+        if self
+            .speculative_support
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ManifestError::EmptyField);
+        }
+        if let Some(support) = self.speculative_support.as_deref() {
+            let expected = if self.dspark_enabled {
+                "dspark"
+            } else {
+                "none"
+            };
+            if support != expected {
+                return Err(ManifestError::InconsistentSpeculativeSupport);
+            }
         }
         Ok(())
     }
@@ -431,6 +468,8 @@ pub enum ManifestError {
     InvalidDsparkConfidence,
     #[error("DSpark support fingerprint or typed settings do not match the standalone manifest")]
     DsparkBindingMismatch,
+    #[error("speculative support metadata does not match DSpark settings")]
+    InconsistentSpeculativeSupport,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -530,6 +569,14 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn default_layer_parallel_name() -> String {
+    "layer-parallel".into()
+}
+
+fn default_none_name() -> String {
+    "none".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,7 +585,7 @@ mod tests {
     fn manifest() -> DistributedManifest {
         DistributedManifest {
             schema_version: 2,
-            profile: "distributed-mxfp4".into(),
+            profile: "distributed-layer-parallel".into(),
             ds4_binary_sha256: "11".repeat(32),
             compatible_ds4_binary_sha256: vec!["11".repeat(32), "44".repeat(32)],
             ds4_source_commit: "b0309611041655f4e45671cfd9c9886aff161406".into(),
@@ -546,7 +593,9 @@ mod tests {
             model_size: 100,
             checkpoint: "flash-0731".into(),
             model_family: "deepseek-v4-flash".into(),
-            quantization: "mxfp4-experts".into(),
+            quantization: "mxfp4".into(),
+            topology: "layer-parallel".into(),
+            speculative_support: "none".into(),
             context_size: 262_144,
             coordinator_layers: "0:19".into(),
             worker_layers: "20:output".into(),
@@ -563,10 +612,11 @@ mod tests {
             ds4_binary_sha256: "11".repeat(32),
             model_sha256: "22".repeat(32),
             checkpoint: "flash-0731".into(),
-            model_variant: "q2-q4".into(),
+            quantization: "q2-q4".into(),
             residency: "resident".into(),
             context_size: 262_144,
             argv_profile_sha256: "33".repeat(32),
+            speculative_support: Some("dspark".into()),
             dspark_enabled: true,
             dspark_support_sha256: Some("44".repeat(32)),
             dspark_support_size: Some(1024),
@@ -594,6 +644,8 @@ mod tests {
             "profile",
             "quantization",
             "schema_version",
+            "speculative_support",
+            "topology",
             "worker_layers",
         ];
         let positions = keys
@@ -674,6 +726,24 @@ mod tests {
             manifest.validate_dspark_binding(&fingerprint, Some(0.7), true),
             Err(ManifestError::DsparkBindingMismatch)
         ));
+    }
+
+    #[test]
+    fn reads_legacy_standalone_model_variant_without_merging_speculative_support() {
+        let mut value = serde_json::to_value(standalone_manifest()).unwrap();
+        let quantization = value
+            .as_object_mut()
+            .unwrap()
+            .remove("quantization")
+            .unwrap();
+        value["model_variant"] = quantization;
+        value.as_object_mut().unwrap().remove("speculative_support");
+
+        let decoded: StandaloneManifest = serde_json::from_value(value).unwrap();
+        decoded.validate().unwrap();
+        let encoded = String::from_utf8(decoded.canonical_json().unwrap()).unwrap();
+        assert!(encoded.contains("\"quantization\""));
+        assert!(!encoded.contains("model_variant"));
     }
 
     #[test]

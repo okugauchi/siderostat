@@ -102,10 +102,11 @@ Hardened Runtime のみを有効にし、App Sandbox は無効とする。例外
 ~/Library/Logs/siderostat/
 ```
 
-monitor の crash または通常終了は runtime を終了させない。runtime の crash は launchd が
-再起動する。一方、利用者が menu の「バックグラウンド実行を停止」を選んだ場合は、runtime を
-quiesce して DS4 child を graceful stop した後に LaunchAgent を unregister する。
-`SMAppService.unregister()` が実行中の LaunchAgent を終了し、将来の起動も停止する。
+monitor の crash または通常終了は `siderostat-runtime` を終了させない。`siderostat-runtime` の crash は launchd が
+再起動する。一方、利用者が menu の「siderostat-runtimeを停止して自動起動を無効化」を選んだ場合は、
+`siderostat-runtime` を quiesce して `ds4-server` child を graceful stop した後に LaunchAgent を unregister する。
+`SMAppService.unregister()` が実行中の LaunchAgent を終了し、将来の起動も停止するため、
+この menu 操作は現在の `siderostat-runtime` と `ds4-server` の停止も伴う。
 
 ## 5. bundle 仕様
 
@@ -254,8 +255,9 @@ runtime の常駐許可と monitor の login start は別設定として表示�
 - runtime background service: 推論 service の稼働に必要
 - monitor login start: menu bar UI を login 時に表示する利用者設定
 
-初回 setup では両方を推奨値として提示するが、利用者の承認状態を偽装せず、System Settings の
-実状態を source of truth とする。
+初回 setup では両方を推奨値として `SMAppService` へ登録する。ただし利用者の承認状態を
+偽装せず、Runtime と main app の各 `status` がともに `enabled` になるまで完了扱いにしない。
+Runtime の開始／停止操作は Runtime の登録だけを変更し、main app の login start には影響させない。
 
 ### 6.3 menu 操作
 
@@ -263,12 +265,11 @@ runtime の常駐許可と monitor の login start は別設定として表示�
 
 | 操作 | 挙動 |
 |---|---|
-| Monitor を終了 | main app だけ終了。runtime は継続 |
+| Siderostatを終了 | main app だけ終了。runtime は継続 |
 | 設定ファイルを開く | `~/Library/Application Support/siderostat/config.toml` を既定アプリで開く。未作成時は最寄りの既存親フォルダを開く |
-| Runtime を再起動 | authenticated admin API で drain 後に self-restart。launchd が再起動 |
-| バックグラウンド実行を停止 | drain、DS4 child stop、runtime service unregister。unregister が runtime process を終了 |
-| バックグラウンド実行を開始 | runtime service register。approval が必要なら案内 |
-| Siderostat を終了 | monitor 終了前に runtime を止めるか継続するか、意味が明確な二操作へ分ける |
+| siderostat-runtimeを再起動 | authenticated admin API で drain 後に self-restart。launchd が再起動 |
+| siderostat-runtimeを停止して自動起動を無効化 | drain、`ds4-server` child stop、runtime service unregister。unregister が runtime process を終了 |
+| siderostat-runtimeを起動して自動起動を有効化 | runtime service register。LaunchAgent は登録時に起動し、approval が必要なら案内 |
 
 現行 monitor の `launchctl kickstart` / `bootout` 直接呼出しは互換 mode に限定し、新 bundle
 mode では Service Management と admin API に置き換える。runtime が応答しない場合の recovery は、
@@ -277,12 +278,12 @@ mode では Service Management と admin API に置き換える。runtime が応
 
 ### 6.4 background activity の可視性
 
-monitor を終了しても runtime を継続する設計であるため、利用者が次を常に確認・停止できなければ
+Siderostat のメニューバーアプリを終了しても runtime を継続する設計であるため、利用者が次を常に確認・停止できなければ
 ならない。
 
-- menu bar の runtime 稼働状態
+- menu bar の `siderostat-runtime` 稼働状態
 - System Settings > General > Login Items の Siderostat background item
-- menu の「バックグラウンド実行を停止」
+- menu の「siderostat-runtimeを停止して自動起動を無効化」
 - CPU、memory、model、cluster mode の概要
 
 これは、background process が main app 終了後も動く場合に利用者へ可視性と停止手段を与える
@@ -381,8 +382,12 @@ component package を `pkgbuild`、最終 product archive を `productbuild` で
 概念上の build flow は次である。
 
 ```sh
+ditto build/Siderostat.app build/payload-root/Siderostat.app
+
 pkgbuild \
-  --component build/Siderostat.app \
+  --root build/payload-root \
+  --component-plist build/component-plist.plist \
+  --scripts build/pkg-scripts \
   --install-location /Applications \
   --identifier dev.siderostat-ds4-proxy.pkg \
   --version "$VERSION" \
@@ -398,30 +403,36 @@ productbuild \
 ```
 
 実際の `productbuild` option と Distribution XML の要否は build implementation で固定し、
-同一 receipt ID と version 比較で upgrade 可能にする。
+同一 receipt ID と version 比較で upgrade 可能にする。component plist では
+`BundleIsRelocatable=false` を指定し、既存 bundle identifier による `/Applications` 外への
+relocation を許可しない。
 
 ### 9.2 installer script policy
 
-初期版は `preinstall` / `postinstall` script を持たない構成を第一選択とする。
+`preinstall` script を一つだけ許可し、`/Applications/Siderostat.app/Contents/MacOS/Siderostat`
+という完全一致した実行パスの既存 Monitor を、bundle replacement 前に終了させる。通常は SIGTERM を
+送り、最大10秒待機する。終了しない場合だけ同じ完全一致の Monitor に SIGKILL を送り、他のプロセスへ
+波及させない。`postinstall` script は持たない。
 
-特に installer process から次を行わない。
+installer process から次を行わない。
 
-- console user の推測
+- console user の推測や user session の変更
 - `launchctl bootstrap gui/<uid>`
 - `~/Library/LaunchAgents` の変更
 - user config / secret の生成または上書き
-- active runtime / DS4 child の強制終了
+- active runtime / DS4 child の停止または強制終了
 - Recovery での RDMA 有効化
 
-runtime の登録は、install 後に利用者が Siderostat を起動した user session で
-`SMAppService` を通して行う。将来 script が必要になった場合は system-level file migration
-だけに限定し、idempotent、rollback-safe、user data preserving とする。
+runtime と main app login start の登録は、install 後に利用者が Siderostat を起動した user
+session で `SMAppService` を通して行う。preinstall は bundle replacement 前の Monitor 終了だけに
+限定し、idempotent、rollback-safe、user data preserving とする。
 
 ### 9.3 installer UX
 
 - install 先は `/Applications`
 - package installation の管理者承認と、runtime background item の user approval は別物
-- install 完了後、Siderostat を初回起動して background service を登録する旨を明示
+- install 完了後、Siderostat を初回起動して background service と Siderostat の login start を
+  登録する旨を明示
 - model は同梱されず、既存設定を検出するか setup で選択する旨を明示
 
 ## 10. notarization
@@ -447,10 +458,10 @@ notarization 対象であり、旧 `altool` ではなく `notarytool` を使う�
 1. app version、signature/build metadata を表示可能にする。
 2. legacy install を検出する。
 3. user config、secret、manifest を読み取り、schema と permission を検証する。
-4. runtime LaunchAgent の status を取得する。
-5. background service の目的を説明し、登録する。
+4. runtime LaunchAgent と main app login item の status を取得する。
+5. background service と monitor login start の目的を説明し、未登録のものを登録する。
 6. approval が不足する場合は System Settings を開く導線を示す。
-7. monitor の login start 設定を確認する。
+7. runtime と monitor login start の両 status が `enabled` になったことを確認する。
 8. runtime admin API readiness を待つ。
 9. DwarfStar/model manifest readiness を表示する。
 
@@ -493,7 +504,8 @@ child を競合させない。
 - user data、model、cache、secret を保持する。
 - LaunchAgent plist の label と bundle-relative helper path を安定させる。
 - active runtime は旧 executable image のまま動き得るため、monitor は app version と
-  runtime version を比較し、必要なら admin API で graceful restart を提案または実行する。
+  runtime version を比較し、不一致を macOS 通知で知らせる。runtime の再起動は
+  ユーザーが既存のメニュー項目から明示的に実行する。
 - plist schema または identifier を変える release は、明示的 unregister/register migration を持つ。
 
 ### 13.2 rollback
@@ -549,7 +561,7 @@ artifact、log に出力しない。
 - clean Mac へ `.pkg` を install できる
 - `/Applications` 以外に system payload を作らない
 - first launch まで runtime を勝手に登録しない
-- first launch で background item の説明と approval flow が動く
+- first launch で background item と Siderostat の login item の登録、説明、approval flow が動く
 - runtime と monitor が次回 login で設定どおり起動する
 - monitor を終了しても runtime が継続する
 - runtime crash 後に launchd が再起動する

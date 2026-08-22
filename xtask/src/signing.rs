@@ -262,7 +262,7 @@ fn build_metadata(app: &Path, package: &Path, submission: &str, args: &SignArgs)
         "artifact": package.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
         "version": args.version.as_str(),
         "build_number": args.build_number,
-        "app_sha256": util::sha256_hex(app)?,
+        "app_sha256": util::sha256_tree(app)?,
         "pkg_sha256": util::sha256_hex(package)?,
         "git_commit": git_commit.trim(),
         "rust_version": rust_version,
@@ -291,8 +291,7 @@ fn dry_run_plan(app: &Path, package: &Path, log_path: &Path, args: &SignArgs) ->
         ),
         format!("codesign --verify --strict --verbose=4 {}", app.display()),
         format!(
-            "pkgbuild --component {} --install-location /Applications --identifier {} --version {} <component package>",
-            app.display(),
+            "pkgbuild --root <payload root> --component-plist <component plist> --scripts <controlled preinstall> --install-location /Applications --identifier {} --version {} <component package>",
             package::COMPONENT_IDENTIFIER,
             args.version
         ),

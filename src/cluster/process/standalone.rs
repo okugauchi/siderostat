@@ -152,7 +152,10 @@ impl StandaloneSupervisor {
             log_task.abort();
             return Err(error.into());
         }
-        if self.inner.command.profile.dspark_required && !*dspark_activation_rx.borrow() {
+        if self.inner.command.profile.speculative_support
+            == crate::config::SpeculativeSupport::Dspark
+            && !*dspark_activation_rx.borrow()
+        {
             let remaining = startup_deadline.saturating_duration_since(Instant::now());
             let activation_observed = match tokio::time::timeout(
                 remaining,

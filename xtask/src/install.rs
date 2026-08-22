@@ -24,9 +24,11 @@ pub struct ModelSelectionArgs {
     /// Standalone model file (path or basename under DWARFSTAR_HOME/gguf).
     #[arg(long)]
     pub standalone_model: Option<PathBuf>,
-    /// MXFP4 model file (path or basename under DWARFSTAR_HOME/gguf).
-    #[arg(long)]
-    pub mxfp4_model: Option<PathBuf>,
+    /// Model used by the distributed topology (path or basename under DWARFSTAR_HOME/gguf).
+    /// `--mxfp4-model` remains accepted as a compatibility alias; MXFP4 is a
+    /// quantization value, not the topology name.
+    #[arg(long = "distributed-model", alias = "mxfp4-model")]
+    pub distributed_model: Option<PathBuf>,
     /// DSpark support model file (path or basename under DWARFSTAR_HOME/gguf).
     #[arg(long)]
     pub dspark_support: Option<PathBuf>,
@@ -83,10 +85,10 @@ pub fn install(args: &InstallArgs) -> Result<()> {
     }
 
     let (home, dwfstar_home, gguf_dir) = discover_ds4(args.models.ds4_server.as_deref())?;
-    let (standalone_model, mxfp4_model, dspark_support) = resolve_models(
+    let (standalone_model, distributed_model, dspark_support) = resolve_models(
         &gguf_dir,
         args.models.standalone_model.as_deref(),
-        args.models.mxfp4_model.as_deref(),
+        args.models.distributed_model.as_deref(),
         args.models.dspark_support.as_deref(),
     )?;
 
@@ -99,14 +101,14 @@ pub fn install(args: &InstallArgs) -> Result<()> {
         manifest::fingerprint_models(
             &cache_path,
             &standalone_model,
-            &mxfp4_model,
+            &distributed_model,
             Some(&dspark_support),
         )?;
     } else {
         manifest::verify_model_cache(
             &cache_path,
             &standalone_model,
-            &mxfp4_model,
+            &distributed_model,
             Some(&dspark_support),
             args.accept_model_metadata_change,
         )?;
@@ -121,7 +123,7 @@ pub fn install(args: &InstallArgs) -> Result<()> {
         &home,
         &dwfstar_home,
         &standalone_model,
-        &mxfp4_model,
+        &distributed_model,
         &dspark_support,
         args.node_id.as_deref(),
     )?;
@@ -146,16 +148,21 @@ pub fn install(args: &InstallArgs) -> Result<()> {
 /// Compute the GGUF digests once and store them beside the generated manifests.
 pub fn fingerprint_models(args: &FingerprintModelsArgs) -> Result<()> {
     let (home, _dwfstar_home, gguf_dir) = discover_ds4(args.models.ds4_server.as_deref())?;
-    let (standalone, mxfp4, dspark_support) = resolve_models(
+    let (standalone, distributed, dspark_support) = resolve_models(
         &gguf_dir,
         args.models.standalone_model.as_deref(),
-        args.models.mxfp4_model.as_deref(),
+        args.models.distributed_model.as_deref(),
         args.models.dspark_support.as_deref(),
     )?;
     let cache_path = home
         .join("Library/Application Support/siderostat/manifests")
         .join(manifest::DIGEST_CACHE_FILE_NAME);
-    manifest::fingerprint_models(&cache_path, &standalone, &mxfp4, Some(&dspark_support))
+    manifest::fingerprint_models(
+        &cache_path,
+        &standalone,
+        &distributed,
+        Some(&dspark_support),
+    )
 }
 
 /// Required CI gates (docs/installation.md section 5). Only run with `--ci`.
@@ -348,29 +355,31 @@ fn discover_ds4(explicit: Option<&Path>) -> Result<(PathBuf, PathBuf, PathBuf)> 
     Ok((home, dwfstar_home, gguf_dir))
 }
 
-/// Classify model files in DWARFSTAR_HOME/gguf: dspark support, mxfp4, standalone.
+/// Classify model files in DWARFSTAR_HOME/gguf by role: distributed model,
+/// standalone model, and DSpark support model. The distributed model's
+/// quantization is recorded separately in its manifest.
 fn resolve_models(
     gguf_dir: &Path,
     standalone_flag: Option<&Path>,
-    mxfp4_flag: Option<&Path>,
+    distributed_flag: Option<&Path>,
     dspark_flag: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let standalone = resolve_one(gguf_dir, standalone_flag, "standalone", |name| {
         let lower = name.to_lowercase();
         !lower.contains("mxfp4") && !lower.contains("dspark")
     })?;
-    let mxfp4 = resolve_one(gguf_dir, mxfp4_flag, "mxfp4", |name| {
+    let distributed = resolve_one(gguf_dir, distributed_flag, "distributed", |name| {
         name.to_lowercase().contains("mxfp4")
     })?;
     let dspark = resolve_one(gguf_dir, dspark_flag, "dspark", |name| {
         name.to_lowercase().contains("dspark")
     })?;
-    if standalone == mxfp4 || standalone == dspark || mxfp4 == dspark {
+    if standalone == distributed || standalone == dspark || distributed == dspark {
         anyhow::bail!(
-            "model classification produced duplicate files; pass --standalone-model/--mxfp4-model/--dspark-support"
+            "model classification produced duplicate files; pass --standalone-model/--distributed-model/--dspark-support"
         );
     }
-    Ok((standalone, mxfp4, dspark))
+    Ok((standalone, distributed, dspark))
 }
 
 fn resolve_one(
@@ -507,7 +516,7 @@ fn write_config(
     home: &Path,
     dwfstar_home: &Path,
     standalone_model: &Path,
-    mxfp4_model: &Path,
+    distributed_model: &Path,
     dspark_support: &Path,
     node_id: Option<&str>,
 ) -> Result<ModeAwareConfig> {
@@ -549,7 +558,7 @@ fn write_config(
         ),
         (
             "model = \"$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf\"",
-            &format!("model = \"{}\"", mxfp4_model.display()),
+            &format!("model = \"{}\"", distributed_model.display()),
         ),
         (
             "model_manifest = \"$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json\"",
@@ -596,7 +605,7 @@ fn resolve_manifest_inputs(
     args: &InstallArgs,
 ) -> Result<(Option<String>, Vec<String>)> {
     let local_digest = util::sha256_hex_logged(&config.ds4.binary, "ds4 binary")?;
-    let prior = manifest::read_existing_distributed(&config.ds4.mxfp4.model_manifest)?;
+    let prior = manifest::read_existing_distributed(&config.ds4.distributed.model_manifest)?;
 
     let source_commit = match args.ds4_source_commit.as_deref() {
         Some(s) => Some(s.to_string()),

@@ -19,7 +19,7 @@ impl LocalRole {
 pub enum StableMode {
     SoloStandalone,
     PairedStandalone,
-    DistributedMxfp4,
+    DistributedLayerParallel,
 }
 
 impl StableMode {
@@ -27,7 +27,7 @@ impl StableMode {
         match self {
             StableMode::SoloStandalone => "solo-standalone",
             StableMode::PairedStandalone => "paired-standalone",
-            StableMode::DistributedMxfp4 => "distributed-mxfp4",
+            StableMode::DistributedLayerParallel => "distributed-layer-parallel",
         }
     }
 }
@@ -136,12 +136,16 @@ pub fn resolve_target(
         (StableMode::PairedStandalone, ClusterState::PairedStandaloneReady, LocalRole::Worker) => {
             ProxyTarget::Coordinator
         }
-        (StableMode::DistributedMxfp4, ClusterState::DistributedReady, LocalRole::Coordinator) => {
-            ProxyTarget::LocalStandalone
-        }
-        (StableMode::DistributedMxfp4, ClusterState::DistributedReady, LocalRole::Worker) => {
-            ProxyTarget::Coordinator
-        }
+        (
+            StableMode::DistributedLayerParallel,
+            ClusterState::DistributedReady,
+            LocalRole::Coordinator,
+        ) => ProxyTarget::LocalStandalone,
+        (
+            StableMode::DistributedLayerParallel,
+            ClusterState::DistributedReady,
+            LocalRole::Worker,
+        ) => ProxyTarget::Coordinator,
         (_, ClusterState::SoloStandaloneReady, _)
         | (_, ClusterState::PairedStandaloneReady, _)
         | (_, ClusterState::DistributedReady, _) => ProxyTarget::Unavailable {
@@ -186,13 +190,13 @@ mod tests {
             ),
             (
                 LocalRole::Coordinator,
-                StableMode::DistributedMxfp4,
+                StableMode::DistributedLayerParallel,
                 ClusterState::DistributedReady,
                 ProxyTarget::LocalStandalone,
             ),
             (
                 LocalRole::Worker,
-                StableMode::DistributedMxfp4,
+                StableMode::DistributedLayerParallel,
                 ClusterState::DistributedReady,
                 ProxyTarget::Coordinator,
             ),
@@ -260,7 +264,7 @@ mod tests {
         assert!(matches!(
             resolve_target(
                 LocalRole::Coordinator,
-                StableMode::DistributedMxfp4,
+                StableMode::DistributedLayerParallel,
                 ClusterState::Backoff,
                 false,
             ),
@@ -288,7 +292,7 @@ mod tests {
         assert_eq!(
             resolve_target(
                 LocalRole::Unknown,
-                StableMode::DistributedMxfp4,
+                StableMode::DistributedLayerParallel,
                 ClusterState::SoloStandaloneReady,
                 true,
             ),
@@ -314,7 +318,10 @@ mod tests {
 
         assert_eq!(StableMode::SoloStandalone.name(), "solo-standalone");
         assert_eq!(StableMode::PairedStandalone.name(), "paired-standalone");
-        assert_eq!(StableMode::DistributedMxfp4.name(), "distributed-mxfp4");
+        assert_eq!(
+            StableMode::DistributedLayerParallel.name(),
+            "distributed-layer-parallel"
+        );
 
         assert_eq!(ClusterState::Booting.name(), "booting");
         assert_eq!(

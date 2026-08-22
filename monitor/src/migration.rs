@@ -601,7 +601,6 @@ mod tests {
     fn backup_re_run_does_not_overwrite_previous_backup() {
         let (_dir, root) = fixture();
         let home = root.join("home");
-        let usr_local_bin = root.join("usr-local-bin");
         let app_support = root.join("app-support");
         let plist_path = home
             .join(LEGACY_LAUNCH_AGENTS_DIR)
@@ -864,8 +863,10 @@ mod tests {
 
     #[test]
     fn run_cutover_drain_failure_rolls_back() {
-        let mut driver = FakeCutoverDriver::default();
-        driver.drain = Err("boom".into());
+        let mut driver = FakeCutoverDriver {
+            drain: Err("boom".into()),
+            ..Default::default()
+        };
         let state = run_cutover(&mut driver);
         assert_eq!(state, CutoverState::RolledBack);
         // drain 失敗後は stop/register を呼ばず即 rollback。
@@ -874,8 +875,10 @@ mod tests {
 
     #[test]
     fn run_cutover_readiness_failure_rolls_back() {
-        let mut driver = FakeCutoverDriver::default();
-        driver.readiness = Err("not-ready".into());
+        let mut driver = FakeCutoverDriver {
+            readiness: Err("not-ready".into()),
+            ..Default::default()
+        };
         let state = run_cutover(&mut driver);
         assert_eq!(state, CutoverState::RolledBack);
         // register まで進み、readiness 失敗で rollback。
@@ -894,8 +897,10 @@ mod tests {
 
     #[test]
     fn run_cutover_port_conflict_triggers_immediate_rollback() {
-        let mut driver = FakeCutoverDriver::default();
-        driver.conflict = true;
+        let mut driver = FakeCutoverDriver {
+            conflict: true,
+            ..Default::default()
+        };
         let state = run_cutover(&mut driver);
         assert_eq!(state, CutoverState::RolledBack);
         // conflict 検出後は readiness を呼ばず即 rollback。
@@ -907,9 +912,11 @@ mod tests {
 
     #[test]
     fn run_cutover_rollback_failure_marks_manual_intervention() {
-        let mut driver = FakeCutoverDriver::default();
-        driver.drain = Err("boom".into());
-        driver.rollback = Err("restore-failed".into());
+        let mut driver = FakeCutoverDriver {
+            drain: Err("boom".into()),
+            rollback: Err("restore-failed".into()),
+            ..Default::default()
+        };
         let state = run_cutover(&mut driver);
         assert_eq!(state, CutoverState::RollbackFailed);
     }

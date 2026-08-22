@@ -1,10 +1,11 @@
-//! Scriptless flat `.pkg` builder (E-01).
+//! Flat `.pkg` builder with a controlled preinstall hook (E-01).
 //!
 //! `cargo xtask pkg-dev` turns an `app-dev` bundle into a component package
-//! and product archive with a single `/Applications/Siderostat.app` payload,
-//! without certificate or notary credential. No `preinstall` / `postinstall`
-//! script is generated, and the expanded package is inspected so a forbidden
-//! path or installer script fails the build.
+//! and product archive with a single `/Applications/Siderostat.app` payload.
+//! The preinstall hook terminates only an existing Monitor executable at the
+//! exact `/Applications/Siderostat.app` path before the bundle is replaced;
+//! runtime, ds4-server, and user data are not touched. The expanded package is
+//! inspected so unexpected scripts or forbidden payload paths fail the build.
 //!
 //! Identifier / version are fixed here (spec §9.1) so a later signed release
 //! shares the same receipt ID and version comparison for upgrade.
@@ -14,6 +15,7 @@ use crate::bundle::PkgDevArgs;
 use crate::util;
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// Component package receipt identifier (spec §9.1).
@@ -26,8 +28,97 @@ pub const INSTALL_LOCATION: &str = "/Applications";
 pub const PAYLOAD_PATH: &str = "/Applications/Siderostat.app";
 /// Staging directory for the intermediate component package.
 const PKG_STAGING_DIR: &str = "build/pkg-dev";
+const PREINSTALL_SCRIPT_NAME: &str = "preinstall";
 
-/// Build a scriptless flat `.pkg` from an app-dev bundle.
+/// Installer runs this script as root before replacing the app bundle. It is
+/// deliberately restricted to the exact installed Monitor executable path;
+/// it does not stop the runtime helper or any ds4-server child.
+const PREINSTALL_SCRIPT: &str = r##"#!/bin/sh
+set -eu
+
+APP_EXECUTABLE='/Applications/Siderostat.app/Contents/MacOS/Siderostat'
+WAIT_STEPS=50
+
+running_monitor_pids() {
+    /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk -v expected="$APP_EXECUTABLE" '
+        {
+            pid = $1
+            command = $0
+            sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+            if (command == expected || index(command, expected " ") == 1) {
+                print pid
+            }
+        }
+    '
+}
+
+log_message() {
+    /usr/bin/logger -t SiderostatInstaller "$1" 2>/dev/null || true
+}
+
+pids=$(running_monitor_pids)
+if [ -z "$pids" ]; then
+    exit 0
+fi
+
+log_message 'terminating the existing Siderostat Monitor before upgrade'
+for pid in $pids; do
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+done
+
+step=0
+while [ "$step" -lt "$WAIT_STEPS" ]; do
+    remaining=$(running_monitor_pids)
+    [ -z "$remaining" ] && exit 0
+    /bin/sleep 0.2
+    step=$((step + 1))
+done
+
+remaining=$(running_monitor_pids)
+if [ -n "$remaining" ]; then
+    log_message 'Siderostat Monitor did not exit after TERM; forcing only the exact Monitor path'
+    for pid in $remaining; do
+        /bin/kill -KILL "$pid" 2>/dev/null || true
+    done
+fi
+
+step=0
+while [ "$step" -lt "$WAIT_STEPS" ]; do
+    remaining=$(running_monitor_pids)
+    [ -z "$remaining" ] && exit 0
+    /bin/sleep 0.2
+    step=$((step + 1))
+done
+
+log_message 'could not stop the existing Siderostat Monitor'
+exit 1
+"##;
+
+/// Bundle-specific Installer behavior for the fixed `/Applications` payload.
+/// In particular, relocation must be disabled so an existing bundle with the
+/// same identifier cannot redirect a clean install into another directory.
+const COMPONENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <dict>
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsRelocatable</key>
+        <false/>
+        <key>BundleIsVersionChecked</key>
+        <true/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+        <key>RootRelativeBundlePath</key>
+        <string>Siderostat.app</string>
+    </dict>
+</array>
+</plist>
+"#;
+
+/// Build a flat `.pkg` from an app-dev bundle.
 pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!("pkg-dev requires macOS (pkgbuild/productbuild/pkgutil)");
@@ -52,7 +143,8 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
     // 2. product archive wrapping the component.
     build_product(&component_pkg, &product_pkg, &args.version, None)?;
 
-    // 3. expand and inspect: one payload item, no scripts, no forbidden paths.
+    // 3. expand and inspect: one payload item, one controlled preinstall script,
+    // and no forbidden paths.
     let expand_dir = staging.join("expand");
     if expand_dir.exists() {
         std::fs::remove_dir_all(&expand_dir)
@@ -73,8 +165,8 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
         report.payload
     );
     anyhow::ensure!(
-        report.scripts.is_empty(),
-        "installer scripts are forbidden: {:?}",
+        report.scripts == [PREINSTALL_SCRIPT_NAME],
+        "unexpected installer scripts: {:?}",
         report.scripts
     );
     anyhow::ensure!(
@@ -89,12 +181,59 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
 }
 
 /// Run `pkgbuild` to create the component package with one app payload.
+///
+/// The app is copied under a temporary root and packaged with `--root` rather
+/// than `--component`. `--component` adds a relocatable bundle declaration;
+/// Installer may then move an existing bundle with the same identifier out of
+/// `/Applications`, which is unsafe for a clean install and for upgrade
+/// verification.
 pub(crate) fn build_component(app: &Path, component_pkg: &Path, version: &str) -> Result<()> {
-    util::run(
+    let staging = component_pkg
+        .parent()
+        .context("component package has no parent directory")?
+        .join("payload-root");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("clean package payload staging {}", staging.display()))?;
+    }
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create package payload staging {}", staging.display()))?;
+    let staged_app = staging.join("Siderostat.app");
+    util::run("ditto", &[app.as_os_str(), staged_app.as_os_str()])
+        .with_context(|| format!("stage app payload {}", staged_app.display()))?;
+
+    let component_plist = component_pkg
+        .parent()
+        .context("component package has no parent directory")?
+        .join("component-plist.xml");
+    std::fs::write(&component_plist, COMPONENT_PLIST)
+        .with_context(|| format!("write component plist {}", component_plist.display()))?;
+
+    let scripts = component_pkg
+        .parent()
+        .context("component package has no parent directory")?
+        .join("scripts");
+    if scripts.exists() {
+        std::fs::remove_dir_all(&scripts)
+            .with_context(|| format!("clean installer scripts {}", scripts.display()))?;
+    }
+    std::fs::create_dir_all(&scripts)
+        .with_context(|| format!("create installer scripts {}", scripts.display()))?;
+    let preinstall = scripts.join(PREINSTALL_SCRIPT_NAME);
+    std::fs::write(&preinstall, PREINSTALL_SCRIPT)
+        .with_context(|| format!("write installer script {}", preinstall.display()))?;
+    std::fs::set_permissions(&preinstall, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("make installer script executable {}", preinstall.display()))?;
+
+    let result = util::run(
         "pkgbuild",
         &[
-            OsStr::new("--component"),
-            OsStr::new(app),
+            OsStr::new("--root"),
+            OsStr::new(&staging),
+            OsStr::new("--component-plist"),
+            OsStr::new(&component_plist),
+            OsStr::new("--scripts"),
+            OsStr::new(&scripts),
             OsStr::new("--install-location"),
             OsStr::new(INSTALL_LOCATION),
             OsStr::new("--identifier"),
@@ -104,8 +243,11 @@ pub(crate) fn build_component(app: &Path, component_pkg: &Path, version: &str) -
             OsStr::new(component_pkg),
         ],
     )
-    .with_context(|| format!("pkgbuild component {}", component_pkg.display()))?;
-    Ok(())
+    .with_context(|| format!("pkgbuild component {}", component_pkg.display()));
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&scripts);
+    let _ = std::fs::remove_file(&component_plist);
+    result.map(|_| ())
 }
 
 /// Run `productbuild` to wrap the component into the final product archive.
@@ -142,16 +284,16 @@ pub(crate) fn build_product(
 pub struct ExpandedPackageReport {
     /// Top-level items in the `Payload` directory (install-time destinations).
     pub payload: Vec<String>,
-    /// Installer script files found (must be empty).
+    /// Installer script files found (must contain only the controlled preinstall).
     pub scripts: Vec<String>,
     /// Forbidden paths found (must be empty).
     pub forbidden: Vec<String>,
 }
 
-/// Inspect an expanded flat package: verify exactly one payload item, no
-/// installer scripts, and no forbidden paths. Pure so it can be unit-tested
-/// against a fixture. `scripts` is non-empty when a `Scripts` directory or a
-/// `.postinstall`/`.preinstall` file is present; `forbidden` flags
+/// Inspect an expanded flat package: verify exactly one payload item, the
+/// controlled installer script, and no forbidden paths. Pure so it can be
+/// unit-tested against a fixture. `scripts` is non-empty when a `Scripts`
+/// directory or a `.postinstall`/`.preinstall` file is present; `forbidden` flags
 /// `/usr/local/bin`, LaunchAgents, or LaunchDaemons payload entries.
 pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
     let mut report = ExpandedPackageReport {
@@ -163,7 +305,7 @@ pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
     let mut payload_dirs = Vec::new();
     collect_dirs_named(expand_dir, "Payload", &mut payload_dirs)?;
     if let [payload_dir] = payload_dirs.as_slice() {
-        for entry in std::fs::read_dir(&payload_dir)
+        for entry in std::fs::read_dir(payload_dir)
             .with_context(|| format!("read Payload {}", payload_dir.display()))?
         {
             let entry = entry.context("read Payload entry")?;
@@ -172,7 +314,7 @@ pub fn inspect_expanded(expand_dir: &Path) -> Result<ExpandedPackageReport> {
             // Payload 内 entry を payload_dir に対して相対化して
             // install-relative パス（例: Applications）を得る。
             let path = entry.path();
-            let rel = path.strip_prefix(&payload_dir).unwrap_or(&path);
+            let rel = path.strip_prefix(payload_dir).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().into_owned();
             // Forbidden install destinations: any non-Applications payload.
             if is_forbidden_payload(&rel_str) {
@@ -287,6 +429,27 @@ mod tests {
         assert_eq!(PRODUCT_IDENTIFIER, "dev.siderostat-ds4-proxy.product");
         assert_eq!(INSTALL_LOCATION, "/Applications");
         assert_eq!(PAYLOAD_PATH, "/Applications/Siderostat.app");
+    }
+
+    #[test]
+    fn component_plist_disables_bundle_relocation() {
+        assert!(COMPONENT_PLIST.contains("<key>BundleIsRelocatable</key>\n        <false/>"));
+        assert!(
+            COMPONENT_PLIST
+                .contains("<key>BundleOverwriteAction</key>\n        <string>upgrade</string>")
+        );
+    }
+
+    #[test]
+    fn preinstall_script_is_scoped_to_the_installed_monitor_path() {
+        assert!(
+            PREINSTALL_SCRIPT.contains("/Applications/Siderostat.app/Contents/MacOS/Siderostat")
+        );
+        assert!(PREINSTALL_SCRIPT.contains("/bin/kill -TERM"));
+        assert!(PREINSTALL_SCRIPT.contains("/bin/kill -KILL"));
+        assert!(!PREINSTALL_SCRIPT.contains("killall"));
+        assert!(!PREINSTALL_SCRIPT.contains("pkill"));
+        assert!(!PREINSTALL_SCRIPT.contains("/Library/LaunchAgents"));
     }
 
     #[test]

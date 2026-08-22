@@ -22,14 +22,14 @@ pub fn generate(
     ds4_source_commit: Option<&str>,
     approved: &[String],
 ) -> Result<()> {
-    // Digest cache lives beside the MXFP4 manifest so re-installs skip re-reading
+    // Digest cache lives beside the distributed manifest so re-installs skip re-reading
     // the (multi-GB) model files when their metadata is unchanged.
     let cache_path = config
         .ds4
-        .mxfp4
+        .distributed
         .model_manifest
         .parent()
-        .context("mxfp4 model_manifest has no parent directory")?
+        .context("distributed model_manifest has no parent directory")?
         .join(DIGEST_CACHE_FILE_NAME);
     let mut digest_cache = util::load_digest_cache(&cache_path);
 
@@ -83,10 +83,15 @@ pub fn generate(
         ds4_binary_sha256: ds4_digest.clone(),
         model_sha256: standalone_model_digest,
         checkpoint: config.ds4.standalone.checkpoint.clone(),
-        model_variant: config.ds4.standalone.model_variant.name().to_string(),
+        quantization: config.ds4.standalone.quantization.name().to_string(),
         residency: config.ds4.standalone.residency.name().to_string(),
         context_size: config.ds4.standalone.context_size as u64,
         argv_profile_sha256: standalone_argv_profile,
+        speculative_support: Some(if dspark_enabled {
+            "dspark".into()
+        } else {
+            "none".into()
+        }),
         dspark_enabled,
         dspark_support_sha256: if dspark_enabled {
             Some(dspark_digest)
@@ -115,16 +120,15 @@ pub fn generate(
         config.ds4.standalone.model_manifest.display()
     ));
 
-    // Distributed manifest (MXFP4). The worker command argv is used for the
-    // recorded argv profile; both nodes must generate from the same ds4.mxfp4
-    // config so the values agree (spec: MXFP4 config is shared).
-    let mxfp4_digest = model_digest(
-        &config.ds4.mxfp4.model,
-        "mxfp4 model",
+    // Distributed manifest. The worker command argv is used for the recorded
+    // argv profile; topology and quantization are recorded independently.
+    let distributed_digest = model_digest(
+        &config.ds4.distributed.model,
+        "distributed model",
         "mxfp4-model",
         &mut digest_cache,
     )?;
-    let mxfp4_size = util::file_size(&config.ds4.mxfp4.model)?;
+    let distributed_size = util::file_size(&config.ds4.distributed.model)?;
     let worker_command = build_distributed_worker_command(
         &config.ds4,
         config.cluster.coordinator_address,
@@ -141,18 +145,20 @@ pub fn generate(
 
     let distributed = DistributedManifest {
         schema_version: DEPLOYMENT_MANIFEST_SCHEMA_VERSION,
-        profile: "distributed-mxfp4".into(),
+        profile: "distributed-layer-parallel".into(),
         ds4_binary_sha256: ds4_digest,
         compatible_ds4_binary_sha256: compatible,
         ds4_source_commit: source_commit,
-        model_sha256: mxfp4_digest,
-        model_size: mxfp4_size,
-        checkpoint: config.ds4.mxfp4.checkpoint.clone(),
+        model_sha256: distributed_digest,
+        model_size: distributed_size,
+        checkpoint: config.ds4.distributed.checkpoint.clone(),
         model_family: "DeepSeek V4 Flash".into(),
-        quantization: "mxfp4-experts".into(),
-        context_size: config.ds4.mxfp4.context_size as u64,
-        coordinator_layers: config.ds4.mxfp4.coordinator_layers.clone(),
-        worker_layers: config.ds4.mxfp4.worker_layers.clone(),
+        quantization: config.ds4.distributed.quantization.name().into(),
+        topology: config.ds4.distributed.topology.name().into(),
+        speculative_support: "none".into(),
+        context_size: config.ds4.distributed.context_size as u64,
+        coordinator_layers: config.ds4.distributed.coordinator_layers.clone(),
+        worker_layers: config.ds4.distributed.worker_layers.clone(),
         ds4_wire_schema: "ds4d-v1-hello40".into(),
         argv_profile_sha256: distributed_argv_profile,
     };
@@ -161,13 +167,13 @@ pub fn generate(
         .context("distributed manifest validation failed")?;
     let distributed_json = serde_json::to_string_pretty(&distributed)?;
     util::write(
-        &config.ds4.mxfp4.model_manifest,
+        &config.ds4.distributed.model_manifest,
         distributed_json.as_bytes(),
     )
     .context("write distributed manifest")?;
     util::tracing_log(&format!(
         "wrote distributed manifest -> {}",
-        config.ds4.mxfp4.model_manifest.display()
+        config.ds4.distributed.model_manifest.display()
     ));
 
     util::save_digest_cache(&cache_path, &digest_cache)?;
@@ -180,13 +186,13 @@ pub fn generate(
 pub fn fingerprint_models(
     cache_path: &Path,
     standalone: &Path,
-    mxfp4: &Path,
+    distributed: &Path,
     dspark_support: Option<&Path>,
 ) -> Result<()> {
     let mut digest_cache = util::load_digest_cache(cache_path);
     for (path, label, key) in [
         (standalone, "standalone model", "standalone-model"),
-        (mxfp4, "mxfp4 model", "mxfp4-model"),
+        (distributed, "distributed model", "mxfp4-model"),
     ] {
         let (digest, _) = util::sha256_cached(path, label, key, &mut digest_cache)?;
         util::tracing_log(&format!(
@@ -220,7 +226,7 @@ pub fn fingerprint_models(
 pub fn verify_model_cache(
     cache_path: &Path,
     standalone: &Path,
-    mxfp4: &Path,
+    distributed: &Path,
     dspark_support: Option<&Path>,
     accept_metadata_change: bool,
 ) -> Result<()> {
@@ -228,7 +234,7 @@ pub fn verify_model_cache(
     let original_cache = digest_cache.clone();
     for (path, label, key) in [
         (standalone, "standalone model", "standalone-model"),
-        (mxfp4, "mxfp4 model", "mxfp4-model"),
+        (distributed, "distributed model", "mxfp4-model"),
     ] {
         let _ =
             util::sha256_from_cache(path, label, key, &mut digest_cache, accept_metadata_change)?;

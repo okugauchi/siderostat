@@ -99,4 +99,19 @@ fn resources_include_license_notices_and_default_config() {
     }
     let license = std::fs::read_to_string(resources.join("LICENSE")).unwrap();
     assert!(license.contains("MIT License"));
+    for locale in ["en.lproj", "ja.lproj"] {
+        let strings = resources.join(locale).join("Localizable.strings");
+        assert!(
+            strings.is_file(),
+            "missing localized resource {}",
+            strings.display()
+        );
+        let contents = std::fs::read_to_string(strings).unwrap();
+        assert!(contents.contains("app.name"));
+        assert!(contents.contains("menu.settings"));
+        assert!(contents.contains("menu.quit"));
+        assert!(contents.contains("first_launch.version"));
+        assert!(contents.contains("first_launch.approval"));
+        assert!(contents.contains("first_launch.model_ready"));
+    }
 }

@@ -92,7 +92,12 @@ impl DisplayState {
         self.decode_elapsed_secs = snapshot.decode.elapsed_secs;
     }
 
-    /// Mark the monitor as offline after a failed poll.
+    /// Mark the monitor as connected but unable to read the selected metrics.
+    pub fn mark_degraded(&mut self) {
+        self.status = MonitorStatus::Degraded;
+    }
+
+    /// Mark the monitor as offline after both metrics and health polling fail.
     pub fn mark_offline(&mut self) {
         self.status = MonitorStatus::Offline;
     }
@@ -100,8 +105,9 @@ impl DisplayState {
 
 /// First-launch step from the distribution spec §11. Registration progress and
 /// model-startup progress are distinct phases so the UI can render them as
-/// separate progress states (C-05b). Wired to production UI in C-05; dead
-/// until then from the bin crate's perspective.
+/// separate progress states (C-05b). The monitor startup path feeds the same
+/// events into this reducer; the legacy inventory remains read-only and is
+/// supplied by D-01.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstLaunchState {
@@ -112,8 +118,13 @@ pub enum FirstLaunchState {
     InventoryChecked { legacy_present: bool },
     /// User config, secret, manifest validated (spec step 3).
     ConfigValidated { valid: bool },
-    /// Runtime LaunchAgent status read (spec step 4).
-    RuntimeStatusChecked { status: ServiceStatus },
+    /// Runtime LaunchAgent and main-app login-item statuses read (spec steps
+    /// 4 and 7). They are kept together so registration cannot report success
+    /// while either independent service is still unregistered.
+    ServiceStatusesChecked {
+        runtime_status: ServiceStatus,
+        main_app_login_status: ServiceStatus,
+    },
     /// Background service purpose explained and registration requested (step 5).
     Registering,
     /// Registration succeeded (spec step 5 success).
@@ -122,8 +133,8 @@ pub enum FirstLaunchState {
     RequiresApproval,
     /// Registration failed; user may retry.
     RegisterFailed,
-    /// Monitor login-start setting confirmed (spec step 7). Registration
-    /// progress is complete; model-startup progress begins.
+    /// Runtime and monitor login-start settings confirmed (spec step 7).
+    /// Registration progress is complete; model-startup progress begins.
     MonitorLoginChecked,
     /// Runtime admin API is ready (spec step 8).
     RuntimeAdminReady,
@@ -134,14 +145,21 @@ pub enum FirstLaunchState {
 
 /// Event fed to the first-launch reducer. Kept minimal and pure so the order,
 /// approval gating, and failure branches are unit-testable. Real inventory /
-/// config / status payloads are connected in D-01 / C-05c.
+/// config / status payloads are connected by the C-05 startup driver.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstLaunchEvent {
     VersionShown,
-    InventoryChecked { legacy_present: bool },
-    ConfigChecked { valid: bool },
-    RuntimeStatusChecked { status: ServiceStatus },
+    InventoryChecked {
+        legacy_present: bool,
+    },
+    ConfigChecked {
+        valid: bool,
+    },
+    ServiceStatusesChecked {
+        runtime_status: ServiceStatus,
+        main_app_login_status: ServiceStatus,
+    },
     RegisterRequested,
     RegisterSucceeded,
     RegisterRequiresApproval,
@@ -173,9 +191,15 @@ pub fn first_launch_reducer(state: FirstLaunchState, event: FirstLaunchEvent) ->
         ) => FirstLaunchState::ConfigValidated { valid: false },
         (
             FirstLaunchState::ConfigValidated { valid: true },
-            FirstLaunchEvent::RuntimeStatusChecked { status },
-        ) => FirstLaunchState::RuntimeStatusChecked { status },
-        (FirstLaunchState::RuntimeStatusChecked { .. }, FirstLaunchEvent::RegisterRequested) => {
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status,
+                main_app_login_status,
+            },
+        ) => FirstLaunchState::ServiceStatusesChecked {
+            runtime_status,
+            main_app_login_status,
+        },
+        (FirstLaunchState::ServiceStatusesChecked { .. }, FirstLaunchEvent::RegisterRequested) => {
             FirstLaunchState::Registering
         }
         (FirstLaunchState::Registering, FirstLaunchEvent::RegisterSucceeded) => {
@@ -187,6 +211,19 @@ pub fn first_launch_reducer(state: FirstLaunchState, event: FirstLaunchEvent) ->
         }
         (FirstLaunchState::Registering, FirstLaunchEvent::RegisterFailed) => {
             FirstLaunchState::RegisterFailed
+        }
+        // The user may approve the already registered service in System
+        // Settings after the initial registration returned RequiresApproval.
+        (
+            FirstLaunchState::RequiresApproval,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: ServiceStatus::Enabled,
+                main_app_login_status: ServiceStatus::Enabled,
+            },
+        ) => FirstLaunchState::Registered,
+        // A failed registration can be retried by the next first-launch run.
+        (FirstLaunchState::RegisterFailed, FirstLaunchEvent::RegisterRequested) => {
+            FirstLaunchState::Registering
         }
         // registration progress 完了後に model-startup progress へ。
         (FirstLaunchState::Registered, FirstLaunchEvent::MonitorLoginConfirmed) => {
@@ -218,14 +255,14 @@ pub fn first_launch_complete(state: &FirstLaunchState) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// D-03: app/runtime version handshake and upgrade proposal
+// D-03: app/runtime version handshake and notification
 //
 // The `.pkg` can replace `/Applications/Siderostat.app` while the old runtime
 // executable image keeps running (spec §13.1). The monitor compares its own
-// app version against the runtime `/healthz` version and, on mismatch,
-// proposes a single graceful restart (never an automatic loop). Rolling back
-// to a prior app with an incompatible schema warns instead of auto-converting
-// user data.
+// app version against the runtime `/healthz` version and, on mismatch, emits a
+// state-change notification (never an automatic restart loop). Rolling back to
+// a prior app with an incompatible schema warns instead of auto-converting user
+// data.
 // ---------------------------------------------------------------------------
 
 /// Result of comparing the app version against the running runtime version.
@@ -261,6 +298,39 @@ pub fn version_handshake(app: &str, runtime: &str) -> VersionHandshake {
     }
 }
 
+/// Compare both version and build number. An unavailable build number is
+/// ignored because developer binaries and older runtimes may not expose one;
+/// the version comparison remains authoritative in that case.
+pub fn version_handshake_with_build(
+    app_version: &str,
+    app_build: &str,
+    runtime_version: &str,
+    runtime_build: &str,
+) -> VersionHandshake {
+    let version_result = version_handshake(app_version, runtime_version);
+    if version_result != VersionHandshake::Matched {
+        return version_result;
+    }
+    if app_build == runtime_build
+        || app_build.trim().is_empty()
+        || runtime_build.trim().is_empty()
+        || app_build.eq_ignore_ascii_case("unknown")
+        || runtime_build.eq_ignore_ascii_case("unknown")
+    {
+        return VersionHandshake::Matched;
+    }
+    match (parse_version(app_build), parse_version(runtime_build)) {
+        (Some(app), Some(runtime)) if app != runtime => {
+            if app < runtime {
+                VersionHandshake::RuntimeNewer
+            } else {
+                VersionHandshake::RuntimeOlder
+            }
+        }
+        _ => VersionHandshake::Matched,
+    }
+}
+
 /// Parse a dotted numeric version into comparable components. Returns `None`
 /// when any segment is non-numeric (fall back to string comparison).
 fn parse_version(version: &str) -> Option<Vec<u64>> {
@@ -271,47 +341,13 @@ fn parse_version(version: &str) -> Option<Vec<u64>> {
         .collect::<Option<Vec<_>>>()
 }
 
-/// Whether a graceful-restart proposal is allowed. The proposal is offered at
-/// most once per mismatch (D-03 action 3): a second restart is not offered
-/// automatically, so the monitor never loops on a stuck runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UpgradeProposal {
-    pub offered: bool,
-}
-
-impl Default for UpgradeProposal {
-    fn default() -> Self {
-        Self { offered: false }
-    }
-}
-
-impl UpgradeProposal {
-    /// Decide whether to offer a graceful restart for `handshake`. Offered at
-    /// most once, and only when the runtime is older than the app.
-    pub fn decide(&mut self, handshake: VersionHandshake) -> bool {
-        let should_offer = !self.offered && handshake == VersionHandshake::RuntimeOlder;
-        if should_offer {
-            self.offered = true;
-        }
-        should_offer
-    }
-
-    /// Whether a prior-app rollback with incompatible schema should warn
-    /// instead of auto-converting user data (D-03 action 4).
-    pub fn rollback_warning_required(&self) -> bool {
-        // Prior app rollback never auto-converts data; the warning is always
-        // required when a rollback is offered.
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn snapshot() -> MetricsSnapshot {
         MetricsSnapshot {
-            cluster_mode: Some("distributed-mxfp4".into()),
+            cluster_mode: Some("distributed-layer-parallel".into()),
             cluster_state: Some("distributed-ready".into()),
             generation: Some(7),
             target_ready: Some(true),
@@ -346,7 +382,10 @@ mod tests {
         let mut state = DisplayState::default();
         state.apply_metrics(&snapshot());
         assert_eq!(state.status, MonitorStatus::Online);
-        assert_eq!(state.cluster_mode.as_deref(), Some("distributed-mxfp4"));
+        assert_eq!(
+            state.cluster_mode.as_deref(),
+            Some("distributed-layer-parallel")
+        );
         assert_eq!(state.generation, Some(7));
         assert!(state.prefill_active);
         assert_eq!(state.prefill_percent, 45.5);
@@ -364,12 +403,27 @@ mod tests {
         assert_eq!(state.status, MonitorStatus::Offline);
     }
 
+    #[test]
+    fn degraded_state_preserves_the_last_metrics_snapshot() {
+        let mut state = DisplayState::default();
+        state.apply_metrics(&snapshot());
+        state.mark_degraded();
+
+        assert_eq!(state.status, MonitorStatus::Degraded);
+        assert_eq!(
+            state.cluster_mode.as_deref(),
+            Some("distributed-layer-parallel")
+        );
+        assert_eq!(state.cluster_state.as_deref(), Some("distributed-ready"));
+        assert_eq!(state.target_ready, Some(true));
+    }
+
     // ---- C-05b: first-launch reducer ----
 
     use crate::service_management::ServiceStatus as S;
 
     /// Drive the happy-path first launch: version → inventory → config →
-    /// runtime status → register → login → admin ready → model ready.
+    /// service statuses → register → login → admin ready → model ready.
     fn happy_path() -> FirstLaunchState {
         let mut state = FirstLaunchState::VersionShown;
         state = first_launch_reducer(
@@ -381,8 +435,9 @@ mod tests {
         state = first_launch_reducer(state, FirstLaunchEvent::ConfigChecked { valid: true });
         state = first_launch_reducer(
             state,
-            FirstLaunchEvent::RuntimeStatusChecked {
-                status: S::NotRegistered,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: S::NotRegistered,
+                main_app_login_status: S::NotRegistered,
             },
         );
         state = first_launch_reducer(state, FirstLaunchEvent::RegisterRequested);
@@ -454,8 +509,9 @@ mod tests {
         state = first_launch_reducer(state, FirstLaunchEvent::ConfigChecked { valid: true });
         state = first_launch_reducer(
             state,
-            FirstLaunchEvent::RuntimeStatusChecked {
-                status: S::RequiresApproval,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: S::RequiresApproval,
+                main_app_login_status: S::RequiresApproval,
             },
         );
         state = first_launch_reducer(state, FirstLaunchEvent::RegisterRequested);
@@ -470,6 +526,41 @@ mod tests {
     }
 
     #[test]
+    fn approval_can_resume_after_system_settings_changes_status() {
+        let state = first_launch_reducer(
+            FirstLaunchState::RequiresApproval,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: S::Enabled,
+                main_app_login_status: S::Enabled,
+            },
+        );
+        assert_eq!(state, FirstLaunchState::Registered);
+    }
+
+    #[test]
+    fn approval_does_not_resume_until_both_services_are_enabled() {
+        let state = first_launch_reducer(
+            FirstLaunchState::RequiresApproval,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: S::Enabled,
+                main_app_login_status: S::RequiresApproval,
+            },
+        );
+        assert_eq!(state, FirstLaunchState::RequiresApproval);
+    }
+
+    #[test]
+    fn failed_registration_can_be_retried() {
+        assert_eq!(
+            first_launch_reducer(
+                FirstLaunchState::RegisterFailed,
+                FirstLaunchEvent::RegisterRequested,
+            ),
+            FirstLaunchState::Registering
+        );
+    }
+
+    #[test]
     fn register_failed_does_not_present_as_enabled() {
         let mut state = FirstLaunchState::VersionShown;
         state = first_launch_reducer(
@@ -481,8 +572,9 @@ mod tests {
         state = first_launch_reducer(state, FirstLaunchEvent::ConfigChecked { valid: true });
         state = first_launch_reducer(
             state,
-            FirstLaunchEvent::RuntimeStatusChecked {
-                status: S::NotRegistered,
+            FirstLaunchEvent::ServiceStatusesChecked {
+                runtime_status: S::NotRegistered,
+                main_app_login_status: S::NotRegistered,
             },
         );
         state = first_launch_reducer(state, FirstLaunchEvent::RegisterRequested);
@@ -493,7 +585,7 @@ mod tests {
 
     #[test]
     fn out_of_order_events_are_ignored() {
-        // RuntimeStatusChecked 前に RegisterRequested は無視される。
+        // ServiceStatusesChecked 前に RegisterRequested は無視される。
         let state = first_launch_reducer(
             FirstLaunchState::ConfigValidated { valid: true },
             FirstLaunchEvent::RegisterRequested,
@@ -517,8 +609,9 @@ mod tests {
                 legacy_present: false,
             },
             FirstLaunchState::ConfigValidated { valid: true },
-            FirstLaunchState::RuntimeStatusChecked {
-                status: S::NotRegistered,
+            FirstLaunchState::ServiceStatusesChecked {
+                runtime_status: S::NotRegistered,
+                main_app_login_status: S::NotRegistered,
             },
             FirstLaunchState::Registering,
             FirstLaunchState::Registered,
@@ -556,7 +649,7 @@ mod tests {
         ));
     }
 
-    // ---- D-03: version handshake and upgrade proposal ----
+    // ---- D-03: version handshake and notification ----
 
     #[test]
     fn version_handshake_matches_equal_versions() {
@@ -600,31 +693,18 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_proposal_is_offered_at_most_once() {
-        let mut proposal = UpgradeProposal::default();
-        // 最初の mismatch で 1 回だけ提案する。
-        assert!(proposal.decide(VersionHandshake::RuntimeOlder));
-        // 2 回目は提案しない（自動 loop を防ぐ）。
-        assert!(!proposal.decide(VersionHandshake::RuntimeOlder));
-        // matched / newer では提案しない。
-        let mut matched = UpgradeProposal::default();
-        assert!(!matched.decide(VersionHandshake::Matched));
-        let mut newer = UpgradeProposal::default();
-        assert!(!newer.decide(VersionHandshake::RuntimeNewer));
-    }
-
-    #[test]
-    fn upgrade_proposal_does_not_offer_on_unavailable() {
-        let mut proposal = UpgradeProposal::default();
-        // 取得不能では提案しない。
-        assert!(!proposal.decide(VersionHandshake::Unavailable));
-    }
-
-    #[test]
-    fn rollback_warning_is_required_for_schema_incompatibility() {
-        // prior app へ rollback する際、schema 非互換なら警告する。
-        // data を自動変換しない。
-        let proposal = UpgradeProposal::default();
-        assert!(proposal.rollback_warning_required());
+    fn version_handshake_compares_build_numbers_when_versions_match() {
+        assert_eq!(
+            version_handshake_with_build("0.3.0", "2", "0.3.0", "1"),
+            VersionHandshake::RuntimeOlder
+        );
+        assert_eq!(
+            version_handshake_with_build("0.3.0", "1", "0.3.0", "2"),
+            VersionHandshake::RuntimeNewer
+        );
+        assert_eq!(
+            version_handshake_with_build("0.3.0", "1", "0.3.0", "unknown"),
+            VersionHandshake::Matched
+        );
     }
 }

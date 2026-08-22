@@ -52,7 +52,7 @@ cargo xtask fingerprint-models [options]
 |---|---|
 | `--ds4-server <path>` | ds4-server の場所を明示（既定: `$HOME` 探索） |
 | `--node-id <name>` | config に書く `cluster.node_id`（既定: hostname） |
-| `--standalone-model` / `--mxfp4-model` / `--dspark-support` | モデルを明示（既定: gguf 配下を名前で自動判別） |
+| `--standalone-model` / `--distributed-model` / `--dspark-support` | モデルを明示（既定: gguf 配下を名前で自動判別）。`--mxfp4-model` は旧 alias |
 | `--shared-secret-dir <dir>` | 共有する cluster-control / peer-proxy の供給元（legacy `.key` も可） |
 | `--ds4-source-commit <sha>` | distributed manifest の verified DS4 commit（初回 install で必須） |
 | `--ds4-binary-digest <sha>...` | distributed manifest の承認済み binary digest 集合（既定: 実機 digest） |
@@ -96,8 +96,9 @@ cargo xtask install --peer-ds4-binary-digest "<coordinator-ds4-sha256>"
 
 ## app-dev
 
-`contrib/macos/` の bundle template と `target/release` の runtime / monitor binary から、
-production と同じ layout の `Siderostat.app` を ad-hoc 署名で生成する（B-03）。
+`contrib/macos/` の bundle template と release build の runtime / monitor binary から、
+production と同じ layout の `Siderostat.app` を ad-hoc 署名で生成する（B-03）。指定した
+version/build number は Info.plist と runtime の `/healthz` metadata の両方へ注入される。
 
 ```sh
 cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
@@ -114,14 +115,16 @@ cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
 
 ## pkg-dev
 
-`app-dev` で生成した bundle を scriptless flat `.pkg` にする（E-01）。
+`app-dev` で生成した bundle を flat `.pkg` にする（E-01）。インストール前に、既存の
+`/Applications/Siderostat.app/Contents/MacOS/Siderostat` が動作中であれば、その Monitor だけを
+終了する `preinstall` script を含める。runtime、`ds4-server`、ユーザーデータは対象にしない。
 
 ```sh
 cargo xtask pkg-dev --app-dir <staging> --version <semver> [--output-dir dist]
 ```
 
-payload は `/Applications/Siderostat.app` 一項目のみ。`preinstall` / `postinstall`
-script は生成しない。E-01 で実装される。
+payload は `/Applications/Siderostat.app` 一項目のみ。`postinstall` script は生成せず、
+`preinstall` は上記の Monitor 終了処理に限定する。
 
 ## macOS CI の ad-hoc artifact verification
 

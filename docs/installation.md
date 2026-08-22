@@ -52,10 +52,10 @@ Supervisorが使用予定のoptionがCLI helpに存在することを確認す�
 
 Standalone profileとdistributed profileは独立した設定である（spec第14.1節）。
 
-- Standalone model variant: `q2`、`q2-q4`、`mxfp4`。
+- Standalone quantization: `q2`、`q2-q4`、`mxfp4`。
 - Standalone residency: `resident`または`ssd-streaming`。
 - Production Standalone: resident + DSpark support GGUF（現行DS4ではSSD streamingおよびDistributedとの併用不可）。
-- Distributed profile: `distributed-mxfp4`。
+- Distributed profile: `distributed-layer-parallel`（topology=`layer-parallel`、quantization=`mxfp4`、speculative support=`none`）。
 
 Modelはoperatorの既知のsourceから取得する。URLや配布条件は推測しない。取得後、両nodeでchecksumとsizeを記録する。
 
@@ -76,7 +76,7 @@ cargo xtask fingerprint-models --ds4-server "/absolute/path/to/ds4-server"
 
 旧形式cacheにはサンプル署名がない。modelが移動・複製・`touch`されただけで内容不変だとoperatorが確認済みの場合は、`cargo xtask install --accept-model-metadata-change`を一度指定してcached full digestを維持したままmetadataを更新できる。この指定でもsize変更は受理しない。内容に確信がない場合はfull SHA-256を再計算する。サンプル署名はmetadata drift時の高速な偶発変更検出であり、full-file SHA-256と同等の保証ではない。
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
+Distributed (layer-parallel) に用いる両nodeのmodel content SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（MXFP4はquantizationであり、topologyではない）。不一致ならlayer-parallel promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFはspeculative supportの独立項目としてchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`siderostat.example.toml`のplaceholder pathへ合わせる。
 
@@ -198,7 +198,7 @@ cp siderostat.example.toml "$HOME/Library/Application Support/siderostat/config.
 
 - `ds4.binary`の`PLACEHOLDER-ds4-server`。
 - `ds4.dspark.support_model`の`PLACEHOLDER-dspark-support-0731.gguf`。
-- `ds4.standalone.model`と`ds4.mxfp4.model`の`PLACEHOLDER-*.gguf`。
+- `ds4.standalone.model`と`ds4.distributed.model`の`PLACEHOLDER-*.gguf`。
 - Secret fileの`PLACEHOLDER-cluster-control`、`PLACEHOLDER-peer-proxy`、`PLACEHOLDER-admin`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
 - Manifest pathの`PLACEHOLDER-standalone.gguf`相当のmanifest JSON。
 
@@ -260,7 +260,7 @@ Pairing完了後は両nodeで`mode=paired-standalone`、`state=paired-standalone
 
 ### Promotion
 
-MXFP4 promotionにはdeployment matchと実HELLOとcomplete routeが必須（spec第33.3節）。まずfingerprintを実行する。
+layer-parallel promotionにはdeployment matchと実HELLOとcomplete routeが必須（spec第33.3節）。まずfingerprintを実行する。
 
 ```sh
 siderostat cluster fingerprint --profile standalone
@@ -275,9 +275,9 @@ Binary/model/checkpoint/context/layer split/wire schema/argv profileが一致す
 siderostat cluster promote
 ```
 
-Cluster-wide drain後にDS4を停止し、coordinator MXFP4起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
+Cluster-wide drain後にDS4を停止し、coordinator の layer-parallel child を起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
 
-Promotion完了後は両nodeで`mode=distributed-mxfp4`、`state=distributed-ready`、`ready=true`を確認する。Fingerprint commandは受付時にjob ID付きJSONを返す。Compatibility不一致、HELLO timeout、route incompleteのいずれかがある場合は`distributed-ready`を期待せず、[`docs/troubleshooting.md`](troubleshooting.md)に従う。
+Promotion完了後は両nodeで`mode=distributed-layer-parallel`、`state=distributed-ready`、`ready=true`を確認する。Fingerprint commandは受付時にjob ID付きJSONを返す。Compatibility不一致、HELLO timeout、route incompleteのいずれかがある場合は`distributed-ready`を期待せず、[`docs/troubleshooting.md`](troubleshooting.md)に従う。
 
 ### LaunchAgent
 

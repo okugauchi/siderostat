@@ -447,7 +447,7 @@ fn transition(
             false,
         ),
         (ClusterState::DistributedStarting, ClusterEventKind::DistributedRouteReady) => (
-            StableMode::DistributedMxfp4,
+            StableMode::DistributedLayerParallel,
             ClusterState::DistributedReady,
             current.role != LocalRole::Worker,
         ),
@@ -480,9 +480,11 @@ fn transition(
             ClusterState::SoloStandaloneReady,
             true,
         ),
-        (ClusterState::DistributedReady, ClusterEventKind::BeginDemotion) => {
-            (StableMode::DistributedMxfp4, ClusterState::Demoting, false)
-        }
+        (ClusterState::DistributedReady, ClusterEventKind::BeginDemotion) => (
+            StableMode::DistributedLayerParallel,
+            ClusterState::Demoting,
+            false,
+        ),
         (ClusterState::Demoting, ClusterEventKind::PairingReady) => (
             StableMode::PairedStandalone,
             ClusterState::PairedStandaloneReady,
@@ -549,7 +551,7 @@ fn stable_ready_state(mode: StableMode) -> ClusterState {
     match mode {
         StableMode::SoloStandalone => ClusterState::SoloStandaloneReady,
         StableMode::PairedStandalone => ClusterState::PairedStandaloneReady,
-        StableMode::DistributedMxfp4 => ClusterState::DistributedReady,
+        StableMode::DistributedLayerParallel => ClusterState::DistributedReady,
     }
 }
 

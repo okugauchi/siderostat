@@ -158,9 +158,9 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
   - mode → 描画の対応:
     - `solo`（solo-standalone）: 上が緑・下が赤、2つの円は直線で接続されていない
     - `paired`（paired-standalone）: 2つとも緑、2つの円は直線で接続されていない
-    - `dist`（distributed-mxfp4）: 2つとも緑、2つの円を接続する縦線を描画
+    - `Distributed (layer-parallel)`（machine name: `distributed-layer-parallel`）: 2つとも緑、2つの円を接続する縦線を描画
     - offline / 不明: 2つとも赤、接続線なし
-- アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed の接続線は
+- アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed (layer-parallel) の接続線は
   視認できる太さにする。
 - アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値を優先して表示する。
   既定値は `prefill-avg-tps` とする。選択した値が現在進行中でない場合は、進行中の
@@ -192,12 +192,19 @@ KV cache: hit tokens=9005 load=12.3ms
 Decode:  completion=42 chunk=32.1t/s avg=28.5t/s
 ────────────────────────
 設定ファイルを開く
-Proxy 再起動
-Monitor 再起動
-終了
+siderostat-runtimeを再起動
+siderostat-runtimeを起動して自動起動を有効化／siderostat-runtimeを停止して自動起動を無効化
+ログイン項目を開く
+Siderostatを終了
 ```
 
 - セクションは状態に応じて動的に表示する（prefill 非進行中は prefill 行を出さない）。
+- メニュー操作、登録状態、非同期操作結果の文言は、App bundle 内の
+  `Resources/en.lproj/Localizable.strings` と `Resources/ja.lproj/Localizable.strings` から
+  `NSBundle` 経由で解決する。macOS の優先言語に対応するリソースを使用し、未解決時はソースの
+  日本語フォールバックを使用する。
+- `Mode`、`State`、`Prefill`、`KV cache`、`Decode` などのメトリクス名・単位は、ログやメトリクスと
+  対応する技術的な識別子として英語表記に固定する。
 - 「設定ファイルを開く」は `~/Library/Application Support/siderostat/config.toml` が存在すれば
   `/usr/bin/open` により既定アプリで開く。存在しない場合は、設定の保存場所を確認できるよう
   最寄りの既存親フォルダを開く。この操作で設定ファイルやディレクトリを暗黙に作成しない。
@@ -222,11 +229,14 @@ poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
 live_metric = "prefill-avg-tps"            # メニューバーに優先表示する随時更新値
-admin_token = ""                           # /metrics に認証を設定する場合のみ使用
+admin_token = ""                           # 指定時は hex 形式の Bearer token
+admin_token_file = ""                      # 省略時は共有 secrets/admin を使用
 ```
 
-- `admin_token` は将来 `/metrics` に認証を設定する場合に使用する。本仕様の LaunchAgent
-  操作は `launchctl` を使うため、再起動操作には使用しない。
+- `admin_token` は指定時に優先される hex 形式の Bearer token。省略時は `siderostat-runtime` と共有する
+  `~/Library/Application Support/siderostat/secrets/admin` を読み、`siderostat-runtime` と同じ hex 形式へ
+  変換して `/admin/restart` などの mutation に使用する。
+- `admin_token_file` は共有 token file の場所を変更する場合に指定する。
 
 - 設定が存在しない場合は既定値で動作する。
 - 設定変更は Monitor の再起動後に反映される。
@@ -234,7 +244,7 @@ admin_token = ""                           # /metrics に認証を設定する�
 
 ## 7. セキュリティ
 
-- admin token は設定ファイルまたは環境変数から読み、ログ・メニューへ出力しない。
+- admin token は設定値または `siderostat-runtime` と共有する secret file から読み、ログ・メニューへ出力しない。
 - monitor と本体の通信は loopback（admin_listen）限定とする。worker 本体と coordinator
   本体のメトリクス転送は、既存の source-pinned HMAC control plane に限定する。
 - モニターのログに API レスポンス本文（cluster 状態の JSON）をそのまま出力しない。
@@ -310,7 +320,7 @@ Phase 1〜4 は 2026-08-17 に実装済みとする。
 - Phase 3: `monitor/src/tray.rs`、`main.rs`（完了）
 - Phase 4: 本体の prefill / KV cache / generation イベントを `Metrics` の DS4 gauge として公開し、
   モニターの Decode 表示へ接続（完了）
-- worker の Paired/Distributed 時は、worker の loopback admin API から認証済み control plane
+- worker の Paired Standalone / Distributed (layer-parallel) 時は、worker の loopback admin API から認証済み control plane
   経由で coordinator metrics を取得する経路を追加（完了）
 - Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
   テストとコンパイルを検証済み（本体 189 tests、monitor 20 tests、xtask 2 tests、Required CI 成功）

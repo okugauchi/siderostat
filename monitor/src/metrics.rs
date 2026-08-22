@@ -9,6 +9,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorStatus {
     Online,
+    /// The runtime is reachable, but the selected metrics source is temporarily
+    /// unavailable. Keep this distinct from a runtime connection failure.
+    Degraded,
     Offline,
 }
 
@@ -311,9 +314,13 @@ ds4_proxy_cluster_generation{node_id="macstudio"} not-a-number
 
     #[test]
     fn parses_labels_with_quoted_values() {
-        let text = r#"ds4_proxy_cluster_mode{node_id="node-a",mode="distributed-mxfp4"} 1"#;
+        let text =
+            r#"ds4_proxy_cluster_mode{node_id="node-a",mode="distributed-layer-parallel"} 1"#;
         let snapshot = parse_metrics(text);
-        assert_eq!(snapshot.cluster_mode.as_deref(), Some("distributed-mxfp4"));
+        assert_eq!(
+            snapshot.cluster_mode.as_deref(),
+            Some("distributed-layer-parallel")
+        );
         assert_eq!(snapshot.node_id.as_deref(), Some("node-a"));
     }
 }

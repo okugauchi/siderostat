@@ -5,17 +5,20 @@
 //! cleanup uses the same posting primitive for its short timed restart notice;
 //! notification failures remain non-fatal.
 //!
-//! The macOS implementation posts notifications through `/usr/bin/osascript`
-//! (`display notification`), which works from a LaunchAgent running in the
-//! user's `gui/<uid>` (Aqua) session. Non-macOS targets are a no-op.
+//! The macOS implementation posts through `UNUserNotificationCenter` from the
+//! signed Siderostat.app process. The runtime helper is not itself an app
+//! bundle, so it forwards notification payloads over a per-user Unix socket to
+//! the menu-bar monitor. Non-macOS targets are a no-op.
 
 use crate::{
     cluster::{ClusterFailure, ClusterSnapshot},
+    localization::text,
     target::ClusterState,
 };
 use futures::future::BoxFuture;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::watch;
 
 /// Minimum interval between desktop notifications. High-frequency transitions
@@ -26,10 +29,60 @@ pub const NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub const NOTIFICATION_SOUND: &str = "Glass";
 
 /// A single desktop notification payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notification {
     pub title: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NotificationKind {
+    SoloStandaloneReady,
+    PairedStandaloneReady,
+    StandaloneRestart,
+    DistributedReady,
+    Backoff,
+    ManualInterventionRequired,
+    DeploymentMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationEvent {
+    kind: NotificationKind,
+    notification: Notification,
+}
+
+impl NotificationEvent {
+    fn new(kind: NotificationKind, notification: Notification) -> Self {
+        Self { kind, notification }
+    }
+}
+
+/// Keep stable standalone notifications at most once per recovery epoch.
+///
+/// A peer-discovery retry can move the runtime between Solo and Paired stable
+/// states more than once. The state machine remains authoritative, but the
+/// desktop notification layer should not turn those retries into a banner
+/// loop. DistributedReady closes the current epoch and prepares the next one.
+#[derive(Debug, Default)]
+struct NotificationDeduplicator {
+    emitted_stable_states: BTreeSet<NotificationKind>,
+}
+
+impl NotificationDeduplicator {
+    fn should_emit(&mut self, kind: NotificationKind) -> bool {
+        if kind == NotificationKind::DistributedReady {
+            self.emitted_stable_states.clear();
+            return true;
+        }
+        if matches!(
+            kind,
+            NotificationKind::SoloStandaloneReady | NotificationKind::PairedStandaloneReady
+        ) {
+            return self.emitted_stable_states.insert(kind);
+        }
+        true
+    }
 }
 
 impl Notification {
@@ -46,9 +99,11 @@ impl Notification {
 pub enum NotifyError {
     #[error("desktop notification session is unavailable")]
     SessionUnavailable,
-    #[error("osascript failed: {0}")]
-    Osascript(String),
-    #[error("osascript is unavailable: {0}")]
+    #[error("native macOS notification failed: {0}")]
+    Native(String),
+    #[error("notification relay failed: {0}")]
+    Relay(String),
+    #[error("notification relay I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -70,57 +125,88 @@ impl DesktopNotifier for NoopNotifier {
     }
 }
 
-/// macOS implementation that posts through `/usr/bin/osascript`.
+/// macOS implementation used by the signed Siderostat.app process.
 #[derive(Debug, Clone)]
-pub struct OsascriptNotifier {
+struct UserNotificationsNotifier {
     enabled: bool,
     sound: bool,
 }
 
-impl OsascriptNotifier {
+impl UserNotificationsNotifier {
     pub fn new(enabled: bool, sound: bool) -> Self {
         Self { enabled, sound }
     }
 
-    fn command(&self, notification: &Notification) -> std::process::Command {
-        let mut command = std::process::Command::new("/usr/bin/osascript");
-        command.arg("-e");
-        let mut script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            escape_apple_script(&notification.body),
-            escape_apple_script(&notification.title),
-        );
-        if self.sound {
-            script.push_str(&format!(" sound name \"{NOTIFICATION_SOUND}\""));
+    #[cfg(target_os = "macos")]
+    fn post(&self, notification: Notification) -> Result<(), NotifyError> {
+        if !self.enabled {
+            return Ok(());
         }
-        command.arg(script);
-        command
+        post_user_notification(notification, self.sound)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn post(&self, _notification: Notification) -> Result<(), NotifyError> {
+        Ok(())
     }
 }
 
-impl DesktopNotifier for OsascriptNotifier {
+impl DesktopNotifier for UserNotificationsNotifier {
     fn notify(&self, notification: Notification) -> BoxFuture<'static, Result<(), NotifyError>> {
         if !self.enabled {
             return Box::pin(async { Ok(()) });
         }
-        let command = self.command(&notification);
-        Box::pin(async move {
-            let output = tokio::process::Command::from(command)
-                .output()
-                .await
-                .map_err(NotifyError::Io)?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(NotifyError::Osascript(stderr.trim().to_string()));
-            }
-            Ok(())
-        })
+        let notifier = self.clone();
+        Box::pin(async move { notifier.post(notification) })
     }
 }
 
-/// Escape a string for use inside a double-quoted AppleScript literal.
-fn escape_apple_script(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+/// Runtime-to-monitor payload sent over the local notification relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NotificationEnvelope {
+    notification: Notification,
+    sound: bool,
+}
+
+/// Runtime-side notifier that forwards payloads to the menu-bar monitor.
+#[derive(Debug, Clone)]
+struct NotificationRelayNotifier {
+    enabled: bool,
+    sound: bool,
+}
+
+impl NotificationRelayNotifier {
+    fn new(enabled: bool, sound: bool) -> Self {
+        Self { enabled, sound }
+    }
+
+    async fn send(&self, notification: Notification) -> Result<(), NotifyError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let envelope = NotificationEnvelope {
+                notification,
+                sound: self.sound,
+            };
+            send_notification_envelope(envelope).await
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = notification;
+            Ok(())
+        }
+    }
+}
+
+impl DesktopNotifier for NotificationRelayNotifier {
+    fn notify(&self, notification: Notification) -> BoxFuture<'static, Result<(), NotifyError>> {
+        let notifier = self.clone();
+        Box::pin(async move { notifier.send(notification).await })
+    }
 }
 
 /// Build a notifier from the resolved notification configuration.
@@ -130,9 +216,259 @@ pub fn build_notifier(
     platform: NotifyPlatform,
 ) -> Arc<dyn DesktopNotifier> {
     match platform {
-        NotifyPlatform::MacOs => Arc::new(OsascriptNotifier::new(enabled, sound)),
+        NotifyPlatform::MacOs => {
+            if is_siderostat_app_process() {
+                Arc::new(UserNotificationsNotifier::new(enabled, sound))
+            } else {
+                Arc::new(NotificationRelayNotifier::new(enabled, sound))
+            }
+        }
         NotifyPlatform::Other => Arc::new(NoopNotifier),
     }
+}
+
+/// Start the monitor-side notification relay.
+///
+/// The relay is intentionally owned by the menu-bar app. Calling
+/// `UNUserNotificationCenter` from `Contents/Helpers/siderostat-runtime` does
+/// not provide the app bundle identity that Notification Center needs, while
+/// the monitor is the signed `Siderostat.app` executable.
+#[cfg(target_os = "macos")]
+pub fn start_notification_relay(
+    enabled: bool,
+    sound: bool,
+) -> Result<std::thread::JoinHandle<()>, NotifyError> {
+    use std::os::unix::net::UnixListener;
+
+    let path = notification_relay_path().ok_or_else(|| {
+        NotifyError::Relay("HOME is unavailable; cannot locate notification relay".to_string())
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if path.exists() {
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(NotifyError::Relay(
+                    "another notification relay is already running".to_string(),
+                ));
+            }
+            Err(_) => std::fs::remove_file(&path)?,
+        }
+    }
+
+    let listener = UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| NotifyError::Relay(error.to_string()))?;
+
+    let handle = std::thread::Builder::new()
+        .name("siderostat-notification-relay".to_string())
+        .spawn(move || {
+            runtime.block_on(async move {
+                match tokio::net::UnixListener::from_std(listener) {
+                    Ok(listener) => notification_relay_loop(listener, enabled, sound).await,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "notification relay listener setup failed");
+                    }
+                }
+            });
+            let _ = std::fs::remove_file(&path);
+        })
+        .map_err(NotifyError::Io)?;
+    Ok(handle)
+}
+
+#[cfg(target_os = "macos")]
+async fn notification_relay_loop(listener: tokio::net::UnixListener, enabled: bool, sound: bool) {
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(error = %error, "notification relay accept failed");
+                break;
+            }
+        };
+        tokio::spawn(handle_notification_connection(stream, enabled, sound));
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn handle_notification_connection(
+    mut stream: tokio::net::UnixStream,
+    enabled: bool,
+    sound: bool,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut payload = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut payload).await {
+        tracing::warn!(error = %error, "notification relay read failed");
+        return;
+    }
+    let envelope = match serde_json::from_slice::<NotificationEnvelope>(&payload) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            tracing::warn!(error = %error, "notification relay payload was invalid");
+            return;
+        }
+    };
+    if let Err(error) =
+        UserNotificationsNotifier::new(enabled, sound && envelope.sound).post(envelope.notification)
+    {
+        tracing::warn!(error = %error, "native macOS notification failed");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn send_notification_envelope(envelope: NotificationEnvelope) -> Result<(), NotifyError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let path = notification_relay_path().ok_or_else(|| {
+        NotifyError::Relay("HOME is unavailable; cannot locate notification relay".to_string())
+    })?;
+    let payload =
+        serde_json::to_vec(&envelope).map_err(|error| NotifyError::Relay(error.to_string()))?;
+    let retry_delays = [
+        Duration::from_millis(0),
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    ];
+    let mut last_error = None;
+    for delay in retry_delays {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        match UnixStream::connect(&path).await {
+            Ok(mut stream) => {
+                stream.write_all(&payload).await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(NotifyError::Relay(format!(
+        "could not connect to {} after retries: {}",
+        path.display(),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown connection error".to_string())
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn notification_relay_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join("Library/Application Support/siderostat/notifications.sock")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn is_siderostat_app_process() -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    executable.file_name().and_then(|name| name.to_str()) == Some("Siderostat")
+        && executable.ancestors().any(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("app")
+                && path.join("Contents/Info.plist").is_file()
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn post_user_notification(notification: Notification, sound: bool) -> Result<(), NotifyError> {
+    use objc2_foundation::NSString;
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+        UNNotificationSound, UNUserNotificationCenter,
+    };
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static AUTHORIZATION_STATE: AtomicU8 = AtomicU8::new(0);
+    const AUTHORIZATION_UNREQUESTED: u8 = 0;
+    const AUTHORIZATION_PENDING: u8 = 1;
+    const AUTHORIZATION_GRANTED: u8 = 2;
+    const AUTHORIZATION_DENIED: u8 = 3;
+
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    let content = UNMutableNotificationContent::new();
+    let title = NSString::from_str(&notification.title);
+    let body = NSString::from_str(&notification.body);
+    content.setTitle(&title);
+    content.setBody(&body);
+    if sound {
+        let sound_name = NSString::from_str(NOTIFICATION_SOUND);
+        let sound = UNNotificationSound::soundNamed(&sound_name);
+        content.setSound(Some(&sound));
+    }
+    let identifier = NSString::from_str(&uuid::Uuid::new_v4().to_string());
+    let request =
+        UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
+
+    match AUTHORIZATION_STATE.compare_exchange(
+        AUTHORIZATION_UNREQUESTED,
+        AUTHORIZATION_PENDING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            let authorization_options = if sound {
+                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound
+            } else {
+                UNAuthorizationOptions::Alert
+            };
+            let completion: block2::RcBlock<
+                dyn Fn(objc2::runtime::Bool, *mut objc2_foundation::NSError),
+            > = block2::RcBlock::new(
+                move |granted: objc2::runtime::Bool, _error: *mut objc2_foundation::NSError| {
+                    if granted.is_true() {
+                        AUTHORIZATION_STATE.store(AUTHORIZATION_GRANTED, Ordering::Release);
+                        let center = UNUserNotificationCenter::currentNotificationCenter();
+                        center.addNotificationRequest_withCompletionHandler(&request, None);
+                    } else {
+                        AUTHORIZATION_STATE.store(AUTHORIZATION_DENIED, Ordering::Release);
+                        tracing::warn!(
+                            "Siderostat desktop notification permission was not granted"
+                        );
+                    }
+                },
+            );
+            center.requestAuthorizationWithOptions_completionHandler(
+                authorization_options,
+                &completion,
+            );
+        }
+        Err(AUTHORIZATION_GRANTED) => {
+            center.addNotificationRequest_withCompletionHandler(&request, None);
+        }
+        Err(AUTHORIZATION_PENDING | AUTHORIZATION_DENIED) => {}
+        Err(state) => {
+            return Err(NotifyError::Native(format!(
+                "unexpected notification authorization state {state}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn start_notification_relay(
+    _enabled: bool,
+    _sound: bool,
+) -> Result<std::thread::JoinHandle<()>, NotifyError> {
+    Err(NotifyError::Relay(
+        "notification relay is only available on macOS".to_string(),
+    ))
 }
 
 /// Platform classification used to choose a notifier implementation.
@@ -184,6 +520,7 @@ pub struct DesktopNotificationService {
     notifier: Arc<dyn DesktopNotifier>,
     last_sent_at: Option<Instant>,
     session_check: SessionCheck,
+    deduplicator: NotificationDeduplicator,
 }
 
 impl DesktopNotificationService {
@@ -192,6 +529,7 @@ impl DesktopNotificationService {
             notifier,
             last_sent_at: None,
             session_check: Box::new(|| Box::pin(gui_session_available())),
+            deduplicator: NotificationDeduplicator::default(),
         }
     }
 
@@ -220,14 +558,15 @@ impl DesktopNotificationService {
             notifier,
             last_sent_at: None,
             session_check,
+            deduplicator: NotificationDeduplicator::default(),
         }
     }
 
     /// Handle one observed transition. Only stable or important states are
     /// reported; intermediate transitions such as `Promoting` are skipped.
     pub fn observe_transition(&mut self, previous: ClusterState, current: ClusterState) {
-        if let Some(notification) = notification_for_transition(previous, current) {
-            self.maybe_notify(notification);
+        if let Some(event) = notification_event_for_snapshot_transition(previous, current, None) {
+            self.observe_event(event);
         }
     }
 
@@ -239,38 +578,75 @@ impl DesktopNotificationService {
         previous: ClusterSnapshot,
         current: ClusterSnapshot,
     ) {
-        if let Some(notification) = notification_for_snapshot_transition(
+        if let Some(event) = notification_event_for_snapshot_transition(
             previous.state,
             current.state,
             current.last_failure,
         ) {
-            self.maybe_notify(notification);
+            self.observe_event(event);
         }
     }
 
     /// Handle a startup notification explicitly. The transition monitor only
     /// subscribes after boot, so boot transitions are reported here.
     pub fn observe_startup(&mut self, state: ClusterState) {
-        let notification = match state {
-            ClusterState::SoloStandaloneReady => Notification::new(
-                "siderostat 起動",
-                "ds4-server が Standalone モードで起動しました",
-            ),
-            ClusterState::ManualInterventionRequired => Notification::new(
-                "siderostat 起動",
-                "ds4-server のモード変更に失敗しました (要手動復旧)",
-            ),
-            _ => Notification::new("siderostat 起動", "起動中"),
+        let event = match state {
+            ClusterState::SoloStandaloneReady => Some(NotificationEvent::new(
+                NotificationKind::SoloStandaloneReady,
+                Notification::new(
+                    text("notification.startup.title", "ds4-serverの起動"),
+                    text(
+                        "notification.standalone.started",
+                        "ds4-serverをStandaloneモードで起動しました",
+                    ),
+                ),
+            )),
+            ClusterState::ManualInterventionRequired => Some(NotificationEvent::new(
+                NotificationKind::ManualInterventionRequired,
+                Notification::new(
+                    text("notification.startup.title", "ds4-serverの起動"),
+                    text(
+                        "notification.manual_intervention",
+                        "ds4-serverのモード変更に失敗しました。手動で復旧してください",
+                    ),
+                ),
+            )),
+            _ => None,
         };
-        self.maybe_notify(notification);
+        if let Some(event) = event {
+            self.observe_event(event);
+        } else {
+            self.maybe_notify(Notification::new(
+                text("notification.startup.title", "ds4-serverの起動"),
+                text("notification.startup.starting", "ds4-serverを起動中"),
+            ));
+        }
     }
 
     /// Handle a standalone child restart detected by the local monitor.
     pub fn observe_child_restart(&mut self) {
         self.maybe_notify(Notification::new(
-            "siderostat",
-            "ds4-server を Standalone モードで再起動しました",
+            text("app.name", "Siderostat"),
+            text(
+                "notification.standalone.restarted",
+                "ds4-serverをStandaloneモードで再起動しました",
+            ),
         ));
+    }
+
+    /// Post one notification through the same session check and throttle used
+    /// by state-transition notifications. Callers remain responsible for
+    /// deciding whether a state change is worth reporting.
+    pub fn notify(&mut self, notification: Notification) {
+        self.maybe_notify(notification);
+    }
+
+    fn observe_event(&mut self, event: NotificationEvent) {
+        if self.deduplicator.should_emit(event.kind) {
+            self.maybe_notify(event.notification);
+        } else {
+            tracing::debug!(?event.kind, "desktop notification suppressed within recovery epoch");
+        }
     }
 
     fn maybe_notify(&mut self, notification: Notification) {
@@ -305,53 +681,109 @@ impl DesktopNotificationService {
 
 /// Map a transition to an optional notification. Only stable states and
 /// important lifecycle transitions are reported.
+#[cfg(test)]
 fn notification_for_transition(
     previous: ClusterState,
     current: ClusterState,
 ) -> Option<Notification> {
-    notification_for_snapshot_transition(previous, current, None)
+    notification_event_for_snapshot_transition(previous, current, None)
+        .map(|event| event.notification)
 }
 
+#[cfg(test)]
 fn notification_for_snapshot_transition(
     previous: ClusterState,
     current: ClusterState,
     failure: Option<ClusterFailure>,
 ) -> Option<Notification> {
+    notification_event_for_snapshot_transition(previous, current, failure)
+        .map(|event| event.notification)
+}
+
+fn notification_event_for_snapshot_transition(
+    previous: ClusterState,
+    current: ClusterState,
+    failure: Option<ClusterFailure>,
+) -> Option<NotificationEvent> {
     if current == ClusterState::SoloStandaloneReady
         && failure == Some(ClusterFailure::DeploymentMismatch)
     {
-        return Some(Notification::new(
-            "siderostat",
-            "2台の ds4-server の構成が一致しないため Distributed Inference を開始できません。設定を確認して再試行してください。Standalone モードで待機します",
+        return Some(NotificationEvent::new(
+            NotificationKind::DeploymentMismatch,
+            Notification::new(
+                text("app.name", "Siderostat"),
+                text(
+                    "notification.deployment_mismatch",
+                    "2台のds4-serverの設定が一致しないためDistributed（layer-parallel）モードを開始できません。設定を確認して再試行してください。Standaloneモードで待機します",
+                ),
+            ),
         ));
     }
 
     match (previous, current) {
-        (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => Some(Notification::new(
-            "siderostat",
-            "ds4-server を Standalone モードで再起動しました",
-        )),
-        (_, ClusterState::SoloStandaloneReady) => Some(Notification::new(
-            "siderostat",
-            "ds4-server が Standalone モードで起動しました",
-        )),
-        (_, ClusterState::PairedStandaloneReady) => Some(Notification::new(
-            "siderostat",
-            "ネットワーク上の ds4-server ノードを検出しました",
-        )),
-        (ClusterState::DistributedStarting, ClusterState::DistributedReady) => {
-            Some(Notification::new(
-                "siderostat",
-                "2ノードの ds4-server が Distributed Inference モードで相互接続しました",
+        (ClusterState::Demoting, ClusterState::PairedStandaloneReady) => {
+            Some(NotificationEvent::new(
+                NotificationKind::StandaloneRestart,
+                Notification::new(
+                    text("app.name", "Siderostat"),
+                    text(
+                        "notification.standalone.restarted",
+                        "ds4-serverをStandaloneモードで再起動しました",
+                    ),
+                ),
             ))
         }
-        (_, ClusterState::Backoff) => Some(Notification::new(
-            "siderostat",
-            "ds4-server の Distributed 起動に失敗しました。Standalone モードで待機します",
+        (_, ClusterState::SoloStandaloneReady) => Some(NotificationEvent::new(
+            NotificationKind::SoloStandaloneReady,
+            Notification::new(
+                text("app.name", "Siderostat"),
+                text(
+                    "notification.standalone.started",
+                    "ds4-serverをStandaloneモードで起動しました",
+                ),
+            ),
         )),
-        (_, ClusterState::ManualInterventionRequired) => Some(Notification::new(
-            "siderostat",
-            "ds4-server のモード変更に失敗しました (要手動復旧)",
+        (_, ClusterState::PairedStandaloneReady) => Some(NotificationEvent::new(
+            NotificationKind::PairedStandaloneReady,
+            Notification::new(
+                text("app.name", "Siderostat"),
+                text(
+                    "notification.standalone.peer_detected",
+                    "ネットワーク上の別のds4-serverを検出しました",
+                ),
+            ),
+        )),
+        (ClusterState::DistributedStarting, ClusterState::DistributedReady) => {
+            Some(NotificationEvent::new(
+                NotificationKind::DistributedReady,
+                Notification::new(
+                    text("app.name", "Siderostat"),
+                    text(
+                        "notification.distributed.ready",
+                        "2台のds4-serverをDistributed（layer-parallel）モードに切り替えました",
+                    ),
+                ),
+            ))
+        }
+        (_, ClusterState::Backoff) => Some(NotificationEvent::new(
+            NotificationKind::Backoff,
+            Notification::new(
+                text("app.name", "Siderostat"),
+                text(
+                    "notification.distributed.backoff",
+                    "ds4-serverのDistributed（layer-parallel）モードへの切替に失敗しました。Standaloneモードで待機します",
+                ),
+            ),
+        )),
+        (_, ClusterState::ManualInterventionRequired) => Some(NotificationEvent::new(
+            NotificationKind::ManualInterventionRequired,
+            Notification::new(
+                text("app.name", "Siderostat"),
+                text(
+                    "notification.manual_intervention",
+                    "ds4-serverのモード変更に失敗しました。手動で復旧してください",
+                ),
+            ),
         )),
         _ => None,
     }
@@ -410,21 +842,17 @@ mod tests {
     }
 
     #[test]
-    fn osascript_command_posts_a_sounding_banner() {
-        let notifier = OsascriptNotifier::new(true, true);
-        let command = notifier.command(&Notification::new(
-            "siderostat",
-            "5秒後に ds4-server を再起動します",
-        ));
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(args.first().map(String::as_str), Some("-e"));
-        assert!(args[1].contains("display notification"));
-        assert!(args[1].contains("sound name \"Glass\""));
-        assert!(args[1].contains("5秒後に ds4-server を再起動します"));
+    fn notification_envelope_preserves_payload_and_sound_preference() {
+        let envelope = NotificationEnvelope {
+            notification: Notification::new(
+                "Siderostat",
+                "5秒後にsiderostat-runtimeを再起動します",
+            ),
+            sound: true,
+        };
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        let decoded: NotificationEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, envelope);
     }
 
     #[test]
@@ -438,7 +866,7 @@ mod tests {
             (
                 ClusterState::SoloStandaloneStarting,
                 ClusterState::SoloStandaloneReady,
-                Some("ds4-server が Standalone モードで起動しました"),
+                Some("ds4-serverをStandaloneモードで起動しました"),
             ),
             (
                 ClusterState::SoloStandaloneReady,
@@ -448,7 +876,7 @@ mod tests {
             (
                 ClusterState::Pairing,
                 ClusterState::PairedStandaloneReady,
-                Some("ネットワーク上の ds4-server ノードを検出しました"),
+                Some("ネットワーク上の別のds4-serverを検出しました"),
             ),
             (
                 ClusterState::PairedStandaloneReady,
@@ -463,23 +891,25 @@ mod tests {
             (
                 ClusterState::DistributedStarting,
                 ClusterState::DistributedReady,
-                Some("2ノードの ds4-server が Distributed Inference モードで相互接続しました"),
+                Some("2台のds4-serverをDistributed（layer-parallel）モードに切り替えました"),
             ),
             (
                 ClusterState::PairedStandaloneReady,
                 ClusterState::Backoff,
-                Some("ds4-server の Distributed 起動に失敗しました。Standalone モードで待機します"),
+                Some(
+                    "ds4-serverのDistributed（layer-parallel）モードへの切替に失敗しました。Standaloneモードで待機します",
+                ),
             ),
             (
                 ClusterState::Backoff,
                 ClusterState::ManualInterventionRequired,
-                Some("ds4-server のモード変更に失敗しました (要手動復旧)"),
+                Some("ds4-serverのモード変更に失敗しました。手動で復旧してください"),
             ),
             (ClusterState::DistributedReady, ClusterState::Demoting, None),
             (
                 ClusterState::Demoting,
                 ClusterState::PairedStandaloneReady,
-                Some("ds4-server を Standalone モードで再起動しました"),
+                Some("ds4-serverをStandaloneモードで再起動しました"),
             ),
         ];
         for (previous, current, expected) in rows {
@@ -503,7 +933,7 @@ mod tests {
 
         assert_eq!(
             notification.body,
-            "2台の ds4-server の構成が一致しないため Distributed Inference を開始できません。設定を確認して再試行してください。Standalone モードで待機します"
+            "2台のds4-serverの設定が一致しないためDistributed（layer-parallel）モードを開始できません。設定を確認して再試行してください。Standaloneモードで待機します"
         );
     }
 
@@ -534,7 +964,7 @@ mod tests {
         assert_eq!(ready_notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             ready_notifier.notifications.lock().unwrap()[0].body,
-            "ds4-server が Standalone モードで起動しました"
+            "ds4-serverをStandaloneモードで起動しました"
         );
 
         let manual_notifier = Arc::new(RecordingNotifier::default());
@@ -545,7 +975,7 @@ mod tests {
         assert_eq!(manual_notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             manual_notifier.notifications.lock().unwrap()[0].body,
-            "ds4-server のモード変更に失敗しました (要手動復旧)"
+            "ds4-serverのモード変更に失敗しました。手動で復旧してください"
         );
     }
 
@@ -633,13 +1063,8 @@ mod tests {
         assert_eq!(notifier.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             notifier.notifications.lock().unwrap()[0].body,
-            "ds4-server が Standalone モードで起動しました"
+            "ds4-serverをStandaloneモードで起動しました"
         );
-    }
-
-    #[test]
-    fn escape_apple_script_quotes_and_backslashes() {
-        assert_eq!(escape_apple_script(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
     #[tokio::test]
@@ -679,7 +1104,45 @@ mod tests {
     fn stable_mode_names_are_stable() {
         assert_eq!(StableMode::SoloStandalone.name(), "solo-standalone");
         assert_eq!(StableMode::PairedStandalone.name(), "paired-standalone");
-        assert_eq!(StableMode::DistributedMxfp4.name(), "distributed-mxfp4");
+        assert_eq!(
+            StableMode::DistributedLayerParallel.name(),
+            "distributed-layer-parallel"
+        );
+    }
+
+    #[test]
+    fn stable_standalone_notifications_are_once_per_epoch() {
+        let mut deduplicator = NotificationDeduplicator::default();
+        assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+    }
+
+    #[test]
+    fn distributed_ready_rolls_the_standalone_notification_epoch() {
+        let mut deduplicator = NotificationDeduplicator::default();
+        assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+        assert!(deduplicator.should_emit(NotificationKind::DistributedReady));
+        assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+    }
+
+    #[test]
+    fn important_failure_and_restart_notifications_are_not_deduplicated() {
+        let mut deduplicator = NotificationDeduplicator::default();
+        for kind in [
+            NotificationKind::StandaloneRestart,
+            NotificationKind::Backoff,
+            NotificationKind::ManualInterventionRequired,
+            NotificationKind::DeploymentMismatch,
+        ] {
+            assert!(deduplicator.should_emit(kind));
+            assert!(deduplicator.should_emit(kind));
+        }
     }
 
     #[derive(Clone, Default)]

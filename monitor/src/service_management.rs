@@ -2,17 +2,16 @@
 //!
 //! A small interface that lets the menu / first-launch UI read the platform
 //! status of the runtime LaunchAgent helper and the main-app login item
-//! without touching framework objects directly. This task implements status
-//! reads only; registration state is NOT changed here (C-02 adds register /
-//! unregister).
+//! without touching framework objects directly. The menu and first-launch
+//! startup driver use the same adapter for status, registration, and
+//! unregistration.
 //!
 //! The macOS implementation uses the ServiceManagement framework via objc2.
 //! The test fake is a separate type so UI logic can be exercised without a
 //! framework session.
 //!
-//! The adapter is exercised from the first-launch / menu UI in C-05; until it
-//! is wired to production code the module is dead code from the crate's
-//! perspective, so allow dead_code here.
+//! The fake remains available so UI lifecycle logic can be tested without a
+//! framework session.
 #![allow(dead_code)]
 
 #[cfg(target_os = "macos")]
@@ -162,7 +161,17 @@ impl ServiceManagementAdapter for ServiceManagement {
         let service = self.service(kind);
         // SAFETY: main-thread framework call (see status).
         if let Err(error) = unsafe { service.registerAndReturnError() } {
-            return classify_register_error(&error);
+            let outcome = classify_register_error(&error);
+            // Apple reports kSMErrorLaunchDeniedByUser while an item is still
+            // awaiting the user's Login Items approval. Preserve that state so
+            // the UI opens the approval path instead of reporting a hard
+            // denial.
+            if outcome == RegisterOutcome::DeniedByUser
+                && self.status(kind) == ServiceStatus::RequiresApproval
+            {
+                return RegisterOutcome::RequiresApproval;
+            }
+            return outcome;
         }
         // Do not fake approval shortages as success: re-read the real status.
         match self.status(kind) {

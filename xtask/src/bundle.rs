@@ -12,6 +12,7 @@ use clap::Args;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 /// Default staging root under the repository (not user data).
@@ -69,6 +70,12 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
     let app = staging.join("Siderostat.app");
     let contents = app.join("Contents");
 
+    // Build the two embedded executables with the exact metadata written to
+    // the app bundle. Without this step only Info.plist would carry the
+    // requested release version while /healthz would keep reporting the
+    // Cargo workspace version (for example 0.2.1 after a 0.3.0 bundle build).
+    build_release_binaries(&root, &args.version, args.build_number)?;
+
     // 1. Rebuild staging from an empty state every run.
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
@@ -111,6 +118,14 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
     for name in ["LICENSE", "THIRD-PARTY-NOTICES.md", "default-config.toml"] {
         std::fs::copy(resources.join(name), contents.join("Resources").join(name))?;
     }
+    for locale in ["en.lproj", "ja.lproj"] {
+        let destination = contents.join("Resources").join(locale);
+        std::fs::create_dir_all(&destination)?;
+        std::fs::copy(
+            resources.join(locale).join("Localizable.strings"),
+            destination.join("Localizable.strings"),
+        )?;
+    }
     let icon_dest = contents.join("Resources/AppIcon.icns");
     match &args.icon {
         Some(explicit) => {
@@ -136,6 +151,30 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
         verify_bundle_strict(&app)?;
         println!("verification: PASS (plutil, codesign --verify --deep --strict)");
     }
+    Ok(())
+}
+
+fn build_release_binaries(root: &Path, version: &str, build_number: u32) -> Result<()> {
+    let build_number = build_number.to_string();
+    let status = Command::new("cargo")
+        .current_dir(root)
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "siderostat",
+            "--package",
+            "siderostat-monitor",
+        ])
+        .env("SIDEROSTAT_VERSION", version)
+        .env("SIDEROSTAT_BUILD_NUMBER", &build_number)
+        .status()
+        .context("build app-dev runtime and monitor binaries")?;
+    anyhow::ensure!(
+        status.success(),
+        "cargo release build failed with status {:?}",
+        status.code()
+    );
     Ok(())
 }
 

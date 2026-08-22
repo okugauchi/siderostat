@@ -6,7 +6,7 @@
 //! - verify:  check the installed LaunchAgent and admin API.
 //! - uninstall: stop the LaunchAgent and disable its plist.
 //! - app-dev: build a deterministic ad-hoc signed `Siderostat.app` bundle.
-//! - pkg-dev: build a scriptless flat `.pkg` from an `app-dev` bundle.
+//! - pkg-dev: build a flat `.pkg` with a controlled Monitor preinstall hook.
 //! - sign: sign, notarize, staple, and verify a release package.
 
 mod bundle;
@@ -40,7 +40,7 @@ enum Command {
     Uninstall,
     /// Build a deterministic ad-hoc signed Siderostat.app bundle (B-03).
     AppDev(bundle::AppDevArgs),
-    /// Build a scriptless flat .pkg from an app-dev bundle (E-01).
+    /// Build a flat .pkg with a controlled Monitor preinstall hook (E-01).
     PkgDev(bundle::PkgDevArgs),
     /// Build, sign, notarize, staple, and verify a release package (E-02).
     Sign(signing::SignArgs),

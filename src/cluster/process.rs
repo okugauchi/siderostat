@@ -971,7 +971,7 @@ mod tests {
     async fn macos_spawn_owns_process_group_and_reaps_verified_child() {
         use crate::{
             cluster::Ds4Profile,
-            config::{ModelVariant, Residency},
+            config::{Quantization, Residency},
         };
 
         let command = Ds4Command {
@@ -980,9 +980,9 @@ mod tests {
             argv: vec![OsString::from("30")],
             profile: Ds4Profile {
                 profile_id: "process-smoke".into(),
-                model_variant: ModelVariant::Q2,
+                quantization: Quantization::Q2,
                 residency: Residency::Resident,
-                dspark_required: false,
+                speculative_support: crate::config::SpeculativeSupport::None,
             },
         };
         let mut child = ManagedChild::spawn(&command, 9).await.unwrap();
@@ -996,7 +996,7 @@ mod tests {
     async fn distributed_worker_supervisor_starts_and_reaps_one_owned_child() {
         use crate::{
             cluster::Ds4Profile,
-            config::{ModelVariant, Residency},
+            config::{Quantization, Residency},
         };
 
         let command = Ds4Command {
@@ -1005,9 +1005,9 @@ mod tests {
             argv: vec![OsString::from("30")],
             profile: Ds4Profile {
                 profile_id: "distributed-worker-smoke".into(),
-                model_variant: ModelVariant::Mxfp4,
+                quantization: Quantization::Mxfp4,
                 residency: Residency::Resident,
-                dspark_required: false,
+                speculative_support: crate::config::SpeculativeSupport::None,
             },
         };
         let supervisor = DistributedWorkerSupervisor::new(

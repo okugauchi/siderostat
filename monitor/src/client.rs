@@ -45,7 +45,7 @@ impl MetricsClient {
                 .build()
                 .context("build admin API client")?,
             base_url,
-            admin_token: config.admin_token.clone(),
+            admin_token: config.effective_admin_token()?,
             poll_interval: config.poll_interval(),
             offline_backoff: config.offline_backoff(),
         })
@@ -102,8 +102,10 @@ impl MetricsClient {
     }
 
     /// Request a graceful runtime restart via the authenticated `/admin/restart`
-    /// endpoint (C-04). Returns the HTTP status and the JSON response body.
-    pub async fn graceful_restart(&self) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+    /// endpoint (C-04). Returns the HTTP status and response body. The body is
+    /// intentionally kept as text because an older runtime may acknowledge a
+    /// successful restart with an empty or non-JSON response.
+    pub async fn graceful_restart(&self) -> Result<(reqwest::StatusCode, String)> {
         let url = format!("{}/admin/restart", self.base_url);
         let mut request = self.http.post(&url);
         if let Some(token) = &self.admin_token {
@@ -114,11 +116,11 @@ impl MetricsClient {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
-        let value: serde_json::Value = response
-            .json()
+        let body = response
+            .text()
             .await
-            .context("parse graceful restart response")?;
-        Ok((status, value))
+            .context("read graceful restart response body")?;
+        Ok((status, body))
     }
 
     /// Fetch the runtime build metadata from the read-only `/healthz` endpoint
@@ -136,6 +138,18 @@ impl MetricsClient {
         }
         let version: RuntimeVersion = response.json().await.context("parse healthz response")?;
         Ok(version)
+    }
+
+    /// Return whether the runtime is ready to serve model traffic. A 503 from
+    /// `/readyz` is an expected not-yet-ready result, not a client error.
+    pub async fn ready(&self) -> Result<bool> {
+        let url = format!("{}/readyz", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        Ok(response.status().is_success())
     }
 }
 
@@ -184,5 +198,11 @@ mod tests {
             target: "local-standalone".into(),
         };
         assert_eq!(metrics_path(&routing), "/metrics");
+    }
+
+    #[test]
+    fn ready_endpoint_distinguishes_ready_from_not_ready() {
+        assert!(reqwest::StatusCode::OK.is_success());
+        assert!(!reqwest::StatusCode::SERVICE_UNAVAILABLE.is_success());
     }
 }

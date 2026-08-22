@@ -14,7 +14,7 @@ use super::{
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
     cluster::{ClusterEvent, ClusterEventKind},
-    config::ModeAwareConfig,
+    config::{ModeAwareConfig, SpeculativeSupport},
     metrics::{MetricSnapshot, Metrics},
     proxy::ModeAwareProxyState,
     target::{ClusterState, LocalRole},
@@ -689,7 +689,12 @@ impl ProductionClusterRuntime {
             peer_lease_seconds: 0.0,
             thunderbolt_ip_state: "unknown",
             discovery_results: 0,
-            model_variant: self.inner.config.ds4.standalone.model_variant,
+            quantization: self.inner.config.ds4.standalone.quantization,
+            speculative_support: if self.inner.config.ds4.dspark.enabled {
+                SpeculativeSupport::Dspark
+            } else {
+                SpeculativeSupport::None
+            },
             residency: self.inner.config.ds4.standalone.residency,
         })
     }
