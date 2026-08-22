@@ -4,6 +4,13 @@
 
 本書はrepository全体で継続して適用するGit運用の正本である。完了済みv0.1.0の作業順序と進捗は `docs/archive/implementation-plan-v0.1.0.md`、製品behaviorは `docs/spec.md` で管理する。
 
+### README の言語と正本
+
+- `README.md` は英語版の正本として管理する。
+- `README.ja.md` は日本語翻訳版の提供文書として管理する。
+- README の内容を変更する場合は、英語版を先に更新し、日本語版との対応を確認する。
+- README の相互リンクと関連文書へのリンクは、両言語版で有効であることを確認する。
+
 ### 基本原則
 
 - 設計変更を通常のcommit ancestryとして残し、既存履歴を書き換えない。
