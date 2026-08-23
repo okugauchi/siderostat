@@ -1077,6 +1077,16 @@ coordinator_startup = "600s"
 complete_route = "180s"
 standalone_startup = "900s"
 
+[recovery]
+enabled = false
+admission_drain_timeout = "60s"
+cooldown = "3600s"
+max_attempts_12h = 2
+low_decode_tps = 5.0
+low_decode_duration = "30s"
+progress_stall = "60s"
+canary_deadline = "30s"
+
 [ds4]
 binary = "$HOME/LLM/ds4/ds4-server"
 working_directory = "$HOME/LLM/ds4"
@@ -1346,6 +1356,7 @@ ds4_proxy_cluster_child_restarts_total{profile,reason}
 ds4_proxy_standalone_profile_info{node_id,quantization,speculative_support,residency}
 ds4_proxy_cluster_hello_total{result,reason}
 ds4_proxy_cluster_deployment_mismatch_total{field}
+ds4_proxy_recovery_events_total{event,reason}
 ds4_proxy_ds4_prefill_active
 ds4_proxy_ds4_prefill_current
 ds4_proxy_ds4_prefill_total
@@ -1354,6 +1365,8 @@ ds4_proxy_ds4_prefill_cached
 ds4_proxy_ds4_prefill_chunk_tps
 ds4_proxy_ds4_prefill_avg_tps
 ds4_proxy_ds4_prefill_elapsed_seconds
+ds4_proxy_ds4_prefill_last_progress_age_seconds
+ds4_proxy_ds4_prefill_progress_token_delta
 ds4_proxy_ds4_kv_cache_hits_total
 ds4_proxy_ds4_kv_cache_hit_tokens
 ds4_proxy_ds4_kv_cache_load_ms
@@ -1362,7 +1375,17 @@ ds4_proxy_ds4_generation_completion
 ds4_proxy_ds4_generation_chunk_tps
 ds4_proxy_ds4_generation_avg_tps
 ds4_proxy_ds4_generation_elapsed_seconds
+ds4_proxy_ds4_generation_progress_observed
+ds4_proxy_ds4_generation_last_progress_age_seconds
+ds4_proxy_ds4_generation_progress_token_delta
 ```
+
+`*_last_progress_age_seconds` は、Siderostat が最後の DS4 progress event を受信してからの
+monotonic elapsed seconds である。active request または prefill が idle/完了の場合は `0` とし、
+この値を failure threshold の wall clock として解釈しない。`ds4_proxy_ds4_generation_active=1` と
+`ds4_proxy_ds4_generation_progress_observed=0` の組み合わせは、最初の progress event 前の
+first-token waiting を表す。`*_progress_token_delta` は前回 event から増加した token 数であり、
+DS4 の token counter が新しい request で戻った場合は現在値を新しい区間の delta とする。
 
 `quantization`、`speculative_support`、`residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない。
 

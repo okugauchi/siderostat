@@ -40,6 +40,10 @@ impl super::ProductionClusterRuntime {
             self.inner.role == LocalRole::Coordinator,
             "pairing must be initiated by the coordinator"
         );
+        ensure!(
+            !self.recovery_owner_active(),
+            "degraded recovery owner is active"
+        );
         // Offer/confirm negotiation (design §4): the coordinator, as session authority, first
         // learns the worker's control session generation from /v1/node, computes a candidate
         // that is no lower than either side, and advances its own generation before offering so
@@ -106,6 +110,21 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn promote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        ensure!(
+            !self.recovery_owner_active(),
+            "degraded recovery owner is active"
+        );
+        self.promote_internal(true).await
+    }
+
+    pub async fn promote_for_recovery(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        self.promote_internal(false).await
+    }
+
+    async fn promote_internal(
+        &self,
+        resume_admission: bool,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may promote"
@@ -178,18 +197,31 @@ impl super::ProductionClusterRuntime {
                 && control.peer_present(now_millis())
         };
         let lease = self.inner.lease.clone();
-        let snapshot = self
-            .inner
-            .coordinator_runtime
-            .get()
-            .context("coordinator runtime unavailable")?
-            .promote_validated(
-                hello,
-                prerequisites,
-                Arc::new(move || lease.valid()),
-                now_millis(),
-            )
-            .await?;
+        let snapshot = if resume_admission {
+            self.inner
+                .coordinator_runtime
+                .get()
+                .context("coordinator runtime unavailable")?
+                .promote_validated(
+                    hello,
+                    prerequisites,
+                    Arc::new(move || lease.valid()),
+                    now_millis(),
+                )
+                .await?
+        } else {
+            self.inner
+                .coordinator_runtime
+                .get()
+                .context("coordinator runtime unavailable")?
+                .promote_validated_for_recovery(
+                    hello,
+                    prerequisites,
+                    Arc::new(move || lease.valid()),
+                    now_millis(),
+                )
+                .await?
+        };
         let ready = {
             let RoleControl::Coordinator(control) = &self.inner.control else {
                 unreachable!()
@@ -200,6 +232,13 @@ impl super::ProductionClusterRuntime {
                 .distributed_ready_message(uuid::Uuid::new_v4().to_string())?
         };
         self.inner.client.send(&ready).await?;
+        if resume_admission {
+            self.start_route_loss_monitor();
+        }
+        Ok(snapshot)
+    }
+
+    pub fn start_route_loss_monitor(&self) {
         if self.inner.config.cluster.policy.auto_demote {
             let runtime = self.clone();
             tokio::spawn(async move {
@@ -208,10 +247,30 @@ impl super::ProductionClusterRuntime {
                 }
             });
         }
-        Ok(snapshot)
     }
 
     pub async fn demote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        ensure!(
+            self.inner.role == LocalRole::Coordinator,
+            "only the coordinator may demote"
+        );
+        ensure!(
+            !self.recovery_owner_active(),
+            "degraded recovery owner is active"
+        );
+        self.inner
+            .coordinator_runtime
+            .get()
+            .context("coordinator runtime unavailable")?
+            .demote()
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn demote_for_recovery(
+        &self,
+        drain_timeout: std::time::Duration,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may demote"
@@ -220,7 +279,7 @@ impl super::ProductionClusterRuntime {
             .coordinator_runtime
             .get()
             .context("coordinator runtime unavailable")?
-            .demote()
+            .demote_for_recovery(drain_timeout)
             .await
             .map_err(Into::into)
     }

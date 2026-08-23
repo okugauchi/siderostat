@@ -11,7 +11,7 @@
 macOS のメニューバーに常駐するアイコン型モニターで、次を可視化する。
 
 - siderostat の cluster mode / state / target readiness
-- DS4 の prefill loading progress（チャンク進行・%・chunk/average token/s・経過秒・cached tokens）
+- DS4 の prefill loading progress（チャンク進行・%・current chunk/average token/s・経過秒・cached tokens・progress age）
 - KV cache hit / miss の状況（hit tokens、load 時間、累計）
 - generation（デコード）の直近 TPS
 
@@ -109,10 +109,13 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | prefill chunk TPS | `ds4_proxy_ds4_prefill_chunk_tps` | gauge |
 | prefill average TPS | `ds4_proxy_ds4_prefill_avg_tps` | gauge |
 | prefill elapsed seconds | `ds4_proxy_ds4_prefill_elapsed_seconds` | gauge |
+| prefill last progress age seconds | `ds4_proxy_ds4_prefill_last_progress_age_seconds` | gauge |
 | KV cache hit 累計 | `ds4_proxy_ds4_kv_cache_hits_total` | counter |
 | 直近 KV cache hit tokens | `ds4_proxy_ds4_kv_cache_hit_tokens` | gauge |
 | 直近 KV cache load ms | `ds4_proxy_ds4_kv_cache_load_ms` | gauge |
 | Decode 進行中フラグ | `ds4_proxy_ds4_generation_active` | gauge |
+| Decode progress observed | `ds4_proxy_ds4_generation_progress_observed` | gauge |
+| Decode last progress age seconds | `ds4_proxy_ds4_generation_last_progress_age_seconds` | gauge |
 | Decode completion | `ds4_proxy_ds4_generation_completion` | gauge |
 | 直近 Decode chunk TPS | `ds4_proxy_ds4_generation_chunk_tps` | gauge |
 | Decode average TPS | `ds4_proxy_ds4_generation_avg_tps` | gauge |
@@ -163,14 +166,18 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
 - アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed (layer-parallel) の接続線は
   視認できる太さにする。
 - アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値を優先して表示する。
-  既定値は `prefill-avg-tps` とする。選択した値が現在進行中でない場合は、進行中の
-  decode 平均 TPS（または chunk TPS）へ切り替える。これにより prefill 中は prefill の
-  スループット、decode 中は decode のスループットを表示する。
+  既定値は `prefill-chunk-tps` とする。選択した値が現在進行中でない場合は、進行中の
+  decode current chunk TPS（または average TPS）へ切り替える。これにより prefill 中は
+  prefill の直近チャンク、decode 中は decode の直近チャンクを優先して表示する。
   選択肢は `prefill-percent`、`prefill-chunk-tps`、`prefill-avg-tps`、`prefill-elapsed`、
   `decode-chunk-tps`、`decode-avg-tps`、`decode-elapsed`、`kv-cache`、`none` とし、
-  値がまだ取得できない場合は空表示にする。
+  値がまだ取得できない場合は空表示にする。ただし TPS を選択している間に progress age が
+  欠落している場合は `progress age unavailable`、60 秒以上の場合は `stalled` を表示し、
+  古い TPS を現在値として表示しない。
 - prefill のタイトル値は prefill 完了時にクリアする。メニュー内の詳細行も完了後は `Prefill: --` とする。
-- decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。
+- decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。最初の
+  progress event 前は `first-token waiting`、progress age 欠落時は `progress age unavailable`、
+  60 秒以上の場合は `stalled` とし、古い chunk/average TPS を表示しない。
 - offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
@@ -184,12 +191,12 @@ State:   solo-standalone-ready
 Gen:     42
 Target:  local-standalone (ready)
 ────────────────────────
-Prefill: 4096/9005 (45.5%) chunk=123.4t/s avg=100.0t/s elapsed=10.0s cached=0
+Prefill: 4096/9005 (45.5%) chunk=123.4t/s avg=100.0t/s elapsed=10.0s cached=0 age=2.5s
 ────────────────────────
 KV cache: hit tokens=9005 load=12.3ms
   total hits: 7
 ────────────────────────
-Decode:  completion=42 chunk=32.1t/s avg=28.5t/s
+Decode:  completion=42 chunk=32.1t/s avg=28.5t/s age=1.0s
 ────────────────────────
 設定ファイルを開く
 siderostat-runtimeを再起動
@@ -228,7 +235,7 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
-live_metric = "prefill-avg-tps"            # メニューバーに優先表示する随時更新値
+live_metric = "prefill-chunk-tps"          # メニューバーに優先表示する随時更新値
 admin_token = ""                           # 指定時は hex 形式の Bearer token
 admin_token_file = ""                      # 省略時は共有 secrets/admin を使用
 ```

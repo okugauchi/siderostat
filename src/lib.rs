@@ -1,12 +1,15 @@
 pub mod admission;
 pub mod app;
+pub mod canary;
 pub mod cli;
 pub mod cluster;
 pub mod config;
+pub mod diagnostics;
 mod error;
 mod localization;
 pub mod metrics;
 pub mod notify;
 pub mod proxy;
+pub mod recovery;
 mod startup_cleanup;
 pub mod target;

@@ -88,6 +88,44 @@ pub struct ModeAwareConfig {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub startup_cleanup: StartupCleanupConfig,
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Automatic throughput recovery is deliberately opt-in.
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub admission_drain_timeout: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub cooldown: Duration,
+    pub max_attempts_12h: usize,
+    pub low_decode_tps: f64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub low_decode_duration: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub progress_stall: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub canary_deadline: Duration,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admission_drain_timeout: Duration::from_secs(60),
+            cooldown: Duration::from_secs(60 * 60),
+            max_attempts_12h: 2,
+            low_decode_tps: 5.0,
+            low_decode_duration: Duration::from_millis(
+                crate::recovery::RECOVERY_LOW_TPS_SUSTAINED_MILLIS,
+            ),
+            progress_stall: Duration::from_secs(60),
+            canary_deadline: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -554,6 +592,34 @@ fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
         cluster.timeouts.standalone_startup,
     );
     anyhow::ensure!(
+        !config.recovery.admission_drain_timeout.is_zero(),
+        "recovery.admission_drain_timeout must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.cooldown.is_zero(),
+        "recovery.cooldown must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.low_decode_duration.is_zero(),
+        "recovery.low_decode_duration must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.progress_stall.is_zero(),
+        "recovery.progress_stall must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.canary_deadline.is_zero(),
+        "recovery.canary_deadline must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.recovery.max_attempts_12h > 0,
+        "recovery.max_attempts_12h must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.recovery.low_decode_tps.is_finite() && config.recovery.low_decode_tps >= 0.0,
+        "recovery.low_decode_tps must be finite and non-negative"
+    );
+    anyhow::ensure!(
         config.cluster.timeouts.rendezvous_hello >= config.cluster.timeouts.worker_startup,
         "cluster.timeouts.rendezvous_hello must not be shorter than worker_startup"
     );
@@ -996,6 +1062,11 @@ fn zero_duration_at(config: &mut ModeAwareConfig, path: &str) {
         "cluster.timeouts.coordinator_startup" => &mut config.cluster.timeouts.coordinator_startup,
         "cluster.timeouts.complete_route" => &mut config.cluster.timeouts.complete_route,
         "cluster.timeouts.standalone_startup" => &mut config.cluster.timeouts.standalone_startup,
+        "recovery.admission_drain_timeout" => &mut config.recovery.admission_drain_timeout,
+        "recovery.cooldown" => &mut config.recovery.cooldown,
+        "recovery.low_decode_duration" => &mut config.recovery.low_decode_duration,
+        "recovery.progress_stall" => &mut config.recovery.progress_stall,
+        "recovery.canary_deadline" => &mut config.recovery.canary_deadline,
         _ => unreachable!("unknown duration path {path}"),
     };
     *duration = Duration::ZERO;
@@ -1201,6 +1272,17 @@ auto_restart = true
         assert!(config.notifications.enabled);
         assert!(config.notifications.sound);
         assert!(config.startup_cleanup.auto_restart);
+        assert!(!config.recovery.enabled);
+        assert_eq!(
+            config.recovery.admission_drain_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.recovery.cooldown, Duration::from_secs(3_600));
+        assert_eq!(config.recovery.max_attempts_12h, 2);
+        assert_eq!(config.recovery.low_decode_tps, 5.0);
+        assert_eq!(config.recovery.low_decode_duration, Duration::from_secs(30));
+        assert_eq!(config.recovery.progress_stall, Duration::from_secs(60));
+        assert_eq!(config.recovery.canary_deadline, Duration::from_secs(30));
     }
 
     #[test]
@@ -1217,6 +1299,33 @@ auto_restart = true
         let input = mode_aware_config().replace("[startup_cleanup]\nauto_restart = true\n", "");
         let config: ModeAwareConfig = toml::from_str(&input).unwrap();
         assert!(config.startup_cleanup.auto_restart);
+    }
+
+    #[test]
+    fn recovery_section_defaults_are_backward_compatible() {
+        let input = mode_aware_config();
+        let config: ModeAwareConfig = toml::from_str(input).unwrap();
+        assert_eq!(config.recovery, RecoveryConfig::default());
+    }
+
+    #[test]
+    fn recovery_section_accepts_explicit_opt_in_policy() {
+        let input = format!(
+            "{}\n[recovery]\nenabled = true\nadmission_drain_timeout = \"45s\"\ncooldown = \"2h\"\nmax_attempts_12h = 3\nlow_decode_tps = 4.5\nlow_decode_duration = \"20s\"\nprogress_stall = \"55s\"\ncanary_deadline = \"25s\"\n",
+            mode_aware_config()
+        );
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert!(config.recovery.enabled);
+        assert_eq!(
+            config.recovery.admission_drain_timeout,
+            Duration::from_secs(45)
+        );
+        assert_eq!(config.recovery.cooldown, Duration::from_secs(7_200));
+        assert_eq!(config.recovery.max_attempts_12h, 3);
+        assert_eq!(config.recovery.low_decode_tps, 4.5);
+        assert_eq!(config.recovery.low_decode_duration, Duration::from_secs(20));
+        assert_eq!(config.recovery.progress_stall, Duration::from_secs(55));
+        assert_eq!(config.recovery.canary_deadline, Duration::from_secs(25));
     }
 
     #[test]
@@ -1486,6 +1595,30 @@ auto_restart = true
     }
 
     #[test]
+    fn rejects_invalid_recovery_policy() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.recovery.max_attempts_12h = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery.max_attempts_12h")
+        );
+
+        let mut config = files.config();
+        config.recovery.low_decode_tps = f64::NAN;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery.low_decode_tps")
+        );
+    }
+
+    #[test]
     fn rejects_every_duration_at_zero_with_dotted_path() {
         let files = ConfigTestFiles::new();
         let paths = [
@@ -1510,6 +1643,11 @@ auto_restart = true
             "cluster.timeouts.coordinator_startup",
             "cluster.timeouts.complete_route",
             "cluster.timeouts.standalone_startup",
+            "recovery.admission_drain_timeout",
+            "recovery.cooldown",
+            "recovery.low_decode_duration",
+            "recovery.progress_stall",
+            "recovery.canary_deadline",
         ];
         for path in paths {
             let mut config = files.config();

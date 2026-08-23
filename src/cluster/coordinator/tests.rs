@@ -125,13 +125,18 @@ impl DistributedCoordinatorLifecycle for FakeDistributedCoordinator {
 struct FakePeer {
     drains: Arc<AtomicUsize>,
     stops: Arc<AtomicUsize>,
+    drain_fails: Arc<AtomicBool>,
 }
 
 impl CoordinatorPeerLifecycle for FakePeer {
     fn begin_drain(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
         let drains = self.drains.clone();
+        let fails = self.drain_fails.clone();
         Box::pin(async move {
             drains.fetch_add(1, Ordering::SeqCst);
+            if fails.load(Ordering::SeqCst) {
+                anyhow::bail!("fake peer drain failed");
+            }
             Ok(())
         })
     }
@@ -674,6 +679,112 @@ async fn promotion_waits_for_in_flight_stream_and_complete_route_before_serving(
     assert_eq!(peer.drains.load(Ordering::SeqCst), 1);
     assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);
     assert!(proxy.target_snapshot().ready);
+    task.abort();
+}
+
+#[tokio::test]
+async fn recovery_promotion_keeps_admission_blocked_until_canary() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.set_route_ready(true);
+    let (runtime, proxy, _, _, task) = promotion_runtime(coordinator).await;
+
+    let ready = runtime
+        .promote_validated_for_recovery(validated_hello(), true, Arc::new(|| true), NOW + 5_000)
+        .await
+        .unwrap();
+
+    assert_eq!(ready.state, ClusterState::DistributedReady);
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Blocked
+    );
+    assert!(proxy.admission().try_acquire(true).is_err());
+    task.abort();
+}
+
+#[tokio::test]
+async fn recovery_drain_timeout_does_not_stop_distributed_children() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.set_route_ready(true);
+    let (runtime, proxy, _, peer, task) = promotion_runtime(coordinator.clone()).await;
+    runtime
+        .promote_after_hello(
+            validated_hello(),
+            &ready_worker_control(),
+            NOW + 5_000,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    let permit = proxy.admission().try_acquire(true).unwrap();
+
+    assert!(matches!(
+        runtime.demote_for_recovery(Duration::from_millis(5)).await,
+        Err(CoordinatorLifecycleError::Drain(DrainError::Timeout))
+    ));
+    assert_eq!(coordinator.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(peer.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Draining
+    );
+    drop(permit);
+    task.abort();
+}
+
+#[tokio::test]
+async fn recovery_demotion_failure_does_not_stop_distributed_children() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.set_route_ready(true);
+    let (runtime, proxy, _, peer, task) = promotion_runtime(coordinator.clone()).await;
+    runtime
+        .promote_after_hello(
+            validated_hello(),
+            &ready_worker_control(),
+            NOW + 5_000,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    peer.drain_fails.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        runtime.demote_for_recovery(Duration::from_millis(50)).await,
+        Err(CoordinatorLifecycleError::Peer(_))
+    ));
+    assert_eq!(coordinator.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(peer.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Blocked
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn recovery_promotion_failure_keeps_admission_blocked_in_paired_state() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.start_hangs.store(true, Ordering::SeqCst);
+    let (runtime, proxy, standalone, peer, task) = promotion_runtime(coordinator).await;
+
+    assert!(matches!(
+        runtime
+            .promote_validated_for_recovery(
+                validated_hello(),
+                true,
+                Arc::new(|| true),
+                NOW + 5_000,
+            )
+            .await,
+        Err(CoordinatorLifecycleError::StartupTimeout)
+    ));
+    assert_eq!(runtime.cluster.snapshot().state, ClusterState::Backoff);
+    assert!(standalone.running.load(Ordering::SeqCst));
+    assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Blocked
+    );
     task.abort();
 }
 

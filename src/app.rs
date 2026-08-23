@@ -2,6 +2,7 @@
 use crate::cluster::MacOsDynamicStoreWatcher;
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState, DrainError},
+    canary::{CanaryExecutor, CanaryPolicy, CanaryReason},
     cluster::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
         ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
@@ -13,12 +14,19 @@ use crate::{
         detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
         required_port_available, spawn_network_event_monitor,
     },
-    config::{ModeAwareConfig, Quantization, Residency, SpeculativeSupport},
+    config::{ModeAwareConfig, Quantization, RecoveryConfig, Residency, SpeculativeSupport},
+    diagnostics::{DiagnosticSnapshot, DiagnosticSnapshotStore},
     metrics::{MetricSnapshot, Metrics},
     notify::{DesktopNotificationService, NotifyPlatform, build_notifier},
     proxy::{
         ModeAwareProxyOptions, ModeAwareProxyState, PeerProxyToken, mode_aware_proxy_handler,
         peer_ingress_handler,
+    },
+    recovery::{
+        RECOVERY_HISTORY_LIMIT, RECOVERY_WINDOW_MILLIS, RecoveryDetector, RecoveryDetectorPolicy,
+        RecoveryFailureReason, RecoveryGate, RecoveryJob, RecoveryObservation, RecoveryPhase,
+        RecoveryPolicy, RecoveryReason, RecoveryRequest, RecoveryService, RecoveryStart,
+        RecoveryTrigger,
     },
     target::{LocalRole, ProxyTarget, StableMode, UnavailableReason},
 };
@@ -61,6 +69,8 @@ pub struct AppState {
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
     supervisor: RwLock<Option<Arc<StandaloneSupervisor>>>,
+    recovery: RecoveryService,
+    recovery_config: RecoveryConfig,
     graceful_restart_in_progress: std::sync::atomic::AtomicBool,
     /// Default in-flight drain timeout for `/admin/restart` when the request
     /// omits `drain_timeout_ms` (C-04a). Taken from the cluster stop timeout.
@@ -69,6 +79,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
+        let recovery_config = config.recovery.clone();
         let metrics = Arc::new(Metrics::default());
         let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
         let coordinator_address = SocketAddr::new(
@@ -127,6 +138,13 @@ impl AppState {
             admin: RwLock::new(None),
             production: RwLock::new(None),
             supervisor: RwLock::new(None),
+            recovery: RecoveryService::with_policy(RecoveryPolicy {
+                history_limit: RECOVERY_HISTORY_LIMIT,
+                cooldown: duration_millis(recovery_config.cooldown),
+                window: RECOVERY_WINDOW_MILLIS,
+                max_attempts: recovery_config.max_attempts_12h,
+            }),
+            recovery_config,
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
             default_drain_timeout: config.cluster.timeouts.stop,
         }))
@@ -164,6 +182,53 @@ impl AppState {
             Some(production) => Some(production.diagnostics().await),
             None => None,
         }
+    }
+
+    fn production_runtime(&self) -> Option<ProductionClusterRuntime> {
+        self.production
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Capture a redaction-safe diagnostic snapshot without changing cluster,
+    /// admission, or child state. Recovery orchestration owns the decision to
+    /// persist this snapshot before any mutation.
+    pub(crate) async fn diagnostic_snapshot(
+        &self,
+        recovery_id: uuid::Uuid,
+    ) -> anyhow::Result<DiagnosticSnapshot> {
+        Ok(DiagnosticSnapshot::from_runtime(
+            recovery_id,
+            crate::diagnostics::now_millis()?,
+            &self.config.node_id,
+            &self.config.interface,
+            self.cluster_snapshot(),
+            self.proxy.target_snapshot(),
+            self.proxy.admission().snapshot(),
+            self.production_diagnostics().await.as_ref(),
+            self.metrics.diagnostic_snapshot(),
+        ))
+    }
+
+    /// Persist a diagnostic snapshot through the user-scoped private store.
+    /// H-06 recovery orchestration will call this before admission mutation.
+    #[allow(dead_code)]
+    pub(crate) async fn write_diagnostic_snapshot(
+        &self,
+        recovery_id: uuid::Uuid,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let snapshot = self.diagnostic_snapshot(recovery_id).await?;
+        self.write_diagnostic_snapshot_to(&DiagnosticSnapshotStore::for_current_user()?, &snapshot)
+            .await
+    }
+
+    pub(crate) async fn write_diagnostic_snapshot_to(
+        &self,
+        store: &DiagnosticSnapshotStore,
+        snapshot: &DiagnosticSnapshot,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        store.write(snapshot)
     }
 
     fn attach_admin(&self, admin: AdminController) {
@@ -917,6 +982,75 @@ fn spawn_local_monitor(
     })
 }
 
+fn spawn_recovery_detector(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    let policy = recovery_detector_policy(&state.recovery_config);
+    tokio::spawn(async move {
+        let mut detector = match RecoveryDetector::new(policy) {
+            Ok(detector) => detector,
+            Err(error) => {
+                tracing::error!(error = %error, "recovery detector configuration is invalid");
+                return;
+            }
+        };
+        let detector_clock_start = std::time::Instant::now();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = state.metrics.diagnostic_snapshot();
+            let observation = if snapshot.generation_in_flight == 0 {
+                RecoveryObservation::Idle
+            } else {
+                RecoveryObservation::Active {
+                    first_progress_observed: snapshot.generation.progress_observed,
+                    active_age_millis: state
+                        .metrics
+                        .generation_active_age_secs()
+                        .and_then(seconds_to_millis)
+                        .unwrap_or(0),
+                    progress_age_millis: snapshot.generation.age_secs.and_then(seconds_to_millis),
+                    chunk_tps: snapshot
+                        .generation
+                        .progress_observed
+                        .then_some(snapshot.generation.chunk_tps),
+                }
+            };
+            let now_millis = duration_millis(detector_clock_start.elapsed());
+            if let Some(trigger) = detector.observe_at(now_millis, observation) {
+                let request = match RecoveryRequest::new(
+                    RecoveryReason::ThroughputDegraded,
+                    trigger,
+                    format!("automatic-{}", uuid::Uuid::new_v4()),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::error!(error = %error, "automatic recovery request construction failed");
+                        continue;
+                    }
+                };
+                let started = begin_recovery(state.clone(), request);
+                if let RecoveryStart::Suppressed(job) = started {
+                    tracing::info!(
+                        event = "recovery-suppressed",
+                        reason = job
+                            .failure_reason
+                            .map(RecoveryFailureReason::as_str)
+                            .unwrap_or("suppressed"),
+                        "automatic recovery was suppressed by a start gate"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn seconds_to_millis(seconds: f64) -> Option<u64> {
+    seconds
+        .is_finite()
+        .then_some(seconds.max(0.0) * 1_000.0)
+        .and_then(|millis| (millis <= u64::MAX as f64).then_some(millis as u64))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_servers(
     config: &ModeAwareConfig,
@@ -958,6 +1092,10 @@ async fn run_servers(
     let reconcile_task = production
         .as_ref()
         .map(ProductionClusterRuntime::start_reconcile_task);
+    let recovery_detector_task = config
+        .recovery
+        .enabled
+        .then(|| spawn_recovery_detector(state.clone()));
     let control_task = control_listener
         .zip(production.clone())
         .map(|(listener, production)| {
@@ -1009,6 +1147,9 @@ async fn run_servers(
     transition_monitor.abort();
     desktop_notifier.abort();
     if let Some(task) = reconcile_task {
+        task.abort();
+    }
+    if let Some(task) = recovery_detector_task {
         task.abort();
     }
     if let Some(task) = control_task {
@@ -1181,6 +1322,11 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/cluster/demote", post(demote))
         .route("/cluster/restart", post(restart))
         .route("/cluster/fingerprint", post(fingerprint))
+        .route("/cluster/recover-degraded", post(recover_degraded))
+        .route(
+            "/cluster/recover-degraded/{recovery_id}",
+            get(recover_degraded_status),
+        )
         .route("/admin/restart", post(graceful_restart))
         .with_state(state)
 }
@@ -1195,6 +1341,470 @@ struct DemoteRequest {
 #[serde(deny_unknown_fields)]
 struct FingerprintRequest {
     profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryStartRequest {
+    reason: String,
+    trigger: String,
+    idempotency_key: String,
+}
+
+async fn recover_degraded(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let request = match parse_recovery_request(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid recovery request: {error}")}),
+            );
+        }
+    };
+    let started = begin_recovery(state, request);
+    let status = match &started {
+        RecoveryStart::Suppressed(_) => StatusCode::CONFLICT,
+        RecoveryStart::Existing(job)
+            if job.failure_reason == Some(RecoveryFailureReason::RecoveryOwnerBusy) =>
+        {
+            StatusCode::CONFLICT
+        }
+        RecoveryStart::Created(_) | RecoveryStart::Existing(_) => StatusCode::ACCEPTED,
+    };
+    recovery_response(status, recovery_job(&started))
+}
+
+async fn recover_degraded_status(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(recovery_id): axum::extract::Path<String>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    if uuid::Uuid::parse_str(&recovery_id).is_err() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "recovery_id must be a UUID"}),
+        );
+    }
+    match state.recovery.status(&recovery_id) {
+        Some(job) => recovery_response(StatusCode::OK, job),
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({
+                "error": "recovery_not_found",
+                "failure_reason": RecoveryFailureReason::UnknownRecoveryId,
+            }),
+        ),
+    }
+}
+
+fn parse_recovery_request(body: &Bytes) -> anyhow::Result<RecoveryRequest> {
+    let request: RecoveryStartRequest = serde_json::from_slice(body)?;
+    let reason = match request.reason.as_str() {
+        "throughput-degraded" => RecoveryReason::ThroughputDegraded,
+        _ => anyhow::bail!("reason must be throughput-degraded"),
+    };
+    let trigger = match request.trigger.as_str() {
+        "manual-canary-failure" => RecoveryTrigger::ManualCanaryFailure,
+        "progress-stall" => RecoveryTrigger::ProgressStall,
+        "low-decode-tps" => RecoveryTrigger::LowDecodeTps,
+        "first-token-timeout" => RecoveryTrigger::FirstTokenTimeout,
+        _ => anyhow::bail!("trigger is not supported"),
+    };
+    RecoveryRequest::new(reason, trigger, request.idempotency_key)
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn recovery_detector_policy(config: &RecoveryConfig) -> RecoveryDetectorPolicy {
+    RecoveryDetectorPolicy {
+        low_decode_tps: config.low_decode_tps,
+        low_decode_duration_millis: duration_millis(config.low_decode_duration),
+        progress_stall_millis: duration_millis(config.progress_stall),
+        first_token_timeout_millis: duration_millis(config.canary_deadline),
+    }
+}
+
+fn recovery_gate(state: &AppState) -> RecoveryGate {
+    state
+        .cluster_snapshot()
+        .map(|snapshot| RecoveryGate {
+            role: snapshot.role,
+            mode: snapshot.stable_mode,
+            state: snapshot.state,
+            generation: snapshot.generation,
+        })
+        .unwrap_or(RecoveryGate {
+            role: LocalRole::Unknown,
+            mode: StableMode::SoloStandalone,
+            state: crate::target::ClusterState::Booting,
+            generation: 0,
+        })
+}
+
+fn spawn_recovery_snapshot(state: Arc<AppState>, recovery_id: String) {
+    let service = state.recovery.clone();
+    tokio::spawn(async move {
+        let uuid = match uuid::Uuid::parse_str(&recovery_id) {
+            Ok(uuid) => uuid,
+            Err(error) => {
+                tracing::error!(recovery_id = %recovery_id, error = %error, "invalid recovery ID in snapshot task");
+                let _ = service.mark_snapshot_failed(
+                    &recovery_id,
+                    RecoveryFailureReason::SnapshotWrite,
+                    crate::recovery::now_millis(),
+                );
+                if let Some(production) = state.production_runtime() {
+                    production.release_recovery_owner();
+                }
+                return;
+            }
+        };
+        match state.diagnostic_snapshot(uuid).await {
+            Ok(snapshot) => match DiagnosticSnapshotStore::for_current_user()
+                .and_then(|store| store.write(&snapshot))
+            {
+                Ok(_path) => {
+                    let redacted_path = format!("recovery/snapshots/{recovery_id}/snapshot.json");
+                    let _ = service.mark_snapshot_succeeded(&recovery_id, redacted_path);
+                    if let Err((reason, error)) =
+                        run_recovery_lifecycle(state.clone(), recovery_id.clone()).await
+                    {
+                        tracing::error!(
+                            recovery_id = %recovery_id,
+                            reason = ?reason,
+                            error = %error,
+                            "degraded recovery lifecycle failed"
+                        );
+                        state.metrics.recovery_failed(reason.as_str());
+                        let _ = service.mark_failed(
+                            &recovery_id,
+                            crate::recovery::now_millis(),
+                            reason,
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(recovery_id = %recovery_id, error = %error, "recovery snapshot write failed");
+                    state
+                        .metrics
+                        .recovery_failed(RecoveryFailureReason::SnapshotWrite.as_str());
+                    let _ = service.mark_snapshot_failed(
+                        &recovery_id,
+                        RecoveryFailureReason::SnapshotWrite,
+                        crate::recovery::now_millis(),
+                    );
+                    if let Some(production) = state.production_runtime() {
+                        production.release_recovery_owner();
+                    }
+                }
+            },
+            Err(error) => {
+                tracing::error!(recovery_id = %recovery_id, error = %error, "recovery snapshot capture failed");
+                state
+                    .metrics
+                    .recovery_failed(RecoveryFailureReason::SnapshotWrite.as_str());
+                let _ = service.mark_snapshot_failed(
+                    &recovery_id,
+                    RecoveryFailureReason::SnapshotWrite,
+                    crate::recovery::now_millis(),
+                );
+                if let Some(production) = state.production_runtime() {
+                    production.release_recovery_owner();
+                }
+            }
+        }
+    });
+}
+
+async fn run_recovery_lifecycle(
+    state: Arc<AppState>,
+    recovery_id: String,
+) -> Result<(), (RecoveryFailureReason, anyhow::Error)> {
+    let service = state.recovery.clone();
+    let production = state.production_runtime().ok_or_else(|| {
+        (
+            RecoveryFailureReason::RecoveryOwnerBusy,
+            anyhow::anyhow!("production cluster runtime is unavailable"),
+        )
+    })?;
+    let old_generation = service
+        .status(&recovery_id)
+        .map(|job| job.cluster_generation)
+        .ok_or_else(|| {
+            (
+                RecoveryFailureReason::UnknownRecoveryId,
+                anyhow::anyhow!("recovery job disappeared before lifecycle execution"),
+            )
+        })?;
+    let old_diagnostics = production.diagnostics().await;
+    let old_target = state.proxy.target_snapshot();
+    let old_admission = state.proxy.admission().snapshot();
+
+    let result = async {
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::AdmissionBlocked,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job is no longer active"))?;
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::Draining,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::Demoting,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        let paired = production
+            .demote_for_recovery(state.recovery_config.admission_drain_timeout)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::PairedStandalone,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::Promoting,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        let distributed = production
+            .promote_for_recovery()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        anyhow::ensure!(
+            distributed.generation > old_generation,
+            "recovery promotion did not create a new cluster generation"
+        );
+        let new_diagnostics = production.diagnostics().await;
+        anyhow::ensure!(
+            recovery_children_replaced(&old_diagnostics, &new_diagnostics),
+            "recovery child identity/generation did not change on both nodes"
+        );
+        service
+            .mark_phase(
+                &recovery_id,
+                RecoveryPhase::PostRecoveryCanary,
+                Some("blocked".into()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        let permit = state
+            .proxy
+            .issue_recovery_canary_permit(&recovery_id, state.recovery_config.canary_deadline);
+        let canary = CanaryExecutor::new(
+            state.config.public_listen,
+            CanaryPolicy {
+                deadline: state.recovery_config.canary_deadline,
+                progress_stall: state.recovery_config.progress_stall,
+                low_decode_tps: state.recovery_config.low_decode_tps,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!(error))?
+        .execute_with_recovery_permit(&permit)
+        .await;
+        service
+            .mark_post_recovery_canary(&recovery_id, canary.reason)
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        anyhow::ensure!(
+            canary.reason == CanaryReason::Healthy,
+            "post-recovery canary failed: {:?}",
+            canary.reason
+        );
+        state.proxy.admission().start_serving();
+        service
+            .mark_phase(&recovery_id, RecoveryPhase::Serving, Some("serving".into()))
+            .ok_or_else(|| anyhow::anyhow!("recovery job left the active owner"))?;
+        service
+            .mark_succeeded(
+                &recovery_id,
+                crate::recovery::now_millis(),
+                distributed.generation,
+            )
+            .ok_or_else(|| anyhow::anyhow!("recovery job could not be completed"))?;
+        state.metrics.recovery_completed(
+            service
+                .status(&recovery_id)
+                .map(|job| job.trigger.as_str())
+                .unwrap_or("throughput-degraded"),
+        );
+        production.start_route_loss_monitor();
+        let _ = paired;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    production.release_recovery_owner();
+    if result.is_err() {
+        if restore_recovery_admission_if_unchanged(
+            &state,
+            old_generation,
+            old_target,
+            old_admission.state,
+        ) {
+            tracing::info!(
+                event = "recovery-admission-restored",
+                reason = "generation-and-target-unchanged",
+                "recovery failure restored the pre-recovery admission state"
+            );
+        } else {
+            tracing::warn!(
+                event = "recovery-manual-intervention-needed",
+                reason = "generation-or-target-changed",
+                "recovery failure left admission blocked for manual intervention"
+            );
+        }
+    }
+    result.map_err(|error| {
+        let error_text = error.to_string();
+        let reason = if error_text.contains("drain") {
+            RecoveryFailureReason::DrainTimeout
+        } else if error_text.contains("child identity") {
+            RecoveryFailureReason::ChildIdentityMismatch
+        } else if error_text.contains("promotion") {
+            RecoveryFailureReason::PromotionFailed
+        } else if error_text.contains("canary") {
+            RecoveryFailureReason::CanaryFailed
+        } else {
+            RecoveryFailureReason::DemotionFailed
+        };
+        (reason, error)
+    })
+}
+
+fn restore_recovery_admission_if_unchanged(
+    state: &AppState,
+    old_generation: u64,
+    old_target: crate::proxy::ModeAwareTargetSnapshot,
+    old_admission_state: AdmissionState,
+) -> bool {
+    let generation_unchanged = state
+        .cluster_snapshot()
+        .is_some_and(|snapshot| snapshot.generation == old_generation);
+    let target_unchanged = state.proxy.target_snapshot() == old_target;
+    if generation_unchanged && target_unchanged && old_admission_state == AdmissionState::Serving {
+        state.proxy.admission().start_serving();
+        true
+    } else {
+        false
+    }
+}
+
+fn begin_recovery(state: Arc<AppState>, request: RecoveryRequest) -> RecoveryStart {
+    let started = state.recovery.begin(recovery_gate(&state), request);
+    match &started {
+        RecoveryStart::Created(job) => {
+            state.metrics.recovery_started(job.trigger.as_str());
+            tracing::info!(
+                event = "recovery-started",
+                trigger = job.trigger.as_str(),
+                "automatic or manual degraded recovery accepted"
+            );
+            if let Some(production) = state.production_runtime()
+                && !production.try_claim_recovery_owner()
+            {
+                let _ = state.recovery.mark_failed(
+                    &job.recovery_id,
+                    crate::recovery::now_millis(),
+                    RecoveryFailureReason::RecoveryOwnerBusy,
+                );
+                state
+                    .metrics
+                    .recovery_failed(RecoveryFailureReason::RecoveryOwnerBusy.as_str());
+                tracing::warn!(
+                    event = "recovery-failed",
+                    reason = RecoveryFailureReason::RecoveryOwnerBusy.as_str(),
+                    "degraded recovery owner was busy"
+                );
+                return RecoveryStart::Existing(
+                    state
+                        .recovery
+                        .status(&job.recovery_id)
+                        .unwrap_or_else(|| job.clone()),
+                );
+            }
+            spawn_recovery_snapshot(state, job.recovery_id.clone());
+        }
+        RecoveryStart::Suppressed(job) => {
+            let reason = job
+                .failure_reason
+                .map(RecoveryFailureReason::as_str)
+                .unwrap_or("suppressed");
+            state.metrics.recovery_suppressed(reason);
+            tracing::info!(
+                event = "recovery-suppressed",
+                reason,
+                "degraded recovery start gate suppressed the request"
+            );
+        }
+        RecoveryStart::Existing(_) => {}
+    }
+    started
+}
+
+fn recovery_children_replaced(
+    before: &crate::cluster::ProductionDiagnostics,
+    after: &crate::cluster::ProductionDiagnostics,
+) -> bool {
+    let local_child_replaced = before
+        .children
+        .distributed_coordinator
+        .as_ref()
+        .zip(after.children.distributed_coordinator.as_ref())
+        .is_some_and(|(old, new)| old.generation != new.generation || old.pid != new.pid);
+    let peer_generation_replaced = before
+        .control_session
+        .lease
+        .peer
+        .as_ref()
+        .zip(after.control_session.lease.peer.as_ref())
+        .is_some_and(|(old, new)| old.generation != new.generation);
+    local_child_replaced && peer_generation_replaced
+}
+
+fn recovery_job(start: &RecoveryStart) -> RecoveryJob {
+    match start {
+        RecoveryStart::Created(job)
+        | RecoveryStart::Existing(job)
+        | RecoveryStart::Suppressed(job) => job.clone(),
+    }
+}
+
+fn recovery_response(status: StatusCode, job: RecoveryJob) -> Response<Body> {
+    match serde_json::to_value(job) {
+        Ok(value) => json_response(status, value),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to serialize recovery job");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "failed to serialize recovery job"}),
+            )
+        }
+    }
 }
 
 async fn reconcile(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
@@ -1862,6 +2472,8 @@ mod tests {
             admin: RwLock::new(None),
             production: RwLock::new(None),
             supervisor: RwLock::new(None),
+            recovery: RecoveryService::new(),
+            recovery_config: RecoveryConfig::default(),
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
             default_drain_timeout: std::time::Duration::from_millis(5000),
         });
@@ -1927,6 +2539,90 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    async fn get_with_token(
+        state: Arc<AppState>,
+        path: &'static str,
+        token: &str,
+    ) -> (StatusCode, String) {
+        let response = admin_router(state)
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn test_admin_token() -> String {
+        format!("Bearer {}", crate::cluster::encode_token(&[3; 32]))
+    }
+
+    #[tokio::test]
+    async fn recovery_endpoint_authenticates_and_applies_role_gate_read_only() {
+        let state = test_state(true);
+        let body = r#"{
+            "reason":"throughput-degraded",
+            "trigger":"manual-canary-failure",
+            "idempotency_key":"app-test"
+        }"#;
+        let (unauthorized, _) = post(state.clone(), "/cluster/recover-degraded", None, body).await;
+        assert_eq!(unauthorized, StatusCode::UNAUTHORIZED);
+
+        let token = test_admin_token();
+        let (suppressed, response) = post(
+            state.clone(),
+            "/cluster/recover-degraded",
+            Some(&token),
+            body,
+        )
+        .await;
+        assert_eq!(suppressed, StatusCode::CONFLICT);
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["state"], "suppressed");
+        assert_eq!(response["failure_reason"], "not_coordinator");
+        assert!(!state.recovery.has_active_job());
+    }
+
+    #[tokio::test]
+    async fn recovery_endpoint_rejects_unknown_fields_and_stale_ids() {
+        let state = test_state(true);
+        let token = test_admin_token();
+        let (bad_request, _) = post(
+            state.clone(),
+            "/cluster/recover-degraded",
+            Some(&token),
+            r#"{
+                "reason":"throughput-degraded",
+                "trigger":"manual-canary-failure",
+                "idempotency_key":"app-test",
+                "prompt":"must-not-be-accepted"
+            }"#,
+        )
+        .await;
+        assert_eq!(bad_request, StatusCode::BAD_REQUEST);
+
+        let (stale, response) = get_with_token(
+            state.clone(),
+            "/cluster/recover-degraded/00000000-0000-4000-8000-000000000000",
+            &token,
+        )
+        .await;
+        assert_eq!(stale, StatusCode::NOT_FOUND);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["error"],
+            "recovery_not_found"
+        );
+
+        let (invalid, _) =
+            get_with_token(state, "/cluster/recover-degraded/not-a-uuid", &token).await;
+        assert_eq!(invalid, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn basic_admin_endpoints_report_serving_solo_state() {
         let state = test_state(true);
@@ -1956,6 +2652,22 @@ mod tests {
         );
         assert_eq!(metrics_status, StatusCode::OK);
         assert!(metrics_body.contains("ds4_proxy_target_ready{target=\"local-standalone\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_snapshot_capture_is_read_only_and_redaction_safe() {
+        let state = test_state(true);
+        let recovery_id = uuid::Uuid::new_v4();
+        let snapshot = state.diagnostic_snapshot(recovery_id).await.unwrap();
+        let value = serde_json::to_value(&snapshot).unwrap();
+
+        assert_eq!(value["recovery_id"], recovery_id.to_string());
+        assert_eq!(value["cluster"]["state"], "booting");
+        assert_eq!(value["admission"]["state"], "serving");
+        assert_eq!(value["network"]["interface"], "bridge0");
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("response").is_none());
+        assert!(value.get("deployment_id").is_none());
     }
 
     #[tokio::test]

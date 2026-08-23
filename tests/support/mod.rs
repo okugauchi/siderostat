@@ -150,9 +150,13 @@ pub struct RecordedChild {
 
 impl RecordedChild {
     pub fn start(&self, generation: u64, pid: u32, profile: impl Into<String>) {
-        self.starts.fetch_add(1, Ordering::SeqCst);
+        let start_number = self.starts.fetch_add(1, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
-        self.pid.store(pid, Ordering::SeqCst);
+        // Each start represents a new owned process. Keep the first PID stable for readable
+        // diagnostics, then advance it so recovery tests can assert process replacement as well
+        // as generation replacement without touching real processes.
+        self.pid
+            .store(pid.saturating_add(start_number as u32), Ordering::SeqCst);
         self.generation.store(generation, Ordering::SeqCst);
         *self.profile.lock().unwrap() = profile.into();
     }

@@ -269,6 +269,7 @@ struct ProductionInner {
     config: ModeAwareConfig,
     manifest: DistributedManifest,
     recovery: Arc<recovery::PeerLossRecovery>,
+    recovery_owner_active: AtomicBool,
     automatic_pairing_blocked: AtomicBool,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
@@ -465,6 +466,7 @@ impl ProductionClusterRuntime {
             config,
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
+            recovery_owner_active: AtomicBool::new(false),
             automatic_pairing_blocked: AtomicBool::new(false),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
@@ -654,6 +656,23 @@ impl ProductionClusterRuntime {
 
     pub fn role(&self) -> LocalRole {
         self.inner.role
+    }
+
+    pub fn try_claim_recovery_owner(&self) -> bool {
+        self.inner
+            .recovery_owner_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn release_recovery_owner(&self) {
+        self.inner
+            .recovery_owner_active
+            .store(false, Ordering::Release);
+    }
+
+    pub fn recovery_owner_active(&self) -> bool {
+        self.inner.recovery_owner_active.load(Ordering::Acquire)
     }
 
     pub(super) fn block_automatic_pairing(&self) {
@@ -874,32 +893,16 @@ struct PeerLifecycle {
 }
 
 impl CoordinatorPeerLifecycle for PeerLifecycle {
-    fn begin_drain(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let inner = inner.upgrade().context("production runtime stopped")?;
-            let RoleControl::Coordinator(control) = &inner.control else {
-                anyhow::bail!("coordinator control unavailable")
-            };
-            let message = {
-                let mut control = control.lock().await;
-                let message = control.begin_drain_message(uuid::Uuid::new_v4().to_string())?;
-                control.note_begin_drain_sent(message.generation)?;
-                message
-            };
-            inner.client.send(&message).await?;
-            let deadline = tokio::time::Instant::now() + inner.config.cluster.timeouts.drain;
-            loop {
-                if control.lock().await.phase() == super::DistributedControlPhase::Drained {
-                    return Ok(());
-                }
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "worker drain acknowledgement timed out"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
+    fn begin_drain(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
+        self.begin_drain_with_deadline(generation, None)
+    }
+
+    fn begin_drain_with_timeout(
+        &self,
+        generation: u64,
+        timeout: Duration,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        self.begin_drain_with_deadline(generation, Some(timeout))
     }
 
     fn stop_worker(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
@@ -921,6 +924,41 @@ impl CoordinatorPeerLifecycle for PeerLifecycle {
                 .await
                 .note_demote_complete(message.generation)?;
             Ok(())
+        })
+    }
+}
+
+impl PeerLifecycle {
+    fn begin_drain_with_deadline(
+        &self,
+        _generation: u64,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let inner = inner.upgrade().context("production runtime stopped")?;
+            let RoleControl::Coordinator(control) = &inner.control else {
+                anyhow::bail!("coordinator control unavailable")
+            };
+            let message = {
+                let mut control = control.lock().await;
+                let message = control.begin_drain_message(uuid::Uuid::new_v4().to_string())?;
+                control.note_begin_drain_sent(message.generation)?;
+                message
+            };
+            inner.client.send(&message).await?;
+            let deadline = tokio::time::Instant::now()
+                + timeout.unwrap_or(inner.config.cluster.timeouts.drain);
+            loop {
+                if control.lock().await.phase() == super::DistributedControlPhase::Drained {
+                    return Ok(());
+                }
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "worker drain acknowledgement timed out"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         })
     }
 }

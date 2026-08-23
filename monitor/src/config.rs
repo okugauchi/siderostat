@@ -17,8 +17,8 @@ const DEFAULT_ADMIN_TOKEN_RELATIVE_PATH: &str =
 #[serde(rename_all = "kebab-case")]
 pub enum LiveMetric {
     PrefillPercent,
-    PrefillChunkTps,
     #[default]
+    PrefillChunkTps,
     PrefillAvgTps,
     PrefillElapsed,
     DecodeChunkTps,
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(config.poll_interval_secs, 2);
         assert_eq!(config.offline_backoff_secs, 5);
         assert!(config.show_decode_tps);
-        assert_eq!(config.live_metric, LiveMetric::PrefillAvgTps);
+        assert_eq!(config.live_metric, LiveMetric::PrefillChunkTps);
         assert!(path.is_some());
     }
 

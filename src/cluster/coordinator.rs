@@ -30,6 +30,13 @@ pub trait DistributedCoordinatorLifecycle: Send + Sync + 'static {
 
 pub trait CoordinatorPeerLifecycle: Send + Sync + 'static {
     fn begin_drain(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn begin_drain_with_timeout(
+        &self,
+        generation: u64,
+        _timeout: Duration,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        self.begin_drain(generation)
+    }
     fn stop_worker(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>>;
 }
 
@@ -158,6 +165,41 @@ impl CoordinatorDistributedRuntime {
         lease: Arc<dyn CoordinatorLeaseStatus>,
         now_millis: u64,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.promote_validated_with_admission(
+            _validated_hello,
+            prerequisites_ready,
+            lease,
+            now_millis,
+            true,
+        )
+        .await
+    }
+
+    pub async fn promote_validated_for_recovery(
+        &self,
+        validated_hello: Ds4Hello,
+        prerequisites_ready: bool,
+        lease: Arc<dyn CoordinatorLeaseStatus>,
+        now_millis: u64,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.promote_validated_with_admission(
+            validated_hello,
+            prerequisites_ready,
+            lease,
+            now_millis,
+            false,
+        )
+        .await
+    }
+
+    async fn promote_validated_with_admission(
+        &self,
+        _validated_hello: Ds4Hello,
+        prerequisites_ready: bool,
+        lease: Arc<dyn CoordinatorLeaseStatus>,
+        now_millis: u64,
+        resume_admission: bool,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         if !prerequisites_ready || !lease.is_valid() {
             return Err(CoordinatorLifecycleError::PrerequisiteMissing);
         }
@@ -171,7 +213,7 @@ impl CoordinatorDistributedRuntime {
             .await?;
         self.block_transition();
 
-        let result = self.promote_inner(promoting, lease).await;
+        let result = self.promote_inner(promoting, lease, resume_admission).await;
         match result {
             Ok(snapshot) => {
                 self.failures.lock().await.note_success();
@@ -179,11 +221,12 @@ impl CoordinatorDistributedRuntime {
             }
             Err(error) => {
                 if matches!(error, CoordinatorLifecycleError::LeaseLost) {
-                    self.recover_solo().await?;
+                    self.recover_solo(resume_admission).await?;
                 } else {
-                    self.recover_paired().await?;
+                    self.recover_paired(resume_admission).await?;
                     if let Some(failure) = promotion_failure_for_error(&error) {
-                        self.enter_promotion_failure(failure, now_millis).await?;
+                        self.enter_promotion_failure(failure, now_millis, resume_admission)
+                            .await?;
                     }
                 }
                 Err(error)
@@ -195,6 +238,7 @@ impl CoordinatorDistributedRuntime {
         &self,
         promoting: ClusterSnapshot,
         lease: Arc<dyn CoordinatorLeaseStatus>,
+        resume_admission: bool,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         let local_drain = self
             .proxy
@@ -204,6 +248,9 @@ impl CoordinatorDistributedRuntime {
         let (local_result, peer_result) = tokio::join!(local_drain, peer_drain);
         local_result?;
         peer_result.map_err(CoordinatorLifecycleError::Peer)?;
+        if !resume_admission {
+            self.proxy.admission().reset_blocked_generation();
+        }
         if !lease.is_valid() {
             return Err(CoordinatorLifecycleError::LeaseLost);
         }
@@ -249,7 +296,9 @@ impl CoordinatorDistributedRuntime {
             })
             .await?;
         self.proxy.set_target(ready.target, true);
-        self.proxy.admission().start_serving();
+        if resume_admission {
+            self.proxy.admission().start_serving();
+        }
         Ok(ready)
     }
 
@@ -285,6 +334,31 @@ impl CoordinatorDistributedRuntime {
     }
 
     pub async fn demote(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.demote_with_drain_timeout_and_admission(self.drain_timeout, true)
+            .await
+    }
+
+    pub async fn demote_with_drain_timeout(
+        &self,
+        drain_timeout: Duration,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.demote_with_drain_timeout_and_admission(drain_timeout, true)
+            .await
+    }
+
+    pub async fn demote_for_recovery(
+        &self,
+        drain_timeout: Duration,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        self.demote_with_drain_timeout_and_admission(drain_timeout, false)
+            .await
+    }
+
+    async fn demote_with_drain_timeout_and_admission(
+        &self,
+        drain_timeout: Duration,
+        resume_admission: bool,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         let current = self.cluster.snapshot();
         let demoting = self
             .cluster
@@ -297,11 +371,16 @@ impl CoordinatorDistributedRuntime {
         let local_drain = self
             .proxy
             .admission()
-            .drain(demoting.generation, self.drain_timeout);
-        let peer_drain = self.peer.begin_drain(demoting.generation);
+            .drain(demoting.generation, drain_timeout);
+        let peer_drain = self
+            .peer
+            .begin_drain_with_timeout(demoting.generation, drain_timeout);
         let (local_result, peer_result) = tokio::join!(local_drain, peer_drain);
         local_result?;
         peer_result.map_err(CoordinatorLifecycleError::Peer)?;
+        if !resume_admission {
+            self.proxy.admission().reset_blocked_generation();
+        }
         self.coordinator
             .stop()
             .await
@@ -322,7 +401,9 @@ impl CoordinatorDistributedRuntime {
             })
             .await?;
         self.proxy.set_target(paired.target, true);
-        self.proxy.admission().start_serving();
+        if resume_admission {
+            self.proxy.admission().start_serving();
+        }
         Ok(paired)
     }
 
@@ -331,7 +412,8 @@ impl CoordinatorDistributedRuntime {
         failure: ClusterFailure,
         now_millis: u64,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
-        self.enter_promotion_failure(failure, now_millis).await
+        self.enter_promotion_failure(failure, now_millis, true)
+            .await
     }
 
     pub async fn reconcile_backoff(
@@ -388,7 +470,10 @@ impl CoordinatorDistributedRuntime {
         );
     }
 
-    async fn recover_paired(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+    async fn recover_paired(
+        &self,
+        resume_admission: bool,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         self.block_transition();
         let generation = self.cluster.snapshot().generation;
         let coordinator_stop = self.coordinator.stop();
@@ -415,11 +500,16 @@ impl CoordinatorDistributedRuntime {
             })
             .await?;
         self.proxy.set_target(paired.target, true);
-        self.proxy.admission().start_serving();
+        if resume_admission {
+            self.proxy.admission().start_serving();
+        }
         Ok(paired)
     }
 
-    async fn recover_solo(&self) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+    async fn recover_solo(
+        &self,
+        resume_admission: bool,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         self.block_transition();
         let generation = self.cluster.snapshot().generation;
         let coordinator_stop = self.coordinator.stop();
@@ -446,7 +536,9 @@ impl CoordinatorDistributedRuntime {
             })
             .await?;
         self.proxy.set_target(ready.target, true);
-        self.proxy.admission().start_serving();
+        if resume_admission {
+            self.proxy.admission().start_serving();
+        }
         Ok(ready)
     }
 
@@ -454,6 +546,7 @@ impl CoordinatorDistributedRuntime {
         &self,
         failure: ClusterFailure,
         now_millis: u64,
+        resume_admission: bool,
     ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
         let decision = self.failures.lock().await.record(failure, now_millis)?;
         let current = self.cluster.snapshot();
@@ -472,7 +565,7 @@ impl CoordinatorDistributedRuntime {
             .await?;
         let ready = !matches!(next.target, ProxyTarget::Unavailable { .. });
         self.proxy.set_target(next.target, ready);
-        if ready {
+        if ready && resume_admission {
             self.proxy.admission().start_serving();
         } else {
             self.proxy.admission().block();

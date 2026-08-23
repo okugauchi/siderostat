@@ -19,7 +19,43 @@ struct Summary {
     count: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
+struct ProgressFreshness {
+    last_progress_at: Option<Instant>,
+    last_tokens: Option<u64>,
+    token_delta: u64,
+}
+
+impl ProgressFreshness {
+    fn record(&mut self, now: Instant, tokens: u64) {
+        self.token_delta = match self.last_tokens {
+            Some(previous) if tokens >= previous => tokens - previous,
+            Some(_) | None => tokens,
+        };
+        self.last_tokens = Some(tokens);
+        self.last_progress_at = Some(now);
+    }
+
+    fn age_seconds(&self, now: Instant, active: bool) -> f64 {
+        if !active {
+            return 0.0;
+        }
+        self.last_progress_at.map_or(0.0, |last_progress_at| {
+            now.saturating_duration_since(last_progress_at)
+                .as_secs_f64()
+        })
+    }
+
+    fn observed(&self) -> bool {
+        self.last_progress_at.is_some()
+    }
+
+    fn token_delta(&self) -> u64 {
+        self.token_delta
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct Ds4MetricsState {
     prefill_active: bool,
     prefill_current: u64,
@@ -36,6 +72,8 @@ struct Ds4MetricsState {
     generation_chunk_tps: f64,
     generation_avg_tps: f64,
     generation_elapsed_secs: f64,
+    prefill_progress: ProgressFreshness,
+    generation_progress: ProgressFreshness,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,12 +87,57 @@ pub struct PrefillProgress {
     pub elapsed_secs: f64,
 }
 
+/// Redaction-safe metrics state used by the recovery diagnostic snapshot. It
+/// contains aggregate progress only; request identifiers and payload data are
+/// intentionally not represented by this type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgressDiagnosticSnapshot {
+    pub active: bool,
+    pub progress_observed: bool,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub percent: f64,
+    pub cached: Option<u64>,
+    pub chunk_tps: f64,
+    pub avg_tps: f64,
+    pub elapsed_secs: f64,
+    pub age_secs: Option<f64>,
+    pub token_delta: u64,
+}
+
+impl Default for ProgressDiagnosticSnapshot {
+    fn default() -> Self {
+        Self {
+            active: false,
+            progress_observed: false,
+            current: None,
+            total: None,
+            percent: 0.0,
+            cached: None,
+            chunk_tps: 0.0,
+            avg_tps: 0.0,
+            elapsed_secs: 0.0,
+            age_secs: None,
+            token_delta: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsDiagnosticSnapshot {
+    pub in_flight: u64,
+    pub generation_in_flight: u64,
+    pub prefill: ProgressDiagnosticSnapshot,
+    pub generation: ProgressDiagnosticSnapshot,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     counters: Mutex<HashMap<String, u64>>,
     summaries: Mutex<HashMap<String, Summary>>,
     in_flight: Mutex<HashMap<(String, String), u64>>,
     generation_in_flight: Mutex<u64>,
+    generation_started_at: Mutex<Option<Instant>>,
     ds4: Mutex<Ds4MetricsState>,
 }
 
@@ -99,6 +182,12 @@ impl Metrics {
                 .generation_in_flight
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *generation_in_flight == 0 {
+                *self
+                    .generation_started_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+            }
             *generation_in_flight += 1;
         }
         RequestMetricGuard {
@@ -169,6 +258,29 @@ impl Metrics {
         );
     }
 
+    pub fn recovery_started(&self, trigger: &str) {
+        self.recovery_event("started", trigger);
+    }
+
+    pub fn recovery_completed(&self, trigger: &str) {
+        self.recovery_event("completed", trigger);
+    }
+
+    pub fn recovery_failed(&self, reason: &str) {
+        self.recovery_event("failed", reason);
+    }
+
+    pub fn recovery_suppressed(&self, reason: &str) {
+        self.recovery_event("suppressed", reason);
+    }
+
+    fn recovery_event(&self, event: &'static str, reason: &str) {
+        self.increment(
+            "ds4_proxy_recovery_events_total",
+            &[("event", event), ("reason", reason)],
+        );
+    }
+
     /// Record DS4 prefill progress. When `current >= total` the prefill is
     /// considered finished and the active flag is cleared.
     pub fn prefill_progress(&self, progress: PrefillProgress) {
@@ -176,6 +288,8 @@ impl Metrics {
             .ds4
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.prefill_progress
+            .record(Instant::now(), progress.current);
         ds4.prefill_active = progress.current < progress.total;
         ds4.prefill_current = progress.current;
         ds4.prefill_total = progress.total;
@@ -209,6 +323,7 @@ impl Metrics {
             .ds4
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ds4.generation_progress.record(Instant::now(), completion);
         ds4.generation_completion = completion;
         ds4.generation_chunk_tps = chunk_tps;
         ds4.generation_avg_tps = avg_tps;
@@ -224,6 +339,75 @@ impl Metrics {
         ds4.generation_chunk_tps = 0.0;
         ds4.generation_avg_tps = 0.0;
         ds4.generation_elapsed_secs = 0.0;
+        ds4.generation_progress = ProgressFreshness::default();
+    }
+
+    /// Return aggregate, redaction-safe metrics for a diagnostic snapshot.
+    /// Request IDs, paths, headers, and payloads are not retained here.
+    pub fn diagnostic_snapshot(&self) -> MetricsDiagnosticSnapshot {
+        let in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .copied()
+            .sum();
+        let generation_in_flight = *self
+            .generation_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ds4 = self
+            .ds4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        MetricsDiagnosticSnapshot {
+            in_flight,
+            generation_in_flight,
+            prefill: ProgressDiagnosticSnapshot {
+                active: ds4.prefill_active,
+                progress_observed: ds4.prefill_progress.observed(),
+                current: Some(ds4.prefill_current),
+                total: Some(ds4.prefill_total),
+                percent: ds4.prefill_percent,
+                cached: Some(ds4.prefill_cached),
+                chunk_tps: ds4.prefill_chunk_tps,
+                avg_tps: ds4.prefill_avg_tps,
+                elapsed_secs: ds4.prefill_elapsed_secs,
+                age_secs: ds4
+                    .prefill_active
+                    .then(|| ds4.prefill_progress.age_seconds(now, true)),
+                token_delta: ds4.prefill_progress.token_delta(),
+            },
+            generation: ProgressDiagnosticSnapshot {
+                active: generation_in_flight > 0,
+                progress_observed: ds4.generation_progress.observed(),
+                current: Some(ds4.generation_completion),
+                total: None,
+                percent: 0.0,
+                cached: None,
+                chunk_tps: ds4.generation_chunk_tps,
+                avg_tps: ds4.generation_avg_tps,
+                elapsed_secs: ds4.generation_elapsed_secs,
+                age_secs: (generation_in_flight > 0)
+                    .then(|| ds4.generation_progress.age_seconds(now, true)),
+                token_delta: ds4.generation_progress.token_delta(),
+            },
+        }
+    }
+
+    pub fn generation_active_age_secs(&self) -> Option<f64> {
+        let active = *self
+            .generation_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            > 0;
+        active.then(|| {
+            self.generation_started_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .map_or(0.0, |started| started.elapsed().as_secs_f64())
+        })
     }
 
     pub fn render_mode_aware(&self, snapshot: MetricSnapshot<'_>) -> String {
@@ -328,6 +512,7 @@ impl Metrics {
             .ds4
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
         output.push_str("# TYPE ds4_proxy_ds4_prefill_active gauge\n");
         let _ = writeln!(
             output,
@@ -371,6 +556,18 @@ impl Metrics {
             output,
             "ds4_proxy_ds4_prefill_elapsed_seconds {}",
             ds4.prefill_elapsed_secs
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_last_progress_age_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_last_progress_age_seconds {}",
+            ds4.prefill_progress.age_seconds(now, ds4.prefill_active)
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_prefill_progress_token_delta gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_prefill_progress_token_delta {}",
+            ds4.prefill_progress.token_delta()
         );
         output.push_str("# TYPE ds4_proxy_ds4_kv_cache_hits_total counter\n");
         let _ = writeln!(
@@ -419,6 +616,24 @@ impl Metrics {
             output,
             "ds4_proxy_ds4_generation_elapsed_seconds {}",
             ds4.generation_elapsed_secs
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_progress_observed gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_progress_observed {}",
+            u8::from(ds4.generation_progress.observed())
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_last_progress_age_seconds gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_last_progress_age_seconds {}",
+            ds4.generation_progress.age_seconds(now, generation_active)
+        );
+        output.push_str("# TYPE ds4_proxy_ds4_generation_progress_token_delta gauge\n");
+        let _ = writeln!(
+            output,
+            "ds4_proxy_ds4_generation_progress_token_delta {}",
+            ds4.generation_progress.token_delta()
         );
         drop(ds4);
         output
@@ -473,6 +688,10 @@ impl Metrics {
             };
             if generation_finished {
                 self.reset_generation();
+                *self
+                    .generation_started_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             }
         }
     }
@@ -566,6 +785,7 @@ fn render_counters(output: &mut String, counters: &Mutex<HashMap<String, u64>>) 
         "ds4_proxy_cluster_child_restarts_total",
         "ds4_proxy_cluster_hello_total",
         "ds4_proxy_cluster_deployment_mismatch_total",
+        "ds4_proxy_recovery_events_total",
     ] {
         let _ = writeln!(output, "# TYPE {name} counter");
     }
@@ -629,7 +849,10 @@ fn escape_label(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::target::{LocalRole, ProxyTarget};
-    use std::io::Write as IoWrite;
+    use std::{
+        io::Write as IoWrite,
+        time::{Duration, Instant},
+    };
 
     #[derive(Clone, Default)]
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -703,7 +926,13 @@ mod tests {
             "ds4_proxy_standalone_profile_info",
             "ds4_proxy_cluster_hello_total",
             "ds4_proxy_cluster_deployment_mismatch_total",
+            "ds4_proxy_recovery_events_total",
             "ds4_proxy_ds4_generation_active",
+            "ds4_proxy_ds4_generation_progress_observed",
+            "ds4_proxy_ds4_generation_last_progress_age_seconds",
+            "ds4_proxy_ds4_generation_progress_token_delta",
+            "ds4_proxy_ds4_prefill_last_progress_age_seconds",
+            "ds4_proxy_ds4_prefill_progress_token_delta",
         ] {
             assert!(rendered.contains(family), "missing metric family {family}");
         }
@@ -864,6 +1093,26 @@ mod tests {
     }
 
     #[test]
+    fn renders_bounded_recovery_events_without_recovery_id_labels() {
+        let metrics = Metrics::default();
+        metrics.recovery_started("low-decode-tps");
+        metrics.recovery_completed("low-decode-tps");
+        metrics.recovery_failed("canary-failed");
+        metrics.recovery_suppressed("cooldown");
+
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        for expected in [
+            "ds4_proxy_recovery_events_total{event=\"started\",reason=\"low-decode-tps\"} 1",
+            "ds4_proxy_recovery_events_total{event=\"completed\",reason=\"low-decode-tps\"} 1",
+            "ds4_proxy_recovery_events_total{event=\"failed\",reason=\"canary-failed\"} 1",
+            "ds4_proxy_recovery_events_total{event=\"suppressed\",reason=\"cooldown\"} 1",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        assert!(!rendered.contains("recovery_id"));
+    }
+
+    #[test]
     fn prefill_completion_clears_active_flag() {
         let metrics = Metrics::default();
         metrics.prefill_progress(PrefillProgress {
@@ -877,5 +1126,77 @@ mod tests {
         });
         let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
         assert!(rendered.contains("ds4_proxy_ds4_prefill_active 0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_last_progress_age_seconds 0"));
+        assert!(rendered.contains("ds4_proxy_ds4_prefill_progress_token_delta 9005"));
+
+        metrics.prefill_progress(PrefillProgress {
+            current: 4,
+            total: 100,
+            percent: 4.0,
+            cached: 0,
+            chunk_tps: 123.4,
+            avg_tps: 100.0,
+            elapsed_secs: 1.0,
+        });
+        let next_request = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(next_request.contains("ds4_proxy_ds4_prefill_active 1"));
+        assert!(next_request.contains("ds4_proxy_ds4_prefill_progress_token_delta 4"));
+    }
+
+    #[test]
+    fn progress_freshness_uses_monotonic_age_and_handles_counter_reset() {
+        let start = Instant::now();
+        let mut progress = ProgressFreshness::default();
+
+        assert!(!progress.observed());
+        assert_eq!(
+            progress.age_seconds(start + Duration::from_secs(5), true),
+            0.0
+        );
+
+        progress.record(start, 100);
+        assert!(progress.observed());
+        assert_eq!(progress.token_delta(), 100);
+        assert_eq!(
+            progress.age_seconds(start + Duration::from_secs(5), true),
+            5.0
+        );
+        assert_eq!(
+            progress.age_seconds(start + Duration::from_secs(5), false),
+            0.0
+        );
+
+        progress.record(start + Duration::from_secs(6), 104);
+        assert_eq!(progress.token_delta(), 4);
+        progress.record(start + Duration::from_secs(7), 3);
+        assert_eq!(progress.token_delta(), 3);
+    }
+
+    #[test]
+    fn generation_progress_exposes_first_token_waiting_and_resets_on_completion() {
+        let metrics = Arc::new(Metrics::default());
+        let request = metrics.begin_request(
+            "public",
+            "local-standalone",
+            "req-first-token".into(),
+            "POST".into(),
+            "/v1/chat/completions",
+        );
+        let waiting = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(waiting.contains("ds4_proxy_ds4_generation_active 1"));
+        assert!(waiting.contains("ds4_proxy_ds4_generation_progress_observed 0"));
+        assert!(waiting.contains("ds4_proxy_ds4_generation_last_progress_age_seconds 0"));
+
+        metrics.generation_progress(2, 8.0, 8.0, 0.25);
+        let progressing = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(progressing.contains("ds4_proxy_ds4_generation_progress_observed 1"));
+        assert!(progressing.contains("ds4_proxy_ds4_generation_progress_token_delta 2"));
+
+        drop(request);
+        let idle = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+        assert!(idle.contains("ds4_proxy_ds4_generation_active 0"));
+        assert!(idle.contains("ds4_proxy_ds4_generation_progress_observed 0"));
+        assert!(idle.contains("ds4_proxy_ds4_generation_last_progress_age_seconds 0"));
+        assert!(idle.contains("ds4_proxy_ds4_generation_progress_token_delta 0"));
     }
 }

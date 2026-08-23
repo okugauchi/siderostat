@@ -35,6 +35,7 @@ const LINE: [u8; 4] = [0x3f, 0x3f, 0x3f, 0xff]; // connector line
 
 const ICON_SIZE: u32 = 18;
 const ICON_SUB: f32 = 4.0; // supersample factor for smooth circles
+const PROGRESS_STALL_AGE_SECS: f64 = 60.0;
 
 pub struct MonitorTray {
     _tray: TrayIcon,
@@ -250,20 +251,7 @@ impl MonitorTray {
                 })
         ));
 
-        if display.prefill_active {
-            self.prefill.set_text(format!(
-                "Prefill: {}/{} ({:.1}%) chunk={:.1}t/s avg={:.1}t/s elapsed={:.1}s cached={}",
-                display.prefill_current,
-                display.prefill_total,
-                display.prefill_percent,
-                display.prefill_chunk_tps,
-                display.prefill_avg_tps,
-                display.prefill_elapsed_secs,
-                display.prefill_cached
-            ));
-        } else {
-            self.prefill.set_text("Prefill: --");
-        }
+        self.prefill.set_text(prefill_detail_text(display));
 
         if display.kv_hits_total > 0 {
             self.kv_cache.set_text(format!(
@@ -275,10 +263,7 @@ impl MonitorTray {
         }
 
         if self.show_decode_tps && has_decode_values(display) {
-            self.decode.set_text(format!(
-                "Decode: completion={} chunk={:.1}t/s avg={:.1}t/s",
-                display.decode_completion, display.decode_chunk_tps, display.decode_avg_tps
-            ));
+            self.decode.set_text(decode_detail_text(display));
         } else {
             self.decode.set_text("Decode: --");
         }
@@ -549,19 +534,11 @@ fn selected_metric_title(
         LiveMetric::PrefillPercent if display.prefill_active && display.prefill_total > 0 => {
             format!("prefill {:.0}%", display.prefill_percent)
         }
-        LiveMetric::PrefillChunkTps
-            if display.prefill_active
-                && display.prefill_total > 0
-                && display.prefill_chunk_tps > 0.0 =>
-        {
-            format!("prefill {:.1}t/s", display.prefill_chunk_tps)
+        LiveMetric::PrefillChunkTps if display.prefill_active && display.prefill_total > 0 => {
+            prefill_tps_title(display, false)
         }
-        LiveMetric::PrefillAvgTps
-            if display.prefill_active
-                && display.prefill_total > 0
-                && display.prefill_avg_tps > 0.0 =>
-        {
-            format!("prefill avg {:.1}t/s", display.prefill_avg_tps)
+        LiveMetric::PrefillAvgTps if display.prefill_active && display.prefill_total > 0 => {
+            prefill_tps_title(display, true)
         }
         LiveMetric::PrefillElapsed
             if display.prefill_active
@@ -571,10 +548,10 @@ fn selected_metric_title(
             format!("prefill {:.1}s", display.prefill_elapsed_secs)
         }
         LiveMetric::DecodeChunkTps if show_decode_tps && has_decode_values(display) => {
-            format!("decode {:.1}t/s", display.decode_chunk_tps)
+            decode_tps_title(display, false)
         }
         LiveMetric::DecodeAvgTps if show_decode_tps && has_decode_values(display) => {
-            format!("decode avg {:.1}t/s", display.decode_avg_tps)
+            decode_tps_title(display, true)
         }
         LiveMetric::DecodeElapsed
             if show_decode_tps && display.decode_active && display.decode_elapsed_secs > 0.0 =>
@@ -616,20 +593,139 @@ fn menu_bar_title(
 }
 
 fn has_decode_values(display: &DisplayState) -> bool {
+    // An active generation with no observed token is still meaningful: the
+    // user needs to see that the first-token wait is in progress rather than
+    // inherit a stale value from the previous request.
     display.decode_active
-        && (display.decode_completion > 0
-            || display.decode_chunk_tps > 0.0
-            || display.decode_avg_tps > 0.0)
 }
 
 fn decode_throughput_title(display: &DisplayState) -> String {
-    if display.decode_avg_tps > 0.0 {
-        format!("decode avg {:.1}t/s", display.decode_avg_tps)
+    if !display.decode_active {
+        String::new()
+    } else if !display.decode_progress_observed {
+        "decode waiting".to_string()
+    } else if progress_stalled(display.decode_progress_age_secs) {
+        "decode stalled".to_string()
+    } else if !progress_age_available(display.decode_progress_age_secs) {
+        "decode progress age unavailable".to_string()
     } else if display.decode_chunk_tps > 0.0 {
         format!("decode {:.1}t/s", display.decode_chunk_tps)
+    } else if display.decode_avg_tps > 0.0 {
+        format!("decode avg {:.1}t/s", display.decode_avg_tps)
     } else {
         String::new()
     }
+}
+
+fn progress_stalled(age_secs: Option<f64>) -> bool {
+    age_secs.is_some_and(|age| age.is_finite() && age >= PROGRESS_STALL_AGE_SECS)
+}
+
+fn progress_age_available(age_secs: Option<f64>) -> bool {
+    age_secs.is_some_and(|age| age.is_finite() && age >= 0.0)
+}
+
+fn prefill_tps_title(display: &DisplayState, average: bool) -> String {
+    if progress_stalled(display.prefill_progress_age_secs) {
+        return "prefill stalled".to_string();
+    }
+    if !progress_age_available(display.prefill_progress_age_secs) {
+        return "prefill progress age unavailable".to_string();
+    }
+
+    if average {
+        if display.prefill_avg_tps > 0.0 {
+            format!("prefill avg {:.1}t/s", display.prefill_avg_tps)
+        } else {
+            String::new()
+        }
+    } else {
+        if display.prefill_chunk_tps > 0.0 {
+            format!("prefill {:.1}t/s", display.prefill_chunk_tps)
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn decode_tps_title(display: &DisplayState, average: bool) -> String {
+    if !display.decode_progress_observed {
+        return "decode waiting".to_string();
+    }
+    if progress_stalled(display.decode_progress_age_secs) {
+        return "decode stalled".to_string();
+    }
+    if !progress_age_available(display.decode_progress_age_secs) {
+        return "decode progress age unavailable".to_string();
+    }
+
+    if average {
+        if display.decode_avg_tps > 0.0 {
+            format!("decode avg {:.1}t/s", display.decode_avg_tps)
+        } else {
+            String::new()
+        }
+    } else {
+        if display.decode_chunk_tps > 0.0 {
+            format!("decode {:.1}t/s", display.decode_chunk_tps)
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn prefill_detail_text(display: &DisplayState) -> String {
+    if !display.prefill_active {
+        return "Prefill: --".to_string();
+    }
+    if progress_stalled(display.prefill_progress_age_secs) {
+        return format!(
+            "Prefill: stalled age={:.1}s",
+            display.prefill_progress_age_secs.unwrap_or_default()
+        );
+    }
+    let Some(age_secs) = display
+        .prefill_progress_age_secs
+        .filter(|age| progress_age_available(Some(*age)))
+    else {
+        return "Prefill: progress age unavailable".to_string();
+    };
+    format!(
+        "Prefill: {}/{} ({:.1}%) chunk={:.1}t/s avg={:.1}t/s elapsed={:.1}s cached={} age={:.1}s",
+        display.prefill_current,
+        display.prefill_total,
+        display.prefill_percent,
+        display.prefill_chunk_tps,
+        display.prefill_avg_tps,
+        display.prefill_elapsed_secs,
+        display.prefill_cached,
+        age_secs
+    )
+}
+
+fn decode_detail_text(display: &DisplayState) -> String {
+    if !display.decode_active {
+        return "Decode: --".to_string();
+    }
+    if !display.decode_progress_observed {
+        return "Decode: first-token waiting".to_string();
+    }
+    if progress_stalled(display.decode_progress_age_secs) {
+        return format!(
+            "Decode: stalled age={:.1}s",
+            display.decode_progress_age_secs.unwrap_or_default()
+        );
+    }
+    let Some(age_secs) = display
+        .decode_progress_age_secs
+        .filter(|age| progress_age_available(Some(*age)))
+    else {
+        return "Decode: progress age unavailable".to_string();
+    };
+    format!(
+        "Decode: completion={} chunk={:.1}t/s avg={:.1}t/s age={:.1}s",
+        display.decode_completion, display.decode_chunk_tps, display.decode_avg_tps, age_secs
+    )
 }
 
 /// Draw the menu bar icon from the cluster mode and online status.
@@ -801,14 +897,17 @@ mod tests {
             prefill_chunk_tps: 123.4,
             prefill_avg_tps: 100.0,
             prefill_elapsed_secs: 10.0,
+            prefill_progress_age_secs: Some(1.0),
             kv_hits_total: 7,
             kv_hit_tokens: 9005,
             kv_load_ms: 12.3,
             decode_active: true,
+            decode_progress_observed: true,
             decode_completion: 42,
             decode_chunk_tps: 32.1,
             decode_avg_tps: 28.5,
             decode_elapsed_secs: 1.5,
+            decode_progress_age_secs: Some(1.0),
             ..DisplayState::default()
         };
 
@@ -864,8 +963,12 @@ mod tests {
             prefill_active: true,
             prefill_total: 9005,
             prefill_avg_tps: 100.0,
+            prefill_progress_age_secs: Some(1.0),
             decode_active: true,
             decode_completion: 42,
+            decode_progress_observed: true,
+            decode_progress_age_secs: Some(1.0),
+            decode_chunk_tps: 32.1,
             decode_avg_tps: 28.5,
             ..DisplayState::default()
         };
@@ -878,13 +981,95 @@ mod tests {
         display.prefill_active = false;
         assert_eq!(
             menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
-            "decode avg 28.5t/s"
+            "decode 32.1t/s"
         );
 
         display.decode_active = false;
         assert_eq!(
             menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
             ""
+        );
+    }
+
+    #[test]
+    fn stale_progress_never_displays_old_chunk_as_current() {
+        let prefill = DisplayState {
+            prefill_active: true,
+            prefill_total: 9005,
+            prefill_chunk_tps: 123.4,
+            prefill_avg_tps: 100.0,
+            prefill_progress_age_secs: Some(60.0),
+            ..DisplayState::default()
+        };
+        assert_eq!(
+            selected_metric_title(&prefill, true, LiveMetric::PrefillChunkTps),
+            "prefill stalled"
+        );
+        assert_eq!(prefill_detail_text(&prefill), "Prefill: stalled age=60.0s");
+
+        let decode = DisplayState {
+            decode_active: true,
+            decode_progress_observed: true,
+            decode_completion: 42,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            decode_progress_age_secs: Some(60.0),
+            ..DisplayState::default()
+        };
+        assert_eq!(
+            menu_bar_title(&decode, true, LiveMetric::PrefillChunkTps),
+            "decode stalled"
+        );
+        assert_eq!(decode_detail_text(&decode), "Decode: stalled age=60.0s");
+    }
+
+    #[test]
+    fn first_token_waiting_is_visible_without_a_stale_tps_value() {
+        let display = DisplayState {
+            decode_active: true,
+            decode_progress_observed: false,
+            decode_progress_age_secs: None,
+            ..DisplayState::default()
+        };
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::DecodeChunkTps),
+            "decode waiting"
+        );
+        assert_eq!(decode_detail_text(&display), "Decode: first-token waiting");
+    }
+
+    #[test]
+    fn missing_progress_age_never_displays_a_tps_as_current() {
+        let prefill = DisplayState {
+            prefill_active: true,
+            prefill_total: 9005,
+            prefill_chunk_tps: 123.4,
+            prefill_avg_tps: 100.0,
+            ..DisplayState::default()
+        };
+        assert_eq!(
+            selected_metric_title(&prefill, true, LiveMetric::PrefillChunkTps),
+            "prefill progress age unavailable"
+        );
+        assert_eq!(
+            prefill_detail_text(&prefill),
+            "Prefill: progress age unavailable"
+        );
+
+        let decode = DisplayState {
+            decode_active: true,
+            decode_progress_observed: true,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            ..DisplayState::default()
+        };
+        assert_eq!(
+            menu_bar_title(&decode, true, LiveMetric::PrefillChunkTps),
+            "decode progress age unavailable"
+        );
+        assert_eq!(
+            decode_detail_text(&decode),
+            "Decode: progress age unavailable"
         );
     }
 

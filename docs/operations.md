@@ -8,8 +8,10 @@ Mac Studio などへ SSH した非対話 shell では、Homebrew の `/opt/homeb
 含まれないことがある。`rg` がインストール済みでも `command not found` になる場合は、絶対
 path を使うか、診断コマンドの先頭で PATH を補う。
 
+`REMOTE_USER`、`COORDINATOR_HOST`、`<coordinator-bridge-ip>`、`<worker-bridge-ip>` は、各利用環境の値へ置き換えるプレースホルダーであり、リポジトリへ実値を記録しない。
+
 ```sh
-ssh o@m4max-macstudio.local 'PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; export PATH; command -v rg; rg --version'
+ssh "${REMOTE_USER}@${COORDINATOR_HOST}" 'PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; export PATH; command -v rg; rg --version'
 ```
 
 これは `rg` のインストール状態の問題ではなく、SSH session の環境差である。agent が read-only
@@ -51,7 +53,7 @@ Human出力は次の形式を確認する。
 node=<node_id> role=<role> mode=<mode> state=<state> target=<target> ready=<bool>
 ```
 
-Roleは`bridge0`のIPv4から決定する。`10.99.0.1`がcoordinator、`10.99.0.2`がworker、その他/未設定/競合はunknown。Role unknownではcluster listenerを開始しない。Roleはconfigで指定しない。
+Roleは`bridge0`のIPv4から決定する。`<coordinator-bridge-ip>`がcoordinator、`<worker-bridge-ip>`がworker、その他/未設定/競合はunknown。Role unknownではcluster listenerを開始しない。Roleはconfigで指定しない。
 
 ## 2. Doctor確認
 
@@ -67,6 +69,56 @@ siderostat cluster doctor --json
 ```
 
 `healthy` は `target_ready && safe_state && admission_serving` の論理積である。`cluster doctor`はread-onlyで、状態を変更しない。
+
+## 2.1 Bounded canary
+
+実推論の応答速度を確認する場合は、次の read-only CLI を coordinator または対象 node
+で実行する。
+
+```sh
+siderostat cluster canary
+siderostat cluster canary --json
+```
+
+canary は設定済みの local public endpoint の `POST /v1/chat/completions` に一回だけ送信する。
+prompt は `Reply with the single word: OK.`、`max_tokens` は64、`stream` は有効で固定されており、
+任意 URL、任意 prompt、任意 token 数、外部課金先を指定する引数はない。出力には elapsed、TTFB、
+生成 token 数、chunk TPS、HTTP status、有限の reason code だけを含め、prompt・response body・
+Authorization・API key・session ID・request ID は含めない。
+
+`reason=healthy` 以外ではコマンドは失敗終了する。`deadline` は first-token を含む deadline 超過、
+`http_error` は HTTP またはストリーム形式のエラー、`low_decode_tps` は継続 token の低速、
+`progress_stall` はストリーム中の進捗停止を示す。canary 自体は cluster state、admission、child
+lifecycle を変更しない。
+
+## 2.2 Degraded recovery job
+
+`throughput-degraded` の復旧要求は coordinator だけが作成できる。admin token と、検出理由に対応する
+trigger を明示する。
+
+```sh
+siderostat cluster recover-degraded \
+  --reason throughput-degraded \
+  --trigger manual-canary-failure \
+  --json
+siderostat cluster recover-degraded --status <recovery-id> --json
+```
+
+recovery job は単一 owner、冪等性、bounded history、認証・role/state gate と、cluster mutation 前の
+diagnostic snapshot を経てから既存 lifecycle owner の demote/promote を一回だけ実行する。recovery
+専用の admission drain timeout は60秒で、通常 lifecycle の timeout とは分離されている。再構成中は
+外部 request を block したまま、DistributedReady 後に30秒・一回限りの内部 canary permitを発行する。
+canary が `healthy` の場合だけ admission を `serving` に戻し、そうでなければ block を維持して
+`failed` とする。gate 拒否、snapshot 失敗、drain timeout、lifecycle failure、stale recovery ID は
+自動 retry や worker-only restart を行わない。status 応答の snapshot path はローカルのユーザー名や
+絶対パスを含まない recovery-scoped identifier である。
+
+自動検知は設定の [recovery] で opt-in する。既定値は enabled = false であり、無効時は
+進捗を観測して metrics に記録するだけで、recovery job は自動開始しない。有効化した場合も、
+decode TPS が30秒継続して5 tokens/s未満、progress ageが60秒以上、または canary failure の
+いずれか一事象につき一回だけ既存の recovery ownerへ送る。cooldownは1時間、12時間内の上限は
+2回で、gate拒否・失敗後の自動 retry は行わない。H-10の実機 change window 外で
+enabled = true にしてはならない。
 
 ## 3. 構造化log
 
@@ -120,8 +172,17 @@ Spec第26節のfamilyを確認する。
 - `ds4_proxy_standalone_profile_info{node_id,quantization,speculative_support,residency}`
 - `ds4_proxy_cluster_hello_total{result,reason}`
 - `ds4_proxy_cluster_deployment_mismatch_total{field}`
+- `ds4_proxy_ds4_prefill_last_progress_age_seconds`
+- `ds4_proxy_ds4_prefill_progress_token_delta`
+- `ds4_proxy_ds4_generation_progress_observed`
+- `ds4_proxy_ds4_generation_last_progress_age_seconds`
+- `ds4_proxy_ds4_generation_progress_token_delta`
 
 `quantization`、`speculative_support`、`residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない（spec第26節）。
+
+`ds4_proxy_ds4_generation_active=1` かつ `ds4_proxy_ds4_generation_progress_observed=0` の場合は、
+最初の DS4 progress event をまだ受信していない first-token waiting である。active 中の
+`*_last_progress_age_seconds` は monotonic clock に基づく受信経過時間であり、idle/完了時は `0` になる。
 
 ## 5. Manual state
 

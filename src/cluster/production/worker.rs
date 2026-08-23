@@ -197,6 +197,7 @@ impl super::ProductionClusterRuntime {
                 } else if snapshot.state == ClusterState::PairedStandaloneReady
                     && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_promote
+                    && !runtime.recovery_owner_active()
                     && promotion_running
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()

@@ -1254,7 +1254,7 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 
 ## 11. Phase H: throughput degradation の観測と復旧
 
-### [ ] H-01 degraded detection / recovery contract を固定する
+### [x] H-01 degraded detection / recovery contract を固定する
 
 - Actor: agent + user review
 - Depends on: E-06
@@ -1263,20 +1263,23 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - Files: `docs/recovery/throughput-degraded-contract-v0.3.0.md`（新規）
 - Actions:
   1. 初期値を canary 64 token、deadline 30 秒、decode 下限 5 tokens/s、progress stall 60 秒、
-     cooldown 1 時間、12 時間に最大 2 回として固定する。
+     recovery admission drain timeout 60 秒、cooldown 1 時間、12 時間に最大 2 回として固定する。
   2. idle の 0 TPS を異常にしない条件と、prefill/decode/first-token の判定順を固定する。
   3. `recover-degraded` request/status JSON、recovery ID、単一 owner、冪等性を固定する。
   4. `admission block -> snapshot -> drain -> demote -> paired standalone -> promote -> canary -> serving`
      の順序を固定する。
-  5. drain timeout、demote failure、promotion failure、canary failure の安全な最終状態を表にする。
-  6. 自動復旧は opt-in 既定 `false` とし、H-10 実機 evidence 後の既定値変更は別レビューとする。
+  5. recovery admission drain timeout、demote failure、promotion failure、canary failure の安全な最終状態を表にする。
+  6. 通常 lifecycle の `cluster.timeouts.drain` と DS4 stop の `cluster.timeouts.stop` は各180秒のまま維持し、recoveryだけ operation-scoped timeout を使用する。
+  7. 自動復旧は opt-in 既定 `false` とし、H-10 実機 evidence 後の既定値変更は別レビューとする。
+  8. admission block 中は通常の外部 request を受け付けず、drain 後に recovery owner が一回限りの canary 例外許可を発行する。これは ds4-server の優先処理、予約 slot、queue bypass を前提にしない。
 - 事後条件: H-02〜H-09 の実装者が閾値、状態、failure behavior を推測しない
 - 受入基準: 低 TPS、first-token stall、progress stall、idle、cooldown、上限、競合の入力/出力表がある
 - Verification: Hermes 調査 9.4/11 節との対応表、sequence diagram、`git diff --check`
 - ユーザーレビュー・手作業: 閾値、回数上限、opt-in、drain timeout、失敗時の通知方針を承認する
+- レビュー記録（2026-08-23）: ユーザーは、通常の外部 request を遮断し、drain 後に canary だけを一回通す recovery canary 例外許可の方針、および DS4 の優先処理を前提にしない方針を承認した。H-01 の review gate を完了とする。
 - 停止条件: active request の強制 kill または既存 demotion owner の迂回を正常経路にする必要がある
 
-### [ ] H-02 monotonic progress freshness metrics を実装する
+### [x] H-02 monotonic progress freshness metrics を実装する
 
 - Actor: agent
 - Depends on: H-01
@@ -1292,9 +1295,10 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: idle、first-token、正常 chunk、stall、完了、次 request の reset test がある
 - Verification: metrics unit test、render snapshot test、共通 local gate
 - ユーザーレビュー・手作業: なし
+- Evidence: `src/metrics.rs` に prefill/decode の monotonic progress timestamp、last progress age、token delta、first-token waiting (`generation_active=1` / `generation_progress_observed=0`) を追加。idle/完了時は active と age を分離し、generation 完了時に freshness state を reset。`docs/spec.md` と `docs/operations.md` に metric family と判定方法を反映。H-02 専用テストを含む `cargo test --all-targets`（221 tests + integration tests）、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --check`、`git diff --check` が成功（2026-08-23）。
 - 停止条件: prompt、response、session ID を metric label に含める必要がある
 
-### [ ] H-03 monitor を current chunk と progress age 表示へ変更する
+### [x] H-03 monitor を current chunk と progress age 表示へ変更する
 
 - Actor: agent
 - Depends on: H-02
@@ -1311,9 +1315,10 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: chunk/average の乖離、age threshold 超過、完了、offline の UI test がある
 - Verification: monitor unit test、共通 local gate
 - ユーザーレビュー・手作業: 表示文言と値の変動の見やすさを画面で確認する
+- Evidence: `monitor/src/metrics.rs` が H-02 の prefill progress age、generation progress observed / progress age を解析し、`monitor/src/state.rs` が表示状態へ伝搬。`monitor/src/tray.rs` は既定の prefill current chunk TPS、decode fallback の chunk-first、progress age 欠落時の `progress age unavailable`、60 秒以上の `stalled`、first-token waiting を表示し、古い TPS を現在値として表示しない。`cargo test -p siderostat-monitor`（116 tests）、`cargo test --all-targets`（221 tests + integration tests）、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --check`、`git diff --check` が成功（2026-08-23）。ユーザーが画面上の文言と値の変動を確認し、H-03 を完了と評価した。
 - 停止条件: detector が UI 表示文字列を parse しないと成立しない
 
-### [ ] H-04 redaction 済み diagnostic snapshot を実装する
+### [x] H-04 redaction 済み diagnostic snapshot を実装する
 
 - Actor: agent
 - Depends on: H-03
@@ -1329,9 +1334,10 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: schema golden test、redaction forbidden-key test、atomic write failure、retention test がある
 - Verification: unit test、permission check、共通 local gate
 - ユーザーレビュー・手作業: snapshot の保存項目と retention を承認する
+- Evidence（実装）: `src/diagnostics.rs` に schema version 1 の redaction-safe snapshot、`~/Library/Application Support/siderostat/recovery/snapshots/<recovery-id>/snapshot.json` への `0700/0600` private permission、同一ディレクトリ内 temporary file・file sync・atomic rename・directory sync、最新8件 retention を実装。`src/metrics.rs` の aggregate progress/in-flight と既存 `/cluster` 相当の control/lease/child identity を `src/app.rs` から read-only に収集する。schema golden、forbidden-key、atomic write failure、permission、retention、app capture tests が成功。保存項目および最新8件 retention をユーザーが承認し、H-04 を完了と評価した（2026-08-23）。
 - 停止条件: snapshot 取得が cluster state を mutation する、または secret を保存しないと診断不能になる
 
-### [ ] H-05 bounded canary executor と CLI を実装する
+### [x] H-05 bounded canary executor と CLI を実装する
 
 - Actor: agent
 - Depends on: H-04
@@ -1347,9 +1353,11 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: 正常、低 TPS、first-token timeout、mid-stream stall、HTTP error の fake DS4 test がある
 - Verification: canary integration test、共通 local gate
 - ユーザーレビュー・手作業: canary prompt が機密情報を含まず、課金先を外部 endpoint に変更できないことを確認する
+- Evidence（実装）: `src/canary.rs` に固定 prompt/body、設定済み local public endpoint のみに接続する `CanaryExecutor`、128 KiB bounded SSE parser、30秒 deadline、60秒 progress stall、5 tokens/s lower bound、`healthy` / `deadline` / `http_error` / `low_decode_tps` / `progress_stall` の有限結果を実装。`src/cli.rs` に `siderostat cluster canary --json` を追加し、admin API tokenやcluster state mutationを経由せず、失敗時は非0終了とした。fake DS4 に遅延・stall・HTTP status制御を追加し、5ケースの canary integration test が成功。`cargo test --all-targets --features test-support`（229 unit、canary 5、既存 integration、reconnect 37）、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --check`、`git diff --check` が成功（2026-08-23）。
+- ユーザーレビュー記録（2026-08-23）: ユーザーは固定 prompt が非秘密であること、任意URL・任意prompt・外部課金先を指定できないこと、JSON出力項目を承認し、H-05 を完了と評価した。
 - 停止条件: canary が任意 URL、任意 prompt、無制限 token を受け付ける必要がある
 
-### [ ] H-06 recovery job の単一 owner と admin API を実装する
+### [x] H-06 recovery job の単一 owner と admin API を実装する
 
 - Actor: agent
 - Depends on: H-05
@@ -1366,9 +1374,10 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: auth、role/state gate、duplicate、stale ID、snapshot failure、history bound の test がある
 - Verification: handler/state test、共通 local gate
 - ユーザーレビュー・手作業: なし
+- Evidence（実装）: `src/recovery.rs` に coordinator + `DistributedReady` + `distributed-layer-parallel` の gate、single active owner、recovery ID / reason / phase / start・end / result の bounded history（既定32件）、idempotency、cooldown（既定1時間）・attempt limit（12時間あたり2回）を実装。`src/app.rs` に bearer-auth 付き POST `/cluster/recover-degraded` と GET `/cluster/recover-degraded/{recovery_id}` を追加し、snapshot 成功前の cluster/admission/child mutation を行わない。`src/cli.rs` に `cluster recover-degraded` の start/status と `--json` を追加。`tests/recovery.rs` および app handler test で auth、role/state gate、duplicate、stale ID、snapshot failure、history bound、completed idempotent replay を確認。`cargo test --all-targets --features test-support`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --check`、`git diff --check` が成功（2026-08-23）。
 - 停止条件: recovery job state を既存 cluster state の代用 source of truth にする必要がある
 
-### [ ] H-07 demote / promote / post-canary を recovery job へ接続する
+### [x] H-07 demote / promote / post-canary を recovery job へ接続する
 
 - Actor: agent
 - Depends on: H-06
@@ -1376,7 +1385,7 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 事前条件: recovery job phase reducer と既存 demotion integration test が GREEN
 - Files: `src/recovery.rs`、`src/cluster/production/pairing.rs`、`src/app.rs`、関連 test
 - Actions:
-  1. admission block、in-flight drain、既存 demote の順で PairedStandaloneReady へ戻す。
+  1. recovery admission drain timeout を既存 demote ownerへ渡し、admission block、in-flight drain、既存 demote の順で PairedStandaloneReady へ戻す。通常 lifecycle の drain timeout は変更しない。
   2. `auto_promote` の既存 owner を利用して新 generation の DistributedReady を待つ。
   3. 両 node の old/new child identity と generation を比較する。
   4. post-recovery canary 成功後だけ admission を再開し job を success にする。
@@ -1385,9 +1394,10 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: 正常、drain timeout、demote failure、promotion failure、canary failure、peer loss の test がある
 - Verification: 2 node fake integration test、既存 reconnect suite、共通 local gate
 - ユーザーレビュー・手作業: なし
+- Evidence（実装）: `CoordinatorDistributedRuntime` に通常 lifecycle と分離した recovery 用 demote timeout、admission を再開しない recovery promotion、promotion failure 時の safe-state 保持を追加。`ProductionClusterRuntime` の recovery owner flag で auto-promote と operator の通常 pair/promote/demote を抑止し、既存 lifecycle owner を一回だけ利用する。`src/proxy.rs` に外部へ転送しない一回限り・30秒の recovery canary permit、`src/app.rs` に `snapshot -> admission_blocked -> draining -> demoting -> paired_standalone -> promoting -> post_recovery_canary -> serving` の orchestration を接続し、canary `healthy` 後だけ admission を再開する。local distributed child の PID/generation と peer generation の更新を確認し、失敗時は child を追加 restart せず admission を block したままとした。coordinator test で normal recovery promotion、drain timeout、demote failure、promotion failure、canary permit、既存 reconnect suite の peer loss を確認。全ターゲット test 236 unit、canary 5、既存 integration、reconnect 37、recovery 6、clippy `-D warnings`、format、diff check が成功（2026-08-23）。
 - 停止条件: control protocol を迂回した remote signal、manual state file edit、unverified child kill が必要になる
 
-### [ ] H-08 opt-in 自動 detector と安全弁を実装する
+### [x] H-08 opt-in 自動 detector と安全弁を実装する
 
 - Actor: agent
 - Depends on: H-07
@@ -1398,15 +1408,28 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
   1. `enabled=false` 既定の typed config を追加し、H-01 の閾値を default にする。
   2. low TPS は継続時間、stall は last progress age、pre-cron は canary failure で判定する。
   3. cooldown、12 時間内回数、active owner、DistributedReady、role を全て開始前 gate にする。
-  4. drain timeout または連続失敗では自動 retry せず manual intervention を通知する。
+  4. recovery admission drain timeout または連続失敗では自動 retry せず、generation/target が不変なら admission を復元し、それ以外は manual intervention を通知する。
   5. recovery started/completed/failed と抑制 reason を structured log/metrics にする。
 - 事後条件: opt-in 時だけ bounded automatic recovery が動き、disabled 時は観測だけ行う
 - 受入基準: 単一低 sample、idle 0 TPS、cooldown、回数上限、duplicate event、clock advance の test がある
 - Verification: deterministic-time unit test、fake 2 node integration test、共通 local gate
 - ユーザーレビュー・手作業: 実機で `enabled=true` にするのは H-10 の change window 内だけとする
+- Evidence（実装・検証 2026-08-23）: RecoveryConfig を schema v2 の optional typed section として追加し、
+  enabled=false、admission drain 60秒、cooldown 1時間、12時間内2回、decode下限5 tokens/s・継続30秒、
+  progress stall 60秒、canary deadline 30秒を既定値に固定した。低TPSの単一sample、idle 0 TPS、
+  first-token timeout、progress stall、canary failure、重複event、単調時間の後退を
+  deterministic-time RecoveryDetector unit testで確認した。検知は enabled=true の常駐タスクから
+  既存 RecoveryService のsingle ownerへ一回だけ委譲し、cooldown、attempt limit、role/state、
+  active ownerのgateと自動retry抑止を共通化した。recovery drain timeoutでgeneration/targetが不変の
+  場合だけadmissionを復元し、変更済みの場合はblocked維持とmanual-intervention structured logを
+  出す。ds4_proxy_recovery_events_total{event,reason} と structured logを追加し、recovery IDなど
+  高カーディナリティ情報をlabelに含めない。既存fake 2-node lifecycle/recovery integrationを含む
+  cargo test --all-targets --features test-support（249 unit、bundle 4、canary 5、fake DS4 2、
+  phase/reconnect/recovery integration GREEN）、clippy -D warnings、format、diff checkが成功した。
+  siderostat.example.toml と docs/spec.md／docs/operations.md にopt-inとH-10 change windowを記録した。
 - 停止条件: wall clock 変更、固定 sleep、無制限 retry に依存する test しか作れない
 
-### [ ] H-09 degradation / recovery regression suite を固定する
+### [x] H-09 degradation / recovery regression suite を固定する
 
 - Actor: agent
 - Depends on: H-08
@@ -1423,6 +1446,20 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: Hermes 調査 11.1〜11.10 の repository 内対象が test 名へ一対一対応する
 - Verification: 対象 suite 10 回、標準並列実行、共通 local gate
 - ユーザーレビュー・手作業: なし
+- Evidence（回帰 suite・2026-08-23）: `tests/throughput_recovery.rs` に Hermes 11.1〜11.10 の
+  対象を一対一で表す10 test（`normal_short_request_is_not_degraded`、
+  `long_normal_prefill_does_not_trigger_decode_recovery`、`low_tps_requires_a_sustained_window`、
+  `first_token_stall_is_classified_before_progress_stall`、`progress_stall_is_classified_after_a_progress_event`、
+  `active_request_drain_preserves_order_and_timeout_without_kill`、`promotion_failure_stays_safe_and_suppresses_retry_loop`、
+  `control_unavailable_converges_to_standalone_without_orphans`、`repeated_canary_failure_has_no_automatic_retry`、
+  `two_node_recovery_replaces_children_and_keeps_canary_gate_blocked`）を固定した。active request の
+  event order（request start → drain timeout → request finish → drain complete）、recovery 後の
+  generation/PID 更新、post-recovery canary healthy、admission blocked、distributed child の
+  orphan 不在を検証する共通 helper と、worker/control 不通・promotion failure・連続 canary failure
+  の safe state を追加した。回復後も admission を閉じたまま次の世代へ移行できるよう、
+  `AdmissionGate::reset_blocked_generation` を追加し、recovery demote/promotion で使用した。
+  `tests/support/mod.rs` の fake child は再起動ごとに PID 相当値を更新する。対象 suite は標準並列で
+  10回連続（各回10 test）GREEN、固定 sleep・共有 port/state なしで完了した。
 - 停止条件: production code に test 専用 recovery path を追加しないと成立しない
 
 ### [ ] H-10 2 node 実機 recovery と Hermes handoff を検証する
@@ -1444,6 +1481,15 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - 受入基準: recovery 一回で収束し、失敗時は standalone または明示 unavailable に有限時間で収束する
 - Verification: doctor/public API/canary、PID/generation、snapshot、metrics、config 前後比較
 - ユーザーレビュー・手作業: change window、故障注入、config 切替、Hermes cron 前 canary 組込みを実行する
+- Preparation evidence（2026-08-23、実機変更前）: 両nodeのread-only `/healthz`、`/readyz`、`/cluster`、
+  `/metrics` と `cluster doctor --json` を確認し、version 0.3.0 / build 13、healthy、
+  `in_flight=0`、`admission=serving`、`DistributedReady`、両child runningを確認した。現在インストール
+  されているbuild 13のruntime helperはH-10で必要な `cluster canary` と `recover-degraded` CLIを
+  含まないため、実機 recovery は開始していない。source CLIの初回 canary payload は既存runtimeから
+  HTTP 400を返されたため、Chat Completionsの `messages` payloadへ修正し、source CLIで
+  `healthy / HTTP 200`（TTFB 3682ms、2 tokens、58.627 tokens/s）を確認した。build 14のapp-dev
+  bundle verificationはPASSしたが、Developer ID署名はtimestamp取得失敗で停止し、両nodeへの
+  install・config変更・故障注入は行っていない。change window外のため recovery opt-inも変更していない。
 - 停止条件: production cron 実行中、rollback 不可、force kill/state 削除/OS 再起動が必要になる
 
 ## 12. Phase N: recovery epoch 単位の通知重複排除

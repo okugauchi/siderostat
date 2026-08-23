@@ -26,14 +26,17 @@ pub struct DisplayState {
     pub prefill_chunk_tps: f64,
     pub prefill_avg_tps: f64,
     pub prefill_elapsed_secs: f64,
+    pub prefill_progress_age_secs: Option<f64>,
     pub kv_hits_total: u64,
     pub kv_hit_tokens: u64,
     pub kv_load_ms: f64,
     pub decode_active: bool,
+    pub decode_progress_observed: bool,
     pub decode_completion: u64,
     pub decode_chunk_tps: f64,
     pub decode_avg_tps: f64,
     pub decode_elapsed_secs: f64,
+    pub decode_progress_age_secs: Option<f64>,
 }
 
 impl Default for DisplayState {
@@ -53,14 +56,17 @@ impl Default for DisplayState {
             prefill_chunk_tps: 0.0,
             prefill_avg_tps: 0.0,
             prefill_elapsed_secs: 0.0,
+            prefill_progress_age_secs: None,
             kv_hits_total: 0,
             kv_hit_tokens: 0,
             kv_load_ms: 0.0,
             decode_active: false,
+            decode_progress_observed: false,
             decode_completion: 0,
             decode_chunk_tps: 0.0,
             decode_avg_tps: 0.0,
             decode_elapsed_secs: 0.0,
+            decode_progress_age_secs: None,
         }
     }
 }
@@ -82,14 +88,17 @@ impl DisplayState {
         self.prefill_chunk_tps = snapshot.prefill.chunk_tps;
         self.prefill_avg_tps = snapshot.prefill.avg_tps;
         self.prefill_elapsed_secs = snapshot.prefill.elapsed_secs;
+        self.prefill_progress_age_secs = snapshot.prefill.progress_age_secs;
         self.kv_hits_total = snapshot.kv_cache.hits_total;
         self.kv_hit_tokens = snapshot.kv_cache.hit_tokens;
         self.kv_load_ms = snapshot.kv_cache.load_ms;
         self.decode_active = snapshot.decode.active;
+        self.decode_progress_observed = snapshot.decode.progress_observed;
         self.decode_completion = snapshot.decode.completion;
         self.decode_chunk_tps = snapshot.decode.chunk_tps;
         self.decode_avg_tps = snapshot.decode.avg_tps;
         self.decode_elapsed_secs = snapshot.decode.elapsed_secs;
+        self.decode_progress_age_secs = snapshot.decode.progress_age_secs;
     }
 
     /// Mark the monitor as connected but unable to read the selected metrics.
@@ -361,6 +370,7 @@ mod tests {
                 chunk_tps: 123.4,
                 avg_tps: 100.0,
                 elapsed_secs: 10.0,
+                progress_age_secs: Some(2.5),
             },
             kv_cache: crate::metrics::KvCacheState {
                 hits_total: 3,
@@ -369,10 +379,12 @@ mod tests {
             },
             decode: crate::metrics::DecodeState {
                 active: true,
+                progress_observed: true,
                 completion: 42,
                 chunk_tps: 32.1,
                 avg_tps: 28.5,
                 elapsed_secs: 1.5,
+                progress_age_secs: Some(3.5),
             },
         }
     }
@@ -390,9 +402,12 @@ mod tests {
         assert!(state.prefill_active);
         assert_eq!(state.prefill_percent, 45.5);
         assert_eq!(state.prefill_avg_tps, 100.0);
+        assert_eq!(state.prefill_progress_age_secs, Some(2.5));
         assert!(state.decode_active);
+        assert!(state.decode_progress_observed);
         assert_eq!(state.decode_completion, 42);
         assert_eq!(state.decode_elapsed_secs, 1.5);
+        assert_eq!(state.decode_progress_age_secs, Some(3.5));
     }
 
     #[test]
