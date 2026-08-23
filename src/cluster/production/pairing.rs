@@ -239,7 +239,7 @@ impl super::ProductionClusterRuntime {
             .inner
             .config
             .ds4
-            .mxfp4
+            .distributed
             .worker_layers
             .split_once(':')
             .context("invalid worker layer range")?
@@ -258,7 +258,7 @@ impl super::ProductionClusterRuntime {
                 layer_start: worker_start,
                 layer_end: u32::MAX,
                 has_output: true,
-                context_size: self.inner.config.ds4.mxfp4.context_size,
+                context_size: self.inner.config.ds4.distributed.context_size,
                 model_name: self.inner.manifest.model_family.clone(),
             },
         )
@@ -400,7 +400,7 @@ impl super::ProductionClusterRuntime {
         descriptor.mode = match self.inner.mode.snapshot().stable_mode {
             StableMode::SoloStandalone => ControlMode::SoloStandalone,
             StableMode::PairedStandalone => ControlMode::PairedStandalone,
-            StableMode::DistributedMxfp4 => ControlMode::DistributedMxfp4,
+            StableMode::DistributedLayerParallel => ControlMode::DistributedLayerParallel,
         };
         descriptor
     }

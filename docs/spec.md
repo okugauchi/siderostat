@@ -25,13 +25,13 @@
 peer不在
   -> 各nodeのproxyは、そのnodeで設定されたstandalone profileへ転送
 
-peer接続済み、MXFP4 distributed未完成または不適合
+peer接続済み、layer-parallel distributed未完成または不適合
   -> coordinator proxyはlocal standalone profileへ転送
   -> worker proxyはcoordinatorのpeer ingressへ転送
   -> workerのlocal standalone profileは停止可能
 
-MXFP4 distributed ready
-  -> coordinator proxyはlocal MXFP4 coordinatorへ転送
+layer-parallel distributed ready
+  -> coordinator proxyはlocal layer-parallel coordinatorへ転送
   -> worker proxyはcoordinatorのpeer ingressへ転送
 
 peerまたはdistributed route喪失
@@ -48,8 +48,8 @@ peerまたはdistributed route喪失
 - 公開proxy processとlisten portをDS4 mode切替中も維持する。
 - peer不在時はlocal standalone profileへ転送する。
 - peer存在時はcoordinatorへ転送を集約する。
-- standalone profileとしてQ2、Q2-Q4、MXFP4を選択でき、常駐ロードまたはDS4のSSD streamingを利用できる。
-- compatibleなpeerが揃った場合、standalone profileからMXFP4 distributedへ自動昇格する。
+- standalone profileとして量子化Q2、Q2-Q4、MXFP4を選択でき、quantizationとは独立して常駐ロードまたはDS4のSSD streamingを利用できる。DSpark等のspeculative supportも別項目として管理する。
+- compatibleなpeerが揃った場合、standalone profileからlayer-parallel distributedへ自動昇格する。
 - distributed昇格を実DS4 worker HELLOとcomplete routeで確認する。
 - worker/route喪失時にstandalone profileへ自動降格する。
 - standalone deploymentとdistributed deploymentのKV cacheを分離する。
@@ -105,7 +105,7 @@ peerまたはdistributed route喪失
 | Worker node | `bridge0=10.99.0.2` のnode |
 | Solo Standalone | peer不在で各nodeが自身のstandalone profileを提供するmode |
 | Paired Standalone | peer存在時にrequestをcoordinatorのstandalone profileへ集約するmode |
-| Distributed MXFP4 | coordinator/workerでMXFP4をpipeline parallel実行するmode |
+| Distributed (layer-parallel) | coordinator/workerでmodel layerを分割して実行するmode。現行のquantizationはMXFP4、transportはTCP over Thunderbolt |
 | Admission gate | 新規proxy requestを受理するかをtarget単位で直列化するgate |
 | In-flight | upstream response bodyのEOF、error、client切断までpermitを保持するrequest |
 | Deployment | DS4 binary、model、checkpoint、context、residency、argv、およびdistributed時のlayer splitを含む実行単位 |
@@ -129,7 +129,7 @@ Client on worker node
        | Solo Standalone
        +-> Local upstream 127.0.0.1:8000
        |
-       | Paired Standalone / Distributed MXFP4
+       | Paired Standalone / Distributed (layer-parallel)
        `-> Coordinator peer ingress 10.99.0.1:18082
              -> Coordinator local upstream 127.0.0.1:8000
 
@@ -168,13 +168,27 @@ siderostat process
 
 ## 9. Modeと転送規則
 
+モード、ライフサイクル状態、ノードの役割、通信方式、推測デコード方式の区別と正規表示名は、
+[`ds4-mode-taxonomy.md`](ds4-mode-taxonomy.md) を正とする。ここでいう `mode` は安定した
+リクエスト処理トポロジーだけを指し、`ClusterState` の起動中・接続中・復旧中の値とは区別する。
+
+現行の安定モードは次の3つだけである。
+
+| 正規表示名 | machine name | 定義 |
+|---|---|---|
+| `Solo Standalone` | `solo-standalone` | 各ノードが自身の standalone `ds4-server` で処理する |
+| `Paired Standalone` | `paired-standalone` | peer とペアを形成し、coordinator の standalone `ds4-server` へ request を集約する |
+| `Distributed (layer-parallel)` | `distributed-layer-parallel` | model layer を coordinator / worker の2つの `ds4-server` に分割する。現行のquantizationはMXFP4、transportはTCP over Thunderbolt |
+
+`Distributed` 単独は将来を含む上位分類であり、現行の具体的な mode 名として使用しない。`MXFP4` は model の quantization として別に管理する。
+
 ### 9.1 Cluster mode
 
 ```rust
 enum StableMode {
     SoloStandalone,
     PairedStandalone,
-    DistributedMxfp4,
+    DistributedLayerParallel,
 }
 
 enum ClusterState {
@@ -231,7 +245,7 @@ Peer presentは次をすべて満たす状態とする。
 
 ICMP echoだけでpeer presentと判定しない。
 
-Peer presentになったら、まずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed MXFP4へのpromotionを試みる。自動修復できないdeployment不一致を検出した場合は、両nodeをSolo Standaloneへ収束させ、同じ原因による自動pairingの再試行を止める。
+Peer presentになったら、まずPaired Standaloneを形成する。MXFP4 deploymentが一致すれば、その後Distributed (layer-parallel)へのpromotionを試みる。自動修復できないdeployment不一致を検出した場合は、両nodeをSolo Standaloneへ収束させ、同じ原因による自動pairingの再試行を止める。
 
 ## 10. HTTP reverse proxy contract
 
@@ -331,7 +345,7 @@ Upstreamが返した4xx/5xxは原則そのまま返す。
 
 ### 11.1 目的
 
-Coordinatorだけが `10.99.0.1:18082` にpeer ingressをbindする。Worker public ingressはPaired Standalone/Distributed MXFP4時にここへ転送する。
+Coordinatorだけが `10.99.0.1:18082` にpeer ingressをbindする。Worker public ingressはPaired Standalone/Distributed (layer-parallel)時にここへ転送する。
 
 Peer ingress handlerはmode-aware target resolverを再実行せず、coordinatorのlocal upstreamへだけ転送する。これによりproxy loopを構造上防ぐ。
 
@@ -413,7 +427,7 @@ admission=Draining
 
 ### 12.4 Cluster-wide drain
 
-Paired StandaloneからDistributed MXFP4、またはDistributed MXFP4からPaired/Solo Standaloneへ切り替えるときはcoordinatorがdrain generationを開始する。
+Paired StandaloneからDistributed (layer-parallel)、またはDistributed (layer-parallel)からPaired/Solo Standaloneへ切り替えるときはcoordinatorがdrain generationを開始する。
 
 ```text
 coordinator:
@@ -541,27 +555,29 @@ IOKitのpublish/terminate notificationを追加のwake-up hintまたはdiagnosti
 
 各nodeはstandalone profileを1つ選択する。実装は少なくとも次を表現可能でなければならない。
 
-| standalone model variant | residency | DS4起動形態 |
+| quantization | residency | DS4起動形態 |
 |---|---|---|
 | Q2 | `resident` または `ssd-streaming` | HTTP server |
 | Q2-Q4（Q2を基礎に一部expert layerをQ4化） | `resident` または `ssd-streaming` | HTTP server |
 | MXFP4 | `resident` または `ssd-streaming` | HTTP server |
 
-`ssd-streaming` はDS4の `--ssd-streaming` を意味する。Model variantとresidencyを混同せず、たとえばMXFP4であることだけを理由にSSD streamingを暗黙有効化してはならない。逆にSSD streamingはQ2限定の機能として扱わない。
+`ssd-streaming` はDS4の `--ssd-streaming` を意味する。Quantizationとresidencyを混同せず、たとえばMXFP4であることだけを理由にSSD streamingを暗黙有効化してはならない。逆にSSD streamingはQ2限定の機能として扱わない。
 
-Standalone profileはnode固有でよく、coordinatorとworkerのmodel variant、residency、tuning値の一致をpairing条件にしない。Paired Standaloneではcoordinatorのprofileだけがrequestを処理し、peer喪失後のSolo Standaloneでは各nodeが自身のprofileを処理する。この差は `/cluster`、metrics、logで観測可能にする。
+Standalone profileはnode固有でよく、coordinatorとworkerのquantization、speculative support、residency、tuning値の一致をpairing条件にしない。Paired Standaloneではcoordinatorのprofileだけがrequestを処理し、peer喪失後のSolo Standaloneでは各nodeが自身のprofileを処理する。この差は `/cluster`、metrics、logで観測可能にする。
+
+Quantization と speculative support は別の model detail である。`[ds4.dspark]` の `enabled`、support GGUF、confidence、strict は speculative support の詳細設定であり、mode / topology を変更しない。DSpark を無効にした場合は `speculative_support = "none"` として扱う。
 
 Distributed profileはstandalone profileとは独立した設定であり、初期実装では次を使用する。
 
-| distributed profile | model | coordinator | worker |
-|---|---|---|---|
-| `distributed-mxfp4` | DeepSeek V4 Flash MXFP4 0731 | HTTP + distributed coordinator | distributed worker、HTTPなし |
+| distributed profile | model family / checkpoint | topology | quantization | speculative support | coordinator / worker |
+|---|---|---|---|---|---|
+| `distributed-layer-parallel` | DeepSeek V4 Flash / `flash-0731` | `layer-parallel` | `mxfp4` | `none` | HTTP + distributed coordinator / distributed worker、HTTPなし |
 
 ### 14.2 Pathとstorage
 
 - Modelはcanonical absolute pathで指定する。
 - 書換可能なsymlinkをmodel pathに使わない。
-- Distributedに用いる両nodeのMXFP4 content SHA-256を一致させる。
+- Distributedに用いる両nodeのmodel content SHA-256を一致させる。現行モデルのquantizationはMXFP4である。
 - 現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する。
 - 各distributed processは `--layers` で担当sliceだけをmapする。
 
@@ -587,13 +603,13 @@ worker:      20:output
 | `ssd_preload_experts` | `--ssd-streaming-preload-experts` | 0以上の整数。省略可能。主に計測・warm-up用 |
 | `ssd_cold` | `--ssd-streaming-cold` | default `false`。主にcold benchmark用 |
 
-`residency = "resident"` では上記設定を指定してはならず、SSD streaming optionを生成しない。MXFP4 + SSD streamingを含む各組合せは設定として受理できることと、対象macOS/DS4 buildでproduction利用可能であることを分けて扱い、第32.5節のactual acceptanceをproduction gateとする。
+`residency = "resident"` では上記設定を指定してはならず、SSD streaming optionを生成しない。MXFP4 quantization + SSD streamingを含む各組合せは設定として受理できることと、対象macOS/DS4 buildでproduction利用可能であることを分けて扱い、第32.5節のactual acceptanceをproduction gateとする。
 
 ### 14.5 DSpark
 
 DSparkは現行DS4 baselineではresident Standaloneだけで使用する。`[ds4.dspark]`で`enabled = true`、canonicalかつ非symlinkのsupport GGUF、任意の`confidence`（0以上1以下）と`strict`を型付き指定する。Supervisorは`--mtp <support-model> --dspark`を一度だけ生成し、任意値から`--dspark-confidence`と`--dspark-strict`を生成する。
 
-現DS4は`--ssd-streaming + --mtp`を拒否するため、DSpark有効時のStandaloneは`residency = "resident"`に限定する。DSpark optionはDistributed coordinator/worker argvへ追加しない。MXFP4 Distributedへの昇格中はDSpark非適用であり、DS4本体がdistributed supportを実装するまで有効化済みと表示しない。
+現DS4は`--ssd-streaming + --mtp`を拒否するため、DSpark有効時のStandaloneは`residency = "resident"`に限定する。DSpark optionはDistributed coordinator/worker argvへ追加しない。Distributed (layer-parallel)への昇格中は speculative support を `none` として扱い、DS4本体がdistributed supportを実装するまでDSpark有効化済みと表示しない。
 
 Standalone childをspawnする前にsupport GGUFをstreaming SHA-256し、size、confidence、strictをStandalone manifestと照合する。不一致はfail closedとする。DS4が出力する`DSpark target-hidden capture enabled`をsanitized eventとして認識し、DSpark有効profileではHTTP readinessとこのeventの両方をstartup deadline内に要求する。Support pathとfull digestはadmin response/logへ出力しない。
 
@@ -613,7 +629,7 @@ Standaloneとdistributedでは異なる `--kv-disk-dir` を必須とする。同
 ```json
 {
   "schema_version": 2,
-  "profile": "distributed-mxfp4",
+  "profile": "distributed-layer-parallel",
   "ds4_binary_sha256": "<node-local digest>",
   "compatible_ds4_binary_sha256": ["<coordinator digest>", "<worker digest>"],
   "ds4_source_commit": "<full Git object ID>",
@@ -621,7 +637,9 @@ Standaloneとdistributedでは異なる `--kv-disk-dir` を必須とする。同
   "model_size": 167503724544,
   "checkpoint": "flash-0731",
   "model_family": "deepseek-v4-flash",
-  "quantization": "mxfp4-experts",
+  "quantization": "mxfp4",
+  "topology": "layer-parallel",
+  "speculative_support": "none",
   "context_size": 262144,
   "coordinator_layers": "0:19",
   "worker_layers": "20:output",
@@ -640,7 +658,8 @@ Standalone manifestも同じdigest情報に加え、次を持つ。
   "ds4_binary_sha256": "...",
   "model_sha256": "...",
   "checkpoint": "flash-0731",
-  "model_variant": "q2-q4",
+  "quantization": "q2-q4",
+  "speculative_support": "dspark",
   "residency": "resident",
   "context_size": 262144,
   "argv_profile_sha256": "...",
@@ -677,7 +696,7 @@ Standalone manifestはlocal childのidentity、設定drift、診断に使用す�
 
 ### 15.3 Compatibility
 
-Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけMXFP4 promotionを許可する。deployment mismatch（control planeのHTTP 412）を検出した場合はpromotionを拒否し、両nodeをSolo Standaloneへ収束させる。自動pairingはoperator reconcileまたはruntime再起動まで再試行しない。
+Distributed profileは、承認済みbinary digest集合、full source commit、model digest/size、checkpoint、model family/quantization、context、layer split、wire schema、argv profileを比較する。各local binary digestが共通の承認集合に含まれ、これらのcompatibility fieldがすべて一致する場合だけlayer-parallel promotionを許可する。deployment mismatch（control planeのHTTP 412）を検出した場合はpromotionを拒否し、両nodeをSolo Standaloneへ収束させる。自動pairingはoperator reconcileまたはruntime再起動まで再試行しない。
 
 Binary digestはnode-local child identityと未知rebuildの検出に引き続き使用するが、cross-nodeでのbyte-for-byte一致は要求しない。`-mcpu=native`等による機種別binaryを承認集合へ追加するには、そのdigest pair、full source commit、wire schema、対象model/topologyでactual acceptanceを完了してcompatibility recordへ記録する。Source commitや自己申告のwire schemaだけで未知binaryを自動承認してはならない。
 
@@ -726,7 +745,7 @@ LOWERCASE_HEX_SHA256(BODY)
 | `GET` | `/v1/node` | node descriptor、mode、deployment、lease |
 | `GET` | `/v1/metrics` | 認証済み peer から coordinator の Prometheus metrics を取得 |
 | `POST` | `/v1/pair` | Paired Standalone形成 |
-| `POST` | `/v1/prepare-worker` | MXFP4 worker準備 |
+| `POST` | `/v1/prepare-worker` | layer-parallel worker準備 |
 | `POST` | `/v1/begin-drain` | cluster-wide drain開始 |
 | `POST` | `/v1/drained` | drain完了ack |
 | `POST` | `/v1/cancel-generation` | 未完了transition中止 |
@@ -744,17 +763,17 @@ LOWERCASE_HEX_SHA256(BODY)
 
 ### 17.1 Sequence
 
-Paired StandaloneでMXFP4 compatibilityが一致したら：
+Paired Standaloneでdistributed compatibilityが一致したら：
 
 1. Coordinatorが `10.99.0.1:9911` でrendezvous listener開始。
 2. Workerへprepare指示。
 3. Worker proxyはcoordinator targetをdrainして一時Block。
-4. Worker MXFP4 child起動。
+4. Worker distributed child起動。
 5. 実DS4 childがHELLO送信。
 6. RendezvousがHELLOを検証してsocket close。
 7. Worker DS4は1秒間隔で再接続。
 8. Coordinatorがcluster-wide drainを完了。
-9. Coordinator standalone停止、MXFP4 coordinator起動。
+9. Coordinator standalone停止、layer-parallel coordinator起動。
 10. Worker再接続、complete route形成。
 11. 両proxy admission再開。
 
@@ -836,7 +855,7 @@ SoloStandaloneReady
 
 Coordinator自身はtarget=LocalStandaloneのままPairedStandaloneReadyへ入る。
 
-### 18.3 Paired Standalone to Distributed MXFP4
+### 18.3 Paired Standalone to Distributed (layer-parallel)
 
 ```text
 PairedStandaloneReady
@@ -845,10 +864,10 @@ PairedStandaloneReady
   -> actual HELLO received
   -> cluster-wide drain
   -> coordinator standalone stop
-  -> MXFP4 coordinator start --debug
+  -> layer-parallel coordinator start --debug
   -> worker registered
   -> complete route ready
-  -> coordinator target=local MXFP4
+  -> coordinator target=local layer-parallel coordinator
   -> worker target=coordinator peer ingress
   -> both admission=Serving
   -> DistributedReady
@@ -863,7 +882,7 @@ Peer controlは生きているがrouteが失われた場合：
 ```text
 route loss grace経過
   -> cluster-wide drain
-  -> MXFP4 children stop
+  -> distributed children stop
   -> coordinator standalone start
   -> coordinator local + peer ingress ready
   -> worker target=Coordinator
@@ -906,7 +925,7 @@ Distributed deploymentの不一致を検出した場合も同じlocal recovery�
 | route loss grace | 15秒 |
 | promotion backoff | 300秒 |
 
-MXFP4 model mapは遅いためstartupより短いHELLO timeoutを設定しない。Timeoutは設定可能だが、0または無制限を拒否する。HTTP request全体timeoutは既定なしとする。
+distributed model mapは遅いためstartupより短いHELLO timeoutを設定しない。Timeoutは設定可能だが、0または無制限を拒否する。HTTP request全体timeoutは既定なしとする。
 
 ## 20. DS4 process supervision
 
@@ -964,9 +983,9 @@ ds4: DSpark target-hidden capture enabled: layers=...
 
 | Profile | Ready condition |
 |---|---|
-| Standalone（Q2/Q2-Q4/MXFP4、各residency） | child生存、HTTP listening、`GET /v1/models`成功。DSpark有効時はactivation eventも必須 |
-| MXFP4 coordinator | child生存、HTTP listening、worker registered、complete route |
-| MXFP4 worker | child生存、実HELLO受信、lease有効 |
+| Standalone（各quantization、各residency） | child生存、HTTP listening、`GET /v1/models`成功。DSpark有効時はactivation eventも必須 |
+| layer-parallel coordinator | child生存、HTTP listening、worker registered、complete route |
+| layer-parallel worker | child生存、実HELLO受信、lease有効 |
 
 `GET /v1/models` はlocal managed DS4のnon-inference readinessだけに使う。Backend選択やload balancingには使わない。
 
@@ -1076,14 +1095,16 @@ profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
 checkpoint = "flash-0731"
-model_variant = "q2-q4"
+quantization = "q2-q4"
 residency = "resident"
 context_size = 262144
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 262144
 extra_args = []
 
-[ds4.mxfp4]
+[ds4.distributed]
+topology = "layer-parallel"
+quantization = "mxfp4"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
@@ -1117,7 +1138,7 @@ Worker nodeは `cluster.node_id` とnode固有pathだけを変更する。Role�
 - `event_debounce` と `reconcile_interval` が0/無制限でない。
 - DS4 binaryがregular executable file。
 - Model、DSpark support GGUF、manifestがregular file、canonical absolute path、書換可能symlinkでない。
-- `model_variant` が `q2`、`q2-q4`、`mxfp4` のいずれかである。
+- `quantization` が `q2`、`q2-q4`、`mxfp4` のいずれかである。
 - `residency` が `resident` または `ssd-streaming` である。
 - `resident` ではSSD streaming設定が未指定またはdefault値、`ssd-streaming` ではsupervisorが `--ssd-streaming` を一度だけ生成する。
 - DSpark有効時はsupport modelが必須、confidenceは0以上1以下、Standaloneは`resident`である。
@@ -1171,12 +1192,12 @@ Loopback `127.0.0.1:18081` default。
 |---|---|---|
 | `GET` | `/healthz` | process liveness |
 | `GET` | `/readyz` | current target readiness |
-| `GET` | `/cluster` | role、mode、state、generation、target、lease、child、Thunderbolt IP/discovery状態、active standalone profile ID/model variant/residency |
+| `GET` | `/cluster` | role、mode、state、generation、target、lease、child、Thunderbolt IP/discovery状態、active standalone profile ID/quantization/speculative support/residency |
 | `GET` | `/metrics` | Prometheus text |
 | `GET` | `/metrics/coordinator` | worker が control plane 経由で取得した coordinator の Prometheus text |
 | `POST` | `/cluster/reconcile` | observed stateをdesired stateへ収束 |
 | `POST` | `/cluster/pair` | Paired Standaloneを要求 |
-| `POST` | `/cluster/promote` | MXFP4 promotion要求 |
+| `POST` | `/cluster/promote` | layer-parallel promotion要求 |
 | `POST` | `/cluster/demote` | standalone demotion要求 |
 | `POST` | `/cluster/restart` | current profile child再起動 |
 | `POST` | `/cluster/fingerprint` | async model fingerprint job |
@@ -1215,11 +1236,11 @@ Affinity/backend selection stateは保存しない。Cluster lifecycleだけをJ
 {
   "schema_version": 1,
   "generation": 43,
-  "desired_mode": "distributed-mxfp4",
+  "desired_mode": "distributed-layer-parallel",
   "last_stable_mode": "paired-standalone",
   "cluster_state": "distributed-ready",
   "proxy_target": "coordinator",
-  "active_profile": "distributed-mxfp4-coordinator",
+  "active_profile": "distributed-layer-parallel-coordinator",
   "child": {
     "pid": 12345,
     "executable": "/absolute/path/ds4-server",
@@ -1322,7 +1343,7 @@ ds4_proxy_peer_discovery_events_total{source,result}
 ds4_proxy_cluster_transitions_total{from,to,result,reason}
 ds4_proxy_cluster_transition_duration_seconds{transition}
 ds4_proxy_cluster_child_restarts_total{profile,reason}
-ds4_proxy_standalone_profile_info{node_id,model_variant,residency}
+ds4_proxy_standalone_profile_info{node_id,quantization,speculative_support,residency}
 ds4_proxy_cluster_hello_total{result,reason}
 ds4_proxy_cluster_deployment_mismatch_total{field}
 ds4_proxy_ds4_prefill_active
@@ -1343,7 +1364,7 @@ ds4_proxy_ds4_generation_avg_tps
 ds4_proxy_ds4_generation_elapsed_seconds
 ```
 
-`model_variant` と `residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない。
+`quantization`、`speculative_support`、`residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない。
 
 ## 27. Security
 
@@ -1465,9 +1486,9 @@ persistence.rs（cluster state_storeへ置換）
 | Unauthenticated Bonjour result | candidate破棄、current mode維持 |
 | peer control HMAC不正 | request拒否、Solo/Paired current mode維持 |
 | peer proxy token不正 | peer ingress 403 |
-| deployment mismatch | Solo Standaloneへ収束、MXFP4 promotion禁止、自動pairing停止 |
+| deployment mismatch | Solo Standaloneへ収束、layer-parallel promotion禁止、自動pairing停止 |
 | manifest stale | Paired Standalone、再fingerprint要求 |
-| HELLO timeout | MXFP4 worker停止、Paired Standalone、backoff |
+| HELLO timeout | layer-parallel worker停止、Paired Standalone、backoff |
 | unknown HELLO/log schema | promotion拒否、Paired Standalone |
 | coordinator startup timeout | MXFP4停止、Paired Standalone |
 | route incomplete/lost | grace後Paired Standalone |
@@ -1482,7 +1503,7 @@ persistence.rs（cluster state_storeへ置換）
 ### 32.1 Unit
 
 - Config v2 parse/unknown/legacy field rejection。
-- Standalone `model_variant` × `residency` matrixのparse/argv生成。
+- Standalone `quantization` × `residency` matrixのparse/argv生成。
 - `resident` とSSD streaming設定の矛盾、およびSSD option重複の拒否。
 - Path expansionとsecret permission。
 - Role/address判定。
@@ -1565,7 +1586,7 @@ persistence.rs（cluster state_storeへ置換）
 - 10回promotion/demotionでorphan/port残留/PID誤killなし。
 - Peer ingress追加hopを含むproxy overhead p50 5ms未満を目標。
 
-設定parserが組合せを受理することは、そのmodel/backend/residencyの動作保証を意味しない。特にMXFP4 SSD streaming on MetalとMXFP4 distributedはactual acceptanceをproduction gateとする。
+設定parserが組合せを受理することは、そのmodel/backend/residencyの動作保証を意味しない。特にMXFP4 SSD streaming on Metalとlayer-parallel distributedはactual acceptanceをproduction gateとする。
 
 ## 33. Acceptance criteria
 
@@ -1618,10 +1639,10 @@ persistence.rs（cluster state_storeへ置換）
 ### 33.5 Standalone profile
 
 - [ ] Q2、Q2-Q4、MXFP4を設定可能。
-- [ ] `resident` と `ssd-streaming` をmodel variantから独立して設定可能。
+- [ ] `resident` と `ssd-streaming` をquantizationから独立して設定可能。
 - [ ] SSD streamingの型付き設定から正しいDS4 argvを一度だけ生成。
 - [ ] Standalone/distributedが同じGGUFでもKV namespaceを共有しない。
-- [ ] Active profile ID、model variant、residencyをadmin API、metrics、logで確認可能。
+- [ ] Active profile ID、quantization、speculative support、residencyをadmin API、metrics、logで確認可能。
 
 ## 34. Implementation plan
 
@@ -1657,7 +1678,7 @@ DS4 update時に確認する。
 | server/distributed log | readiness parser |
 | GGUF/checkpoint | manifest/KV namespace |
 | CLI option | generated argv |
-| distributed QA | MXFP4 gate |
+| distributed QA | layer-parallel gate |
 
 Repository内にverified DS4 commit、binary digest、wire/log fixture digest、recognized event、tested model/topology、dateを記録する。Unknown changeではpromotionをfail closedにする。
 
@@ -1670,7 +1691,7 @@ Repository内にverified DS4 commit、binary digest、wire/log fixture digest、
 - Peer discoveryは自動だがrole addressは `10.99.0.1` / `10.99.0.2` 固定で、DHCP based electionは行わない。
 - standalone/distributed間でlive KVを引き継がない。
 - DS4 log textへの依存がある。
-- MXFP4 SSD streaming on MetalとMXFP4 distributedのproduction可否はactual acceptance結果で決める。
+- MXFP4 SSD streaming on Metalとlayer-parallel distributedのproduction可否はactual acceptance結果で決める。
 
 ## 38. Definition of Done
 

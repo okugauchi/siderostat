@@ -1,5 +1,6 @@
 use crate::{
     cluster::{ProcessController, discover_startup_processes},
+    localization::text,
     notify::{Notification, NotifyPlatform, build_notifier, gui_session_available},
 };
 use anyhow::Context;
@@ -72,16 +73,30 @@ pub async fn cleanup_startup_processes(
 
 async fn confirm_cleanup(options: StartupCleanupOptions) -> anyhow::Result<bool> {
     if options.decline || !options.auto_restart {
-        notify_startup_cleanup("既存プロセスを検出しました。起動を中止しました。", options).await;
+        notify_startup_cleanup(
+            text(
+                "notification.startup_cleanup.declined",
+                "既存のds4-serverまたはsiderostat-runtimeを検出しました。起動を中止しました。",
+            ),
+            options,
+        )
+        .await;
         return Ok(false);
     }
 
-    notify_startup_cleanup("5秒後に ds4-server を再起動します", options).await;
+    notify_startup_cleanup(
+        text(
+            "notification.startup_cleanup.restart",
+            "5秒後にsiderostat-runtimeを再起動します",
+        ),
+        options,
+    )
+    .await;
     tokio::time::sleep(STARTUP_CLEANUP_COUNTDOWN).await;
     Ok(true)
 }
 
-async fn notify_startup_cleanup(message: &str, options: StartupCleanupOptions) {
+async fn notify_startup_cleanup(message: String, options: StartupCleanupOptions) {
     let notifier = build_notifier(
         options.notifications_enabled,
         options.notification_sound,
@@ -92,7 +107,7 @@ async fn notify_startup_cleanup(message: &str, options: StartupCleanupOptions) {
         return;
     }
     if let Err(error) = notifier
-        .notify(Notification::new("siderostat", message))
+        .notify(Notification::new(text("app.name", "Siderostat"), message))
         .await
     {
         tracing::warn!(error = %error, "startup cleanup notification failed");

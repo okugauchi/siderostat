@@ -5,7 +5,7 @@
 //! renders the fixed command order with the profile redacted so the release
 //! gate can be reviewed before a signed artifact is produced.
 
-use crate::{package, util};
+use crate::{dmg, package, util};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Value, json};
@@ -51,6 +51,20 @@ pub struct SignArgs {
     /// Print the fixed command order without touching the filesystem or network.
     #[arg(long)]
     pub dry_run: bool,
+    /// Explicitly allow replacing a higher installed app bundle version.
+    #[arg(long)]
+    pub rollback: bool,
+    /// Also build, sign, notarize, staple, and verify the release DMG.
+    #[arg(long)]
+    pub with_dmg: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DmgRelease {
+    uninstaller: PathBuf,
+    dmg: PathBuf,
+    uninstaller_submission: String,
+    dmg_submission: String,
 }
 
 /// Run the signed app/package/notarization pipeline.
@@ -63,12 +77,22 @@ pub fn sign(args: &SignArgs) -> Result<()> {
     let app = args.app_dir.join("Siderostat.app");
     let package = args
         .output_dir
-        .join(format!("Siderostat-{}.pkg", args.version));
+        .join(package::package_filename(&args.version, args.rollback));
     let log_dir = args
         .notary_log_dir
         .clone()
         .unwrap_or_else(|| args.output_dir.join("notary"));
-    let log_path = log_dir.join(format!("Siderostat-{}-notary.json", args.version));
+    let log_path = log_dir.join(package::notary_log_filename(&args.version, args.rollback));
+    let dmg_log_path = log_dir.join(format!(
+        "Siderostat-{}{}-dmg-notary.json",
+        args.version,
+        if args.rollback { "-rollback" } else { "" }
+    ));
+    let uninstaller_log_path = log_dir.join(format!(
+        "Siderostat-{}{}-uninstaller-notary.json",
+        args.version,
+        if args.rollback { "-rollback" } else { "" }
+    ));
 
     if args.dry_run {
         for line in dry_run_plan(&app, &package, &log_path, args) {
@@ -84,7 +108,7 @@ pub fn sign(args: &SignArgs) -> Result<()> {
     let staging = root.join(SIGNING_STAGING_DIR);
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("create signing staging {}", staging.display()))?;
-    let component = staging.join(format!("Siderostat-{}-component.pkg", args.version));
+    let component = staging.join(package::component_filename(&args.version, args.rollback));
 
     // 1. Inside-out Developer ID Application signing. Never use --deep to sign.
     sign_code_item(
@@ -96,7 +120,7 @@ pub fn sign(args: &SignArgs) -> Result<()> {
     verify_app(&app)?;
 
     // 2. Build and sign the final product archive with Developer ID Installer.
-    package::build_component(&app, &component, &args.version)?;
+    package::build_component(&app, &component, &args.version, args.rollback)?;
     package::build_product(
         &component,
         &package,
@@ -137,16 +161,143 @@ pub fn sign(args: &SignArgs) -> Result<()> {
         ],
     )?;
 
-    let metadata = build_metadata(&app, &package, &submission, args)?;
+    let dmg_release = if args.with_dmg {
+        let uninstaller = dmg::build_uninstaller_bundle(
+            &root,
+            &app,
+            &args.version,
+            args.build_number,
+            &staging.join("Siderostat Uninstaller.app"),
+        )?;
+        sign_code_item(
+            &uninstaller.join("Contents/MacOS/Siderostat Uninstaller"),
+            &args.application_identity,
+            dmg::UNINSTALLER_IDENTIFIER,
+        )?;
+        sign_code_item(
+            &uninstaller,
+            &args.application_identity,
+            dmg::UNINSTALLER_IDENTIFIER,
+        )?;
+        dmg::verify_uninstaller_bundle(&uninstaller)?;
+        let uninstaller_zip = dmg::zip_for_notarization(
+            &uninstaller,
+            &staging.join("Siderostat Uninstaller-notary.zip"),
+        )?;
+        let uninstaller_submission =
+            submit_for_notarization(&uninstaller_zip, &args.notary_profile)?;
+        let uninstaller_log = fetch_notary_log(&uninstaller_submission, &args.notary_profile)?;
+        util::write(&uninstaller_log_path, &uninstaller_log).with_context(|| {
+            format!(
+                "save Uninstaller notary log {}",
+                uninstaller_log_path.display()
+            )
+        })?;
+        util::run(
+            "xcrun",
+            &[
+                OsStr::new("stapler"),
+                OsStr::new("staple"),
+                OsStr::new(&uninstaller),
+            ],
+        )?;
+        util::run(
+            "xcrun",
+            &[
+                OsStr::new("stapler"),
+                OsStr::new("validate"),
+                OsStr::new(&uninstaller),
+            ],
+        )?;
+        util::run(
+            "spctl",
+            &[
+                OsStr::new("--assess"),
+                OsStr::new("--type"),
+                OsStr::new("execute"),
+                OsStr::new("--verbose=4"),
+                OsStr::new(&uninstaller),
+            ],
+        )?;
+
+        let dmg = dmg::build_dmg(
+            &package,
+            &uninstaller,
+            &args.version,
+            args.rollback,
+            &args.output_dir,
+            Some(&staging.join("dmg-source")),
+        )?;
+        sign_code_item(&dmg, &args.application_identity, dmg::DMG_IDENTIFIER)?;
+        verify_code_item(&dmg)?;
+        let dmg_submission = submit_for_notarization(&dmg, &args.notary_profile)?;
+        let dmg_log = fetch_notary_log(&dmg_submission, &args.notary_profile)?;
+        util::write(&dmg_log_path, &dmg_log)
+            .with_context(|| format!("save DMG notary log {}", dmg_log_path.display()))?;
+        util::run(
+            "xcrun",
+            &[
+                OsStr::new("stapler"),
+                OsStr::new("staple"),
+                OsStr::new(&dmg),
+            ],
+        )?;
+        util::run(
+            "xcrun",
+            &[
+                OsStr::new("stapler"),
+                OsStr::new("validate"),
+                OsStr::new(&dmg),
+            ],
+        )?;
+        util::run(
+            "spctl",
+            &[
+                OsStr::new("--assess"),
+                OsStr::new("--type"),
+                OsStr::new("open"),
+                OsStr::new("--context"),
+                OsStr::new("context:primary-signature"),
+                OsStr::new("--verbose=4"),
+                OsStr::new(&dmg),
+            ],
+        )?;
+        let package_filename = package
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("package filename is not UTF-8")?;
+        dmg::verify_mounted_dmg(&dmg, &dmg::expected_dmg_entries(package_filename))?;
+        Some(DmgRelease {
+            uninstaller,
+            dmg,
+            uninstaller_submission,
+            dmg_submission,
+        })
+    } else {
+        None
+    };
+
+    let metadata = build_metadata(&app, &package, &submission, dmg_release.as_ref(), args)?;
     let metadata_path = args
         .output_dir
-        .join(format!("Siderostat-{}.metadata.json", args.version));
+        .join(package::metadata_filename(&args.version, args.rollback));
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
     util::write(&metadata_path, &metadata_bytes)?;
 
     println!("app: {}", app.display());
     println!("package: {}", package.display());
     println!("notary_log: {}", log_path.display());
+    if let Some(release) = &dmg_release {
+        println!("uninstaller: {}", release.uninstaller.display());
+        println!("uninstaller_notary_log: {}", uninstaller_log_path.display());
+        println!(
+            "uninstaller_notary_submission_id: {}",
+            release.uninstaller_submission
+        );
+        println!("dmg: {}", release.dmg.display());
+        println!("dmg_notary_log: {}", dmg_log_path.display());
+        println!("dmg_notary_submission_id: {}", release.dmg_submission);
+    }
     println!("metadata: {}", metadata_path.display());
     println!("notary_submission_id: {submission}");
     println!("app_sha256: {}", metadata["app_sha256"]);
@@ -191,13 +342,17 @@ fn sign_code_item(path: &Path, identity: &str, identifier: &str) -> Result<()> {
 }
 
 fn verify_app(app: &Path) -> Result<()> {
+    verify_code_item(app)
+}
+
+fn verify_code_item(path: &Path) -> Result<()> {
     util::run(
         "codesign",
         &[
             OsStr::new("--verify"),
             OsStr::new("--strict"),
             OsStr::new("--verbose=4"),
-            OsStr::new(app),
+            OsStr::new(path),
         ],
     )?;
     Ok(())
@@ -250,7 +405,13 @@ fn fetch_notary_log(submission: &str, profile: &str) -> Result<Vec<u8>> {
     )
 }
 
-fn build_metadata(app: &Path, package: &Path, submission: &str, args: &SignArgs) -> Result<Value> {
+fn build_metadata(
+    app: &Path,
+    package: &Path,
+    submission: &str,
+    dmg_release: Option<&DmgRelease>,
+    args: &SignArgs,
+) -> Result<Value> {
     let rustc = String::from_utf8(util::run("rustc", &[OsStr::new("-vV")])?)?;
     let git_commit = String::from_utf8(util::run(
         "git",
@@ -258,17 +419,26 @@ fn build_metadata(app: &Path, package: &Path, submission: &str, args: &SignArgs)
     )?)?;
     let rust_version = field(&rustc, "release")?;
     let target = field(&rustc, "host")?;
-    Ok(json!({
+    let mut metadata = json!({
         "artifact": package.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
         "version": args.version.as_str(),
         "build_number": args.build_number,
-        "app_sha256": util::sha256_hex(app)?,
+        "rollback": args.rollback,
+        "install_mode": if args.rollback { "rollback" } else { "upgrade" },
+        "app_sha256": util::sha256_tree(app)?,
         "pkg_sha256": util::sha256_hex(package)?,
         "git_commit": git_commit.trim(),
         "rust_version": rust_version,
         "target": target,
         "notary_submission_id": submission,
-    }))
+    });
+    if let Some(release) = dmg_release {
+        metadata["uninstaller_sha256"] = json!(util::sha256_tree(&release.uninstaller)?);
+        metadata["uninstaller_notary_submission_id"] = json!(&release.uninstaller_submission);
+        metadata["dmg_sha256"] = json!(util::sha256_hex(&release.dmg)?);
+        metadata["dmg_notary_submission_id"] = json!(&release.dmg_submission);
+    }
+    Ok(metadata)
 }
 
 fn field(output: &str, name: &str) -> Result<String> {
@@ -280,7 +450,12 @@ fn field(output: &str, name: &str) -> Result<String> {
 }
 
 fn dry_run_plan(app: &Path, package: &Path, log_path: &Path, args: &SignArgs) -> Vec<String> {
-    vec![
+    let mut plan = vec![
+        format!(
+            "package mode: {} (BundleIsVersionChecked={})",
+            if args.rollback { "rollback" } else { "upgrade" },
+            if args.rollback { "false" } else { "true" }
+        ),
         format!(
             "codesign --force --options runtime --timestamp --sign <application identity> --identifier {RUNTIME_IDENTIFIER} {}",
             app.join("Contents/Helpers/siderostat-runtime").display()
@@ -291,8 +466,7 @@ fn dry_run_plan(app: &Path, package: &Path, log_path: &Path, args: &SignArgs) ->
         ),
         format!("codesign --verify --strict --verbose=4 {}", app.display()),
         format!(
-            "pkgbuild --component {} --install-location /Applications --identifier {} --version {} <component package>",
-            app.display(),
+            "pkgbuild --root <payload root> --component-plist <component plist> --scripts <controlled preinstall> --install-location /Applications --identifier {} --version {} <component package>",
             package::COMPONENT_IDENTIFIER,
             args.version
         ),
@@ -318,7 +492,37 @@ fn dry_run_plan(app: &Path, package: &Path, log_path: &Path, args: &SignArgs) ->
         ),
         format!("write notary log {}", log_path.display()),
         format!("write checksum/build metadata beside {}", package.display()),
-    ]
+    ];
+    if args.with_dmg {
+        plan.extend([
+            format!(
+                "build {}/Contents/MacOS/{} with bundle identifier {}",
+                "Siderostat Uninstaller.app",
+                dmg::UNINSTALLER_EXECUTABLE,
+                dmg::UNINSTALLER_IDENTIFIER
+            ),
+            "codesign --verify --deep --strict Siderostat Uninstaller.app".into(),
+            "ditto -c -k --keepParent Siderostat Uninstaller.app <temporary-notary.zip>".into(),
+            "xcrun notarytool submit <temporary-notary.zip> --keychain-profile <redacted> --wait --output-format json".into(),
+            "xcrun stapler staple <uninstaller.app>".into(),
+            "xcrun stapler validate <uninstaller.app>".into(),
+            "spctl --assess --type execute --verbose=4 <uninstaller.app>".into(),
+            format!("hdiutil create Siderostat-{}.dmg", args.version),
+            format!(
+                "codesign --force --options runtime --timestamp --sign <application identity> --identifier {} <dmg>",
+                dmg::DMG_IDENTIFIER
+            ),
+            "codesign --verify --strict --verbose=4 <dmg>".into(),
+            "xcrun notarytool submit <dmg> --keychain-profile <redacted> --wait --output-format json".into(),
+            "xcrun stapler staple <dmg>".into(),
+            "xcrun stapler validate <dmg>".into(),
+            "spctl --assess --type open --context context:primary-signature --verbose=4 <dmg>"
+                .into(),
+            "hdiutil attach/detach and verify exactly pkg + Uninstaller.app + README.html".into(),
+            "write DMG/Uninstaller checksums and DMG notary metadata".into(),
+        ]);
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -336,6 +540,8 @@ mod tests {
             output_dir: PathBuf::from("dist"),
             notary_log_dir: None,
             dry_run: true,
+            rollback: false,
+            with_dmg: false,
         }
     }
 
@@ -375,11 +581,51 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_with_dmg_includes_uninstaller_and_dmg_gate() {
+        let mut input = args("private-profile-name");
+        input.with_dmg = true;
+        let plan = dry_run_plan(
+            &input.app_dir.join("Siderostat.app"),
+            &input.output_dir.join("Siderostat-0.3.0.pkg"),
+            &input.output_dir.join("notary/log.json"),
+            &input,
+        )
+        .join("\n");
+        assert!(plan.contains(dmg::UNINSTALLER_IDENTIFIER));
+        assert!(plan.contains("hdiutil create Siderostat-0.3.0.dmg"));
+        assert!(plan.contains("spctl --assess --type open"));
+    }
+
+    #[test]
     fn profile_and_identity_validation_rejects_control_characters() {
         let mut input = args("profile\nwith-newline");
         assert!(validate_args(&input).is_err());
         input.notary_profile = "valid-profile".into();
         input.application_identity = "identity\0with-nul".into();
         assert!(validate_args(&input).is_err());
+    }
+
+    #[test]
+    fn rollback_dry_run_is_explicit_and_uses_rollback_artifact_names() {
+        let mut input = args("private-profile-name");
+        input.rollback = true;
+        let package = input
+            .output_dir
+            .join(package::package_filename(&input.version, input.rollback));
+        let log = input
+            .output_dir
+            .join("notary")
+            .join(package::notary_log_filename(&input.version, input.rollback));
+        let plan = dry_run_plan(
+            &input.app_dir.join("Siderostat.app"),
+            &package,
+            &log,
+            &input,
+        )
+        .join("\n");
+
+        assert!(plan.contains("package mode: rollback (BundleIsVersionChecked=false)"));
+        assert!(plan.contains("Siderostat-0.3.0-rollback.pkg"));
+        assert!(plan.contains("Siderostat-0.3.0-rollback-notary.json"));
     }
 }

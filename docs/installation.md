@@ -52,10 +52,10 @@ Supervisorが使用予定のoptionがCLI helpに存在することを確認す�
 
 Standalone profileとdistributed profileは独立した設定である（spec第14.1節）。
 
-- Standalone model variant: `q2`、`q2-q4`、`mxfp4`。
+- Standalone quantization: `q2`、`q2-q4`、`mxfp4`。
 - Standalone residency: `resident`または`ssd-streaming`。
 - Production Standalone: resident + DSpark support GGUF（現行DS4ではSSD streamingおよびDistributedとの併用不可）。
-- Distributed profile: `distributed-mxfp4`。
+- Distributed profile: `distributed-layer-parallel`（topology=`layer-parallel`、quantization=`mxfp4`、speculative support=`none`）。
 
 Modelはoperatorの既知のsourceから取得する。URLや配布条件は推測しない。取得後、両nodeでchecksumとsizeを記録する。
 
@@ -76,7 +76,7 @@ cargo xtask fingerprint-models --ds4-server "/absolute/path/to/ds4-server"
 
 旧形式cacheにはサンプル署名がない。modelが移動・複製・`touch`されただけで内容不変だとoperatorが確認済みの場合は、`cargo xtask install --accept-model-metadata-change`を一度指定してcached full digestを維持したままmetadataを更新できる。この指定でもsize変更は受理しない。内容に確信がない場合はfull SHA-256を再計算する。サンプル署名はmetadata drift時の高速な偶発変更検出であり、full-file SHA-256と同等の保証ではない。
 
-Distributed MXFP4は両nodeでcontent SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（spec第14.2節）。不一致ならMXFP4 promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFも各nodeでchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
+Distributed (layer-parallel) に用いる両nodeのmodel content SHA-256を一致させる（spec第14.2節）。現行配布では約156GBのMXFP4 GGUFを両nodeへ配置する（MXFP4はquantizationであり、topologyではない）。不一致ならlayer-parallel promotionを拒否し、両nodeをSolo Standaloneへ収束させて自動pairingを停止する（spec第15.3節）。DSpark support GGUFはspeculative supportの独立項目としてchecksum/sizeを記録し、そのnodeのStandalone manifestへ設定する。DS4 binaryはnode別digestを記録し、byte-for-byte一致ではなく、actual acceptance済みdigestだけを両manifestの同一 `compatible_ds4_binary_sha256` 集合へ昇順で記載する。未知rebuildを自動追加しない。各nodeのinstallでは `--peer-ds4-binary-digest` に相手nodeのdigestだけを指定し、自nodeのdigestはinstallが計算して集合へ追加する。
 
 Modelはcanonical absolute pathで指定し、書換可能なsymlinkを使わない（spec第14.2節、第22.3節）。配置先は`siderostat.example.toml`のplaceholder pathへ合わせる。
 
@@ -198,7 +198,7 @@ cp siderostat.example.toml "$HOME/Library/Application Support/siderostat/config.
 
 - `ds4.binary`の`PLACEHOLDER-ds4-server`。
 - `ds4.dspark.support_model`の`PLACEHOLDER-dspark-support-0731.gguf`。
-- `ds4.standalone.model`と`ds4.mxfp4.model`の`PLACEHOLDER-*.gguf`。
+- `ds4.standalone.model`と`ds4.distributed.model`の`PLACEHOLDER-*.gguf`。
 - Secret fileの`PLACEHOLDER-cluster-control`、`PLACEHOLDER-peer-proxy`、`PLACEHOLDER-admin`。両nodeで共有するcontrol/peerの値とnode-localのadmin値を参照する。
 - Manifest pathの`PLACEHOLDER-standalone.gguf`相当のmanifest JSON。
 
@@ -244,6 +244,25 @@ Standalone起動完了後の期待結果は次のとおりである。起動中�
 
 ## 6. Pairing、promotion、LaunchAgent、recovery、upgrade、rollback、uninstall
 
+### macOS app / package install
+
+配布 DMG 内の `.pkg` を Finder の Installer で開くか、次のコマンドで `/Applications` へ
+インストールする。
+
+```sh
+sudo /usr/sbin/installer -pkg "/path/to/Siderostat-0.3.0.pkg" -target /
+```
+
+既存の `/Applications/Siderostat.app` が起動中なら、package の `preinstall` がその Monitor
+だけを終了してから bundle を置き換える。runtime、`ds4-server`、設定、secret、model、cache は
+停止・削除しない。インストール成功後は `postinstall` が現在ログイン中の GUI ユーザーの session
+で Siderostat を自動起動し、アプリが runtime と Siderostat の Login Item を `SMAppService` へ
+登録する。承認が必要な場合は System Settings > General > Login Items を開く。
+
+ログイン中の GUI ユーザーがいない状態での install は成功するが、自動起動はスキップされる。
+その場合は、ログイン後に `/Applications/Siderostat.app` を一度起動する。package の管理者承認と
+Login Items / Background Items のユーザー承認は別の macOS 操作である。
+
 ### Pairing
 
 両nodeでSolo Standalone ready後、Bonjour discoveryが`bridge0`に限定される。Bonjour結果だけではpairingせず、`bridge0` route、HMAC control handshake、leaseを必須とする（spec第13.3節、第38節）。`AuthenticatedPeer`でpairing候補になり、peer stability（既定5秒）後にpairする。
@@ -260,7 +279,7 @@ Pairing完了後は両nodeで`mode=paired-standalone`、`state=paired-standalone
 
 ### Promotion
 
-MXFP4 promotionにはdeployment matchと実HELLOとcomplete routeが必須（spec第33.3節）。まずfingerprintを実行する。
+layer-parallel promotionにはdeployment matchと実HELLOとcomplete routeが必須（spec第33.3節）。まずfingerprintを実行する。
 
 ```sh
 siderostat cluster fingerprint --profile standalone
@@ -275,9 +294,9 @@ Binary/model/checkpoint/context/layer split/wire schema/argv profileが一致す
 siderostat cluster promote
 ```
 
-Cluster-wide drain後にDS4を停止し、coordinator MXFP4起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
+Cluster-wide drain後にDS4を停止し、coordinator の layer-parallel child を起動（`--debug`）、worker registered、complete route readyでDistributedReadyへ入る（spec第18.3節）。HTTP listeningだけでDistributedReadyにしない。
 
-Promotion完了後は両nodeで`mode=distributed-mxfp4`、`state=distributed-ready`、`ready=true`を確認する。Fingerprint commandは受付時にjob ID付きJSONを返す。Compatibility不一致、HELLO timeout、route incompleteのいずれかがある場合は`distributed-ready`を期待せず、[`docs/troubleshooting.md`](troubleshooting.md)に従う。
+Promotion完了後は両nodeで`mode=distributed-layer-parallel`、`state=distributed-ready`、`ready=true`を確認する。Fingerprint commandは受付時にjob ID付きJSONを返す。Compatibility不一致、HELLO timeout、route incompleteのいずれかがある場合は`distributed-ready`を期待せず、[`docs/troubleshooting.md`](troubleshooting.md)に従う。
 
 ### LaunchAgent
 
@@ -351,10 +370,25 @@ DS4 update時は`docs/spec.md`第36節のcompatibility trackingに従う。
 - 旧affinity databaseを自動削除しない。
 - 新configは旧configと分離し、`schema_version == 2`の作業fileを保持する。
 - Binary rollbackは直前のbinaryを残し、standalone readinessを確認してから行う。Upgrade後にrollbackし、再度upgradeする（plan P7-02）。
+- macOS app bundle の downgrade は通常の `.pkg` では行わない。配布側で `cargo xtask sign --rollback`
+  により生成した `Siderostat-<version>-rollback.pkg` だけを明示的な rollback artifact として使用する。
+  通常 package は bundle version check を維持し、runtime、LaunchAgent、設定、secret、model、cache は
+  installer の対象外である。
 
 ### Uninstall
 
-`contrib/launchd/README.md`に従う。先にjobを停止してからplistを移動する。Model、KV cache、secret、runtime stateは自動削除しない。
+エンドユーザー向けの標準手順は、リリース DMG の `Siderostat Uninstaller.app` を Finder から
+起動することである。確認ダイアログで承認すると、Uninstaller は次を順に実行する。
+
+1. `SMAppService` の `siderostat-runtime` LaunchAgent と Siderostat のログイン項目を解除する。
+2. identity を確認した `Siderostat` Monitor、runtime、管理対象 ds4-server child を停止する。
+3. `/Applications/Siderostat.app` だけを Finder の Trash へ移動する。
+4. Siderostat の package receipt だけを整理する。
+
+Application Support、設定、secret、manifest、cluster state、model、KV cacheは削除しない。
+処理に失敗した場合はアプリ bundleを残し、表示された状態を解消して同じ Uninstaller を再実行する。
+Uninstaller は二重実行にも対応する。Terminal の `launchctl bootout` や手動の削除は、実機診断時を
+除きエンドユーザー向け手順ではない。
 
 ```sh
 launchctl bootout "gui/$(id -u)/local.siderostat.runtime"

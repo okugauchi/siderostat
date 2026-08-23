@@ -669,7 +669,7 @@ async fn promotion_waits_for_in_flight_stream_and_complete_route_before_serving(
 
     coordinator.set_route_ready(true);
     let ready = promotion.await.unwrap().unwrap();
-    assert_eq!(ready.stable_mode, StableMode::DistributedMxfp4);
+    assert_eq!(ready.stable_mode, StableMode::DistributedLayerParallel);
     assert_eq!(ready.state, ClusterState::DistributedReady);
     assert_eq!(peer.drains.load(Ordering::SeqCst), 1);
     assert_eq!(proxy.target_snapshot().target, ProxyTarget::LocalStandalone);

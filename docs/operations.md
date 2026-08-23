@@ -2,6 +2,19 @@
 
 この文書は、`docs/spec.md`と実装済みのadmin API / CLI / logging / metricsに基づき、siderostatの運用手順を定める。実DS4 binaryとmodelを使う導入は [`docs/installation.md`](installation.md) を参照する。
 
+## SSH での診断コマンド
+
+Mac Studio などへ SSH した非対話 shell では、Homebrew の `/opt/homebrew/bin` が `PATH` に
+含まれないことがある。`rg` がインストール済みでも `command not found` になる場合は、絶対
+path を使うか、診断コマンドの先頭で PATH を補う。
+
+```sh
+ssh o@m4max-macstudio.local 'PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; export PATH; command -v rg; rg --version'
+```
+
+これは `rg` のインストール状態の問題ではなく、SSH session の環境差である。agent が read-only
+証跡を収集するときも同じ PATH を明示する。
+
 ## 1. Status確認
 
 Running processの状態を `cluster status` または `GET /cluster` で確認する。CLIはadmin API clientであり、別supervisorを起動しない。
@@ -76,7 +89,7 @@ Redaction（spec第25.3節）:
 
 `GET /metrics` はPrometheus text formatで返す。Loopback `127.0.0.1:18081`（既定）にのみbindする。
 
-worker が Paired Standalone または Distributed MXFP4 で coordinator を target にしている
+worker が Paired Standalone または Distributed (layer-parallel) で coordinator を target にしている
 場合、メニューバーモニターは worker の `/metrics/coordinator` を利用する。この endpoint
 は coordinator の loopback admin API を公開せず、worker の署名付き control request で
 coordinator の `/v1/metrics` を取得する。worker が Solo Standalone の場合は従来どおり
@@ -104,11 +117,11 @@ Spec第26節のfamilyを確認する。
 - `ds4_proxy_cluster_transitions_total{from,to,result,reason}`
 - `ds4_proxy_cluster_transition_duration_seconds{transition}`
 - `ds4_proxy_cluster_child_restarts_total{profile,reason}`
-- `ds4_proxy_standalone_profile_info{node_id,model_variant,residency}`
+- `ds4_proxy_standalone_profile_info{node_id,quantization,speculative_support,residency}`
 - `ds4_proxy_cluster_hello_total{result,reason}`
 - `ds4_proxy_cluster_deployment_mismatch_total{field}`
 
-`model_variant` と `residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない（spec第26節）。
+`quantization`、`speculative_support`、`residency` は設定で許可した有限enumだけをlabel値にする。Profile ID、session、request ID、PID、generation、full digestをlabelにしない（spec第26節）。
 
 ## 5. Manual state
 
@@ -140,7 +153,7 @@ siderostat cluster restart
 - 通常停止はSIGTERM。Drain完了後にsignalする（spec第20.3節）。
 - Stop timeout後のSIGKILLは既定で許可されるが、identityを直前に再確認できたowned childだけを対象とする。`allow_sigkill=false` に変更した場合はmanual intervention（spec第12.4節）。
 - Unknown processへ無条件にsignalしない。起動時に既存の `siderostat` / `ds4-server` を検出した場合は、macOS右上の簡潔な通知と警告音を出し、既定では5秒後に各signal直前のidentity再確認後にSIGTERM、必要ならSIGKILLを送る。拒否は `startup_cleanup.auto_restart = false` または `--decline-startup-cleanup` で指定する。拒否・identity不一致・停止失敗時は新しいsiderostatを起動しない（spec第20.2節、第38節）。
-- Restartはmodeを変えない。Paired Standalone / Distributed MXFP4中のchild再起動はmode遷移を引き起こさない。
+- Restartはmodeを変えない。Paired Standalone / Distributed (layer-parallel) 中のchild再起動はmode遷移を引き起こさない。
 
 ## 7. Rollback
 
@@ -150,6 +163,9 @@ Rollbackは [`docs/installation.md`](installation.md) のRollback節に従う。
 - 旧affinity databaseを自動削除しない。読まない、変更しない、削除しない（spec第22.4節、第38節）。
 - 新configは旧configと分離し、`schema_version == 2` の作業fileを保持する。
 - Binary rollbackは直前のbinaryを残し、standalone readinessを確認してから行う。Upgrade後にrollbackし、再度upgradeする（plan P7-02）。
+- macOS app bundle の downgrade は通常の `.pkg` では行わず、配布側で `cargo xtask sign --rollback`
+  により生成した `Siderostat-<version>-rollback.pkg` を明示的に指定する。通常 package は bundle
+  version check を維持し、runtime、LaunchAgent、設定、secret、model、cache は installer の対象外である。
 - 起動前に `cluster doctor` と `/readyz` でstandalone readinessを確認する。Rollback後はSolo Standalone readyを確認してからpairing/promotionへ進む。
 - candidateを継続利用する判定でも、rollback binary/config/state/plistを緊急復旧用に保持する。正規
   名称のRelease Candidate artifactとchecksumの確定は、merge後の再生成・再検証で行う。
@@ -161,3 +177,14 @@ Rollbackは [`docs/installation.md`](installation.md) のRollback節に従う。
 - Admin mutationはloopbackでもtoken必須。GETはsecretを返さない。
 - Mode切替は503の短いwindowを含む。切替中に新規requestは503 + `Retry-After`で拒否され、既存streamは完走する。
 - Workerからcoordinatorへのrequestはproxyを2 hop通る。Peer data/DS4 native trafficは暗号化されない。専用の物理Thunderbolt linkを信頼境界とする。
+
+## 9. DMG Uninstaller
+
+リリース DMG は `Siderostat-<version>.pkg`、`Siderostat Uninstaller.app`、`README.html` の3項目だけを
+収録する。エンドユーザーは `Siderostat Uninstaller.app` を Finder から起動し、確認 UI の承認後に
+アンインストールを実行する。
+
+Uninstaller は runtime と Siderostat のログイン項目を `SMAppService` で解除し、固定 executable path
+と PID identity が一致するプロセスだけを停止してから `/Applications/Siderostat.app` を Trash へ移動する。
+設定、secret、manifest、cluster state、model、KV cacheは保持する。処理が一部完了した状態でも再実行
+でき、Terminal の `sudo rm -rf` や `killall` は使用しない。

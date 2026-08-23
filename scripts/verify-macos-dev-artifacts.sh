@@ -87,6 +87,8 @@ verify_expanded_package() {
     local payload_dir payload_entry file rel scripts_dir script package_info
     local payload_dirs=()
     local entries=()
+    local scripts_dirs=()
+    local script_files=()
 
     while IFS= read -r -d '' payload_dir; do
         payload_dirs+=("$payload_dir")
@@ -132,9 +134,44 @@ verify_expanded_package() {
     done < <(find "$payload_dir" -type f -print0)
 
     while IFS= read -r -d '' scripts_dir; do
-        script="$(find "$scripts_dir" -type f -print -quit)"
-        [[ -z "$script" ]] || { fail "installer script found: $script"; return 1; }
+        scripts_dirs+=("$scripts_dir")
     done < <(find "$expand_dir" -type d -name Scripts -print0)
+    [[ "${#scripts_dirs[@]}" -eq 1 ]] || {
+        fail "expected exactly one Scripts directory, found ${#scripts_dirs[@]}"
+        return 1
+    }
+    while IFS= read -r -d '' script; do
+        script_files+=("$script")
+    done < <(find "${scripts_dirs[0]}" -type f -print0)
+    [[ "${#script_files[@]}" -eq 1 ]] || {
+        fail "expected exactly one installer script, found ${#script_files[@]}"
+        return 1
+    }
+    script="${script_files[0]}"
+    [[ "${script##*/}" == "preinstall" ]] || {
+        fail "unexpected installer script: $script"
+        return 1
+    }
+    sh -n "$script" || {
+        fail "preinstall script has invalid shell syntax: $script"
+        return 1
+    }
+    grep -Fq "/Applications/Siderostat.app/Contents/MacOS/Siderostat" "$script" || {
+        fail "preinstall script is missing the exact Monitor path"
+        return 1
+    }
+    grep -Fq "/bin/kill -TERM" "$script" || {
+        fail "preinstall script is missing SIGTERM handling"
+        return 1
+    }
+    grep -Fq "/bin/kill -KILL" "$script" || {
+        fail "preinstall script is missing SIGKILL fallback"
+        return 1
+    }
+    if grep -Eq 'killall|pkill|LaunchAgents|launchctl|ds4-server|siderostat-runtime' "$script"; then
+        fail "preinstall script contains an out-of-scope process or service operation"
+        return 1
+    fi
 
     for script in "$expand_dir/.preinstall" "$expand_dir/.postinstall"; do
         [[ ! -e "$script" ]] || { fail "installer script found: $script"; return 1; }

@@ -171,7 +171,7 @@ async fn assert_distributed_consistent(coordinator: &Node, worker: &Node) {
         );
         assert_eq!(
             observed.stable_mode,
-            StableMode::DistributedMxfp4,
+            StableMode::DistributedLayerParallel,
             "distributed stable mode"
         );
         assert!(observed.distributed_running, "distributed child running");

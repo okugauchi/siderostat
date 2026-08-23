@@ -10,6 +10,7 @@ use std::path::PathBuf;
 /// 検査対象の template file（repository root からの相対 path）。
 const TEMPLATES: &[&str] = &[
     "contrib/macos/Info.plist.in",
+    "contrib/macos/Uninstaller-Info.plist.in",
     "contrib/macos/dev.siderostat-ds4-proxy.runtime.plist",
     "contrib/macos/entitlements.plist",
 ];
@@ -82,6 +83,14 @@ fn bundle_templates_use_new_identifier_and_version_placeholders() {
     let runtime_contents = std::fs::read_to_string(&runtime).unwrap();
     assert!(runtime_contents.contains("<string>dev.siderostat-ds4-proxy.runtime</string>"));
 
+    let uninstaller = repo_root().join("contrib/macos/Uninstaller-Info.plist.in");
+    let uninstaller_contents = std::fs::read_to_string(&uninstaller).unwrap();
+    assert!(uninstaller_contents.contains("dev.siderostat-ds4-proxy.uninstaller"));
+    assert!(uninstaller_contents.contains("Siderostat Uninstaller"));
+    assert!(uninstaller_contents.contains("<key>LSUIElement</key>\n  <false/>"));
+    assert!(!uninstaller_contents.contains("CFBundleIconFile"));
+    assert!(!uninstaller_contents.contains("AppIcon"));
+
     let entitlements = repo_root().join("contrib/macos/entitlements.plist");
     let entitlements_contents = std::fs::read_to_string(&entitlements).unwrap();
     assert!(entitlements_contents.contains("<dict>"));
@@ -99,4 +108,21 @@ fn resources_include_license_notices_and_default_config() {
     }
     let license = std::fs::read_to_string(resources.join("LICENSE")).unwrap();
     assert!(license.contains("MIT License"));
+    for locale in ["en.lproj", "ja.lproj"] {
+        let strings = resources.join(locale).join("Localizable.strings");
+        assert!(
+            strings.is_file(),
+            "missing localized resource {}",
+            strings.display()
+        );
+        let contents = std::fs::read_to_string(strings).unwrap();
+        assert!(contents.contains("app.name"));
+        assert!(contents.contains("menu.settings"));
+        assert!(contents.contains("menu.quit"));
+        assert!(contents.contains("first_launch.version"));
+        assert!(contents.contains("first_launch.approval"));
+        assert!(contents.contains("first_launch.model_ready"));
+        assert!(contents.contains("uninstaller.confirm.title"));
+        assert!(contents.contains("uninstaller.failure.title"));
+    }
 }

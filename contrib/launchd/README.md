@@ -41,7 +41,7 @@ monitor の plist は `cargo xtask install` で同じ `LaunchAgents` ディレ�
 ## GUIドメイン必須
 
 このplistには `LimitLoadToSessionType = Aqua` を指定しています。デスクトップ通知
-(`osascript display notification`) はユーザーのAquaセッション内のNotification Centerで
+(UserNotifications) はユーザーのAquaセッション内のNotification Centerで
 表示されるため、LaunchAgentを `gui/<uid>` ドメインに載せる必要があります。
 
 - `system/` (LaunchDaemon) や `user/<uid>` ドメインへ誤ってロードすると、ロード自体が

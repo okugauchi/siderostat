@@ -23,7 +23,8 @@ pub enum ControlRole {
 pub enum ControlMode {
     SoloStandalone,
     PairedStandalone,
-    DistributedMxfp4,
+    #[serde(alias = "distributed-mxfp4")]
+    DistributedLayerParallel,
     Transitioning,
 }
 
@@ -668,5 +669,15 @@ mod tests {
         body.extend(&vec![0; CONTROL_BODY_LIMIT]).unwrap();
         assert_eq!(body.extend(&[0]), Err(AuthError::BodyTooLarge));
         assert_eq!(body.as_bytes().len(), CONTROL_BODY_LIMIT);
+    }
+
+    #[test]
+    fn reads_the_legacy_distributed_mxfp4_control_mode_alias() {
+        let mode: ControlMode = serde_json::from_str("\"distributed-mxfp4\"").unwrap();
+        assert_eq!(mode, ControlMode::DistributedLayerParallel);
+        assert_eq!(
+            serde_json::to_string(&mode).unwrap(),
+            "\"distributed-layer-parallel\""
+        );
     }
 }

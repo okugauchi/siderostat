@@ -2,17 +2,16 @@
 //!
 //! A small interface that lets the menu / first-launch UI read the platform
 //! status of the runtime LaunchAgent helper and the main-app login item
-//! without touching framework objects directly. This task implements status
-//! reads only; registration state is NOT changed here (C-02 adds register /
-//! unregister).
+//! without touching framework objects directly. The menu and first-launch
+//! startup driver use the same adapter for status, registration, and
+//! unregistration.
 //!
 //! The macOS implementation uses the ServiceManagement framework via objc2.
 //! The test fake is a separate type so UI logic can be exercised without a
 //! framework session.
 //!
-//! The adapter is exercised from the first-launch / menu UI in C-05; until it
-//! is wired to production code the module is dead code from the crate's
-//! perspective, so allow dead_code here.
+//! The fake remains available so UI lifecycle logic can be tested without a
+//! framework session.
 #![allow(dead_code)]
 
 #[cfg(target_os = "macos")]
@@ -112,6 +111,28 @@ pub enum UnregisterOutcome {
     Error(String),
 }
 
+/// The services that must be removed by the product uninstaller, in order.
+pub const UNINSTALL_SERVICE_KINDS: [ServiceKind; 2] =
+    [ServiceKind::RuntimeAgent, ServiceKind::MainAppLoginItem];
+
+/// Unregister all product-owned services while preserving idempotency.
+///
+/// Every service is attempted even when an earlier one fails so a retry can
+/// finish cleanup without depending on the previous partial result.
+pub fn unregister_all_services(adapter: &impl ServiceManagementAdapter) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for kind in UNINSTALL_SERVICE_KINDS {
+        if let UnregisterOutcome::Error(error) = adapter.unregister(kind) {
+            errors.push(format!("{}: {error}", kind.label()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Real macOS implementation backed by `SMAppService`.
 ///
 /// `SMAppService` is only usable from the main thread on macOS; callers must
@@ -162,7 +183,17 @@ impl ServiceManagementAdapter for ServiceManagement {
         let service = self.service(kind);
         // SAFETY: main-thread framework call (see status).
         if let Err(error) = unsafe { service.registerAndReturnError() } {
-            return classify_register_error(&error);
+            let outcome = classify_register_error(&error);
+            // Apple reports kSMErrorLaunchDeniedByUser while an item is still
+            // awaiting the user's Login Items approval. Preserve that state so
+            // the UI opens the approval path instead of reporting a hard
+            // denial.
+            if outcome == RegisterOutcome::DeniedByUser
+                && self.status(kind) == ServiceStatus::RequiresApproval
+            {
+                return RegisterOutcome::RequiresApproval;
+            }
+            return outcome;
         }
         // Do not fake approval shortages as success: re-read the real status.
         match self.status(kind) {
@@ -483,6 +514,51 @@ mod tests {
             fake.unregister(ServiceKind::RuntimeAgent),
             UnregisterOutcome::Error("unregister failed".into())
         );
+    }
+
+    #[test]
+    fn uninstaller_service_order_covers_runtime_and_main_app() {
+        assert_eq!(
+            UNINSTALL_SERVICE_KINDS,
+            [ServiceKind::RuntimeAgent, ServiceKind::MainAppLoginItem]
+        );
+    }
+
+    #[test]
+    fn uninstaller_service_order_is_safe_to_repeat() {
+        let mut fake = FakeServiceManagement::new();
+        fake.set_unregister_outcome(
+            ServiceKind::RuntimeAgent,
+            UnregisterOutcome::AlreadyNotRegistered,
+        );
+        fake.set_unregister_outcome(
+            ServiceKind::MainAppLoginItem,
+            UnregisterOutcome::AlreadyNotRegistered,
+        );
+
+        for kind in UNINSTALL_SERVICE_KINDS {
+            assert_eq!(
+                fake.unregister(kind),
+                UnregisterOutcome::AlreadyNotRegistered
+            );
+        }
+    }
+
+    #[test]
+    fn uninstaller_continues_after_one_service_reports_error() {
+        let mut fake = FakeServiceManagement::new();
+        fake.set_unregister_outcome(
+            ServiceKind::RuntimeAgent,
+            UnregisterOutcome::Error("runtime failure".into()),
+        );
+        fake.set_unregister_outcome(
+            ServiceKind::MainAppLoginItem,
+            UnregisterOutcome::Error("login item failure".into()),
+        );
+
+        let error = unregister_all_services(&fake).expect_err("errors must be reported");
+        assert!(error.contains("runtime failure"));
+        assert!(error.contains("login item failure"));
     }
 
     #[cfg(target_os = "macos")]

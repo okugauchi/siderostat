@@ -18,8 +18,9 @@ tray-icon = "0.24.2"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-core-foundation = "0.3"
-objc2-foundation = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSBundle", "NSString", "NSUserDefaults"] }
 objc2-service-management = "0.3.2"
+siderostat-core = { package = "siderostat", path = ".." }
 
 
 [dev-dependencies]

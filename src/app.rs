@@ -13,7 +13,7 @@ use crate::{
         detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
         required_port_available, spawn_network_event_monitor,
     },
-    config::{ModeAwareConfig, ModelVariant, Residency},
+    config::{ModeAwareConfig, Quantization, Residency, SpeculativeSupport},
     metrics::{MetricSnapshot, Metrics},
     notify::{DesktopNotificationService, NotifyPlatform, build_notifier},
     proxy::{
@@ -48,7 +48,8 @@ pub struct AppConfig {
     pub cluster_enabled: bool,
     pub interface: String,
     pub standalone_profile_id: String,
-    pub standalone_model_variant: ModelVariant,
+    pub standalone_quantization: Quantization,
+    pub standalone_speculative_support: SpeculativeSupport,
     pub standalone_residency: Residency,
 }
 
@@ -112,7 +113,12 @@ impl AppState {
                 cluster_enabled: config.cluster.enabled,
                 interface: config.cluster.interface,
                 standalone_profile_id: config.ds4.standalone.profile_id,
-                standalone_model_variant: config.ds4.standalone.model_variant,
+                standalone_quantization: config.ds4.standalone.quantization,
+                standalone_speculative_support: if config.ds4.dspark.enabled {
+                    SpeculativeSupport::Dspark
+                } else {
+                    SpeculativeSupport::None
+                },
                 standalone_residency: config.ds4.standalone.residency,
             }),
             proxy,
@@ -568,7 +574,7 @@ impl BootInputs {
             None
         };
         let distributed_manifest = if config.cluster.enabled {
-            let bytes = std::fs::read(&config.ds4.mxfp4.model_manifest)?;
+            let bytes = std::fs::read(&config.ds4.distributed.model_manifest)?;
             Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
         } else {
             None
@@ -699,7 +705,7 @@ fn attach_control_plane(
             runtime: runtime.clone(),
             supervisor: supervisor.clone(),
             standalone_model: config.ds4.standalone.model.clone(),
-            distributed_model: config.ds4.mxfp4.model.clone(),
+            distributed_model: config.ds4.distributed.model.clone(),
             production: production.clone(),
             interface: config.cluster.interface.clone(),
             coordinator_address: config.cluster.coordinator_address,
@@ -742,7 +748,7 @@ pub async fn admin_http_reconcile(
             runtime: runtime.clone(),
             supervisor,
             standalone_model: config.ds4.standalone.model.clone(),
-            distributed_model: config.ds4.mxfp4.model.clone(),
+            distributed_model: config.ds4.distributed.model.clone(),
             production: production.as_ref().map(|p| (**p).clone()),
             interface: config.cluster.interface.clone(),
             coordinator_address: config.cluster.coordinator_address,
@@ -1055,7 +1061,7 @@ async fn persist_runtime_state(
     active_profile: &str,
 ) -> anyhow::Result<()> {
     let snapshot = runtime.snapshot();
-    let distributed = if snapshot.stable_mode == StableMode::DistributedMxfp4 {
+    let distributed = if snapshot.stable_mode == StableMode::DistributedLayerParallel {
         match production {
             Some(production) => production.distributed_child_identity().await,
             None => None,
@@ -1094,11 +1100,13 @@ async fn persist_runtime_state(
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
             ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
         },
-        active_profile: Some(if snapshot.stable_mode == StableMode::DistributedMxfp4 {
-            "distributed-mxfp4".into()
-        } else {
-            active_profile.into()
-        }),
+        active_profile: Some(
+            if snapshot.stable_mode == StableMode::DistributedLayerParallel {
+                "distributed-layer-parallel".into()
+            } else {
+                active_profile.into()
+            },
+        ),
         child,
         last_failure: None,
     })?;
@@ -1109,7 +1117,7 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
     match mode {
         StableMode::SoloStandalone => PersistentMode::SoloStandalone,
         StableMode::PairedStandalone => PersistentMode::PairedStandalone,
-        StableMode::DistributedMxfp4 => PersistentMode::DistributedMxfp4,
+        StableMode::DistributedLayerParallel => PersistentMode::DistributedLayerParallel,
     }
 }
 
@@ -1523,11 +1531,11 @@ async fn health() -> Json<Value> {
     }))
 }
 
-/// runtime crate version。ビルド時 metadata は配布 bundle の Info.plist と比較するために
-/// read-only admin response から取得できるようにする（B-01）。git commit と build number は
-/// ビルド時に環境変数から注入され、未設定時は "unknown" を返す。user data を作成しない。
+/// runtime version。配布 bundle の build では `SIDEROSTAT_VERSION` を注入し、
+/// 通常の Cargo 開発 build では crate version にフォールバックする。git commit と build
+/// number もビルド時に環境変数から注入され、未設定時は "unknown" を返す（B-01/D-03）。
 fn runtime_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    option_env!("SIDEROSTAT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn runtime_git_commit() -> &'static str {
@@ -1587,7 +1595,8 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
         "interface": state.config.interface,
         "active_standalone_profile": {
             "profile_id": state.config.standalone_profile_id,
-            "model_variant": state.config.standalone_model_variant.name(),
+            "quantization": state.config.standalone_quantization.name(),
+            "speculative_support": state.config.standalone_speculative_support.name(),
             "residency": state.config.standalone_residency.name(),
         },
         "child": Value::Null,
@@ -1604,7 +1613,8 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         peer_lease_seconds: 0.0,
         thunderbolt_ip_state: "unknown",
         discovery_results: 0,
-        model_variant: state.config.standalone_model_variant,
+        quantization: state.config.standalone_quantization,
+        speculative_support: state.config.standalone_speculative_support,
         residency: state.config.standalone_residency,
     });
     response_with_body(
@@ -1842,7 +1852,8 @@ mod tests {
                 cluster_enabled: false,
                 interface: "bridge0".into(),
                 standalone_profile_id: "test-profile".into(),
-                standalone_model_variant: ModelVariant::Q2Q4,
+                standalone_quantization: Quantization::Q2Q4,
+                standalone_speculative_support: SpeculativeSupport::None,
                 standalone_residency: Residency::SsdStreaming,
             }),
             proxy,
@@ -1870,9 +1881,9 @@ mod tests {
             argv: vec![OsString::from("3600")],
             profile: crate::cluster::Ds4Profile {
                 profile_id: "test-profile".into(),
-                model_variant: ModelVariant::Q2Q4,
+                quantization: Quantization::Q2Q4,
                 residency: Residency::SsdStreaming,
-                dspark_required: false,
+                speculative_support: crate::config::SpeculativeSupport::None,
             },
         };
         let supervisor = Arc::new(StandaloneSupervisor::new(
@@ -2004,7 +2015,7 @@ mod tests {
                         node_id: "worker-node".into(),
                         role: ControlRole::Worker,
                         generation: 7,
-                        mode: ControlMode::DistributedMxfp4,
+                        mode: ControlMode::DistributedLayerParallel,
                     }),
                 },
             },
@@ -2038,7 +2049,10 @@ mod tests {
         assert_eq!(session["lease"]["peer"]["node-id"], "worker-node");
         assert_eq!(session["lease"]["peer"]["role"], "worker");
         assert_eq!(session["lease"]["peer"]["generation"], 7);
-        assert_eq!(session["lease"]["peer"]["mode"], "distributed-mxfp4");
+        assert_eq!(
+            session["lease"]["peer"]["mode"],
+            "distributed-layer-parallel"
+        );
 
         let children = children_json(&diagnostics.children);
         assert_eq!(children["standalone"]["pid"], 1234);

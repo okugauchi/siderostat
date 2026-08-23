@@ -64,8 +64,8 @@ fn open_target(config_path: &Path) -> Option<PathBuf> {
 }
 
 /// Open System Settings at the Login Items pane so the user can approve the
-/// Siderostat background service. Shown only when the runtime registration
-/// reports `requiresApproval` (C-05b/C-05c).
+/// Siderostat background service or main-app login item. Shown when either
+/// registration reports `requiresApproval` (C-05b/C-05c).
 pub fn open_login_items() -> Result<()> {
     let status = Command::new("/usr/bin/open")
         .arg(LOGIN_ITEMS_SCHEME)
