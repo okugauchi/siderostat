@@ -143,33 +143,64 @@ verify_expanded_package() {
     while IFS= read -r -d '' script; do
         script_files+=("$script")
     done < <(find "${scripts_dirs[0]}" -type f -print0)
-    [[ "${#script_files[@]}" -eq 1 ]] || {
-        fail "expected exactly one installer script, found ${#script_files[@]}"
+    [[ "${#script_files[@]}" -eq 2 ]] || {
+        fail "expected exactly two installer scripts, found ${#script_files[@]}"
         return 1
     }
-    script="${script_files[0]}"
-    [[ "${script##*/}" == "preinstall" ]] || {
-        fail "unexpected installer script: $script"
+    local preinstall_script=""
+    local postinstall_script=""
+    for script in "${script_files[@]}"; do
+        case "${script##*/}" in
+            preinstall) preinstall_script="$script" ;;
+            postinstall) postinstall_script="$script" ;;
+            *)
+                fail "unexpected installer script: $script"
+                return 1
+                ;;
+        esac
+    done
+    [[ -n "$preinstall_script" && -n "$postinstall_script" ]] || {
+        fail "installer scripts must include preinstall and postinstall"
         return 1
     }
-    sh -n "$script" || {
-        fail "preinstall script has invalid shell syntax: $script"
+    sh -n "$preinstall_script" || {
+        fail "preinstall script has invalid shell syntax: $preinstall_script"
         return 1
     }
-    grep -Fq "/Applications/Siderostat.app/Contents/MacOS/Siderostat" "$script" || {
+    sh -n "$postinstall_script" || {
+        fail "postinstall script has invalid shell syntax: $postinstall_script"
+        return 1
+    }
+    grep -Fq "/Applications/Siderostat.app/Contents/MacOS/Siderostat" "$preinstall_script" || {
         fail "preinstall script is missing the exact Monitor path"
         return 1
     }
-    grep -Fq "/bin/kill -TERM" "$script" || {
+    grep -Fq "/bin/kill -TERM" "$preinstall_script" || {
         fail "preinstall script is missing SIGTERM handling"
         return 1
     }
-    grep -Fq "/bin/kill -KILL" "$script" || {
+    grep -Fq "/bin/kill -KILL" "$preinstall_script" || {
         fail "preinstall script is missing SIGKILL fallback"
         return 1
     }
-    if grep -Eq 'killall|pkill|LaunchAgents|launchctl|ds4-server|siderostat-runtime' "$script"; then
+    if grep -Eq 'killall|pkill|LaunchAgents|launchctl|ds4-server|siderostat-runtime' "$preinstall_script"; then
         fail "preinstall script contains an out-of-scope process or service operation"
+        return 1
+    fi
+    grep -Fq "/bin/launchctl asuser" "$postinstall_script" || {
+        fail "postinstall script is missing the active-user launch request"
+        return 1
+    }
+    grep -Fq "/usr/bin/open -a" "$postinstall_script" || {
+        fail "postinstall script is missing the app launch request"
+        return 1
+    }
+    grep -Fq "/Applications/Siderostat.app" "$postinstall_script" || {
+        fail "postinstall script is missing the exact app path"
+        return 1
+    }
+    if grep -Eq 'killall|pkill|ds4-server|siderostat-runtime|Application Support|LaunchAgents' "$postinstall_script"; then
+        fail "postinstall script contains an out-of-scope process, service, or user-data operation"
         return 1
     fi
 
@@ -210,6 +241,26 @@ run_fixture_tests() {
         > "$fixture/extra-payload/PackageInfo"
     touch "$fixture/extra-payload/Payload/usr/local/bin/rogue"
     expect_failure "extra package payload" verify_expanded_package "$fixture/extra-payload"
+
+    mkdir -p "$fixture/valid-package/Payload/Siderostat.app" \
+        "$fixture/valid-package/Scripts"
+    printf '%s\n' '<pkg-info install-location="/Applications"/>' \
+        > "$fixture/valid-package/PackageInfo"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        "APP_EXECUTABLE='/Applications/Siderostat.app/Contents/MacOS/Siderostat'" \
+        '/bin/kill -TERM "$pid"' \
+        '/bin/kill -KILL "$pid"' \
+        > "$fixture/valid-package/Scripts/preinstall"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        "APP='/Applications/Siderostat.app'" \
+        '/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/open -a "$APP"' \
+        'exit 0' \
+        > "$fixture/valid-package/Scripts/postinstall"
+    chmod +x "$fixture/valid-package/Scripts/preinstall" \
+        "$fixture/valid-package/Scripts/postinstall"
+    verify_expanded_package "$fixture/valid-package"
 
     mkdir -p "$fixture/unsigned-helper/Contents/Helpers" \
         "$fixture/unsigned-helper/Contents/MacOS" \
