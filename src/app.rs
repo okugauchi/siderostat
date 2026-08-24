@@ -69,6 +69,7 @@ pub struct AppState {
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
     supervisor: RwLock<Option<Arc<StandaloneSupervisor>>>,
+    notification_service: RwLock<Option<Arc<std::sync::Mutex<DesktopNotificationService>>>>,
     recovery: RecoveryService,
     recovery_config: RecoveryConfig,
     graceful_restart_in_progress: std::sync::atomic::AtomicBool,
@@ -138,6 +139,7 @@ impl AppState {
             admin: RwLock::new(None),
             production: RwLock::new(None),
             supervisor: RwLock::new(None),
+            notification_service: RwLock::new(None),
             recovery: RecoveryService::with_policy(RecoveryPolicy {
                 history_limit: RECOVERY_HISTORY_LIMIT,
                 cooldown: duration_millis(recovery_config.cooldown),
@@ -250,6 +252,23 @@ impl AppState {
             .supervisor
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supervisor);
+    }
+
+    fn attach_notification_service(
+        &self,
+        service: Arc<std::sync::Mutex<DesktopNotificationService>>,
+    ) {
+        *self
+            .notification_service
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(service);
+    }
+
+    fn notification_service(&self) -> Option<Arc<std::sync::Mutex<DesktopNotificationService>>> {
+        self.notification_service
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn supervisor(&self) -> Option<Arc<StandaloneSupervisor>> {
@@ -554,11 +573,13 @@ pub async fn serve_with_options(
         config.notifications.sound,
         NotifyPlatform::detect(),
     );
-    let notification_service = DesktopNotificationService::new(notifier);
+    let notification_service =
+        DesktopNotificationService::with_metrics(notifier, state.metrics.clone());
     if config.notifications.enabled {
         notification_service.log_session_status().await;
     }
     let notification_service = Arc::new(std::sync::Mutex::new(notification_service));
+    state.attach_notification_service(notification_service.clone());
     let transition_monitor = spawn_transition_monitor(
         &state,
         &state_store,
@@ -1493,6 +1514,7 @@ fn spawn_recovery_snapshot(state: Arc<AppState>, recovery_id: String) {
                             crate::recovery::now_millis(),
                             reason,
                         );
+                        notify_recovery_failed(&state, &recovery_id, reason.as_str());
                     }
                 }
                 Err(error) => {
@@ -1504,6 +1526,11 @@ fn spawn_recovery_snapshot(state: Arc<AppState>, recovery_id: String) {
                         &recovery_id,
                         RecoveryFailureReason::SnapshotWrite,
                         crate::recovery::now_millis(),
+                    );
+                    notify_recovery_failed(
+                        &state,
+                        &recovery_id,
+                        RecoveryFailureReason::SnapshotWrite.as_str(),
                     );
                     if let Some(production) = state.production_runtime() {
                         production.release_recovery_owner();
@@ -1519,6 +1546,11 @@ fn spawn_recovery_snapshot(state: Arc<AppState>, recovery_id: String) {
                     &recovery_id,
                     RecoveryFailureReason::SnapshotWrite,
                     crate::recovery::now_millis(),
+                );
+                notify_recovery_failed(
+                    &state,
+                    &recovery_id,
+                    RecoveryFailureReason::SnapshotWrite.as_str(),
                 );
                 if let Some(production) = state.production_runtime() {
                     production.release_recovery_owner();
@@ -1652,6 +1684,7 @@ async fn run_recovery_lifecycle(
                 .map(|job| job.trigger.as_str())
                 .unwrap_or("throughput-degraded"),
         );
+        notify_recovery_completed(&state, &recovery_id, distributed.generation);
         production.start_route_loss_monitor();
         let _ = paired;
         Ok::<(), anyhow::Error>(())
@@ -1714,11 +1747,44 @@ fn restore_recovery_admission_if_unchanged(
     }
 }
 
+fn notify_recovery_started(state: &Arc<AppState>, recovery_id: &str, generation: u64) {
+    if let Some(service) = state.notification_service() {
+        service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_recovery_started(recovery_id, generation);
+    }
+}
+
+fn notify_recovery_completed(state: &Arc<AppState>, recovery_id: &str, generation: u64) {
+    if let Some(service) = state.notification_service() {
+        service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_recovery_completed(recovery_id, generation);
+    }
+}
+
+fn notify_recovery_failed(state: &Arc<AppState>, recovery_id: &str, reason: &str) {
+    if let Some(service) = state.notification_service() {
+        let generation = state
+            .recovery
+            .status(recovery_id)
+            .map(|job| job.cluster_generation)
+            .unwrap_or_default();
+        service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_recovery_failed(recovery_id, generation, reason);
+    }
+}
+
 fn begin_recovery(state: Arc<AppState>, request: RecoveryRequest) -> RecoveryStart {
     let started = state.recovery.begin(recovery_gate(&state), request);
     match &started {
         RecoveryStart::Created(job) => {
             state.metrics.recovery_started(job.trigger.as_str());
+            notify_recovery_started(&state, &job.recovery_id, job.cluster_generation);
             tracing::info!(
                 event = "recovery-started",
                 trigger = job.trigger.as_str(),
@@ -1735,6 +1801,11 @@ fn begin_recovery(state: Arc<AppState>, request: RecoveryRequest) -> RecoverySta
                 state
                     .metrics
                     .recovery_failed(RecoveryFailureReason::RecoveryOwnerBusy.as_str());
+                notify_recovery_failed(
+                    &state,
+                    &job.recovery_id,
+                    RecoveryFailureReason::RecoveryOwnerBusy.as_str(),
+                );
                 tracing::warn!(
                     event = "recovery-failed",
                     reason = RecoveryFailureReason::RecoveryOwnerBusy.as_str(),
@@ -1776,14 +1847,12 @@ fn recovery_children_replaced(
         .as_ref()
         .zip(after.children.distributed_coordinator.as_ref())
         .is_some_and(|(old, new)| old.generation != new.generation || old.pid != new.pid);
-    let peer_generation_replaced = before
+    let peer_child_generation_replaced = before
         .control_session
-        .lease
-        .peer
-        .as_ref()
-        .zip(after.control_session.lease.peer.as_ref())
-        .is_some_and(|(old, new)| old.generation != new.generation);
-    local_child_replaced && peer_generation_replaced
+        .peer_distributed_child_generation
+        .zip(after.control_session.peer_distributed_child_generation)
+        .is_some_and(|(old, new)| old != new);
+    local_child_replaced && peer_child_generation_replaced
 }
 
 fn recovery_job(start: &RecoveryStart) -> RecoveryJob {
@@ -2320,6 +2389,7 @@ fn control_session_json(session: &ControlSessionDiagnostics) -> Value {
         "generation": session.generation,
         "phase": distributed_phase_name(session.phase),
         "role": control_role_json(session.role),
+        "peer-distributed-child-generation": session.peer_distributed_child_generation,
         "lease": lease_json(&session.lease),
     })
 }
@@ -2472,6 +2542,7 @@ mod tests {
             admin: RwLock::new(None),
             production: RwLock::new(None),
             supervisor: RwLock::new(None),
+            notification_service: RwLock::new(None),
             recovery: RecoveryService::new(),
             recovery_config: RecoveryConfig::default(),
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -2479,6 +2550,50 @@ mod tests {
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
+    }
+
+    #[derive(Clone, Default)]
+    struct NotificationLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for NotificationLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_notification_helpers_use_the_attached_service() {
+        let state = test_state(true);
+        state.attach_notification_service(Arc::new(std::sync::Mutex::new(
+            DesktopNotificationService::new(Arc::new(crate::notify::NoopNotifier)),
+        )));
+        let log = NotificationLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            notify_recovery_started(&state, "recovery-42", 101);
+            notify_recovery_completed(&state, "recovery-42", 102);
+            notify_recovery_failed(&state, "recovery-42", "canary-failed");
+        });
+
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("notification-recovery-epoch-started"));
+        assert!(output.contains("notification-recovery-epoch-completed"));
+        assert!(output.contains("notification-recovery-epoch-failed"));
     }
 
     /// Attach a standalone supervisor so `/admin/restart` sees an owned DS4
@@ -2730,6 +2845,7 @@ mod tests {
                         mode: ControlMode::DistributedLayerParallel,
                     }),
                 },
+                peer_distributed_child_generation: Some(12),
             },
             children: ChildrenDiagnostics {
                 standalone: Some(ChildDiagnostics {
@@ -2761,6 +2877,7 @@ mod tests {
         assert_eq!(session["lease"]["peer"]["node-id"], "worker-node");
         assert_eq!(session["lease"]["peer"]["role"], "worker");
         assert_eq!(session["lease"]["peer"]["generation"], 7);
+        assert_eq!(session["peer-distributed-child-generation"], 12);
         assert_eq!(
             session["lease"]["peer"]["mode"],
             "distributed-layer-parallel"
@@ -2848,6 +2965,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn recovery_test_diagnostics(
+        local_child_generation: u64,
+        peer_child_generation: Option<u64>,
+    ) -> crate::cluster::ProductionDiagnostics {
+        crate::cluster::ProductionDiagnostics {
+            control_session: ControlSessionDiagnostics {
+                generation: 1112,
+                phase: DistributedControlPhase::WorkerReady,
+                role: ControlRole::Coordinator,
+                lease: LeaseDiagnostics {
+                    valid: true,
+                    expires_at_millis: Some(1_770_000_000_000_u64),
+                    route_scoped: true,
+                    peer_present: true,
+                    peer: Some(PeerDiagnostics {
+                        node_id: "worker-node".into(),
+                        role: ControlRole::Worker,
+                        // The control-session generation remains stable across a
+                        // recovery and must not stand in for the worker child generation.
+                        generation: 1112,
+                        mode: ControlMode::DistributedLayerParallel,
+                    }),
+                },
+                peer_distributed_child_generation: peer_child_generation,
+            },
+            children: ChildrenDiagnostics {
+                standalone: None,
+                distributed_coordinator: Some(ChildDiagnostics {
+                    pid: Some(local_child_generation as u32),
+                    profile: Some("distributed-layer-parallel-coordinator".into()),
+                    generation: Some(local_child_generation),
+                    running: true,
+                    ready: None,
+                }),
+                distributed_worker: None,
+            },
+        }
+    }
+
+    #[test]
+    fn recovery_children_replaced_uses_peer_child_generation_not_control_generation() {
+        let before = recovery_test_diagnostics(1124, Some(592));
+        let after = recovery_test_diagnostics(1130, Some(598));
+
+        assert!(recovery_children_replaced(&before, &after));
     }
 
     // ---- C-04a: `/admin/restart` route, auth, body parse, duplicate guard ----

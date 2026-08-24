@@ -314,6 +314,7 @@ impl WorkerControl {
     pub fn worker_ready_message(
         &mut self,
         request_id: impl Into<String>,
+        child_generation: u64,
     ) -> Result<ControlMessage, ControlError> {
         if self.phase != DistributedControlPhase::WorkerPreparing {
             return Err(ControlError::InvalidPhase { phase: self.phase });
@@ -322,7 +323,7 @@ impl WorkerControl {
         Ok(self.processor.message(
             request_id.into(),
             ControlCommand::WorkerEvent {
-                event: WorkerEventKind::Ready,
+                event: WorkerEventKind::ReadyWithChildGeneration { child_generation },
             },
         ))
     }
@@ -635,9 +636,17 @@ mod tests {
             ),
             Err(ControlError::InvalidPhase { .. })
         ));
-        let ready = worker.worker_ready_message("ready-flow").unwrap();
+        let ready = worker.worker_ready_message("ready-flow", 42).unwrap();
         assert_eq!(ready.generation, 3);
         assert_eq!(ready.deployment_id.as_deref(), Some("deployment-a"));
+        assert_eq!(
+            ready.command,
+            ControlCommand::WorkerEvent {
+                event: WorkerEventKind::ReadyWithChildGeneration {
+                    child_generation: 42,
+                },
+            }
+        );
         worker
             .handle(
                 ControlEndpoint::BeginDrain,

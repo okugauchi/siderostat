@@ -13,6 +13,7 @@
 use crate::{
     cluster::{ClusterFailure, ClusterSnapshot},
     localization::text,
+    metrics::Metrics,
     target::ClusterState,
 };
 use futures::future::BoxFuture;
@@ -46,6 +47,20 @@ enum NotificationKind {
     DeploymentMismatch,
 }
 
+impl NotificationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SoloStandaloneReady => "solo-standalone-ready",
+            Self::PairedStandaloneReady => "paired-standalone-ready",
+            Self::StandaloneRestart => "standalone-restart",
+            Self::DistributedReady => "distributed-ready",
+            Self::Backoff => "backoff",
+            Self::ManualInterventionRequired => "manual-intervention-required",
+            Self::DeploymentMismatch => "deployment-mismatch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NotificationEvent {
     kind: NotificationKind,
@@ -64,12 +79,50 @@ impl NotificationEvent {
 /// states more than once. The state machine remains authoritative, but the
 /// desktop notification layer should not turn those retries into a banner
 /// loop. DistributedReady closes the current epoch and prepares the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationEpoch {
+    recovery_id: String,
+    generation: u64,
+}
+
+const IMPLICIT_EPOCH_ID: &str = "cluster-transition";
+
 #[derive(Debug, Default)]
 struct NotificationDeduplicator {
     emitted_stable_states: BTreeSet<NotificationKind>,
+    epoch: Option<NotificationEpoch>,
 }
 
 impl NotificationDeduplicator {
+    fn ensure_implicit_epoch(&mut self, generation: u64) {
+        if self.epoch.is_none() {
+            self.epoch = Some(NotificationEpoch {
+                recovery_id: IMPLICIT_EPOCH_ID.to_string(),
+                generation,
+            });
+        }
+    }
+
+    fn begin_recovery_epoch(&mut self, recovery_id: impl Into<String>, generation: u64) {
+        let epoch = NotificationEpoch {
+            recovery_id: recovery_id.into(),
+            generation,
+        };
+        if self.epoch.as_ref() != Some(&epoch) {
+            self.emitted_stable_states.clear();
+            self.epoch = Some(epoch);
+        }
+    }
+
+    fn epoch(&self) -> Option<&NotificationEpoch> {
+        self.epoch.as_ref()
+    }
+
+    fn end_epoch(&mut self) {
+        self.epoch = None;
+        self.emitted_stable_states.clear();
+    }
+
     fn should_emit(&mut self, kind: NotificationKind) -> bool {
         if kind == NotificationKind::DistributedReady {
             self.emitted_stable_states.clear();
@@ -518,6 +571,7 @@ type SessionCheck = Box<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
 
 pub struct DesktopNotificationService {
     notifier: Arc<dyn DesktopNotifier>,
+    metrics: Arc<Metrics>,
     last_sent_at: Option<Instant>,
     session_check: SessionCheck,
     deduplicator: NotificationDeduplicator,
@@ -525,10 +579,31 @@ pub struct DesktopNotificationService {
 
 impl DesktopNotificationService {
     pub fn new(notifier: Arc<dyn DesktopNotifier>) -> Self {
+        Self::with_session_check_and_metrics(
+            notifier,
+            Box::new(|| Box::pin(gui_session_available())),
+            Arc::new(Metrics::default()),
+        )
+    }
+
+    pub fn with_metrics(notifier: Arc<dyn DesktopNotifier>, metrics: Arc<Metrics>) -> Self {
+        Self::with_session_check_and_metrics(
+            notifier,
+            Box::new(|| Box::pin(gui_session_available())),
+            metrics,
+        )
+    }
+
+    pub fn with_session_check_and_metrics(
+        notifier: Arc<dyn DesktopNotifier>,
+        session_check: SessionCheck,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             notifier,
+            metrics,
             last_sent_at: None,
-            session_check: Box::new(|| Box::pin(gui_session_available())),
+            session_check,
             deduplicator: NotificationDeduplicator::default(),
         }
     }
@@ -556,6 +631,7 @@ impl DesktopNotificationService {
     ) -> Self {
         Self {
             notifier,
+            metrics: Arc::new(Metrics::default()),
             last_sent_at: None,
             session_check,
             deduplicator: NotificationDeduplicator::default(),
@@ -578,12 +654,12 @@ impl DesktopNotificationService {
         previous: ClusterSnapshot,
         current: ClusterSnapshot,
     ) {
-        if let Some(event) = notification_event_for_snapshot_transition(
-            previous.state,
-            current.state,
-            current.last_failure,
-        ) {
+        self.deduplicator.ensure_implicit_epoch(current.generation);
+        if let Some(event) = notification_event_for_snapshots(previous, current) {
             self.observe_event(event);
+        }
+        if current.state == ClusterState::DistributedReady {
+            self.deduplicator.end_epoch();
         }
     }
 
@@ -634,6 +710,39 @@ impl DesktopNotificationService {
         ));
     }
 
+    /// Start a notification epoch for one H-phase recovery job. The job
+    /// identity is retained only in structured logs; it is never a metric
+    /// label or part of the user-facing notification text.
+    pub fn observe_recovery_started(&mut self, recovery_id: &str, generation: u64) {
+        self.deduplicator
+            .begin_recovery_epoch(recovery_id.to_owned(), generation);
+        tracing::info!(
+            event = "notification-recovery-epoch-started",
+            recovery_id,
+            generation,
+            "desktop notification recovery epoch started"
+        );
+    }
+
+    pub fn observe_recovery_completed(&mut self, recovery_id: &str, generation: u64) {
+        tracing::info!(
+            event = "notification-recovery-epoch-completed",
+            recovery_id,
+            generation,
+            "desktop notification recovery epoch completed"
+        );
+    }
+
+    pub fn observe_recovery_failed(&mut self, recovery_id: &str, generation: u64, reason: &str) {
+        tracing::warn!(
+            event = "notification-recovery-epoch-failed",
+            recovery_id,
+            generation,
+            reason,
+            "desktop notification recovery epoch failed"
+        );
+    }
+
     /// Post one notification through the same session check and throttle used
     /// by state-transition notifications. Callers remain responsible for
     /// deciding whether a state change is worth reporting.
@@ -645,7 +754,20 @@ impl DesktopNotificationService {
         if self.deduplicator.should_emit(event.kind) {
             self.maybe_notify(event.notification);
         } else {
-            tracing::debug!(?event.kind, "desktop notification suppressed within recovery epoch");
+            self.metrics.notification_suppressed(event.kind.as_str());
+            if let Some(epoch) = self.deduplicator.epoch() {
+                tracing::debug!(
+                    kind = event.kind.as_str(),
+                    recovery_id = %epoch.recovery_id,
+                    generation = epoch.generation,
+                    "desktop notification suppressed within recovery epoch"
+                );
+            } else {
+                tracing::debug!(
+                    kind = event.kind.as_str(),
+                    "desktop notification suppressed within recovery epoch"
+                );
+            }
         }
     }
 
@@ -789,6 +911,24 @@ fn notification_event_for_snapshot_transition(
     }
 }
 
+fn notification_event_for_snapshots(
+    previous: ClusterSnapshot,
+    current: ClusterSnapshot,
+) -> Option<NotificationEvent> {
+    let event = notification_event_for_snapshot_transition(
+        previous.state,
+        current.state,
+        current.last_failure,
+    )?;
+    if event.kind == NotificationKind::PairedStandaloneReady
+        && current.role == crate::target::LocalRole::Worker
+        && !current.local_standalone_ready
+    {
+        return None;
+    }
+    Some(event)
+}
+
 /// Subscribe to the cluster state watch channel and forward important
 /// transitions to the notification service. Runs until the channel closes.
 pub async fn run_desktop_notifier(
@@ -806,8 +946,13 @@ pub async fn run_desktop_notifier(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::ClusterSnapshot;
     use crate::target::{LocalRole, StableMode};
+    use crate::{
+        admission::{AdmissionSnapshot, AdmissionState},
+        cluster::ClusterSnapshot,
+        metrics::{MetricSnapshot, Metrics},
+        proxy::ModeAwareTargetSnapshot,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -832,6 +977,41 @@ mod tests {
             notifier,
             Box::new(|| Box::pin(async { true })),
         )
+    }
+
+    fn service_with_metrics(
+        notifier: Arc<dyn DesktopNotifier>,
+        metrics: Arc<Metrics>,
+    ) -> DesktopNotificationService {
+        DesktopNotificationService::with_session_check_and_metrics(
+            notifier,
+            Box::new(|| Box::pin(async { true })),
+            metrics,
+        )
+    }
+
+    fn render_metrics(metrics: &Metrics) -> String {
+        metrics.render_mode_aware(MetricSnapshot {
+            node_id: "test-node",
+            interface: "bridge0",
+            target: ModeAwareTargetSnapshot {
+                target: crate::target::ProxyTarget::LocalStandalone,
+                ready: true,
+            },
+            admission: AdmissionSnapshot {
+                state: AdmissionState::Serving,
+                in_flight: 0,
+                max_in_flight: 4,
+                drain_generation: None,
+            },
+            cluster: Some(ClusterSnapshot::booting(LocalRole::Unknown)),
+            peer_lease_seconds: 0.0,
+            thunderbolt_ip_state: "unknown",
+            discovery_results: 0,
+            quantization: crate::config::Quantization::Q2Q4,
+            speculative_support: crate::config::SpeculativeSupport::None,
+            residency: crate::config::Residency::SsdStreaming,
+        })
     }
 
     #[tokio::test]
@@ -1100,6 +1280,110 @@ mod tests {
         notifier_task.abort();
     }
 
+    #[derive(Default)]
+    struct FailingNotifier {
+        calls: AtomicUsize,
+    }
+
+    impl DesktopNotifier for FailingNotifier {
+        fn notify(
+            &self,
+            _notification: Notification,
+        ) -> BoxFuture<'static, Result<(), NotifyError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(NotifyError::Native("test sender failure".to_string())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_failure_does_not_prevent_watch_task_from_closing() {
+        let notifier = Arc::new(FailingNotifier::default());
+        let service = service(notifier.clone());
+        let (sender, receiver) = watch::channel(snapshot(
+            LocalRole::Coordinator,
+            ClusterState::Booting,
+            1,
+            false,
+        ));
+        let task = tokio::spawn(run_desktop_notifier(receiver, service));
+        tokio::task::yield_now().await;
+        sender
+            .send(snapshot(
+                LocalRole::Coordinator,
+                ClusterState::SoloStandaloneReady,
+                2,
+                true,
+            ))
+            .unwrap();
+        drop(sender);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(notifier.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_channel_close_is_a_normal_notification_task_exit() {
+        let service = service(Arc::new(NoopNotifier));
+        let (sender, receiver) = watch::channel(snapshot(
+            LocalRole::Coordinator,
+            ClusterState::Booting,
+            1,
+            false,
+        ));
+        let task = tokio::spawn(run_desktop_notifier(receiver, service));
+        drop(sender);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_temporary_pairing_without_local_standalone_does_not_notify_peer_detection() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut service = service(notifier.clone());
+        let previous = snapshot(LocalRole::Worker, ClusterState::Pairing, 20, false);
+        let current = snapshot(
+            LocalRole::Worker,
+            ClusterState::PairedStandaloneReady,
+            21,
+            false,
+        );
+
+        service.observe_snapshot_transition(previous, current);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(notifier.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn service_records_suppressed_stable_notification_with_bounded_metric_labels() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let metrics = Arc::new(Metrics::default());
+        let mut service = service_with_metrics(notifier, metrics.clone());
+
+        service.observe_transition(
+            ClusterState::SoloStandaloneStarting,
+            ClusterState::SoloStandaloneReady,
+        );
+        service.observe_transition(
+            ClusterState::SoloStandaloneReady,
+            ClusterState::SoloStandaloneReady,
+        );
+
+        tokio::task::yield_now().await;
+        let rendered = render_metrics(&metrics);
+        assert!(rendered.contains(
+            "ds4_proxy_notification_events_total{event=\"suppressed\",kind=\"solo-standalone-ready\"} 1"
+        ));
+    }
+
     #[test]
     fn stable_mode_names_are_stable() {
         assert_eq!(StableMode::SoloStandalone.name(), "solo-standalone");
@@ -1122,6 +1406,21 @@ mod tests {
     }
 
     #[test]
+    fn stable_notifications_remain_once_through_180_transition_retries() {
+        let mut deduplicator = NotificationDeduplicator::default();
+        for attempt in 0..180 {
+            assert_eq!(
+                deduplicator.should_emit(NotificationKind::SoloStandaloneReady),
+                attempt == 0
+            );
+            assert_eq!(
+                deduplicator.should_emit(NotificationKind::PairedStandaloneReady),
+                attempt == 0
+            );
+        }
+    }
+
+    #[test]
     fn distributed_ready_rolls_the_standalone_notification_epoch() {
         let mut deduplicator = NotificationDeduplicator::default();
         assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
@@ -1129,6 +1428,47 @@ mod tests {
         assert!(deduplicator.should_emit(NotificationKind::DistributedReady));
         assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
         assert!(deduplicator.should_emit(NotificationKind::PairedStandaloneReady));
+    }
+
+    #[test]
+    fn explicit_recovery_epoch_rollover_allows_stable_notifications_again() {
+        let mut deduplicator = NotificationDeduplicator::default();
+        assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+
+        deduplicator.begin_recovery_epoch("recovery-42", 101);
+
+        assert!(deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+        assert!(!deduplicator.should_emit(NotificationKind::SoloStandaloneReady));
+    }
+
+    #[test]
+    fn recovery_epoch_lifecycle_logs_redaction_safe_identity() {
+        let mut service = service(Arc::new(NoopNotifier));
+        let log = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            service.observe_recovery_started("recovery-42", 101);
+            service.observe_recovery_completed("recovery-42", 102);
+            service.observe_recovery_failed("recovery-42", 103, "canary-failed");
+        });
+
+        let output = String::from_utf8(log.lines.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("notification-recovery-epoch-started"));
+        assert!(output.contains("notification-recovery-epoch-completed"));
+        assert!(output.contains("notification-recovery-epoch-failed"));
+        assert!(output.contains("recovery-42"));
+        assert!(output.contains("generation=101"));
+        assert!(output.contains("generation=102"));
+        assert!(output.contains("generation=103"));
+        assert!(output.contains("canary-failed"));
     }
 
     #[test]
@@ -1142,6 +1482,25 @@ mod tests {
         ] {
             assert!(deduplicator.should_emit(kind));
             assert!(deduplicator.should_emit(kind));
+        }
+    }
+
+    fn snapshot(
+        role: LocalRole,
+        state: ClusterState,
+        generation: u64,
+        local_standalone_ready: bool,
+    ) -> ClusterSnapshot {
+        ClusterSnapshot {
+            generation,
+            role,
+            stable_mode: StableMode::PairedStandalone,
+            state,
+            target: crate::target::ProxyTarget::Unavailable {
+                reason: crate::target::UnavailableReason::Transition,
+            },
+            local_standalone_ready,
+            last_failure: None,
         }
     }
 

@@ -64,6 +64,7 @@ pub fn dmg_dev(args: &DmgDevArgs) -> Result<()> {
         &uninstaller,
         &args.version,
         args.rollback,
+        false,
         output_dir,
         args.staging.as_deref(),
     )?;
@@ -139,6 +140,7 @@ pub fn build_dmg(
     uninstaller: &Path,
     version: &str,
     rollback: bool,
+    no_timestamp: bool,
     output_dir: &Path,
     requested_staging: Option<&Path>,
 ) -> Result<PathBuf> {
@@ -164,10 +166,10 @@ pub fn build_dmg(
     copy_directory(uninstaller, &staging.join(UNINSTALLER_BUNDLE_NAME))?;
     std::fs::write(
         staging.join(README_FILENAME),
-        readme_html(version, rollback).as_bytes(),
+        readme_html(version, rollback, no_timestamp).as_bytes(),
     )?;
 
-    let dmg = output_dir.join(dmg_filename(version, rollback));
+    let dmg = output_dir.join(dmg_filename_for_mode(version, rollback, no_timestamp));
     util::run_live(
         "hdiutil",
         &[
@@ -213,12 +215,15 @@ pub fn zip_for_notarization(app: &Path, destination: &Path) -> Result<PathBuf> {
 
 const UNINSTALLER_BUNDLE_NAME: &str = "Siderostat Uninstaller.app";
 
-pub fn dmg_filename(version: &str, rollback: bool) -> String {
+pub fn dmg_filename_for_mode(version: &str, rollback: bool, no_timestamp: bool) -> String {
+    let mut suffix = String::new();
     if rollback {
-        format!("Siderostat-{version}-rollback.dmg")
-    } else {
-        format!("Siderostat-{version}.dmg")
+        suffix.push_str("-rollback");
     }
+    if no_timestamp {
+        suffix.push_str("-no-timestamp");
+    }
+    format!("Siderostat-{version}{suffix}.dmg")
 }
 
 pub fn expected_dmg_entries(package_filename: &str) -> Vec<String> {
@@ -244,8 +249,14 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn readme_html(version: &str, rollback: bool) -> String {
-    let mode = if rollback {
+fn readme_html(version: &str, rollback: bool, no_timestamp: bool) -> String {
+    let mode = if no_timestamp {
+        if rollback {
+            "rollback package for local diagnostics without a trusted timestamp"
+        } else {
+            "local diagnostic package without a trusted timestamp"
+        }
+    } else if rollback {
         "rollback package"
     } else {
         "release package"
@@ -341,8 +352,26 @@ mod tests {
 
     #[test]
     fn dmg_filename_marks_rollback_without_changing_release_name() {
-        assert_eq!(dmg_filename("0.3.0", false), "Siderostat-0.3.0.dmg");
-        assert_eq!(dmg_filename("0.3.0", true), "Siderostat-0.3.0-rollback.dmg");
+        assert_eq!(
+            dmg_filename_for_mode("0.3.0", false, false),
+            "Siderostat-0.3.0.dmg"
+        );
+        assert_eq!(
+            dmg_filename_for_mode("0.3.0", true, false),
+            "Siderostat-0.3.0-rollback.dmg"
+        );
+    }
+
+    #[test]
+    fn no_timestamp_dmg_artifacts_are_distinct_from_release_artifacts() {
+        assert_eq!(
+            dmg_filename_for_mode("0.3.0", false, true),
+            "Siderostat-0.3.0-no-timestamp.dmg"
+        );
+        assert_eq!(
+            dmg_filename_for_mode("0.3.0", true, true),
+            "Siderostat-0.3.0-rollback-no-timestamp.dmg"
+        );
     }
 
     #[test]
@@ -359,9 +388,16 @@ mod tests {
 
     #[test]
     fn readme_states_data_preservation_contract() {
-        let readme = readme_html("0.3.0", false);
+        let readme = readme_html("0.3.0", false, false);
         assert!(readme.contains("Siderostat Uninstaller.app"));
         assert!(readme.contains("preserves configuration"));
+    }
+
+    #[test]
+    fn no_timestamp_readme_marks_local_diagnostic_scope() {
+        let readme = readme_html("0.3.0", false, true);
+        assert!(readme.contains("local diagnostic package"));
+        assert!(readme.contains("without a trusted timestamp"));
     }
 
     #[test]

@@ -198,6 +198,7 @@ pub struct ControlDiagnosticSnapshot {
     pub generation: u64,
     pub phase: String,
     pub role: String,
+    pub peer_distributed_child_generation: Option<u64>,
     pub lease: LeaseDiagnosticSnapshot,
 }
 
@@ -479,6 +480,7 @@ impl DiagnosticSnapshot {
                 generation: 7,
                 phase: "worker-ready".to_string(),
                 role: "coordinator".to_string(),
+                peer_distributed_child_generation: None,
                 lease: LeaseDiagnosticSnapshot {
                     valid: true,
                     expires_at_millis: Some(1_700_000_001_000),
@@ -566,6 +568,7 @@ fn control_snapshot(session: &ControlSessionDiagnostics) -> ControlDiagnosticSna
         generation: session.generation,
         phase: control_phase_name(session.phase).to_string(),
         role: control_role_name(session.role).to_string(),
+        peer_distributed_child_generation: session.peer_distributed_child_generation,
         lease: lease_snapshot(&session.lease),
     }
 }

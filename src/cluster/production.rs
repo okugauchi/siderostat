@@ -747,26 +747,29 @@ impl ProductionClusterRuntime {
     pub async fn diagnostics(&self) -> ProductionDiagnostics {
         let inner = &self.inner;
         let now = now_millis();
-        let (generation, phase, role, lease) = match &inner.control {
-            RoleControl::Coordinator(control) => {
-                let control = control.lock().await;
-                (
-                    control.generation(),
-                    control.phase(),
-                    ControlRole::Coordinator,
-                    lease_diagnostics(control.peer_lease(), now),
-                )
-            }
-            RoleControl::Worker(control) => {
-                let control = control.lock().await;
-                (
-                    control.generation(),
-                    control.phase(),
-                    ControlRole::Worker,
-                    lease_diagnostics(control.peer_lease(), now),
-                )
-            }
-        };
+        let (generation, phase, role, lease, peer_distributed_child_generation) =
+            match &inner.control {
+                RoleControl::Coordinator(control) => {
+                    let control = control.lock().await;
+                    (
+                        control.generation(),
+                        control.phase(),
+                        ControlRole::Coordinator,
+                        lease_diagnostics(control.peer_lease(), now),
+                        control.peer_distributed_child_generation(),
+                    )
+                }
+                RoleControl::Worker(control) => {
+                    let control = control.lock().await;
+                    (
+                        control.generation(),
+                        control.phase(),
+                        ControlRole::Worker,
+                        lease_diagnostics(control.peer_lease(), now),
+                        None,
+                    )
+                }
+            };
         let standalone_ready = inner.mode.snapshot().local_standalone_ready;
         let children = ChildrenDiagnostics {
             standalone: Some(child_diagnostics(
@@ -797,6 +800,7 @@ impl ProductionClusterRuntime {
                 phase,
                 role,
                 lease,
+                peer_distributed_child_generation,
             },
             children,
         }
@@ -850,6 +854,7 @@ pub struct ControlSessionDiagnostics {
     pub phase: DistributedControlPhase,
     pub role: ControlRole,
     pub lease: LeaseDiagnostics,
+    pub peer_distributed_child_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

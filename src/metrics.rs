@@ -274,6 +274,13 @@ impl Metrics {
         self.recovery_event("suppressed", reason);
     }
 
+    pub fn notification_suppressed(&self, kind: &'static str) {
+        self.increment(
+            "ds4_proxy_notification_events_total",
+            &[("event", "suppressed"), ("kind", kind)],
+        );
+    }
+
     fn recovery_event(&self, event: &'static str, reason: &str) {
         self.increment(
             "ds4_proxy_recovery_events_total",
@@ -786,6 +793,7 @@ fn render_counters(output: &mut String, counters: &Mutex<HashMap<String, u64>>) 
         "ds4_proxy_cluster_hello_total",
         "ds4_proxy_cluster_deployment_mismatch_total",
         "ds4_proxy_recovery_events_total",
+        "ds4_proxy_notification_events_total",
     ] {
         let _ = writeln!(output, "# TYPE {name} counter");
     }
@@ -1110,6 +1118,25 @@ mod tests {
             assert!(rendered.contains(expected), "missing {expected}");
         }
         assert!(!rendered.contains("recovery_id"));
+    }
+
+    #[test]
+    fn renders_bounded_notification_suppression_events_without_epoch_labels() {
+        let metrics = Metrics::default();
+        metrics.notification_suppressed("solo-standalone-ready");
+        metrics.notification_suppressed("solo-standalone-ready");
+        metrics.notification_suppressed("paired-standalone-ready");
+
+        let rendered = metrics.render_mode_aware(snapshot("node-a", "bridge0"));
+
+        assert!(rendered.contains(
+            "ds4_proxy_notification_events_total{event=\"suppressed\",kind=\"solo-standalone-ready\"} 2"
+        ));
+        assert!(rendered.contains(
+            "ds4_proxy_notification_events_total{event=\"suppressed\",kind=\"paired-standalone-ready\"} 1"
+        ));
+        assert!(!rendered.contains("recovery_id"));
+        assert!(!rendered.contains("generation=\""));
     }
 
     #[test]

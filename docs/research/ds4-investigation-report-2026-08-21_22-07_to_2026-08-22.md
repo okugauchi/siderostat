@@ -4,6 +4,9 @@
 **対象:** `antirez/ds4` の最新開発状況と、ローカルLLM運用・分散推論・ speculative decoding 周辺の検討  
 **関連環境:** Apple Silicon 2台構成、Thunderbolt接続、Hermes Agent、Siderostat
 
+**upstream main 追跡更新:** 2026-08-24 (JST)。本文は調査期間の記録であり、
+その後の `antirez/ds4` `main` との差分と訂正は末尾の「upstream main 追跡更新」に記録する。
+
 ---
 
 ## 1. エグゼクティブサマリー
@@ -601,3 +604,62 @@ multi-session serving
 という段階的な移行が現実的。
 
 次期macOSのRDMA正式化と、ds4側の関連PRのmergeが同じ時期に重なれば、2026年秋ごろが分散構成を再設計する良いタイミングになる可能性が高い。
+
+## 16. upstream main 追跡更新（2026-08-24 JST）
+
+固定 baseline `84cc882` から upstream `main` は 19 commit 進み、追跡時点の HEAD は
+`c1d4597a80e300b803dc642519718f2c999589da`（2026-08-23）だった。本文の「近い将来」や
+「進行中の PR」に関する記述を、現在の main の実装と混同しないため、以下を追記する。
+
+### 16.1 現在の main に入った更新
+
+- DSpark は非ゼロ温度の通常サンプリングにも接続され、通常の `--dspark` は
+  opportunistic sampling を行う。DFlash の temperature-zero draft と target の
+  continuation が一致した部分を直接採用するため、通常の温度サンプリングより決定的に
+  なることがある。
+- 出力分布を通常の target distribution に保つための `--mtp-exact-sampling` が追加された。
+  greedy proposal を target probability で受理し、棄却時は残余分布から選択する方式で、
+  デフォルト confidence threshold は `0.8`。`--temp 0` は fully greedy を指定する。
+- これらの DSpark オプションは `ds4`、`ds4-agent`、非 batched の `ds4-server` で利用できる。
+  `--batched-session` 中は speculative decoding が無効で、通常の target decoding になる。
+- DeepSeek V4 PRO 0813 の q2 imatrix 取得対象と 100 ケースの品質 oracle が追加された。
+  Flash 0731 の checkpoint が置き換わったわけではなく、PRO の別 checkpoint である。
+- ROCm/Strix Halo 向けに routed-expert の native MXFP4 decode/prefill、occupancy variant、
+  検証手順が追加された。これは Apple Metal の tensor parallel や layer-parallel RDMA の
+  実装追加とは別の更新である。
+
+### 16.2 TP / RDMA / distributed pipeline の現在地
+
+今回の main 差分には、次の機能を production capability として追加する変更は確認できなかった。
+
+- Apple 2台の layer-parallel activation transfer を TCP から RDMA に切り替える実装
+- `ds4-server` または `ds4-agent` から Mac-to-Mac tensor parallel を起動・管理する実装
+- distributed pipeline と DSpark の server lifecycle 統合
+
+従って、本文の PR #715、#813、#835 などに基づく RDMA、server TP、distributed DSpark の
+記述は、引き続き開発中・将来候補として扱う。本文に記載した Apple 2台の TCP
+layer-parallel 測定値も、upstream main が RDMA 対応になった証拠ではない。
+
+### 16.3 Siderostat の設計判断の更新
+
+現在の Siderostat v0.3 については、次の判断を維持する。
+
+| 項目 | 2026-08-24 時点の判断 |
+| --- | --- |
+| Apple 2台の実運用 | TCP layer-parallel を現行対象とする |
+| Mac-to-Mac TP | `ds4` CLI の worker/coordinator 機能としてのみ把握し、`ds4-server` 管理対象にはしない |
+| RDMA layer-parallel | upstream main 未実装。将来の採用候補 |
+| distributed DSpark server | upstream main 未統合。将来の採用候補 |
+| ROCm MXFP4 | ROCm/Strix Halo 固有の更新として追跡し、Apple 構成の用語・transport と混同しない |
+
+したがって、本文の総括にある「近い将来 RDMA」「その後 TP + RDMA / distributed DSpark」は
+ロードマップ上の仮説として残すが、現時点の実装済み機能や Siderostat v0.3 の受け入れ条件とは
+分離して記録する。
+
+### 16.4 追跡に使用した upstream の証跡
+
+- [upstream main（追跡時点）](https://github.com/antirez/ds4/commit/c1d4597a80e300b803dc642519718f2c999589da)
+- [ROCm MXFP4 kernel 実装](https://github.com/antirez/ds4/commit/39a8f18)
+- [DSpark exact sampling](https://github.com/antirez/ds4/commit/769a8ba)
+- [DeepSeek V4 PRO 0813 oracle](https://github.com/antirez/ds4/commit/3c63c06)
+- [PRO 0813 model download target](https://github.com/antirez/ds4/commit/c35cf38)

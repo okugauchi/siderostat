@@ -171,9 +171,28 @@ cargo xtask sign \
   --output-dir dist
 ```
 
+タイムスタンプ障害を切り分ける必要がある場合だけ、`--timestamp-mode none` を明示的に指定できる。
+このモードは `codesign` と `productbuild` に `--timestamp=none` を渡し、公証・staple・Gatekeeper
+検証を実行しない。成果物には `-no-timestamp` が付与され、metadata には
+`timestamp_mode=none` と `distribution_ready=false` が記録されるため、通常の配布 artifact を上書きしない。
+公証 profile も不要だが、これはローカル診断専用であり、エンドユーザー配布には使用しない。
+
+```sh
+cargo xtask sign \
+  --app-dir build/app-dev \
+  --version 0.3.0 \
+  --build-number 14 \
+  --application-identity "Developer ID Application: Example (TEAMID)" \
+  --installer-identity "Developer ID Installer: Example (TEAMID)" \
+  --timestamp-mode none \
+  --output-dir dist/no-timestamp-build14
+```
+
 実行前は `--dry-run` を付ける。dry-run は helper → app → package → notary submit/wait →
 log → staple → validate → Gatekeeper の順序、固定 identifier、出力 path を表示するが、
 Keychain profile の実値、Keychain、ネットワーク、artifact は使用・変更しない。
+`--timestamp-mode none` の dry-run では、notary submit、staple、Gatekeeper 検証がスキップされることと、
+`--timestamp=none` および `-no-timestamp` の出力名を確認できる。
 notary log は既定で `dist/notary/`、build metadata は `dist/Siderostat-<version>.metadata.json`
 へ保存される。metadata に credential、profile 名、private key は含めない。
 

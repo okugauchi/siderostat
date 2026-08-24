@@ -7,6 +7,12 @@
 - baseline 日時: 2026-08-09 19:53:31 +02:00
 - baseline 件名: `rocm: enable DSpark speculative decoding`
 - 対象 Siderostat: 2026-08-18 時点のローカル `main`
+- upstream main 追跡日: 2026-08-24 (JST)
+- 追跡時点の upstream main: `c1d4597a80e300b803dc642519718f2c999589da`
+
+> 本文は 2026-08-18 時点のスナップショットである。2026-08-24 時点の
+> upstream main との差分と、本文を現在の実装に適用する際の訂正は、末尾の
+> 「upstream main 追跡更新」に記録する。
 
 ## 1. 目的
 
@@ -465,3 +471,63 @@ drain/cancel し、両 TP child を identity-verified stop してから standalo
 ### Apple
 
 - [TN3205: Low-latency communication with RDMA over Thunderbolt](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt)
+
+## 11. upstream main 追跡更新（2026-08-24 JST）
+
+2026-08-18 の固定 baseline `84cc882` から、upstream `main` は
+`c1d4597a80e300b803dc642519718f2c999589da` まで進んでいる。今回確認した範囲では、
+ROCm/MXFP4、DSpark のサンプリング、DeepSeek V4 PRO 0813 の品質検証とモデル取得が
+更新されている。一方、Mac の `ds4-server` で tensor parallel を起動する経路、
+Mac の layer-parallel を RDMA 化する経路、distributed DSpark を
+`ds4-server` の運用経路に統合する変更は、この main には入っていない。
+
+### 11.1 DSpark / MTP の現在の扱い
+
+- 通常の `--dspark` は、非ゼロ温度でも通常の target sampling と DFlash の
+  temperature-zero draft を組み合わせる opportunistic sampling になった。draft が
+  target の greedy continuation と一致した部分はそのまま採用するため、通常の温度
+  サンプリングより決定的になる場合がある。
+- target の分布を維持したい場合は `--mtp-exact-sampling` を使用する。このモードは
+  greedy draft を target probability で受理し、棄却時は残余の target distribution
+  からサンプリングする。デフォルトの confidence threshold は `0.8` で、
+  `--temp 0` を加えると fully greedy になる。
+- 同じ DSpark オプションは `ds4`、`ds4-agent`、および非 batched の
+  `ds4-server` で利用できる。`--batched-session` による native session batching
+  中は speculative decoding を行わず、通常の target decoding を使用する。
+- DSpark のサポート checkpoint は引き続き Flash 0731 専用であり、PRO は未対応である。
+  したがって、この更新は「distributed DSpark が本番 server に入った」ことを意味しない。
+
+### 11.2 モデルとバックエンドの更新
+
+- Flash の基準 checkpoint は引き続き 0731。新しい Flash checkpoint への更新は確認できない。
+- `pro-q2-imatrix` の取得対象が DeepSeek V4 PRO 0813 の q2 imatrix GGUF に更新され、
+  `gguf-tools/quality-testing/data/pro-0813/` に 100 ケースの品質 oracle が追加された。
+  これは Flash 0731 の更新ではなく、PRO の別 checkpoint / model family である。
+- ROCm では routed-expert の native MXFP4 decode/prefill kernel、occupancy variant、
+  検証用テストと Strix Halo の検証手順が main に入った。README の Strix Halo 分割例は
+  `--layers 0:21` と `--layers 22:output` である。ただし、これは ROCm/Strix Halo の
+  実装であり、Apple Metal の Mac-to-Mac TP や layer-parallel RDMA を追加するものではない。
+
+### 11.3 Siderostat の採用判断への反映
+
+2026-08-24 時点で、Siderostat の実機構成については次の整理を維持する。
+
+| 管理対象 | upstream main の確認結果 | Siderostat での扱い |
+| --- | --- | --- |
+| Apple 2台の layer-parallel | TCP の activation transfer | 現行 v0.3 の対象。RDMA は将来候補 |
+| Apple 2台の tensor parallel | `ds4` CLI の worker/coordinator のみ | `ds4-server` の管理対象としては未採用 |
+| Apple 2台の layer-parallel RDMA | current main に実装なし | 将来タスクのまま |
+| distributed DSpark server | current main に統合なし | 将来タスクのまま |
+| ROCm MXFP4 | Strix Halo 向けに main へ統合 | Apple 構成の transport/topology 変更とは分離 |
+
+従って、本文中の PR・PoC・実機測定を、現行 upstream main の production capability と
+読み替えてはいけない。特に PR #813、#754、#835、#715 は、今回の baseline 比較における
+「関連する将来候補」であり、main にマージ済みの Mac server TP / RDMA 機能を示す証跡ではない。
+
+### 11.4 追跡に使用した upstream の証跡
+
+- [upstream main（追跡時点）](https://github.com/antirez/ds4/commit/c1d4597a80e300b803dc642519718f2c999589da)
+- [ROCm MXFP4 kernel 実装](https://github.com/antirez/ds4/commit/39a8f18)
+- [DSpark exact sampling](https://github.com/antirez/ds4/commit/769a8ba)
+- [DeepSeek V4 PRO 0813 oracle](https://github.com/antirez/ds4/commit/3c63c06)
+- [PRO 0813 model download target](https://github.com/antirez/ds4/commit/c35cf38)

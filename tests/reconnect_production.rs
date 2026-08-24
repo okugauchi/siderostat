@@ -895,6 +895,17 @@ async fn recovery_then_repromotion_uses_new_child_generation() {
         .identity()
         .expect("worker identity")
         .generation;
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .diagnostics()
+            .await
+            .control_session
+            .peer_distributed_child_generation,
+        Some(first_worker_gen),
+        "coordinator diagnostics must expose the worker child generation"
+    );
 
     // Recover both nodes to Solo through the single recovery owner while control HTTP stays up.
     harness
@@ -942,6 +953,17 @@ async fn recovery_then_repromotion_uses_new_child_generation() {
         .identity()
         .expect("worker identity")
         .generation;
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .diagnostics()
+            .await
+            .control_session
+            .peer_distributed_child_generation,
+        Some(second_worker_gen),
+        "coordinator diagnostics must refresh the worker child generation"
+    );
     assert_ne!(
         second_coordinator_gen, first_coordinator_gen,
         "coordinator child generation must not be reused after recovery"

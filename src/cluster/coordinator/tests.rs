@@ -207,7 +207,9 @@ fn ready_worker_control() -> CoordinatorControl {
                 generation: 7,
                 deployment_id: Some("deployment-a".into()),
                 command: ControlCommand::WorkerEvent {
-                    event: WorkerEventKind::Ready,
+                    event: WorkerEventKind::ReadyWithChildGeneration {
+                        child_generation: 592,
+                    },
                 },
             },
             &authenticated(),
@@ -550,7 +552,9 @@ fn distributed_ack_sequence_rejects_reorder_duplicate_change_and_old_generation(
         generation: 7,
         deployment_id: Some("deployment-a".into()),
         command: ControlCommand::WorkerEvent {
-            event: WorkerEventKind::Ready,
+            event: WorkerEventKind::ReadyWithChildGeneration {
+                child_generation: 592,
+            },
         },
     };
     control
@@ -563,6 +567,7 @@ fn distributed_ack_sequence_rejects_reorder_duplicate_change_and_old_generation(
         )
         .unwrap();
     assert_eq!(control.phase(), DistributedControlPhase::WorkerReady);
+    assert_eq!(control.peer_distributed_child_generation(), Some(592));
     assert_eq!(
         control
             .handle(

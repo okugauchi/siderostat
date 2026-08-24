@@ -82,7 +82,7 @@ impl super::ProductionClusterRuntime {
             RoleControl::Worker(control) => control
                 .lock()
                 .await
-                .worker_ready_message(uuid::Uuid::new_v4().to_string())?,
+                .worker_ready_message(uuid::Uuid::new_v4().to_string(), generation)?,
             RoleControl::Coordinator(_) => anyhow::bail!("prepare-worker received by coordinator"),
         };
         self.inner.client.send(&message).await?;

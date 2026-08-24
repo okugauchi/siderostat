@@ -120,6 +120,25 @@ decode TPS が30秒継続して5 tokens/s未満、progress ageが60秒以上、�
 2回で、gate拒否・失敗後の自動 retry は行わない。H-10の実機 change window 外で
 enabled = true にしてはならない。
 
+## 2.3 Hermes cron 前の canary handoff
+
+Hermes の cron を開始する前に、同じ node の loopback endpoint で次を順番に実行する。
+
+```sh
+siderostat cluster doctor --json
+siderostat cluster canary --json
+```
+
+`doctor.healthy=true` かつ canary の `status=healthy` / HTTP 200 を確認できた場合だけ
+cron を開始する。canary が失敗した場合は cron を開始せず、`cluster status --json` と
+実行中の recovery status を確認して operator の判断を待つ。cron の retry や stale
+deadline を recovery owner の代替にしない。
+
+暫定 deadline の順序は Hermes stale timeout `1800s`、Siderostat の
+`first_body_byte` / `stream_idle` `2400s` とする。これは request の期限であり、canary の
+TTFB/chunk TPS 判定値ではない。canary は cron 前の serving gate として一回だけ実行し、
+任意 prompt や任意 endpoint の probe には使用しない。
+
 ## 3. 構造化log
 
 Log形式とlevelはconfigの `[logging]` で決める。

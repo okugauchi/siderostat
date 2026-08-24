@@ -155,39 +155,70 @@ fn component_plist(rollback: bool) -> String {
     COMPONENT_PLIST_TEMPLATE.replace("{{VERSION_CHECKED}}", version_checked)
 }
 
-pub(crate) fn artifact_suffix(rollback: bool) -> &'static str {
-    if rollback { "-rollback" } else { "" }
+fn artifact_suffix_for_mode(rollback: bool, no_timestamp: bool) -> String {
+    let mut suffix = String::new();
+    if rollback {
+        suffix.push_str("-rollback");
+    }
+    if no_timestamp {
+        suffix.push_str("-no-timestamp");
+    }
+    suffix
 }
 
 pub(crate) fn package_filename(version: &str, rollback: bool) -> String {
+    package_filename_for_mode(version, rollback, false)
+}
+
+pub(crate) fn package_filename_for_mode(
+    version: &str,
+    rollback: bool,
+    no_timestamp: bool,
+) -> String {
     format!(
         "Siderostat-{}{suffix}.pkg",
         version,
-        suffix = artifact_suffix(rollback)
+        suffix = artifact_suffix_for_mode(rollback, no_timestamp)
     )
 }
 
 pub(crate) fn component_filename(version: &str, rollback: bool) -> String {
+    component_filename_for_mode(version, rollback, false)
+}
+
+pub(crate) fn component_filename_for_mode(
+    version: &str,
+    rollback: bool,
+    no_timestamp: bool,
+) -> String {
     format!(
         "Siderostat-{}{}-component.pkg",
         version,
-        artifact_suffix(rollback)
+        artifact_suffix_for_mode(rollback, no_timestamp)
     )
 }
 
-pub(crate) fn metadata_filename(version: &str, rollback: bool) -> String {
+pub(crate) fn metadata_filename_for_mode(
+    version: &str,
+    rollback: bool,
+    no_timestamp: bool,
+) -> String {
     format!(
         "Siderostat-{}{}.metadata.json",
         version,
-        artifact_suffix(rollback)
+        artifact_suffix_for_mode(rollback, no_timestamp)
     )
 }
 
-pub(crate) fn notary_log_filename(version: &str, rollback: bool) -> String {
+pub(crate) fn notary_log_filename_for_mode(
+    version: &str,
+    rollback: bool,
+    no_timestamp: bool,
+) -> String {
     format!(
         "Siderostat-{}{}-notary.json",
         version,
-        artifact_suffix(rollback)
+        artifact_suffix_for_mode(rollback, no_timestamp)
     )
 }
 
@@ -214,7 +245,7 @@ pub fn pkg_dev(args: &PkgDevArgs) -> Result<()> {
     build_component(&app, &component_pkg, &args.version, args.rollback)?;
 
     // 2. product archive wrapping the component.
-    build_product(&component_pkg, &product_pkg, &args.version, None)?;
+    build_product(&component_pkg, &product_pkg, &args.version, None, false)?;
 
     // 3. expand and inspect: one payload item and the controlled install scripts,
     // and no forbidden paths.
@@ -344,6 +375,7 @@ pub(crate) fn build_product(
     product_pkg: &Path,
     version: &str,
     installer_identity: Option<&str>,
+    include_timestamp: bool,
 ) -> Result<()> {
     let mut args = vec![
         OsString::from("--package"),
@@ -354,11 +386,12 @@ pub(crate) fn build_product(
         OsString::from(version),
     ];
     if let Some(identity) = installer_identity {
-        args.extend([
-            OsString::from("--sign"),
-            OsString::from(identity),
-            OsString::from("--timestamp"),
-        ]);
+        args.extend([OsString::from("--sign"), OsString::from(identity)]);
+        if include_timestamp {
+            args.push(OsString::from("--timestamp"));
+        } else {
+            args.push(OsString::from("--timestamp=none"));
+        }
     }
     args.push(product_pkg.as_os_str().to_os_string());
     let arg_refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
@@ -662,5 +695,17 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_timestamp_artifacts_are_distinct_from_release_artifacts() {
+        assert_eq!(
+            package_filename_for_mode("0.3.0", false, true),
+            "Siderostat-0.3.0-no-timestamp.pkg"
+        );
+        assert_eq!(
+            metadata_filename_for_mode("0.3.0", true, true),
+            "Siderostat-0.3.0-rollback-no-timestamp.metadata.json"
+        );
     }
 }

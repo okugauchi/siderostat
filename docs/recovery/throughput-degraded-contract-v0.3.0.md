@@ -312,7 +312,7 @@ H-04 の snapshot schema version は `1` とする。snapshot は次の top-leve
 | `captured_at_millis` | snapshot 作成時の wall-clock UNIX epoch ms。threshold 判定には使わない |
 | `node_id` | 現在の node の安定識別子 |
 | `cluster` | generation、role、mode、state、target、readiness、last failure |
-| `control_session` | control generation、phase、role、lease、redacted peer descriptor |
+| `control_session` | control generation、phase、role、lease、redacted peer descriptor、peer distributed child generation |
 | `admission` | state、in-flight、capacity、drain generation |
 | `children` | managed child の PID、profile、generation、running、readiness |
 | `process` | managed child 数と running child 数。実行ファイル path/argv は含めない |

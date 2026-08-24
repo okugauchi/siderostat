@@ -42,6 +42,12 @@ pub enum DistributedControlPhase {
 #[serde(rename_all = "kebab-case")]
 pub enum WorkerEventKind {
     Ready,
+    /// Ready notification carrying the generation of the worker child that was started for the
+    /// current distributed lifecycle. The legacy `Ready` variant remains accepted for peers that
+    /// do not provide this diagnostic field.
+    ReadyWithChildGeneration {
+        child_generation: u64,
+    },
     Exited,
     Reconnecting,
 }

@@ -668,6 +668,9 @@ package expand 検査はこの二つの script 名を許可し、順序に依存
   3. final `.pkg` を `notarytool submit --wait`、log 保存、staple、validate の順で処理する。
   4. credential は Keychain profile 名だけを受け取り、command、log、artifact metadata に展開しない。
   5. checksum、git commit、Rust version、target、build number、notary submission ID を出力する。
+  6. Apple timestamp 障害時の明示的な診断用切替として `--timestamp-mode apple|none` を提供する。
+     `none` は `--timestamp=none` を使い、公証・staple・Gatekeeper 検証を省略した
+     `-no-timestamp` artifact だけを生成する。これは配布用ではない。
 - 事後条件: credential を repository に置かず、単一 command で配布 artifact を生成・検証できる
 - 受入基準: `--dry-run` で command 順、identifier、出力を検証でき、secret pattern test が通る
 - Verification: unit test、dry-run、`git diff --check`、実署名は E-04 で行う
@@ -702,6 +705,12 @@ Evidence（E-04 action 1 完了、clean install 待ち 2026-08-22）: `cargo xta
 Developer ID Application／Installer 署名、notarytool submit/wait、redacted log 保存、staple、
 validate、Gatekeeper 検証、metadata 出力を完了。`dist/Siderostat-0.3.0.metadata.json` に
 version/build、app/pkg SHA-256、Rust version、target、notary submission ID を保存した。
+
+実装追補（2026-08-24）: Apple timestamp endpoint 障害の診断用に `--timestamp-mode apple|none` を
+追加した。既定値は `apple` で、従来どおり公証・staple・Gatekeeper 検証を要求する。`none` は
+`codesign`／`productbuild` の `--timestamp=none`、`-no-timestamp` artifact 名、metadata の
+`timestamp_mode=none`／`distribution_ready=false` を使用し、公証・staple・Gatekeeper 検証を
+スキップする。公証 profile は `none` では不要である。
 
 ### [x] E-03 macOS CI に ad-hoc app/pkg verification を追加する
 
@@ -1462,7 +1471,7 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
   10回連続（各回10 test）GREEN、固定 sleep・共有 port/state なしで完了した。
 - 停止条件: production code に test 専用 recovery path を追加しないと成立しない
 
-### [ ] H-10 2 node 実機 recovery と Hermes handoff を検証する
+### [x] H-10 2 node 実機 recovery と Hermes handoff を検証する
 
 - Actor: user + agent
 - Depends on: H-09
@@ -1490,11 +1499,25 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
   `healthy / HTTP 200`（TTFB 3682ms、2 tokens、58.627 tokens/s）を確認した。build 14のapp-dev
   bundle verificationはPASSしたが、Developer ID署名はtimestamp取得失敗で停止し、両nodeへの
   install・config変更・故障注入は行っていない。change window外のため recovery opt-inも変更していない。
+- Evidence（2026-08-25、build15実機 change window）: `docs/compatibility/v0.3.0-throughput-recovery.md`。
+  両nodeでbuild15（unsigned/ad-hoc DMG SHA-256 `0c681e80cc65498965402aae041b86485929640e105e7c58f419f61ce43e7ea1`）を起動し、
+  DistributedReady、doctor healthy、admission serving、baseline canary HTTP 200を確認した。
+  coordinatorでmanual recoveryを一回実行し、snapshot保存、cluster generation `1141 -> 1147`、
+  両childの置換、post-recovery canary healthy、admission servingを確認した。次にchange window内だけ
+  `[recovery] enabled=true`を両nodeへ追加し、管理対象coordinator childのfirst-token stallを故障注入して
+  automatic recoveryを一回実行した。metricsは `started=1`、`completed=1`、post-canary healthy、
+  DistributedReady、orphanなしとなった。同一事象の二回目は `suppressed{reason="cooldown"}=1` で
+  新jobを作成しなかった。検証後は両nodeのconfigをbackupへ復元し、automatic recovery disabled、
+  doctor healthy、final canary HTTP 200、child各1件を確認した。Hermes handoffのpre-cron doctor/canary、
+  Hermes `1800s` / Siderostat `2400s`暫定deadline順を `docs/operations.md`へ追記した。
+  なおMacBook Proでは旧署名由来のstale Service Management登録により通常登録がcode 57で失敗したため、
+  recovery検証中だけproduct-owned runtimeを同一ユーザーのlaunchd jobへ一時復帰させた。このmacOS
+  lifecycle caveatはrecovery結果とは分離し、bundle更新時のunregister/register follow-upとして残す。
 - 停止条件: production cron 実行中、rollback 不可、force kill/state 削除/OS 再起動が必要になる
 
 ## 12. Phase N: recovery epoch 単位の通知重複排除
 
-### [ ] N-01 pure semantic deduplicator を実装する
+### [x] N-01 pure semantic deduplicator を実装する
 
 - Actor: agent
 - Depends on: H-10
@@ -1513,7 +1536,18 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - ユーザーレビュー・手作業: なし
 - 停止条件: epoch 判定のため通知 service から cluster state を mutation する必要がある
 
-### [ ] N-02 notification service と observability へ接続する
+Evidence（N-01 pure reducer と table/反復 test 完了 2026-08-25）:
+`src/notify.rs` の `NotificationDeduplicator` に recovery ID／generation を持つ
+`NotificationEpoch` を追加し、明示的な recovery epoch と cluster transition の暗黙 epoch を
+区別した。同一 epoch の `SoloStandaloneReady`／`PairedStandaloneReady` は通知種別ごとに一回へ
+制限し、`DistributedReady` で epoch を閉じる。worker で local standalone が未準備の一時
+`PairedStandaloneReady` は `notification_event_for_snapshots` の確定通知対象から除外した。
+`StandaloneRestart`、`DistributedReady`、`Backoff`、`ManualInterventionRequired`、
+`DeploymentMismatch` は deduplicator で抑制しない。180回相当の Solo/Paired 反復、明示 epoch
+rollover、worker 一時 Pairing、重大通知の unit test を追加した。cluster/admission/child state
+への feedback は追加していない。
+
+### [x] N-02 notification service と observability へ接続する
 
 - Actor: agent
 - Depends on: N-01
@@ -1530,6 +1564,19 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
 - Verification: notification integration test、reconnect suite、共通 local gate
 - ユーザーレビュー・手作業: 通知文言と重大通知が抑制されない一覧を承認する
 - 停止条件: metric label に unbounded recovery ID、node 名、本文を入れる必要がある
+
+Evidence（notification service／observability 接続と非干渉 test 完了 2026-08-25）:
+`DesktopNotificationService` に runtime と共有する `Metrics` を接続し、抑制数を
+`ds4_proxy_notification_events_total{event="suppressed",kind="..."}` として記録した。
+metric label は固定された通知種別だけで、recovery ID、generation、node 名、通知本文は含めない。
+recovery started/completed/failed は同じ service に渡し、recovery ID／generation／failure reason は
+構造化ログへ記録する。`AppState` の recovery start gate、snapshot failure、lifecycle failure、
+successful canary後の completion と通知 epoch を接続した。
+
+通知送信失敗、GUI session 不在、watch channel close は通知 task 内で処理し、cluster lifecycle の
+結果へ返さない test を追加した。`cargo test --all-targets`（lib unit tests と integration suites）、
+`cargo clippy --all-targets --all-features -- -D warnings` は PASS。N-03 の実機通知レビューは
+未着手であり、通知文言と実機通知回数のユーザー承認を残す。
 
 ### [ ] N-03 coordinator-only restart の実機通知回数を検証する
 
