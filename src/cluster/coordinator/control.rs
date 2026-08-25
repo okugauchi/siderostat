@@ -203,6 +203,30 @@ impl CoordinatorControl {
             .message(request_id.into(), ControlCommand::BeginDrain))
     }
 
+    pub fn prepare_restart_message(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase != DistributedControlPhase::WorkerReady {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::PrepareRestart))
+    }
+
+    pub fn cancel_restart_message(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if self.phase == DistributedControlPhase::Unpaired {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        Ok(self
+            .processor
+            .message(request_id.into(), ControlCommand::CancelRestart))
+    }
+
     pub fn phase(&self) -> DistributedControlPhase {
         self.phase
     }
@@ -247,7 +271,12 @@ impl CoordinatorControl {
         &self,
         request_id: impl Into<String>,
     ) -> Result<ControlMessage, ControlError> {
-        if self.phase != DistributedControlPhase::Drained {
+        if !matches!(
+            self.phase,
+            DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ) {
             return Err(ControlError::InvalidPhase { phase: self.phase });
         }
         Ok(self
@@ -257,7 +286,12 @@ impl CoordinatorControl {
 
     pub fn note_demote_complete(&mut self, generation: u64) -> Result<(), ControlError> {
         self.require_generation(generation)?;
-        if self.phase != DistributedControlPhase::Drained {
+        if !matches!(
+            self.phase,
+            DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ) {
             return Err(ControlError::InvalidPhase { phase: self.phase });
         }
         self.peer_distributed_child_generation = None;
@@ -318,7 +352,12 @@ fn validate_coordinator_command(
                 | DistributedControlPhase::Draining
                 | DistributedControlPhase::Drained
         ),
-        ControlCommand::Demote => !matches!(phase, DistributedControlPhase::Unpaired),
+        ControlCommand::Demote => matches!(
+            phase,
+            DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ),
         _ => false,
     };
     if valid {

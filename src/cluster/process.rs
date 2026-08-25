@@ -18,6 +18,13 @@ use tokio::{
 };
 use url::Url;
 
+/// The bounded window used to reap a child after SIGKILL.
+pub(crate) const SIGKILL_REAP_WINDOW: Duration = Duration::from_secs(5);
+
+pub(crate) fn sigkill_reap_window(stop_timeout: Duration) -> Duration {
+    stop_timeout.min(SIGKILL_REAP_WINDOW)
+}
+
 mod coordinator;
 mod standalone;
 mod worker;
@@ -655,7 +662,8 @@ impl ManagedChild {
             Err(ProcessControlError::NotRunning) => {}
             Err(error) => return Err(error),
         }
-        if let Some(status) = wait_child_exit(&mut self.child, timeout).await? {
+        let graceful_deadline = Instant::now() + timeout;
+        if let Some(status) = wait_child_exit_until(&mut self.child, graceful_deadline).await? {
             return Ok(status);
         }
         if !allow_sigkill {
@@ -668,17 +676,20 @@ impl ManagedChild {
             Ok(()) | Err(ProcessControlError::NotRunning) => {}
             Err(error) => return Err(error),
         }
-        wait_child_exit(&mut self.child, timeout)
+        // The configured stop timeout is the complete graceful window. After it expires, keep
+        // only a short bounded reaping window for SIGKILL; do not silently add a second full stop
+        // timeout to every restart and recovery operation.
+        let kill_deadline = Instant::now() + sigkill_reap_window(timeout);
+        wait_child_exit_until(&mut self.child, kill_deadline)
             .await?
             .ok_or(ProcessControlError::StopTimeout)
     }
 }
 
-async fn wait_child_exit(
+async fn wait_child_exit_until(
     child: &mut tokio::process::Child,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<Option<std::process::ExitStatus>, ProcessControlError> {
-    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
@@ -989,6 +1000,40 @@ mod tests {
         assert_eq!(child.identity().generation, 9);
         let status = child.stop(Duration::from_secs(2), false).await.unwrap();
         assert!(!status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_stop_uses_a_bounded_kill_window_after_term_timeout() {
+        use crate::{
+            cluster::Ds4Profile,
+            config::{Quantization, Residency},
+        };
+
+        let command = Ds4Command {
+            executable: PathBuf::from("/bin/sh"),
+            working_directory: PathBuf::from("/tmp"),
+            argv: vec![
+                OsString::from("-c"),
+                OsString::from("trap '' TERM; sleep 30"),
+            ],
+            profile: Ds4Profile {
+                profile_id: "process-stop-timeout".into(),
+                quantization: Quantization::Q2,
+                residency: Residency::Resident,
+                speculative_support: crate::config::SpeculativeSupport::None,
+            },
+        };
+        let mut child = ManagedChild::spawn(&command, 10).await.unwrap();
+        let started = std::time::Instant::now();
+        let status = child.stop(Duration::from_millis(100), true).await.unwrap();
+
+        assert!(!status.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop exceeded the bounded kill window: {:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(target_os = "macos")]

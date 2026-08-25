@@ -4,8 +4,8 @@
 
 | 項目 | 値 |
 |---|---|
-| 文書状態 | Target Specification / 実装着手可能 |
-| 最終更新日 | 2026-08-06 |
+| 文書状態 | v0.3.0 Target Specification / 実装・受入済み範囲 |
+| 最終更新日 | 2026-08-26 |
 | 対象platform | macOS 26系、Apple Silicon |
 | 初期topology | Thunderbolt Bridgeで直結した2 node |
 | DS4互換性基準 | full commit `b0309611041655f4e45671cfd9c9886aff161406` |
@@ -1671,9 +1671,21 @@ persistence.rs（cluster state_storeへ置換）
 
 v0.1.0の実装順序、migration、verification、rollback記録は [`implementation-plan-v0.1.0.md`](archive/implementation-plan-v0.1.0.md) にarchiveした。本書はtarget behaviorとacceptance criteriaを定義し、作業進捗やcommit分割を管理しない。
 
-## 35. macOS service
+## 35. macOS service と導入導線
 
-1つのuser service jobだけがproxy processを管理する。
+v0.3.0 の公式提供物はソースコードであり、公式の事前ビルド済み `.app`、`.pkg`、DMG、
+`Siderostat Uninstaller.app` は配布しない。利用者はソース checkout から `cargo xtask install --start`
+を実行して、各 Mac 上で runtime と Monitor をビルド・配置する。`cargo xtask app-dev`、`pkg-dev`、
+`dmg-dev`、`sign` は、macOS のローカル検証または将来のバイナリ配布を検討するための任意経路であり、
+v0.3.0 の公式リリース条件ではない。
+
+ソースからの `cargo xtask install --start` は、各 Mac 上で runtime と Monitor をビルドし、ユーザーの
+LaunchAgent として登録・起動する。app bundle 内の `dev.siderostat-ds4-proxy.runtime.plist` を
+Service Management へ登録する方式は、`app-dev`／package workflow をローカルで検証する場合、または
+将来の任意バイナリ配布を採用する場合に限る。ユーザー承認が必要な場合は System Settings > General >
+Login Items に案内する。管理者認証と Login Items／Background Items のユーザー承認は別の操作である。
+
+1つの user service job だけが runtime process を管理する。
 
 ```text
 macOS user service manager
@@ -1688,6 +1700,9 @@ macOS user service manager
 - Secret/tokenをjob definitionへ直接書かない。
 - DS4 childを別jobへ登録しない。
 - 同じport/processを複数jobから管理しない。
+- product-owned service identifier、runtime child、Siderostat Monitor の identity を確認してから停止する。
+- Uninstaller は runtime／Monitor／managed DS4 child／application bundle／対象 receipt を整理するが、
+  Application Support、secret、manifest、cluster state、model、KV cache は削除しない。
 
 ## 36. Upstream compatibility tracking
 
@@ -1715,6 +1730,9 @@ Repository内にverified DS4 commit、binary digest、wire/log fixture digest、
 - standalone/distributed間でlive KVを引き継がない。
 - DS4 log textへの依存がある。
 - MXFP4 SSD streaming on Metalとlayer-parallel distributedのproduction可否はactual acceptance結果で決める。
+- Mac 間 tensor parallelism、layer-parallel の RDMA transport、distributed DSpark は v0.3.0 の対象外で、
+  v0.4+ の upstream/server lifecycle、HTTP contract、24時間 endurance、fail-closed、rollback gate を
+  満たすまで有効化しない。
 
 ## 38. Definition of Done
 

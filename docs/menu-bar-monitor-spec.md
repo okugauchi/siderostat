@@ -1,5 +1,8 @@
 # siderostat メニューバーモニター 仕様
 
+> v0.3.0 の公式提供物はソースコードのみである。本書の「配布版」および bundle 内 runtime の記述は、
+> ソースからの local install で生成される bundle と、将来の任意バイナリ配布を対象とする。
+
 - 文書状態: 実装済み (Phase 1〜4) / Phase 5 は実機確認待ち
 - 作成日: 2026-08-12
 - 対象baseline: `develop`（通知文言・monitor UI 実装後の `99efd5c` 系列）
@@ -37,7 +40,7 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 
 ```text
 ┌──────────────────────────┐
-│ siderostat (本体)          │ LaunchAgent (gui/<uid> ドメイン)
+│ Siderostat.app (Monitor)  │ SMAppService / gui/<uid> domain
 │  - DS4 child stdout/stderr │
 │    をパイプで直接読取       │
 │  - parse_ds4_log_event で  │
@@ -50,7 +53,7 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
             │ HTTP (loopback, admin_listen)
             ▼
 ┌──────────────────────────┐
-│ siderostat-monitor        │ 別プロセス（ログイン項目 or 手動起動）
+│ siderostat-runtime helper │ bundle 内 LaunchAgent（Background Item）
 │  - tray-icon (NSStatusItem)│
 │  - admin API ポーリング   │
 │  - メニューバー表示        │
@@ -71,9 +74,11 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
   ポーリング間隔を 5 秒へバックオフする。本体復帰を自動検出する。
 - 現状の `/metrics` は認証なしで公開されているため、モニターはトークンなしで取得する。
   将来 `/metrics` に認証が付く場合は、admin token を Bearer で送る設定を追加する。
-- メニュー操作は `gui/<uid>` ドメインの LaunchAgent に委譲する。「Proxy 再起動」は
-  `local.siderostat.runtime`、「Monitor 再起動」は `local.siderostat.monitor` を
-  `launchctl kickstart -k` する。「終了」は両方のジョブを `launchctl bootout` する。
+- 配布版のメニュー操作は bundle runtime の管理 API と `SMAppService` に委譲する。
+  「siderostat-runtimeを再起動」は現在の runtime child を graceful restart する。
+  「siderostat-runtimeを起動して自動起動を有効化」／「siderostat-runtimeを停止して自動起動を無効化」は
+  runtime background item の登録状態と runtime child を連動させる。「Siderostatを終了」は Monitor
+  自身を終了する。配布版の通常操作で `local.siderostat.*` の LaunchAgent を直接操作しない。
   操作失敗時もモニターは継続し、結果をログに記録する。
 - 「設定ファイルを開く」は runtime の主設定
   `~/Library/Application Support/siderostat/config.toml` を macOS の既定アプリで開く。
@@ -215,10 +220,13 @@ Siderostatを終了
 - 「設定ファイルを開く」は `~/Library/Application Support/siderostat/config.toml` が存在すれば
   `/usr/bin/open` により既定アプリで開く。存在しない場合は、設定の保存場所を確認できるよう
   最寄りの既存親フォルダを開く。この操作で設定ファイルやディレクトリを暗黙に作成しない。
-- 「Proxy 再起動」は `gui/<uid>/local.siderostat.runtime` を `launchctl kickstart -k` する。
-- 「Monitor 再起動」は `gui/<uid>/local.siderostat.monitor` を `launchctl kickstart -k` する。
-- 「終了」は `local.siderostat.runtime` と `local.siderostat.monitor` の両方を `launchctl bootout`
-  する。siderostat 本体の管理外プロセスは対象にしない。
+- 「siderostat-runtimeを再起動」は runtime の現在 profile を graceful restart する。
+- 「siderostat-runtimeを起動して自動起動を有効化」／「siderostat-runtimeを停止して自動起動を無効化」は
+  runtime background item の登録・解除と managed runtime の起動・停止を行う。
+- 「ログイン項目を開く」は常に System Settings > General > Login Items を開く。
+- 「Siderostatを終了」は Siderostat Monitor のみを終了し、ユーザーが管理していない process は対象にしない。
+- `dev.siderostat-ds4-proxy.runtime` は Service Management の product identifier であり、UI の文言として
+  そのまま表示しない。`Mode`、`State`、`Quantization`、`Speculative support` は別項目として表示する。
 
 ### 5.3 offline 表示
 

@@ -54,13 +54,15 @@ fn bundle_templates_contain_no_forbidden_strings() {
 }
 
 #[test]
-fn bundle_templates_prescribe_bundle_relative_runtime_path() {
+fn bundle_templates_prescribe_fixed_runtime_program_path() {
     let runtime_plist = repo_root().join("contrib/macos/dev.siderostat-ds4-proxy.runtime.plist");
     let contents = std::fs::read_to_string(&runtime_plist).unwrap();
-    // BundleProgram は bundle からの相対 path を使い、絶対 path で runtime を指定しない。
-    assert!(contents.contains("<key>BundleProgram</key>"));
-    assert!(contents.contains("Contents/Helpers/siderostat-runtime"));
-    // ProgramArguments は bundle-relative helper 名（argv[0]）を使う。
+    // pkg の postinstall から launchctl bootstrap するため、Program は固定の
+    // インストール先を明示する。SMAppService からも同じ plist を利用する。
+    assert!(contents.contains("<key>Program</key>"));
+    assert!(contents.contains("/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime"));
+    assert!(!contents.contains("<key>BundleProgram</key>"));
+    // ProgramArguments は runtime の固定 subcommand を渡す。
     assert!(contents.contains("<string>siderostat-runtime</string>"));
     assert!(contents.contains("<string>serve</string>"));
     // RunAtLoad / KeepAlive / ThrottleInterval が記載される。

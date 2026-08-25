@@ -1,6 +1,4 @@
-use super::{
-    ControlHttpError, RoleControl, effect_requires_ack, endpoint_path, header, now_millis,
-};
+use super::{ControlHttpError, RoleControl, endpoint_path, header, now_millis};
 use crate::{
     cluster::{
         AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
@@ -91,6 +89,15 @@ impl super::ProductionClusterRuntime {
         let message: ControlMessage = serde_json::from_slice(&body)
             .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
         let command = message.command.clone();
+        if self.inner.role == LocalRole::Worker
+            && matches!(&command, ControlCommand::PrepareWorker)
+            && self.planned_restart_blocks_worker_prepare()
+        {
+            // Demote deliberately acknowledges before the child stop completes. Do not let the
+            // control phase advance to WorkerPreparing while the lifecycle owner is still
+            // stopping the old distributed child.
+            return Err(ControlError::PlannedRestartInProgress.into());
+        }
         let cluster_generation = self.inner.mode.snapshot().generation;
         let response = match &self.inner.control {
             RoleControl::Coordinator(control) => {
@@ -136,26 +143,27 @@ impl super::ProductionClusterRuntime {
                 }
             }
         };
-        let response = if effect_requires_ack(&command) {
-            let response_status = response.status;
-            let runtime = self.clone();
-            tokio::spawn(async move { runtime.apply_effect(command).await })
-                .await
-                .map_err(|error| ControlHttpError::Effect(error.to_string()))?
-                .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
-            // Lifecycle effects can take long enough to cross the lease interval. Renew the
-            // inbound control lease after the effect completes and return that fresh expiry to
-            // the caller; otherwise a reciprocal Pair can finish successfully but the next
-            // /v1/node renewal observes the lease as expired.
-            let mut refreshed = self
-                .refresh_control_response(&authenticated, route_scoped)
-                .await?;
-            refreshed.status = response_status;
-            refreshed
-        } else {
-            self.spawn_effect(command);
-            response
-        };
+        let response =
+            if super::effect_requires_ack_for_runtime(&command, self.planned_restart_active()) {
+                let response_status = response.status;
+                let runtime = self.clone();
+                tokio::spawn(async move { runtime.apply_effect(command).await })
+                    .await
+                    .map_err(|error| ControlHttpError::Effect(error.to_string()))?
+                    .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
+                // Lifecycle effects can take long enough to cross the lease interval. Renew the
+                // inbound control lease after the effect completes and return that fresh expiry to
+                // the caller; otherwise a reciprocal Pair can finish successfully but the next
+                // /v1/node renewal observes the lease as expired.
+                let mut refreshed = self
+                    .refresh_control_response(&authenticated, route_scoped)
+                    .await?;
+                refreshed.status = response_status;
+                refreshed
+            } else {
+                self.spawn_effect(command);
+                response
+            };
         self.inner.lease.update(&response);
         Ok(response)
     }
@@ -194,20 +202,17 @@ impl super::ProductionClusterRuntime {
     async fn apply_effect(&self, command: ControlCommand) -> anyhow::Result<()> {
         match command {
             ControlCommand::Pair { .. } => {
-                if self.inner.role == LocalRole::Worker {
-                    let reply = ControlMessage {
-                        request_id: uuid::Uuid::new_v4().to_string(),
-                        generation: self.control_generation().await,
-                        deployment_id: self.inner.descriptor.deployment_id.clone(),
-                        command: ControlCommand::Pair {
-                            descriptor: self.local_descriptor().await,
-                        },
-                    };
-                    let response = self.inner.client.send(&reply).await?;
-                    self.inner.lease.update(&response);
-                }
-                tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-                self.reconcile_peer(EventOwner::Control).await?;
+                let planned_completion = if self.inner.role == LocalRole::Worker {
+                    match self.planned_restart_pair_action() {
+                        super::PlannedRestartPairAction::Defer
+                        | super::PlannedRestartPairAction::AlreadyCompleting => return Ok(()),
+                        super::PlannedRestartPairAction::Run => false,
+                        super::PlannedRestartPairAction::RunAfterChildStop => true,
+                    }
+                } else {
+                    false
+                };
+                self.complete_pair_effect(planned_completion).await?;
             }
             ControlCommand::PrepareWorker => self.prepare_worker().await?,
             ControlCommand::BeginDrain => self.worker_drained().await?,
@@ -215,9 +220,43 @@ impl super::ProductionClusterRuntime {
             ControlCommand::DistributedReady => {
                 self.inner.proxy.admission().start_serving();
             }
+            ControlCommand::PrepareRestart => self.begin_planned_restart(),
+            ControlCommand::CancelRestart => self.cancel_planned_restart().await?,
             ControlCommand::Drained | ControlCommand::WorkerEvent { .. } => {}
         }
         Ok(())
+    }
+
+    pub(super) async fn complete_pair_effect(
+        &self,
+        planned_completion: bool,
+    ) -> anyhow::Result<()> {
+        let result = async {
+            if self.inner.role == LocalRole::Worker {
+                let reply = ControlMessage {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    generation: self.control_generation().await,
+                    deployment_id: self.inner.descriptor.deployment_id.clone(),
+                    command: ControlCommand::Pair {
+                        descriptor: self.local_descriptor().await,
+                    },
+                };
+                let response = self.inner.client.send(&reply).await?;
+                self.inner.lease.update(&response);
+            }
+            self.clear_planned_restart();
+            tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
+            self.reconcile_peer(EventOwner::Control).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if result.is_err() && planned_completion {
+            // Keep the completed-child state so a later Pair can retry if the restarting
+            // coordinator was still between process generations when the reciprocal Pair was
+            // sent.
+            self.inner.planned_restart.retry_pair_after_failure();
+        }
+        result
     }
 
     fn schedule_deployment_mismatch_recovery(&self) {

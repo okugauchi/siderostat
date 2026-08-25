@@ -74,6 +74,8 @@ pub enum ControlCommand {
     WorkerEvent { event: WorkerEventKind },
     DistributedReady,
     Demote,
+    PrepareRestart,
+    CancelRestart,
 }
 
 impl ControlCommand {
@@ -87,6 +89,8 @@ impl ControlCommand {
             Self::WorkerEvent { .. } => ControlEndpoint::WorkerEvent,
             Self::DistributedReady => ControlEndpoint::DistributedReady,
             Self::Demote => ControlEndpoint::Demote,
+            Self::PrepareRestart => ControlEndpoint::PrepareRestart,
+            Self::CancelRestart => ControlEndpoint::CancelRestart,
         }
     }
 
@@ -140,6 +144,8 @@ pub enum ControlError {
     IdempotencyConflict,
     #[error("command is not accepted by this role")]
     CommandNotAllowed,
+    #[error("worker planned restart is still in progress")]
+    PlannedRestartInProgress,
     #[error("control command is not valid in phase {phase:?}")]
     InvalidPhase { phase: DistributedControlPhase },
 }
@@ -151,6 +157,7 @@ impl ControlError {
             Self::GenerationMismatch { .. }
             | Self::IdempotencyConflict
             | Self::PeerNotPaired
+            | Self::PlannedRestartInProgress
             | Self::InvalidPhase { .. } => 409,
             Self::CommandNotAllowed => 403,
             Self::EndpointMismatch
@@ -506,6 +513,8 @@ pub enum ControlEndpoint {
     WorkerEvent,
     DistributedReady,
     Demote,
+    PrepareRestart,
+    CancelRestart,
 }
 
 impl ControlEndpoint {
@@ -520,6 +529,8 @@ impl ControlEndpoint {
             ("POST", "/v1/worker-event") => Some(Self::WorkerEvent),
             ("POST", "/v1/distributed-ready") => Some(Self::DistributedReady),
             ("POST", "/v1/demote") => Some(Self::Demote),
+            ("POST", "/v1/prepare-restart") => Some(Self::PrepareRestart),
+            ("POST", "/v1/cancel-restart") => Some(Self::CancelRestart),
             _ => None,
         }
     }
@@ -664,6 +675,22 @@ mod tests {
         assert_eq!(
             ControlEndpoint::parse("POST", "/v1/prepare-worker"),
             Some(ControlEndpoint::PrepareWorker)
+        );
+        assert_eq!(
+            ControlEndpoint::parse("POST", "/v1/prepare-restart"),
+            Some(ControlEndpoint::PrepareRestart)
+        );
+        assert_eq!(
+            ControlEndpoint::parse("POST", "/v1/cancel-restart"),
+            Some(ControlEndpoint::CancelRestart)
+        );
+        assert_eq!(
+            ControlCommand::PrepareRestart.endpoint(),
+            ControlEndpoint::PrepareRestart
+        );
+        assert_eq!(
+            ControlCommand::CancelRestart.endpoint(),
+            ControlEndpoint::CancelRestart
         );
         assert_eq!(ControlEndpoint::parse("POST", "/v1/node"), None);
         assert_eq!(ControlEndpoint::parse("GET", "/v1/pair"), None);

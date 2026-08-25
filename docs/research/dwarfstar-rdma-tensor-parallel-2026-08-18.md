@@ -531,3 +531,81 @@ Mac の layer-parallel を RDMA 化する経路、distributed DSpark を
 - [DSpark exact sampling](https://github.com/antirez/ds4/commit/769a8ba)
 - [DeepSeek V4 PRO 0813 oracle](https://github.com/antirez/ds4/commit/3c63c06)
 - [PRO 0813 model download target](https://github.com/antirez/ds4/commit/c35cf38)
+
+## 12. upstream main 追跡更新（2026-08-26 JST）
+
+2026-08-26 に upstream の公開 `main` とローカル参照 `origin/main` を再確認した。
+固定 baseline `84cc882352757baf628a1776badf7cc54d584e28` に対し、確認対象の main は
+`c1d4597a80e300b803dc642519718f2c999589da`（2026-08-23、`qa: update DGX Spark host addresses`）で、
+19 commit 進んでいる。main の履歴と README の記述をソースとして照合した結果、前節の
+2026-08-24 時点の判断に、次の補正を加える。
+
+### 12.1 main に入った更新と TP への影響
+
+- DeepSeek V4 PRO 0813 の q2 imatrix 取得対象と 100 ケースの品質 oracle が追加された。
+  これは Flash 0731 の更新ではなく、別 model family／checkpoint の追加である。
+- DSpark は非ゼロ温度の opportunistic sampling と `--mtp-exact-sampling` を備え、`ds4`、
+  `ds4-agent`、非 batched の `ds4-server` で利用できる。`--batched-session` では speculative
+  decoding を使用しない。この変更は single-node／server の decoding policy であり、distributed
+  pipeline の DSpark lifecycle を main に追加したものではない。
+- main README には DeepSeek V4 PRO Q4 の二台 layer split と、M5 Max 二台の pipeline 測定値が
+ 追加されている。これは plain TCP の layer-parallel であり、Mac 間 TP または RDMA ではない。
+- Mac 間 tensor parallel は `ds4 --tensor-parallel --role coordinator|worker` として README と
+  `ds4_tp.c` に存在する。一方 `ds4_server.c` の main 側 option には Mac TP の
+  `--tensor-parallel` role parser はなく、確認できる `--cuda-tensor-parallel` は単一 CUDA host の
+  別経路である。main README も Mac TP roles は `ds4` CLI に限られ、`ds4-server`／`ds4-agent` には
+  公開されていないと明記している。
+
+### 12.2 関連 PR の状態（main へ未採用）
+
+2026-08-26 の公開状態は次のとおりである。Open／Closed は PR の状態であり、採用済み capability
+とは解釈しない。
+
+| PR | 内容 | 公開状態 | T-01 での扱い |
+| --- | --- | --- | --- |
+| [#813](https://github.com/antirez/ds4/pull/813) | ROCm two-machine TP と `ds4-server` 配線 | Open | main 依存にしない。ROCm 専用候補として追跡 |
+| [#754](https://github.com/antirez/ds4/pull/754) | CUDA network EP/TP と server/agent 配線 | Open | CUDA 専用候補として追跡 |
+| [#835](https://github.com/antirez/ds4/pull/835) | layer-parallel の distributed MTP/DSpark | Open | merge・QA 完了までは採用しない |
+| [#715](https://github.com/antirez/ds4/pull/715) | Apple layer-parallel RDMA | Closed | main への採用証跡なし。候補から再利用しない |
+
+したがって、現時点で「関連実装が存在する」ことと「Siderostat が管理対象として採用できる」
+ことを分離する必要がある。特に PR の説明・測定値だけでは server lifecycle、互換性、rollback、
+再接続時の安全性を証明できない。
+
+### 12.3 T-01 の延期判定と v0.4+ backlog
+
+T-01 の判定は **v0.4+ へ延期** とする。v0.3.0 の現行対象は引き続き Apple 2台の
+`Distributed (layer-parallel)`／TCP とし、TP、RDMA layer-parallel、distributed DSpark を
+config、manifest、state machine、metrics の production profile として追加しない。
+
+v0.4+ で再開する候補は、次の順序に固定する。
+
+1. **upstream server path**: upstream main に対象 backend の server role／lifecycle が入り、
+   `ds4-server` の HTTP contract、session、cancel、shutdown、KV policy が文書化・テスト済みで
+   あることを確認する。未採用の場合は、固定 commit に限定した最小 backport を別計画として承認する。
+2. **HTTP contract gate**: `healthz`／model metadata、streaming、client disconnect、request cancel、
+   session persistence、tool/continuation の扱いを、single-node server と同じ意味で定義する。
+   CLI stdout/PTY scrape を production dependency にしない。stdio/PTY bridge は制約付き PoC に限定する。
+3. **24時間 endurance gate**: RDMA と明示的 TCP の各 transport で、request、long prefill、cancel、
+   peer loss/reconnect、worker replacement、multi-turn、session/KV restore を固定 model/source digest
+   で実施し、deadlock、rank desync、request duplication、orphan がないことを確認する。
+4. **fail-closed gate**: source commit、binary digest、model／quantization、topology、world size、
+   context geometry、transport capability の不一致を起動前に拒否する。RDMA unavailable 時の TCP
+   fallback は暗黙に行わず、設定で明示された場合だけ許可する。trusted network 前提と未認証 protocol
+   を Monitor に「ready」と表示しない。
+5. **rollback gate**: TP／RDMA child、peer control、local standalone、layer-parallel へ戻る遷移を
+   lifecycle owner 経由で実装し、途中失敗時の admission、in-flight、state、generation、orphan を
+   既存 v0.3 acceptance と同じ基準で確認する。
+
+T-01 の事後条件を満たすため、上記判断を Siderostat の v0.3 実装へ反映せず、次版の entry
+criteria としてのみ記録する。これにより v0.3 の release candidate に未成熟な TP／RDMA の
+placeholder や silent fallback が混入することを防ぐ。
+
+### 12.4 追跡証跡
+
+- [upstream main commit `c1d4597`](https://github.com/antirez/ds4/commit/c1d4597a80e300b803dc642519718f2c999589da)
+- [upstream main commit history](https://github.com/antirez/ds4/commits/main)
+- [upstream README の Tensor Parallelism over RDMA](https://github.com/antirez/ds4/blob/c1d4597a80e300b803dc642519718f2c999589da/README.md#tensor-parallelism-over-rdma)
+- [DSpark exact sampling](https://github.com/antirez/ds4/commit/769a8ba)
+- [DeepSeek V4 PRO 0813 oracle](https://github.com/antirez/ds4/commit/3c63c06)
+- [PRO 0813 model download target](https://github.com/antirez/ds4/commit/c35cf38)

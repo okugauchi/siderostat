@@ -162,6 +162,12 @@ impl super::ProductionClusterRuntime {
             };
             self.inner.proxy.set_target(paired.target, true);
             self.inner.proxy.admission().start_serving();
+            if self.note_planned_restart_child_stopped() {
+                // Pair may have arrived while Demote was being acknowledged early. The stop
+                // task owns completion in that case, so the reciprocal Pair and stability gate
+                // run only after the child is actually gone.
+                self.complete_pair_effect(true).await?;
+            }
         }
         Ok(())
     }
@@ -182,8 +188,14 @@ impl super::ProductionClusterRuntime {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if runtime.planned_restart_active() {
+                    continue;
+                }
                 if let Err(error) = runtime.reconcile().await {
                     tracing::error!(error = %error, "production cluster reconcile failed");
+                }
+                if runtime.planned_restart_active() {
+                    continue;
                 }
                 let snapshot = runtime.inner.mode.snapshot();
                 if snapshot.state == ClusterState::SoloStandaloneReady

@@ -354,6 +354,86 @@ impl CoordinatorDistributedRuntime {
             .await
     }
 
+    /// Stop the distributed children for a planned process restart without entering the normal
+    /// recovery demotion. The process restart already owns the local admission drain and the
+    /// peer has already entered the planned-restart gate. The state-machine demotion is published
+    /// only after both children have stopped; this keeps a peer timeout from marooning the local
+    /// node in `Demoting` while its coordinator child is already gone.
+    pub async fn stop_for_planned_restart(
+        &self,
+    ) -> Result<ClusterSnapshot, CoordinatorLifecycleError> {
+        let current = self.cluster.snapshot();
+        if current.state != ClusterState::DistributedReady {
+            return Err(CoordinatorLifecycleError::Transition(
+                TransitionError::InvalidTransition {
+                    from: current.state,
+                    event: ClusterEventKind::BeginDemotion,
+                },
+            ));
+        }
+
+        self.block_transition();
+        if let Err(error) = self.coordinator.stop().await {
+            self.proxy.set_target(current.target, true);
+            self.proxy.admission().start_serving();
+            return Err(CoordinatorLifecycleError::Coordinator(error));
+        }
+
+        if let Err(error) = self.peer.stop_worker(current.generation).await {
+            // The peer may have applied Demote before its HTTP response was lost. Restoring the
+            // coordinator child and waiting for a complete distributed route in that case can
+            // never finish: the worker is already Paired and deliberately no longer advertises a
+            // distributed route. Restore the local safe fallback instead, so the failed restart
+            // is bounded and the operator can retry from PairedStandaloneReady.
+            self.restore_paired_after_planned_restart(current.generation)
+                .await?;
+            return Err(CoordinatorLifecycleError::Peer(error));
+        }
+        let demoting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::BeginDemotion,
+            })
+            .await?;
+        let paired = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: demoting.generation,
+                kind: ClusterEventKind::PairingReady,
+            })
+            .await?;
+        self.proxy.set_target(paired.target, true);
+        Ok(paired)
+    }
+
+    async fn restore_paired_after_planned_restart(
+        &self,
+        generation: u64,
+    ) -> Result<(), CoordinatorLifecycleError> {
+        self.standalone
+            .start(generation)
+            .await
+            .map_err(CoordinatorLifecycleError::Standalone)?;
+        let demoting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: generation,
+                kind: ClusterEventKind::BeginDemotion,
+            })
+            .await?;
+        let paired = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: demoting.generation,
+                kind: ClusterEventKind::PairingReady,
+            })
+            .await?;
+        self.proxy.set_target(paired.target, true);
+        self.proxy.admission().start_serving();
+        Ok(())
+    }
+
     async fn demote_with_drain_timeout_and_admission(
         &self,
         drain_timeout: Duration,

@@ -419,7 +419,7 @@ Siderostat、OS/Metalのいずれかへ絞り込める。
 
 ## 13. 関連資料と実装箇所
 
-- [`../operations.md`](../operations.md): status、metrics、safe restartの運用手順
+- [`../internal-operations.md`](../internal-operations.md): status、metrics、safe restartの運用手順
 - [`../compatibility/reconnect-acceptance-2026-08-17.md`](../compatibility/reconnect-acceptance-2026-08-17.md): 実機再接続試験
 - [`../spec.md`](../spec.md): cluster lifecycle、metrics、security contract
 - `src/metrics.rs`: prefill/decode progress metrics

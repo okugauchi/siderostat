@@ -663,3 +663,51 @@ layer-parallel 測定値も、upstream main が RDMA 対応になった証拠で
 - [DSpark exact sampling](https://github.com/antirez/ds4/commit/769a8ba)
 - [DeepSeek V4 PRO 0813 oracle](https://github.com/antirez/ds4/commit/3c63c06)
 - [PRO 0813 model download target](https://github.com/antirez/ds4/commit/c35cf38)
+
+## 17. upstream main 再確認と T-01 判定（2026-08-26 JST）
+
+2026-08-26 に固定 baseline `84cc882` と upstream `main`
+`c1d4597a80e300b803dc642519718f2c999589da`（2026-08-23）を再比較した。main は 19 commit
+進んでいるが、Siderostat の管理対象を変更する機能追加は確認できなかった。
+
+### 17.1 更新された領域
+
+- DeepSeek V4 PRO 0813 q2 imatrix と 100 ケースの quality oracle が main に追加された。
+- DSpark は非ゼロ温度の opportunistic sampling、`--mtp-exact-sampling`、非 batched
+  `ds4-server` 接続を得た。`--batched-session` は従来どおり speculative decoding を使用しない。
+- M5 Max 二台の pipeline 測定値と DeepSeek V4 PRO Q4 の二台 layer split が README に追加された。
+  いずれも plain TCP の layer-parallel であり、TP／RDMA layer-parallel の main 採用ではない。
+
+### 17.2 採用に至っていない領域
+
+main の README、`ds4_tp.c`、`ds4_server.c` を照合した結果、Mac 間 TP は `ds4` CLI の
+`--tensor-parallel --role coordinator|worker` に限られる。`ds4-server` に存在する
+`--cuda-tensor-parallel` は単一 CUDA host の別機能であり、Mac 間 TP の server lifecycle を示さない。
+Mac layer-parallel RDMA と distributed pipeline DSpark も main には入っていない。
+
+関連 PR の公開状態は、#813（ROCm server TP）が Open、#754（CUDA network EP/TP）が Open、
+#835（pipeline DSpark）が Open、#715（Apple layer-parallel RDMA）が Closed である。いずれも
+main の採用証跡ではない。したがって「PR が存在する」ことを「Siderostat が利用可能」と扱わない。
+
+### 17.3 T-01 の結論
+
+TP／RDMA／distributed DSpark は v0.3.0 へ入れず、v0.4+ backlog へ延期する。再開条件は次の
+5 gate とする。
+
+1. 対象 backend の `ds4-server` role/lifecycle が upstream main、または承認済み固定 backport に入る。
+2. HTTP contract（stream、cancel、disconnect、session/KV、tool/continuation）が確定し、CLI/PTY
+   scrape を本番経路にしない。
+3. 固定 source／binary／model digest で RDMA と明示的 TCP の 24時間 endurance を完了する。
+4. mismatch、RDMA 不在、rank desync、peer loss を起動前／実行中に fail-closed で扱い、silent
+   fallback を行わない。
+5. child、peer control、admission、generation、orphan の rollback が現行 v0.3 gate を退行させない。
+
+この判定により、v0.3.0 の config、manifest、state machine、metrics に TP/RDMA placeholder を
+追加せず、現行の TCP layer-parallel baseline を維持する。詳細な backlog と追跡リンクは
+`dwarfstar-rdma-tensor-parallel-2026-08-18.md` の第12節に固定した。
+
+### 17.4 追跡証跡
+
+- [upstream main commit `c1d4597`](https://github.com/antirez/ds4/commit/c1d4597a80e300b803dc642519718f2c999589da)
+- [upstream main commit history](https://github.com/antirez/ds4/commits/main)
+- [PR #813](https://github.com/antirez/ds4/pull/813) / [PR #754](https://github.com/antirez/ds4/pull/754) / [PR #835](https://github.com/antirez/ds4/pull/835) / [PR #715](https://github.com/antirez/ds4/pull/715)

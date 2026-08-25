@@ -1,6 +1,6 @@
 # Siderostat v0.3.0 実装計画
 
-- 文書状態: 実装開始前レビュー案
+- 文書状態: 実装・受入済み範囲とソースリリース計画
 - 作成日: 2026-08-19
 - 対象 baseline: `develop`、crate version `0.2.1`
 - 最優先仕様: [`distribution/macos-app-bundle-pkg-spec.md`](distribution/macos-app-bundle-pkg-spec.md)
@@ -15,11 +15,12 @@
 ## 1. 目的
 
 本書は、上記の配布仕様と調査文書を、v0.3.0 で順番に実行できる小さい task へ分解した
-実装計画である。最優先 feature は、現在の `/usr/local/bin` と
-`~/Library/LaunchAgents` への直接配置を、`Siderostat.app` と署名・公証済み `.pkg` へ
-置き換えることである。
+実装計画である。v0.3.0 の公式提供方針は public repository のソース公開のみとし、
+公式の事前ビルド済みバイナリ、DMG、`.pkg` は配布しない。`Siderostat.app`、bundle、
+package、署名・公証の実装と実機検証記録は、各 Mac 上でソースから導入するための実装と、
+将来の任意バイナリ配布を検討するための内部検証として保持する。
 
-配布 feature が受入基準を満たす前に、低速推論の自動復旧、通知重複排除、TP/RDMA の
+導入 feature が受入基準を満たす前に、低速推論の自動復旧、通知重複排除、TP/RDMA の
 実装へ着手しない。Mac 間 Tensor Parallelism（以下 TP）と RDMA は最後に再評価し、
 本計画では v0.4.0 以降へ延期することを既定判断とする。
 
@@ -33,7 +34,7 @@
 
 | 優先度 | feature | v0.3.0 の扱い |
 |---:|---|---|
-| P0 | macOS `.app` / `.pkg` 配布、Service Management、legacy migration | 必須。最初に完了する |
+| P0 | macOS bundle、Service Management、legacy migration、ソースからの導入 | 必須。最初に完了する |
 | P1 | 推論進捗の鮮度、canary、診断 snapshot、安全な degraded recovery | 必須。P0 完了後に開始する |
 | P2 | recovery epoch 単位の通知重複排除 | 必須。P1 完了後に開始する |
 | P3 | DwarfStar Mac 間 TP / RDMA / DSpark + TP | 実装しない。最後に upstream を再評価して v0.4+ へ送る |
@@ -43,15 +44,15 @@
 
 ### 2.2 v0.3.0 の必須成果物
 
-1. Apple silicon 向け `Siderostat.app` と flat installer package。
+1. Apple silicon 向け bundle と、ソースから各 Mac へ導入する workflow。
 2. monitor を main app、runtime を app 内 LaunchAgent Helper とする bundle layout。
 3. `SMAppService` による runtime の登録・停止と、main app の login start 設定。
 4. legacy LaunchAgent を重複起動なしで移行し、失敗時に復旧できる migration。
-5. Developer ID 署名、Hardened Runtime、公証、stapling、checksum、build metadata。
+5. checksum、build metadata、dependency inventory、third-party notices を含む source release evidence。
 6. active 推論の最終進捗時刻と token 差分の観測、現在 chunk TPS の monitor 表示。
 7. 診断 snapshot、canary、単一 owner の `recover-degraded` job、cooldown と回数上限。
 8. coordinator-only restart 中の通知を recovery epoch 内で意味的に重複排除する機能。
-9. clean install、upgrade、legacy migration、rollback、2 node recovery の実機 evidence。
+9. clean source install、upgrade、legacy migration、rollback、2 node recovery の実機 evidence。
 
 ### 2.3 v0.3.0 の非目標
 
@@ -68,7 +69,7 @@
 | 入力文書 | 実装先 | release 判定 |
 |---|---|---|
 | macOS app/pkg 配布仕様 1〜16 節 | A-01〜E-06 | P0 必須 gate |
-| macOS app/pkg 配布仕様 17〜19 節 | R-01〜R-03 | final artifact と文書 gate |
+| macOS app/pkg 配布仕様 17〜19 節 | R-01〜R-03 | source release と文書 gate（package 条件は将来の任意経路） |
 | Hermes throughput 調査 8〜12 節 | H-01〜H-10 | P1 必須 gate |
 | coordinator restart 通知調査 | N-01〜N-03 | P2 必須 gate |
 | DwarfStar TP/RDMA 調査 | T-01 | P3。実装せず v0.4+ entry criteria に変換 |
@@ -154,15 +155,16 @@ log artifact の SHA-256 を記録する。retry で成功した場合も最初�
 
 - v0.2.1 の local gate が成功し、baseline の LaunchAgent、HTTP port、user data path が記録済み。
 - Apple silicon Mac で ad-hoc app を検証できる。
-- Developer ID の実機 task までに、ユーザーが Application / Installer certificate と
-  notarization 用 Keychain profile を用意できる。
+- ソース公開に必要な version、dependency inventory、third-party notices、公開文書が揃っている。
+- Developer ID certificate、notary profile、Apple timestamp endpoint は v0.3.0 source release の
+  事前条件ではない。
 - legacy install、clean install、upgrade/rollback を壊してよい専用 test user または test Mac がある。
 - 2 node recovery 試験に、推論 request を止められる change window がある。
 
 ### 4.2 全体の事後条件
 
-- 通常のインストール経路は `.pkg` であり、payload は `/Applications/Siderostat.app` だけである。
-  リリース DMG は `.pkg`、`Siderostat Uninstaller.app`、README を同梱する。
+- 通常の導入経路は source checkout から `cargo xtask install --start` を実行する方法である。
+  公式の事前ビルド済み `.app`、`.pkg`、DMG、`Siderostat Uninstaller.app` は配布しない。
 - monitor 終了後も runtime は継続し、background service 停止後は launchd が再起動しない。
 - legacy と新 runtime は同時に同じ port、state、DS4 child を所有しない。
 - user config、secret、manifest、model、cache は install、upgrade、rollback で保持される。
@@ -172,20 +174,20 @@ log artifact の SHA-256 を記録する。retry で成功した場合も最初�
 
 ### 4.3 release 受入基準
 
-1. `plutil`、`codesign`、`spctl`、`pkgutil`、`stapler` の全検証が final artifact で成功する。
-2. clean Mac への install 前と first launch 前に runtime が勝手に登録されない。
-3. background item の拒否、`requiresApproval`、承認、停止、再登録を UI から識別できる。
-4. runtime crash 後は再起動し、monitor の通常終了では runtime を終了しない。
-5. legacy migration 成功、意図的な migration 失敗、upgrade、prior `.pkg` rollback が実機で成功する。
-6. 低 TPS、first-token stall、progress stall の自動 test が別々に原因を判定する。
-7. recovery は diagnostic snapshot を先に保存し、両 distributed child を新 generation へ置換し、
-   canary 成功後だけ正常扱いする。
-8. cooldown、回数上限、同時 owner、drain timeout の test が restart loop と Ready 偽装を防ぐ。
-9. coordinator-only restart の長い stop cycle でも、Solo/Paired 通知は epoch 内各 1 回、最終
-   DistributedReady は 1 回であり、重大通知は失われない。
-10. 既存 standalone、paired、distributed、reconnect acceptance が退行しない。
-11. リリース DMG から `Siderostat Uninstaller.app` を起動して、user data を保持した
-    idempotent uninstall が実行できる。
+1. crate version、source revision、README、公開導入ガイド、release note の対象 version が一致する。
+2. `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
+   `cargo test --all-targets`、`git diff --check` が成功する。
+3. dependency inventory と third-party notices が lockfile と一致し、ライセンス情報が確認できる。
+4. source、release metadata、CI artifact に secret、credential、private key、model、KV cache、
+   runtime state、user data が含まれない。
+5. source checkout からの install、upgrade、legacy migration、rollback、uninstall の導線が
+   英語・日本語の公開文書と実装で一致する。
+6. runtime crash、standalone、paired、distributed、reconnect、recovery、notification dedup の
+   既存自動 test と実機 evidence が退行していない。
+7. TP/RDMA の production code、config field、公開 profile は v0.3.0 に含まれず、延期理由と
+   再開条件が release note に明記されている。
+8. Apple Developer ID、notarization、secure timestamp、DMG/pkg の成否を source release の
+   合否判定に使用しない。これらを使う場合は将来の任意バイナリ配布 task として別管理する。
 
 ## 5. 依存関係
 
@@ -299,7 +301,8 @@ Evidence: src/config.rs に resolve_config_path_pure / platform_default_path_pur
   `contrib/macos/entitlements.plist`、`contrib/macos/Resources/`（すべて新規）
 - Actions:
   1. 配布仕様 5.1 節と同じ bundle layout を template として表現する。
-  2. `BundleProgram`、固定 label、`serve`、`RunAtLoad`、`KeepAlive`、`ThrottleInterval` を記載する。
+  2. `/Applications/Siderostat.app` 固定の `Program`、固定 label、`serve`、`RunAtLoad`、
+     `KeepAlive`、`ThrottleInterval` を記載する。
   3. entitlement は空または A-01 で承認された最小集合だけにする。
   4. LICENSE、third-party notices、default config、icon を resource として列挙する。
 - 事後条件: builder が値を置換する source template が揃う
@@ -308,7 +311,7 @@ Evidence: src/config.rs に resolve_config_path_pure / platform_default_path_pur
 - ユーザーレビュー・手作業: A-01 で正式 icon 提供を選んだ場合、ユーザーが asset を提供する
 - 停止条件: icon の license または再配布許可が不明
 
-Evidence: contrib/macos/Info.plist.in(@VERSION@/@BUILD_NUMBER@ placeholder, LSMinimumSystemVersion 26.0)、dev.siderostat-ds4-proxy.runtime.plist(BundleProgram 相対 path, RunAtLoad/KeepAlive/ThrottleInterval)、entitlements.plist(空)、Resources/{LICENSE(MIT, okugauchi 2026), THIRD-PARTY-NOTICES.md, default-config.toml} を追加。tests/bundle_templates.rs に禁止文字列・bundle-relative path・identifier・resource の静的 test 4件追加。plutil -lint 3件 OK、test 4件 OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+Evidence: contrib/macos/Info.plist.in(@VERSION@/@BUILD_NUMBER@ placeholder, LSMinimumSystemVersion 26.0)、dev.siderostat-ds4-proxy.runtime.plist(`/Applications/Siderostat.app` 固定の Program, RunAtLoad/KeepAlive/ThrottleInterval)、entitlements.plist(空)、Resources/{LICENSE(MIT, okugauchi 2026), THIRD-PARTY-NOTICES.md, default-config.toml} を追加。tests/bundle_templates.rs に禁止文字列・Program path・identifier・resource の静的 test 4件追加。plutil -lint 3件 OK、test 4件 OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
 ### [x] B-03 `app-dev` bundle builder と ad-hoc verification を実装する
 
@@ -403,7 +406,8 @@ Evidence: monitor/src/service_management.rs の MainAppLoginItem（status/regist
 - Files: `src/app.rs`、`src/cli.rs`、既存 lifecycle module、関連 test
 - Actions:
   1. loopback admin endpoint に token authentication を必須化する。
-  2. admission block、in-flight drain、owned DS4 child stop、runtime process exit の順序を実装する。
+  2. admission block、in-flight drain、lifecycle owner による owned DS4 child stop、server loop の
+     cleanup、runtime process exit の順序を実装する。
   3. drain timeout と child identity mismatch では強制 kill せず error を返す。
   4. response 返却前に exit して client が曖昧な transport error だけを見る設計を避ける。
 - 事後条件: launchd が runtime を新 binary で再起動できる graceful path がある
@@ -412,7 +416,7 @@ Evidence: monitor/src/service_management.rs の MainAppLoginItem（status/regist
 - ユーザーレビュー・手作業: なし
 - 停止条件: cluster lifecycle owner を迂回した signal、unknown PID の kill、unauthenticated endpoint が必要になる
 
-Evidence（親タスク集約）: C-04a の route/auth/body parse/重複要求、C-04b の admission block → drain → owned child stop → response → exit 処理、C-04c の CLI と受入基準対応を確認。auth 失敗、正常 drain、drain timeout、identity mismatch、重複要求の5受入基準は子タスクの test で網羅され、停止条件にも該当なし（2026-08-21）。
+Evidence（親タスク集約）: C-04a の route/auth/body parse/重複要求、C-04b の admission block → drain → owned child stop → response → cleanup-aware restart 処理、C-04c の CLI と受入基準対応を確認。auth 失敗、正常 drain、drain timeout、identity mismatch、重複要求の5受入基準は子タスクの test で網羅され、停止条件にも該当なし（2026-08-25 修正反映）。
 
 #### [x] C-04a graceful restart 専用 route・認証・body parse・重複要求を実装する
 
@@ -422,19 +426,19 @@ Evidence（親タスク集約）: C-04a の route/auth/body parse/重複要求�
 - 事前条件: `/admin/restart` の method、path、auth、response が承認済み
 - Files: `src/app.rs`、関連 test
 - Actions:
-  1. AppState に supervisor 参照（`RwLock<Option<Arc<StandaloneSupervisor>>>`）を追加し、`serve_with_options` で attach する。cluster 非有効・solo-standalone のみ supervisor が存在する。
+  1. AppState に supervisor と production runtime の参照を保持し、`serve_with_options` で attach する。distributed 時は production runtime、standalone 時は standalone supervisor を lifecycle owner とする。
   2. `/admin/restart` route を追加する。既存 admin API と同じ Bearer token 認証（`authorized_admin`）を必須化する。
   3. request body の `drain_timeout_ms` を parse し、未指定時は config の cluster stop timeout を既定値にする。
   4. 進行中フラグ（AtomicBool）を追加し、重複要求は `409 { error: "restart_in_progress" }` を返す。
-  5. supervisor が不在（cluster 有効・distributed 等）の場合は graceful restart を拒否する。
+  5. 両 lifecycle owner が不在の場合だけ graceful restart を拒否する。
 - 事後条件: `/admin/restart` が認証・parse・重複チェックを経て graceful restart 処理へ進める
 - 受入基準: 認証成功/失敗、body 既定値、不正 body、重複要求の test がある
 - Verification: handler test、共通 local gate
 - ユーザーレビュー・手作業: なし
 
-Evidence: src/app.rs に AppState へ supervisor 参照（RwLock<Option<Arc<StandaloneSupervisor>>>）・graceful restart 進行中 AtomicBool・default_drain_timeout（cluster stop timeout）を追加し、serve_with_options で supervisor を attach。try_claim_graceful_restart/release_graceful_restart、/admin/restart route、graceful_restart handler（Bearer 認証 → drain_timeout_ms parse → 重複チェック → supervisor 存在確認）を実装。perform_graceful_restart は C-04b の placeholder（202 accepted を返す）。unit test 6件（認証失敗/成功、body 既定値 5000ms、明示 drain_timeout 12000ms、不正 body+unknown field、重複要求、supervisor 不在拒否）。全 214 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+Evidence: src/app.rs に AppState へ supervisor／production runtime 参照、graceful restart 進行中 AtomicBool・default_drain_timeout（cluster stop timeout）を追加し、serve_with_options で両 owner を attach。try_claim_graceful_restart/release_graceful_restart、/admin/restart route、graceful_restart handler（Bearer 認証 → drain_timeout_ms parse → 重複チェック → owner 存在確認）を実装。unit test で認証、body 既定値、明示 timeout、不正 body、重複要求、owner 不在拒否を確認済み。
 
-#### [x] C-04b graceful restart の処理順序（block→drain→child stop→exit）を実装する
+#### [x] C-04b graceful restart の処理順序（block→drain→child stop→cleanup→exit）を実装する
 
 - Actor: agent
 - Depends on: C-04a
@@ -442,16 +446,16 @@ Evidence: src/app.rs に AppState へ supervisor 参照（RwLock<Option<Arc<Stan
 - 事前条件: `/admin/restart` route と認証・parse が GREEN
 - Files: `src/app.rs`、関連 test
 - Actions:
-  1. admission block → in-flight drain（`admission.drain(generation, timeout)`）→ owned DS4 child stop（supervisor.stop）→ `202` を返す → process exit（`spawn_process_restart`）の順序を実装する。
+  1. admission block → in-flight drain（`admission.drain(generation, timeout)`）→ lifecycle owner による owned DS4 child stop → `202` を返す → server loop の listener/task/child cleanup → process exit の順序を実装する。
   2. drain timeout 時は強制 kill せず `409 { error: "drain_timeout", in_flight, drain_timeout_ms }` を返す。
   3. child identity mismatch 時は `409 { error: "child_identity_mismatch" }` を返す。
-  4. `202` を返した後に exit を予約し、response 返却前に exit して client へ曖昧な transport error を見せない。
+  4. `202` を返した後に server restart signal を予約し、`std::process::exit` で production child cleanup を飛ばさない。
 - 事後条件: launchd が runtime を新 binary で再起動できる graceful path が完成する
 - 受入基準: 正常 drain、drain timeout、identity mismatch の test がある
 - Verification: handler/lifecycle test、共通 local gate
 - ユーザーレビュー・手作業: なし
 
-Evidence: src/app.rs で C-04a の placeholder だった perform_graceful_restart を本実装。GracefulRestartOutcome（Ready/DrainTimeout/ChildIdentityMismatch/ChildStopFailed）と graceful_restart_sequence（admission block → drain → owned child stop、exit 副作用なし）を追加。perform_graceful_restart は sequence 結果を HTTP へ写像し Ready 時のみ spawn_process_restart（100ms 後 exit）を予約、失敗時は進行中フラグを解放。resolve_drain_timeout を純粋関数化し handler の body parse を分離。is_graceful_identity_mismatch ヘルパー（ProcessControlError::IdentityMismatch 検出、強制 kill 回避）。テスト可能性のため handler 経由の成功系 test を exit 副作用のない形（resolve_drain_timeout 直接 + 進行中フラグ直接 + sequence 直接）に変更。unit test 3件（正常 drain+Blocked、drain timeout+in-flight 保持、identity mismatch 検出）。全 217 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+Evidence: src/app.rs で C-04a の placeholder だった perform_graceful_restart を本実装。GracefulRestartOutcome（Ready/DrainTimeout/ChildIdentityMismatch/ChildStopFailed）と graceful_restart_sequence（admission block → drain → lifecycle owner child stop、exit 副作用なし）を追加。2026-08-25 の実機調査で、従来の `std::process::exit` が `run_servers` の production cleanup を飛ばす原因を特定したため、distributed は `ProductionClusterRuntime::stop_distributed()`、standalone は `StandaloneSupervisor` を選択し、成功後は server loop の restart signal を通して listener/task/child cleanup を実行するよう修正した。owner 選択、signal 到達、既存 graceful sequence の unit test、`cargo test --all-targets` 263件、`cargo clippy --all-targets -- -D warnings`、fmt/diff-check が PASS。
 
 #### [x] C-04c graceful restart CLI サブコマンドと受入基準 test を追加する
 
@@ -469,7 +473,7 @@ Evidence: src/app.rs で C-04a の placeholder だった perform_graceful_restar
 - Verification: CLI test、共通 local gate
 - ユーザーレビュー・手作業: なし
 
-Evidence: src/cli.rs に ClusterCommand::GracefulRestart（`cluster graceful-restart`）を追加し、run_cluster の request 決定を純粋関数 cluster_request(command) へ抽出。GracefulRestart は `/admin/restart` POST（既存 cluster restart の `/cluster/restart` と区別）、POST は mutation 扱いで admin token を読み bearer auth を付与。unit test 3件（全サブコマンドが admin client path を選択 + graceful-restart 含む、GracefulRestart が /admin/restart を選び cluster Restart と区別、POST mutation で bearer auth / GET と区別）。C-04 の 5 受入基準（auth 失敗・正常 drain・drain timeout・identity mismatch・重複要求）は C-04a/C-04b の handler/sequence test が対応。停止条件（cluster lifecycle owner 迂回 signal、unknown PID kill、unauthenticated endpoint）は CLI では発生しない（/admin/restart のみ、bearer auth、supervisor.stop 経由のみ）。全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
+Evidence: src/cli.rs に ClusterCommand::GracefulRestart（`cluster graceful-restart`）を追加し、run_cluster の request 決定を純粋関数 cluster_request(command) へ抽出。GracefulRestart は `/admin/restart` POST（既存 cluster restart の `/cluster/restart` と区別）、POST は mutation 扱いで admin token を読み bearer auth を付与。unit test 3件（全サブコマンドが admin client path を選択 + graceful-restart 含む、GracefulRestart が /admin/restart を選び cluster Restart と区別、POST mutation で bearer auth / GET と区別）。C-04 の 5 受入基準（auth 失敗・正常 drain・drain timeout・identity mismatch・重複要求）は C-04a/C-04b の handler/sequence test が対応。停止条件（cluster lifecycle owner 迂回 signal、unknown PID kill、unauthenticated endpoint）は CLI では発生しない（/admin/restart のみ、bearer auth、lifecycle owner 経由）。全 219 test OK、fmt/clippy/diff-check OK(2026-08-19); 2026-08-19
 
 ### [x] C-05 bundle mode の menu と first launch を完成する
 
@@ -623,7 +627,11 @@ Evidence: monitor/src/migration.rs に cutover state machine（D-02）を追加�
 
 Evidence（自動実装・検証完了 2026-08-22）: `monitor/src/client.rs` の `/healthz` を `RuntimeVersion（version/git_commit/build_number）` として利用し、`monitor/src/localization.rs` の app version/build と `monitor/src/state.rs` の `version_handshake_with_build` で version/build の両方を比較する構成を追加。`VersionHandshake（Matched/RuntimeOlder/RuntimeNewer/Unavailable）` を monitor の常駐 poll に接続し、Matched は無表示、旧版・新版・取得不能は状態変化ごとに macOS 通知を一度だけ表示する。同じ不一致の重複通知を抑止し、初回起動時の取得不能は通知せず、再起動は既存の「siderostat-runtimeを再起動」メニューからの明示操作に限定する。通知文言は `contrib/macos/Resources/{en,ja}.lproj/Localizable.strings` に外部化し、app/runtime の version/build を本文へ含める。`monitor/src/tray.rs` から version 状態・upgrade 専用メニュー項目・常時表示の一致文言を削除し、既存の runtime restart 結果は成功・失敗・拒否（401/403）として外部化された日英文言で表示する。旧 builder が Info.plist だけを 0.3.0 に置換し runtime binary を Cargo version 0.2.1 のまま同梱していたため、`src/app.rs` の runtime version override と `xtask/src/bundle.rs` の version/build 注入付き release build を追加し、bundle 内 app/runtime metadata を一致させた。unit test は version/build matrix、通知対象・重複抑止・初回取得不能の扱い、restart 成功/失敗/拒否表示、menu id/action gating を含む。検証は monitor test、`cargo build --release --workspace`、`cargo test --all-targets`、`cargo xtask app-dev --version 0.3.0 --build-number 1 --verify`、`cargo fmt --all`、`git diff --check` で実施した。実機通知表示は修正後に不一致状態を再現できないため受入要件から除外し、再現 fixture／手順整備後に確認する将来 TODO とする。
 
-## 10. Phase E: `.pkg`、署名、公証、配布 feature gate
+## 10. Phase E: bundle/package、署名、公証の内部実装と任意 binary workflow
+
+> Phase E の task は bundle/package 実装、実機検証、将来の任意バイナリ配布 workflow を記録する。
+> v0.3.0 の公式 source release gate は R-02/R-03 で定義し、Phase E の Developer ID、notarization、
+> secure timestamp、DMG/pkg artifact を公式配布物として要求しない。
 
 ### [x] E-01 Monitor 終了 hook 付き flat `.pkg` builder を実装する
 
@@ -636,17 +644,21 @@ Evidence（自動実装・検証完了 2026-08-22）: `monitor/src/client.rs` �
   1. `cargo xtask pkg-dev` を追加し、B-03 の app を component package と product archive にする。
   2. payload を `/Applications/Siderostat.app` 一項目に限定する。
   3. component receipt/product identifier と semver を template から固定する。
-  4. bundle replacement 前に既存 Monitor だけを終了する `preinstall` を生成する。
-  5. install 完了後、active console user の GUI session で Siderostat を起動する controlled
-     `postinstall` を生成する。設定、secret、LaunchAgent、Service Management は変更しない。
+  4. bundle replacement 前に、active console user の GUI domain にある product-owned runtime
+     LaunchAgent を unload し、その後既存 Monitor を終了する `preinstall` を生成する。
+  5. install 完了後、runtime が更新前から `enabled` だった場合だけ新しい bundle 内の
+     LaunchAgent を同じ GUI domain へ bootstrap し、active console user の GUI session で
+     Siderostat を起動する controlled `postinstall` を生成する。設定、secret、plist ファイル、
+     Service Management の恒久的な登録状態は変更しない。
   6. package expand 結果を検査し、想定外の script と禁止 path があれば失敗する。
 - 事後条件: certificate なしで final と同形の installable package を作れる
 - 受入基準: package payload manifest が一項目、制御された `preinstall` / `postinstall` のみ、同一入力で receipt/version 一致
 - Verification: package builder test、`pkgutil --expand-full` の静的検査、共通 local gate
 - ユーザーレビュー・手作業: なし
-- 停止条件: package script から user session、LaunchAgent、config を操作する必要が生じる
+- 停止条件: package script から product-owned runtime job と exact-path Monitor 以外の process、
+  user data、または永続的な Service Management 登録を操作する必要が生じる
 
-Evidence: `xtask/src/package.rs` を本実装に置き換え（E-01）。固定 identifier（COMPONENT_IDENTIFIER=dev.siderostat-ds4-proxy.pkg、PRODUCT_IDENTIFIER=dev.siderostat-ds4-proxy.product、INSTALL_LOCATION=/Applications、PAYLOAD_PATH=/Applications/Siderostat.app）と PKG_STAGING_DIR=build/pkg-dev。`pkg_dev()` が app を一時 payload root へ `ditto` し、BundleIsRelocatable=false の component plist と、既存 Monitor の完全一致した実行パスだけを SIGTERM（最大10秒）→必要時のみ SIGKILL する `preinstall` を指定した `pkgbuild`（`--root --component-plist --scripts --install-location --identifier --version`）→ `productbuild`（`--package --identifier --version`）→ `pkgutil --expand-full` → `inspect_expanded` の順で実行する。既存 bundle identifier による `/Applications` 外への relocation を抑止し、`Siderostat.app` 一項目・制御された `preinstall` 一項目・禁止 path を検査し、違反時は fail-closed する。runtime、`ds4-server`、LaunchAgent、設定、secret、ユーザーデータは installer script の対象外とする。`inspect_expanded()` は展開結果を再帰的に探索し、payload/script/禁止 path を検査する。unit test 7件、xtask package test 7件、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check` が PASS（2026-08-22）。certificate なしで final と同形の installable package を作れる。`pkg-dev` CLI は B-03 から安定。
+Evidence: `xtask/src/package.rs` を本実装に置き換え（E-01）。固定 identifier（COMPONENT_IDENTIFIER=dev.siderostat-ds4-proxy.pkg、PRODUCT_IDENTIFIER=dev.siderostat-ds4-proxy.product、INSTALL_LOCATION=/Applications、PAYLOAD_PATH=/Applications/Siderostat.app）と PKG_STAGING_DIR=build/pkg-dev。`pkg_dev()` が app を一時 payload root へ `ditto` し、BundleIsRelocatable=false の component plist と、active console user の `gui/<uid>/dev.siderostat-ds4-proxy.runtime` だけを `launchctl bootout` し、必要時に同じ job target と exact runtime path を SIGKILL した後、既存 Monitor の exact path を SIGTERM（最大10秒）→必要時のみ SIGKILL する `preinstall` を指定した `pkgbuild`（`--root --component-plist --scripts --install-location --identifier --version`）→ `productbuild`（`--package --identifier --version`）→ `pkgutil --expand-full` → `inspect_expanded` の順で実行する。`postinstall` は更新前の `enabled` 状態を保持している場合だけ新しい bundle 内の LaunchAgent を bootstrap し、その後 active console user の GUI session で新しい Siderostat.app を起動する。既存 bundle identifier による `/Applications` 外への relocation を抑止し、`Siderostat.app` 一項目・制御された `preinstall`／`postinstall`・禁止 path を検査し、違反時は fail-closed する。installer は plist ファイル、Service Management の恒久登録、設定、secret、model、cache を変更せず、任意 process や `ds4-server` child を直接対象にしない。`inspect_expanded()` は展開結果を再帰的に探索し、payload/script/禁止 path を検査する。unit test、xtask package test、shell static verification、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check` が PASS（2026-08-25）。certificate なしで final と同形の installable package を作れる。`pkg-dev` CLI は B-03 から安定。
 
 補正記録（2026-08-23）: package の script policy を `preinstall` と controlled `postinstall` に更新した。
 `postinstall` は `/bin/launchctl asuser <console-uid> /usr/bin/open -a /Applications/Siderostat.app`
@@ -1062,6 +1074,51 @@ trusted timestamp を確認した。実機で Monitor 稼働中に build 11 を�
 自動終了項目を PASS とする。runtime／設定の保持は両ノードの起動および distributed 運用確認と合わせて
 確認済みとする。build 10 の runtime 再起動後に約3分以上 offline が継続した事象は、installer の
 Monitor 終了処理とは別の runtime readiness／復旧時間の課題として扱う。
+
+仕様補正（2026-08-25）: 従来の E-01 記録は Monitor だけを停止し runtime を対象外としていたため、
+現在の installer 仕様と不一致になっていた。`preinstall` は runtime を先に停止してから Monitor を
+停止する。停止対象は active console user の product-owned LaunchAgent と bundle 内の exact path
+だけであり、user data、設定、secret、model、cache、永続的な Service Management 登録は変更しない。
+`postinstall` は新しい app を起動し、app 側の Service Management 復帰処理へ引き渡す。Rust unit
+test、shell 静的検証、package expand policy へこの順序・対象限定・強制停止 fallback の検査を追加した。
+
+追加補正（2026-08-25）: build19 の両 node install では Monitor の自動起動は確認できたが、
+`preinstall` の runtime `bootout` 後に runtime LaunchAgent が復帰しなかった。原因は、既に
+`enabled` だった Service Management job を app 側が再登録せず、job が unload 状態に残ったことと
+判定した。`postinstall` に事前の `print-disabled` が `enabled` を示す場合だけ新 bundle の plist を
+bootstrap する処理を追加し、disabled／未登録／承認待ちでは従来どおり app 側へ委譲する。これにより
+インストール後の手動 runtime 停止・起動を不要にする。
+
+再補正（2026-08-25）: build20 の両 node install では Monitor は起動したが runtime job は未ロードのまま
+だった。`launchctl asuser <uid> launchctl bootstrap` はユーザーセッションからは `Bootstrap failed:
+5: Input/output error` となり、root postinstall の実行主体と一致しないため不適切だった。enabled 状態の
+確認後は root の postinstall から `/bin/launchctl bootstrap "gui/<uid>" <bundle plist>` を直接実行し、
+Siderostat の GUI 起動だけを `launchctl asuser <uid> open -a` で行うよう修正した。TDD（旧実装で失敗→修正後
+成功）、`cargo test -p xtask` 43件、clippy、fmt、`scripts/verify-macos-dev-artifacts.sh` は PASS。修正済み
+build21 の DMG を両ノードの `/tmp/Siderostat-0.3.0-build21.dmg` へ同一 SHA-256
+`f6d2f9fb7b750b1a8802350838f608c965bd301e58b55b46c41cb50600ccb300` で配置し、実機インストール後の
+runtime 起動確認を待つ。
+
+再補正（2026-08-25、build22準備）: build21 の両 node install でも Monitor は build21 で起動したが、
+runtime LaunchAgent は未ロードで、`/healthz`・`/readyz`・`/cluster` は接続拒否だった。Apple の
+Service Management 仕様では LaunchAgent の `register()` は即時 bootstrap する一方、既登録状態では
+`kSMErrorAlreadyRegistered` となるため、app 側の status=`enabled` 判定だけでは `preinstall` が unload
+した job を復帰できない。さらに pkg script から直接 bootstrap する plist は `BundleProgram` ではなく
+`Program` または `ProgramArguments` を使う必要があるため、plist を `/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime`
+の固定 `Program` path に変更した。bundle template test 4件、xtask test 44件、clippy、fmt、E-03静的検証は
+PASS。修正済み build22 の DMG を両ノードの `/tmp/Siderostat-0.3.0-build22.dmg` へ同一 SHA-256
+`85650ed89c6d511be5aee8dcd44522f91a50db96131e445b606ed643511843e7` で配置し、実機インストール後の
+runtime 自動ロード確認を待つ。
+
+Evidence（build22 installer runtime 自動復帰・両 node 2026-08-25）: ユーザーが両ノードへ
+`/tmp/Siderostat-0.3.0-build22.dmg` 内の pkg をインストールした。MacBook Pro と Mac Studio の
+Info.plist はともに version=`0.3.0` / build=`22`、`launchctl print gui/501/dev.siderostat-ds4-proxy.runtime`
+は両ノードで `state = running`、`program = /Applications/Siderostat.app/Contents/Helpers/siderostat-runtime`
+を示した。`/healthz` は両ノードで `status=ok` / build_number=`22`。起動直後の短い `admission=blocked`
+から収束後、両ノードの `/readyz` は `status=ready` / `admission=serving`、`/cluster` は
+`state=distributed-ready` / `mode=distributed-layer-parallel` となった。MacBook Pro は worker、
+Mac Studio は coordinator として安定していた。Program 固定 path への変更と installer postinstall による
+runtime 自動復帰を実機 PASS とする。
 
 Evidence（build 11 両ノード実機起動・distributed 運用確認 2026-08-22）:
 ユーザーが MacBook Pro と Mac Studio の両ノードへ `dist/native-build11/Siderostat-0.3.0.pkg` を
@@ -1510,7 +1567,7 @@ app/Uninstaller/pkg の Gatekeeper、staple、DMG 3項目検証を PASS とし�
   新jobを作成しなかった。検証後は両nodeのconfigをbackupへ復元し、automatic recovery disabled、
   doctor healthy、final canary HTTP 200、child各1件を確認した。Hermes handoffのpre-cron doctor/canary、
   Hermes `1800s` / Siderostat `2400s`暫定deadline順を `docs/operations.md`へ追記した。
-  なおMacBook Proでは旧署名由来のstale Service Management登録により通常登録がcode 57で失敗したため、
+ なおMacBook Proでは旧署名由来のstale Service Management登録により通常登録がcode 57で失敗したため、
   recovery検証中だけproduct-owned runtimeを同一ユーザーのlaunchd jobへ一時復帰させた。このmacOS
   lifecycle caveatはrecovery結果とは分離し、bundle更新時のunregister/register follow-upとして残す。
 - 停止条件: production cron 実行中、rollback 不可、force kill/state 削除/OS 再起動が必要になる
@@ -1578,7 +1635,7 @@ successful canary後の completion と通知 epoch を接続した。
 `cargo clippy --all-targets --all-features -- -D warnings` は PASS。N-03 の実機通知レビューは
 未着手であり、通知文言と実機通知回数のユーザー承認を残す。
 
-### [ ] N-03 coordinator-only restart の実機通知回数を検証する
+### [x] N-03 coordinator-only restart の実機通知回数を検証する
 
 - Actor: user + agent
 - Depends on: N-02
@@ -1596,15 +1653,206 @@ successful canary後の completion と通知 epoch を接続した。
 - ユーザーレビュー・手作業: change window、coordinator restart、macOS 通知履歴の確認を行う
 - 停止条件: request 実行中、job 重複、rollback 不可、state file 削除が必要になる
 
+Evidence（coordinator-only restart の長い停止経路と通知レビュー、2026-08-25）:
+ユーザーが coordinator の Monitor から `siderostat-runtimeを再起動` を一回実行した。
+agent は再起動中の Solo/Paired/Promoting/DistributedReady 遷移と、両 node の最終
+`doctor healthy=true`、admission `serving`、in-flight `0`、新しい child PID/generation、
+orphan 不在を確認した。約100秒で両 node が DistributedReady へ復帰し、長い停止経路の
+実機観測は PASS とした。
+
+ユーザーが macOS 通知履歴を確認した結果、coordinator 側は「5秒後に再起動」1回、
+Standalone 起動1回、Paired/ノード検出1回、最終 DistributedReady 1回、worker 側は
+Standalone 起動1回だった。同一 epoch 内の安定状態通知の反復はなく、重大な再起動通知も
+失われていないため、通知回数と文言のレビューは PASS とした。短い停止経路の実機観測と、
+その時系列の metrics/structured log 照合は未実施であり、N-03 は未完了のままとする。
+
+追加観測（2026-08-25）では、事前条件を再確認した後、agent が coordinator の同じ
+graceful restart route を一回だけ発行した。worker stop は短い経路へ入らず、coordinator
+側で Solo/Paired と worker hello 待ちの再試行を複数回経由した。約3分半後に両 node は
+再び `DistributedReady`、admission `serving`、in-flight `0`、`doctor healthy=true` へ
+復帰し、新しい distributed child PID/generation と orphan 不在を確認した。しかしこれは
+短い停止経路の証跡ではなく、2回目の macOS 通知履歴レビューも行っていないため、N-03 の
+短い経路受入条件は未達のままとする。
+
+実装調査・修正（2026-08-25）: 上記の長い経路をコード追跡した結果、`/admin/restart` が
+distributed mode でも standalone supervisor を停止対象にし、直後の `std::process::exit`
+で `run_servers` の `ProductionClusterRuntime::stop_distributed()` を実行しない問題を特定した。
+修正後は distributed runtime を lifecycle owner として停止し、HTTP 202 後は server loop の
+restart signal から listener/task/production child/standalone child の cleanup を通す。owner
+選択と signal 到達の回帰 test、既存 graceful sequence test、全 263 test、clippy、fmt、diff-check
+は PASS。実機の短い停止経路と通知履歴の再確認は、この修正版 artifact 適用後に行う。
+
+再検証 preflight（2026-08-25、build16）では、両 node の bundle metadata／DMG SHA-256 は一致したが、
+runtime Service Management job が `spawn failed` / exit code `78: EX_CONFIG`、admin port が
+`Connection refused` だった。Mac Studio の unified log には `Contents/Helpers/siderostat-runtime`
+の find/execute 失敗があり、bundle 内 helper の存在、arm64、codesign verification は PASS だった。
+short-stop 操作と通知履歴レビューは実施せず、N-03 の build16 実機 evidence には採用しない。stale
+Service Management registration を unregister → register して runtime readiness を復旧した後に
+再開する。
+
+追加確認（2026-08-25、ad-hoc build16）は、両 node が `DistributedReady` へ復帰した後に coordinator
+の再起動を一回実行したが、LaunchAgent 再起動時の DiagnosticReports に
+`SIGKILL (Code Signature Invalid)` / `Launch Constraint Violation` が両 node で記録された。
+coordinator 側では Solo/Paired の反復も観測したため、この試行は短い停止経路の evidence に採用しない。
+`dmg-dev` が生成した helper は ad-hoc 署名で `TeamIdentifier` 未設定だったことが原因であり、
+Developer ID Application／Developer ID Installer、`timestamp none` のローカル診断用 build16 artifact
+を別途作成して両 node の `/tmp` に配置した（公証済み配布 artifact ではない）。
+
+Developer ID 署名済み build16 の再検証（2026-08-25）では、両 node の再起動前 baseline
+（`DistributedReady`、admission `serving`、in-flight `0`、LaunchAgent `running`）は PASS だった。
+ユーザーが coordinator の再起動を一回実行した後、Mac Studio は Solo/Paired と worker hello 待ちを
+複数回経由し、180 秒の観測終了時点では `paired-standalone-ready` だった。MacBook Pro も一時的に
+`unavailable-transition`／admission `blocked` へ遷移した。追加確認では最終的に両 node が
+`DistributedReady`、admission `serving`、in-flight `0` へ復帰したが、反復と長い再収束があるため
+短い停止経路の受入基準は未達とする。ad-hoc build16 と異なり Code Signature Invalid は再発せず、
+残る課題は distributed child 停止後の cluster 再収束である。通知履歴レビューは技術 gate 未達のため
+保留し、N-03 は未完了のままとする。
+
+原因再調査（2026-08-25）: `ProductionClusterRuntime::stop_distributed()` はローカル distributed
+child を停止するだけで peer へ計画停止を通知せず、restart signal による server loop cleanup が
+完了するまで reconcile／route-loss monitor も動作可能である。control endpoint 停止後、peer は
+lease 喪失を通常の `PeerLost` として処理し、`recover_from_peer_loss` により Solo へ fallback する。
+一方 coordinator は `auto_pair`／`auto_promote` により自動復帰を試みるため、control session と
+worker hello が安定する前の Solo/Paired 反復になる。実機 metrics の反復と source の分岐が一致した。
+既存の deployment-mismatch 用 pairing block は計画 restart を抑止せず、既存の begin-drain／
+stop-worker 制御経路も graceful process restart から呼ばれていない。前回修正は lifecycle owner
+迂回を解消したが、この cluster-wide planned-restart protocol の欠落を未修正のまま残していた。
+
+計画再起動プロトコル実装（2026-08-25）: 原因に対応して authenticated control plane の
+`prepare-restart`／`cancel-restart`、runtime の planned-restart gate、peer acknowledgement、
+既存 demotion lifecycle への接続を実装した。gate 中は reconcile、PeerLost recovery、route-loss
+demotion、automatic Pair/Promote を抑止し、再起動後の新しい Pair で worker 側 gate を解除する。
+control protocol、worker/coordinator phase、graceful restart の回帰を含む全 `cargo test
+--all-targets`（265 tests）、`cargo clippy --all-targets -- -D warnings`、format、diff-check は PASS。
+この結果はコード検証の完了を示すが、N-03 の実機受入を完了させるものではない。次の signed build を
+両 node に適用し、Solo/Paired 反復のない短い停止経路を実機で再検証する。
+
+planned-restart 修正版 build17 の `app-dev --verify`、no-timestamp package/DMG 生成、DMG の
+`hdiutil verify` は PASS した。検証用 DMG は両 node の `/tmp` に配置し、SHA-256
+`579add4ecf66b2097f32bef1f5bb434d5f3895b5f1372cbffd65cd9536bc762f` の一致を確認した。
+一方、Apple timestamp endpoint は両 node から HTTPS 443 接続不能で、no-timestamp package の
+Notary 提出は secure timestamp 不在により `Invalid` となった。この artifact は内部検証専用であり、
+再配布可能な公証済み DMG の条件を満たさない。したがって N-03 は build17 の secure timestamp
+付き DMG の生成・両 node 配置・ユーザー再操作まで未完了とする。
+
+追加実機観測（2026-08-25、build17 no-timestamp 内部診断 artifact）では、両 node の
+`DistributedReady`／admission `serving`／in-flight `0` を確認後、ユーザーが Mac Studio の
+Monitor から `siderostat-runtimeを再起動` を一回実行した。Solo/Paired の反復は発生しなかったが、
+Mac Studio の coordinator child が停止せず、`demoting`／admission `blocked` のまま残留した。
+MacBook Pro は worker として `DistributedReady`／`serving` へ復帰した。このため短い停止経路の
+実機受入は未達であり、通知履歴のレビューは実施しない。
+
+原因再調査・修正（2026-08-25）: build22 では coordinator child を先に停止した後、worker 側の
+`Demote` 応答を待っていた。managed child の SIGKILL 後 reaping window（最大5秒）が peer HTTP
+lifecycle timeout に含まれておらず、worker 側の停止・`PairedStandaloneReady` 遷移が完了しても
+coordinator の要求だけが timeout し、local state が `Demoting / blocked` に残る経路があった。
+planned restart 専用 lifecycle は、coordinator child 停止後、worker 側 `Demote` が成功してからだけ
+local `BeginDemotion → PairingReady` を実行するよう変更した。peer 停止失敗時は coordinator child
+を readiness 確認付きで復旧し、local target／admission と `DistributedReady / Serving` を戻す。
+さらに lifecycle timeout を `stop + sigkill_reap_window + peer_request` に拡張し、SIGTERM 待機と
+SIGKILL 後の reaping window（最大5秒）を分離した。回帰 test は planned restart の coordinator／
+peer 停止失敗復元、既存の peer-loss 抑止、SIGTERM timeout 後の bounded kill を含む。
+
+build22 短い停止経路再検証（2026-08-25）では、両 node の runtime が build22 であることを確認後、
+ユーザーが coordinator の Monitor から `siderostat-runtimeを再起動` を一回実行した。agent は約5分間、
+両 node の `/cluster`、`/readyz`、`/metrics`、LaunchAgent 状態を時系列収集した。worker は
+`paired-standalone-ready`／admission `serving` へ復帰したが、coordinator は
+`demoting`／admission `blocked`／`target_ready=false` のまま残り、distributed child の復帰、
+新 generation、runtime の新世代起動は確認できなかった。worker metrics には
+`distributed-ready → paired-standalone-ready`、coordinator metrics には
+`distributed-ready → demoting` が記録された。in-flight は両 node とも `0` だった。
+技術 gate 未達のため通知履歴レビューは実施せず、短い停止経路の evidence には採用しない。
+raw capture は `/private/tmp/n03-short-build22-20260825.log` に保存し、N-03 は未完了のままとする。
+
+build23 修正 artifact 準備（2026-08-25）: `cargo fmt --check`、`git diff --check`、clippy
+(`--all-targets -- -D warnings`)、`cargo test --all-targets`（全テスト成功）が PASS。`app-dev --verify`
+で 0.3.0 / build23 の bundle 検証、`pkg-dev` で package payload／installer script 検証、
+`dmg-dev --verify` で DMG の readonly attach、直下3項目（pkg、`Siderostat Uninstaller.app`、
+`README.html`）検証、`hdiutil verify` が PASS した。検証用 DMG は
+`dist/native-build23/Siderostat-0.3.0.dmg`、SHA-256 は
+`3fb7e4b1d696d38cfb73d2a2d98be436e3f208244abb8112cb0d09a5bfc4787d`。MacBook Pro の
+`/tmp/Siderostat-0.3.0-build23.dmg` と Mac Studio の同名 path へ配置し、両方の SHA-256 が一致した。
+これは Apple secure timestamp／notarization を含まない ad-hoc の実機検証 artifact
+（`distribution_ready=false`）であり、公証済みリリース artifact の証跡には採用しない。
+
+build23 実機再検証（2026-08-25）では、Mac Studio の restart 要求後に MacBook Pro が
+`PairedStandaloneReady`／`Serving` へ遷移した一方、Mac Studio は `DistributedReady` の表示を
+維持したまま target unavailable／admission blocked となり、LaunchAgent の runtime process が
+再起動しなかった。coordinator 側の peer 停止完了通知が記録されず、peer 停止失敗時に coordinator
+child を再起動して complete route を待つ rollback が、worker の Paired 復帰後に完了不能となる
+可能性を確認した。この試行は N-03 の受入 evidence には採用しない。
+
+追加修正では、planned restart の peer 停止失敗時に分散 child の complete route 復旧を待たず、
+local standalone を起動して `BeginDemotion → PairingReady` を適用し、coordinator を
+`PairedStandaloneReady`／admission `Serving` へ復旧する。これにより応答欠落後も長時間の
+startup timeout 待機を避け、ユーザーが再試行できる状態へ戻す。
+N-03 は build23 の実機短い停止経路再検証待ちとする。
+
+build24 再検証 artifact 準備（2026-08-25）: 追加修正を含む `app-dev --verify`、package 生成、
+DMG の `hdiutil verify`／readonly attach 検証が PASS。DMG は
+`dist/native-build24/Siderostat-0.3.0.dmg`、SHA-256 は
+`90c7b660e2056ab9ca6b28ad5c9d71feddbe29de26e79ef2f1eee64f8af63754`。同一ファイルを MacBook Pro と
+Mac Studio の `/tmp/Siderostat-0.3.0-build24.dmg` に配置した。現在 build23 の固着 runtime は
+sudo なしで product-owned runtime process を終了し、両 node は `PairedStandaloneReady`／admission
+`Serving` へ復旧した。build24 の両 node インストール、coordinator-only restart、短い停止経路と
+通知履歴の実機確認は未実施である。
+
+build24 実機再検証（2026-08-25）では、両 node の healthz と runtime binary checksum を確認後、
+ユーザーが Mac Studio の Monitor から `siderostat-runtimeを再起動` を一回実行した。MacBook Pro は
+`PairedStandaloneReady`／`Serving` へ復帰したが、Mac Studio は `DistributedReady` の表示を維持した
+まま `target=unavailable-transition`／admission `blocked`、distributed child 不在、LaunchAgent の
+runtime process 世代不変となった。planned restart 中も worker 側 `Demote` の HTTP 応答を child 停止完了
+まで待っていたため、coordinator が peer lifecycle 待機に残ることを source trace と live sample で
+確認した。この試行は N-03 の短い停止経路 evidence に採用しない。
+
+build25 修正（2026-08-25）: planned restart gate 中の `Demote` だけは control handler が先に ACK を返し、
+worker child の停止は既存 lifecycle owner の非同期 effect として継続するよう変更した。通常の demote
+と他の lifecycle command の完了 ACK は維持する。全 `cargo test --all-targets`（269 tests）、clippy、
+format、diff-check は PASS。検証用 DMG は `dist/native-build25/Siderostat-0.3.0.dmg`、SHA-256 は
+`ef1f32d02f60cfadd715df67b5b0d00670b366dcfba3bd5699f7c4728dadf590`。同一 DMG を両 node の
+`/tmp/Siderostat-0.3.0-build25.dmg` に配置した。coordinator-only restart の短い停止経路を再実機確認
+するまで N-03 は未完了のままとする。
+
+build26 追加修正（2026-08-26）: build25 の実機適用前に、早期 `Demote` ACK 後の `Pair → PrepareWorker`
+競合を追加監査した。worker は Demote 応答後も旧 distributed child を停止中であり、この期間に
+Pair effect が gate を解除すると、worker の実状態が PairedStandaloneReady になる前に制御 phase だけが
+WorkerPreparing へ進み得る。build26 では planned restart の child-running／Pair-pending／child-stopped／
+completion を atomic gate で管理し、停止完了前の Pair は保留、停止完了前の PrepareWorker は `409
+worker planned restart is still in progress` で拒否する。停止後の reciprocal Pair 送信失敗は child-stopped
+状態を保持して後続 Pair で再試行する。通常の Pair／demote 経路と planned restart 以外の ACK 待ちは変更しない。
+全 `cargo test --all-targets`（271 tests）、clippy、format、diff-check は PASS。修正を含む内部検証用 DMG は
+`dist/native-build26/Siderostat-0.3.0.dmg`、SHA-256 は
+`a1749436c1aaf4cb7296e38c95ed1f9844fb2d0c9ddb87ec7b2ab11d4aa590f1`。同一 DMG を MacBook Pro と Mac Studio
+の `/tmp/Siderostat-0.3.0-build26.dmg` に配置した。secure timestamp／notarization を含まない内部検証用
+artifact のため、N-03 の受入は build26 適用後の coordinator-only restart 実機確認まで未完了とする。
+
+build26 実機再検証（2026-08-26）: 両 node へ build26 を適用し、DistributedReady を確認した後、ユーザーが
+Mac Studio の Monitor から coordinator-only の `siderostat-runtimeを再起動` を一回実行した。再起動直後の
+一時的な standalone／ready 待ちを経て、両 node が `state=distributed-ready`、
+`mode=distributed-layer-parallel`、`admission=serving`、`in_flight=0`、`readyz 200` へ復帰した。
+MacBook Pro は distributed worker generation 761 / PID 10139、Mac Studio は distributed coordinator
+generation 1407 / PID 59194 を確認し、standalone child は停止済み、orphan はなし。Mac Studio の runtime
+LaunchAgent は `runs=2`／新 PID 59052、peer lease は両 node で present／route-scoped／valid だった。
+今回の再起動では build24 までの `demoting`／`unavailable-transition` 固着、runtime 世代不変、child 不在は
+再現せず、追加20秒の安定観測後も serving を維持した。`target=local-standalone` は distributed coordinator
+に対する内部 target 解決仕様であり、readyz 200 と矛盾しない。
+
+これにより N-03 の短い停止経路に関する技術 gate（再起動、再収束、serving safety、generation、child／
+orphan）は PASS とする。通知履歴レビュー（ユーザー確認、2026-08-26）では、開始前の baseline
+`DistributedReady` 1回とは別に、coordinator restart の recovery epoch 内で `5秒後に再起動`、
+`Standalone 起動`、`Paired / ノード検出`、`最終 DistributedReady` が各1回だった。epoch 内の Solo／Paired
+相当通知は各1回、最終 DistributedReady も1回で、重大通知の欠落・反復はなかった。通知回数を含む N-03
+受入基準を満たしたため、N-03 を完了とする。
+
 ## 13. Phase T: TP/RDMA の最終再評価と延期
 
-### [ ] T-01 TP/RDMA を最後に再評価し v0.4+ backlog を固定する
+### [x] T-01 TP/RDMA を最後に再評価し v0.4+ backlog を固定する（v0.4+ 延期承認済み）
 
 - Actor: agent + user review
 - Depends on: N-03
 - 参照: DwarfStar TP/RDMA 調査 全節
 - 事前条件: P0〜P2 の feature と実機 gate が完了済み
-- Files: `docs/research/dwarfstar-rdma-tensor-parallel-2026-08-18.md` の追跡 addendum、
+- Files: `docs/research/dwarfstar-rdma-tensor-parallel-2026-08-18.md` および `docs/research/ds4-investigation-report-2026-08-21_22-07_to_2026-08-22.md` の追跡 addendum、
   または `docs/roadmap-v0.4.md`（新規）
 - Actions:
   1. upstream main の TP server lifecycle、Mac backend、disk KV、DSpark、batching の状態を再確認する。
@@ -1619,20 +1867,42 @@ successful canary後の completion と通知 epoch を接続した。
 - ユーザーレビュー・手作業: v0.4+ 延期を承認する。v0.3 採用へ変更する場合は本計画を止め、独立計画を作る
 - 停止条件: 未マージ PR、人間向け REPL scrape、silent TCP fallback を production dependency にする必要がある
 
+Evidence（T-01 調査・backlog 固定、2026-08-26）:
+upstream の公開 main とローカル `origin/main` を再確認し、固定 commit は
+`c1d4597a80e300b803dc642519718f2c999589da`（2026-08-23）、baseline `84cc882` から19 commit進んでいる
+ことを確認した。main には DeepSeek V4 PRO 0813 の model/quality 更新、DSpark の非ゼロ温度対応と
+`--mtp-exact-sampling`、M5 Max pipeline 測定値が入った。一方、Mac 間 TP は `ds4` CLI のみで、
+`ds4-server` の `--cuda-tensor-parallel` は単一 CUDA host の別経路だった。Mac 間 TP の server
+lifecycle、layer-parallel RDMA、distributed pipeline DSpark は main に未採用である。
+
+関連 PR の公開状態も照合した。#813（ROCm server TP）、#754（CUDA network EP/TP）、#835（pipeline
+DSpark）は Open、#715（Apple layer-parallel RDMA）は Closed で、いずれも main 採用の証跡ではない。
+したがって v0.3.0 の production capability へ追加せず、TP/RDMA/distributed DSpark を v0.4+ backlog
+へ延期する。再開条件は、対象 server role/lifecycle、HTTP contract、固定 digest による RDMA／明示的
+TCP の24時間 endurance、fail-closed／no silent fallback、child・peer・admission・generation・orphan
+rollback の5 gateとした。CLI stdout/PTY scrape は production dependency とせず、stdio bridge は
+制約付き PoC に限る。
+
+詳細な更新、matrix、upstream link、backlog は次に記録した。
+`docs/research/dwarfstar-rdma-tensor-parallel-2026-08-18.md` 第12節、
+`docs/research/ds4-investigation-report-2026-08-21_22-07_to_2026-08-22.md` 第17節。
+ユーザーは 2026-08-26 に v0.4+ への延期を承認した。T-01 は完了とし、再開条件を満たすまで v0.3.0 の対象外として扱う。
+
 ## 14. Phase R: 文書、release candidate、最終受入
 
-### [ ] R-01 利用者・運用・開発文書を v0.3.0 へ同期する
+### [x] R-01 利用者・運用・開発文書を v0.3.0 へ同期する（ソース公開方針へ更新）
 
 - Actor: agent + user review
 - Depends on: T-01, E-06
 - 参照: P0〜P2 の完了 Evidence
 - 事前条件: behavior、default、path、command、既知制約が実装で確定済み
-- Files: `README.md`、`docs/installation.md`、`docs/operations.md`、`docs/troubleshooting.md`、
-  `docs/development.md`、`docs/menu-bar-monitor-spec.md`、`docs/spec.md`、`contrib/launchd/README.md`
+- Files: `README.md`、`README.ja.md`、`docs/installation.md`、`docs/installation.ja.md`、
+  `docs/operations.md`、`docs/operations.ja.md`、`docs/troubleshooting.md`、
+  `docs/troubleshooting.ja.md`、既存の開発・仕様文書
 - Actions:
-  1. 通常 install を `.pkg` と first launch に置き換え、旧 `cargo xtask install` は開発/legacy と明示する。
-  2. background service、login start、migration、upgrade、rollback、DMG の
-     `Siderostat Uninstaller.app` を使った uninstall を記載する。
+  1. 通常 install を source checkout からの `cargo xtask install --start` とし、公式の事前ビルド済み
+     `.app`、`.pkg`、DMG、`Siderostat Uninstaller.app` を配布しない方針を明記する。
+  2. background service、login start、migration、upgrade、rollback、`cargo xtask uninstall` を記載する。
   3. progress age、canary、manual/automatic recovery、snapshot、cooldown を記載する。
   4. notification epoch と TP/RDMA 延期を既知制約として記載する。
   5. command、path、identifier、既定値を実装から再照合する。
@@ -1642,44 +1912,74 @@ successful canary後の completion と通知 epoch を接続した。
 - ユーザーレビュー・手作業: install、Background Items、recovery の文言と安全警告を承認する
 - 停止条件: 実装と文書の default が一致しない、または未検証 command を記載する必要がある
 
-### [ ] R-02 v0.3.0 release candidate と supply-chain artifact を作る
+Evidence（R-01 文書同期、2026-08-26）:
+`README.md`、`docs/installation.md`、`docs/operations.md`、`docs/troubleshooting.md`、
+`docs/development.md`、`docs/menu-bar-monitor-spec.md`、`docs/spec.md`、`contrib/launchd/README.md` を
+v0.3.0 の導入経路へ同期した。現行の公式経路は source checkout からの
+`cargo xtask install --start` とし、事前ビルド済み DMG/pkg、Developer ID、notarization、timestamp は
+公式リリース条件から除外した。background service、Login Items / Background Items の承認、旧版 migration、
+upgrade、rollback、`cargo xtask uninstall` とユーザーデータ保持境界を記録した。progress age、bounded canary、manual/opt-in automatic recovery、
+redacted snapshot、cooldown、notification epoch dedup、および TP/RDMA/distributed DSpark の v0.4+ 延期も
+利用者・運用文書から辿れる状態にした。
+
+実装との再照合では、runtime config、secret、state、manifest、public/admin/control/peer/DS4 の各 endpoint、
+`dev.siderostat-ds4-proxy.runtime`、`~/monitor.toml`、既定の recovery 値（drain 60秒、canary 30秒、cooldown
+1時間、progress stall 60秒）を確認した。`git diff --check` と記載対象ファイルの存在確認は成功した。
+追加で、`README.md` を英語正本、`README.ja.md` を日本語版として再同期し、README から辿る公開文書を
+`docs/installation.md`、`docs/operations.md`、`docs/troubleshooting.md` とそれぞれの `.ja.md` に限定した。
+旧来の開発・operator向け詳細文書は `docs/internal-*.md` へ退避し、公開文書から cargo/LaunchAgent、CI、
+commit/digest、fixture、ソースパスを除外した。英日各3文書の見出し数、相互リンク、`git diff --check` は成功した。
+ユーザーは 2026-08-26 に README と英日エンドユーザー文書、install、Background Items、recovery の文言と安全警告の変更を確認し、承認した。
+同日、公式バイナリを配布しない方針を指定したため、公開文書と release gate を source-only に更新した。R-01 は完了とする。
+
+### [ ] R-02 v0.3.0 source release candidate と supply-chain evidence を作る
 
 - Actor: user + agent
 - Depends on: R-01
-- 参照: 配布仕様 15、16 節
+- 参照: 本書 4.3、配布仕様 15、16 節（package 条件は将来の任意バイナリ経路として参照）
 - 事前条件: 全 automated suite と documentation check が GREEN
 - Files: `Cargo.toml`、`monitor/Cargo.toml`、`Cargo.lock`、`docs/releases/v0.3.0.md`、
   `docs/releases/v0.3.0-acceptance.md`、release metadata/SBOM 生成設定
 - Actions:
-  1. crate version を一括して `0.3.0` に更新し、build number を固定する。
-  2. final signed/stapled `.pkg`、DMG、Uninstaller.app、app archive、SHA-256、SBOM/dependency inventory、
-     third-party notices を作る。
-  3. git commit、Rust version、target、Team ID、notary submission ID を metadata に記録する。
-  4. automatic test、clean install、migration、recovery、notification evidence を acceptance 文書へ集約する。
-- 事後条件: 内容と由来を検証できる release candidate 一式がある
-- 受入基準: artifact の checksum、signature、notary、version、receipt が相互一致する
-- Verification: 共通 local gate、CI、static distribution verification、SBOM/notice/file-list check
-- ユーザーレビュー・手作業: final signing/notarization command の実行を承認する。credential 本文は共有しない
-- 停止条件: uncommitted source、dirty tree、未追跡 credential、model/user data を artifact に含む
+  1. crate version を一括して `0.3.0` に更新し、source release revision を固定する。
+  2. `docs/releases/v0.3.0.md` と `docs/releases/v0.3.0-acceptance.md`、source checksum、
+     SBOM/dependency inventory、third-party notices を作る。
+  3. git revision、Rust version、target、build metadata を記録する。Team ID、notary submission ID、
+     secure timestamp は source release metadata に記録しない。
+  4. automatic test、clean source install、migration、recovery、notification evidence を acceptance
+     文書へ集約する。
+- 事後条件: source revision と依存関係の由来を検証できる release candidate 一式がある
+- 受入基準: version、source revision、lockfile、dependency inventory、notices、公開文書が相互一致し、
+  source-only release に不要な credential、model、user data、配布不能 binary artifact を含まない
+- Verification: 共通 local gate、CI、source checksum、SBOM/notice/file-list/secret scan check
+- ユーザーレビュー・手作業: source release scope、release note、known limitation、v0.4+ 延期項目を承認する
+- 停止条件: uncommitted source、dirty tree、未追跡 credential、model/user data が source release evidence に含まれる
+
+Evidence（R-02 preflight、2026-08-26、旧配布方針）:
+R-01 承認後に `git status --short` を確認したところ、既存の source、test、配布スクリプト、仕様・互換性文書の
+未コミット変更と、今回の公開文書を含む未追跡ファイルが残っていた。`git diff --check` は成功したが、旧 R-02 の
+停止条件にある clean tree を満たさないため、version変更、署名、公証、release candidate artifact の生成は実施していない。
+その後、source-only 方針への変更に伴い、署名・公証 artifact の生成は v0.3.0 の R-02 から除外した。再開には、
+source-only の対象変更をレビュー可能な commit に確定し、clean tree を作る必要がある。
 
 ### [ ] R-03 final acceptance と release 承認を完了する
 
 - Actor: user + agent
 - Depends on: R-02
 - 参照: 本書 4.3、各実機 Evidence
-- 事前条件: candidate checksum が固定され、prior package と rollback 手順がある
+- 事前条件: source candidate checksum が固定され、source revision と rollback 手順がある
 - Files: `docs/releases/v0.3.0-acceptance.md` の結果追記
 - Actions:
-  1. clean install、migration/upgrade/rollback、login、runtime crash、background stop を最終 artifact で再確認する。
+  1. clean source install、migration/upgrade/rollback、login、runtime crash、background stop を source revision で再確認する。
   2. standalone/paired/distributed/reconnect、throughput recovery、notification dedup の回帰 gate を実行する。
-  3. credential、secret、model、user data が source と artifact にないことを再確認する。
+  3. credential、secret、model、user data、配布不能なバイナリ artifact が source release evidence にないことを再確認する。
   4. known risk、TP/RDMA 延期、automatic recovery opt-in を release note へ明記する。
   5. ユーザー承認後だけ、`CONTRIBUTING.md` に従う merge、tag、push を別操作として行う。
-- 事後条件: v0.3.0 の release 可否、rollback artifact、既知制約が一意に判定される
-- 受入基準: 本書 4.3 の 10 項目が全て PASS。FAIL または未実施を waiver で暗黙に通さない
-- Verification: final checksum を使った全 acceptance、`git status --short`、`git diff --check`
-- ユーザーレビュー・手作業: install 承認、System Settings、login/restart、2 node 操作、最終 release 可否を承認する
-- 停止条件: acceptance 未実施、rollback 不可、署名/公証不一致、データ損失、orphan、restart loop が一件でもある
+- 事後条件: v0.3.0 source release の可否、rollback 手順、既知制約が一意に判定される
+- 受入基準: 本書 4.3 の 8 項目が全て PASS。FAIL または未実施を waiver で暗黙に通さない
+- Verification: source checksum を使った全 acceptance、`git status --short`、`git diff --check`
+- ユーザーレビュー・手作業: release note、source revision、2 node の source install/recovery、最終 source release 可否を承認する
+- 停止条件: acceptance 未実施、source rollback 不可、データ損失、orphan、restart loop が一件でもある
 
 ## 15. 共通停止・エスカレーション条件
 

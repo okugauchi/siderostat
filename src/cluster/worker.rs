@@ -249,6 +249,8 @@ impl WorkerControl {
                 | ControlCommand::DistributedReady
                 | ControlCommand::CancelGeneration
                 | ControlCommand::Demote
+                | ControlCommand::PrepareRestart
+                | ControlCommand::CancelRestart
         ) {
             return Err(ControlError::CommandNotAllowed);
         }
@@ -272,6 +274,7 @@ impl WorkerControl {
                 ControlCommand::CancelGeneration | ControlCommand::Demote => {
                     DistributedControlPhase::Paired
                 }
+                ControlCommand::PrepareRestart | ControlCommand::CancelRestart => phase,
                 _ => phase,
             };
         }
@@ -373,6 +376,9 @@ fn validate_worker_command(
                 | DistributedControlPhase::Drained
         ),
         ControlCommand::Demote => !matches!(phase, DistributedControlPhase::Unpaired),
+        ControlCommand::PrepareRestart | ControlCommand::CancelRestart => {
+            !matches!(phase, DistributedControlPhase::Unpaired)
+        }
         _ => false,
     };
     if valid {
@@ -693,6 +699,121 @@ mod tests {
         assert_eq!(standalone.stops.load(Ordering::SeqCst), 1);
         assert_eq!(worker.starts.load(Ordering::SeqCst), 1);
         assert!(worker.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn worker_accepts_planned_restart_commands_only_after_pairing() {
+        let mut worker = WorkerControl::new(
+            descriptor(ControlRole::Worker, "worker"),
+            Duration::from_secs(15),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let authenticated =
+            AuthenticatedPeer::new_for_test("coordinator", IpAddr::from([10, 99, 0, 1]), 1_000);
+        let prepare = ControlMessage {
+            request_id: "prepare-restart-unpaired".into(),
+            generation: 3,
+            deployment_id: Some("deployment-a".into()),
+            command: ControlCommand::PrepareRestart,
+        };
+        assert!(matches!(
+            worker.handle(
+                ControlEndpoint::PrepareRestart,
+                prepare,
+                &authenticated,
+                true,
+                1_000,
+            ),
+            Err(ControlError::InvalidPhase {
+                phase: DistributedControlPhase::Unpaired
+            })
+        ));
+
+        worker
+            .handle(
+                ControlEndpoint::Pair,
+                ControlMessage {
+                    request_id: "planned-restart-pair".into(),
+                    generation: 3,
+                    deployment_id: None,
+                    command: ControlCommand::Pair {
+                        descriptor: descriptor(ControlRole::Coordinator, "coordinator"),
+                    },
+                },
+                &authenticated,
+                true,
+                1_001,
+            )
+            .unwrap();
+        worker
+            .handle(
+                ControlEndpoint::PrepareWorker,
+                ControlMessage {
+                    request_id: "planned-restart-prepare-worker".into(),
+                    generation: 3,
+                    deployment_id: Some("deployment-a".into()),
+                    command: ControlCommand::PrepareWorker,
+                },
+                &authenticated,
+                true,
+                1_002,
+            )
+            .unwrap();
+        worker
+            .worker_ready_message("planned-restart-ready", 42)
+            .unwrap();
+
+        assert!(
+            worker
+                .handle(
+                    ControlEndpoint::PrepareRestart,
+                    ControlMessage {
+                        request_id: "planned-restart-prepare".into(),
+                        generation: 3,
+                        deployment_id: Some("deployment-a".into()),
+                        command: ControlCommand::PrepareRestart,
+                    },
+                    &authenticated,
+                    true,
+                    1_003,
+                )
+                .is_ok()
+        );
+        assert!(
+            worker
+                .handle(
+                    ControlEndpoint::CancelRestart,
+                    ControlMessage {
+                        request_id: "planned-restart-cancel".into(),
+                        generation: 3,
+                        deployment_id: Some("deployment-a".into()),
+                        command: ControlCommand::CancelRestart,
+                    },
+                    &authenticated,
+                    true,
+                    1_004,
+                )
+                .is_ok()
+        );
+
+        assert!(
+            worker
+                .handle(
+                    ControlEndpoint::Demote,
+                    ControlMessage {
+                        request_id: "planned-restart-demote-retry".into(),
+                        generation: 3,
+                        deployment_id: Some("deployment-a".into()),
+                        command: ControlCommand::Demote,
+                    },
+                    &authenticated,
+                    true,
+                    1_005,
+                )
+                .is_ok(),
+            "a planned demote retry must be accepted after the worker already returned to Paired"
+        );
     }
 
     #[tokio::test]

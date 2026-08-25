@@ -7,6 +7,9 @@ use anyhow::Context;
 
 impl super::ProductionClusterRuntime {
     pub async fn reconcile(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.planned_restart_active() {
+            return Ok(self.inner.mode.snapshot());
+        }
         match self.inner.client.node().await {
             Ok(response) => {
                 self.inner.lease.update(&response);
@@ -56,6 +59,9 @@ impl super::ProductionClusterRuntime {
         &self,
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.planned_restart_active() {
+            return Ok(self.inner.mode.snapshot());
+        }
         let now = now_millis();
         // Detect peer loss before delegating to the pure state machine so the production
         // recovery owner stops the distributed child and restarts the standalone. The pure

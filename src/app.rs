@@ -73,6 +73,10 @@ pub struct AppState {
     recovery: RecoveryService,
     recovery_config: RecoveryConfig,
     graceful_restart_in_progress: std::sync::atomic::AtomicBool,
+    /// Signal a graceful restart to the server loop after the HTTP response has been sent.
+    /// The server loop then performs the same cleanup as SIGTERM instead of calling
+    /// `std::process::exit` from an HTTP task.
+    restart_requested: Arc<tokio::sync::Notify>,
     /// Default in-flight drain timeout for `/admin/restart` when the request
     /// omits `drain_timeout_ms` (C-04a). Taken from the cluster stop timeout.
     default_drain_timeout: std::time::Duration,
@@ -148,6 +152,7 @@ impl AppState {
             }),
             recovery_config,
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: Arc::new(tokio::sync::Notify::new()),
             default_drain_timeout: config.cluster.timeouts.stop,
         }))
     }
@@ -293,6 +298,10 @@ impl AppState {
         self.graceful_restart_in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+
+    fn request_graceful_restart(&self) {
+        self.restart_requested.notify_one();
+    }
 }
 
 struct RuntimeAdminExecutor {
@@ -415,6 +424,16 @@ fn spawn_process_restart() {
     tokio::task::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         std::process::exit(0);
+    });
+}
+
+fn spawn_graceful_server_restart(state: Arc<AppState>) {
+    // HTTP 202 を返す猶予を確保した後、server loop に cleanup-aware restart を通知する。
+    // process exit は run_servers の production/standalone cleanup を飛ばすため、ここでは
+    // 直接呼ばない。
+    tokio::task::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.request_graceful_restart();
     });
 }
 
@@ -551,9 +570,8 @@ pub async fn serve_with_options(
         false,
     );
     let supervisor = build_standalone_supervisor(&config, &state)?;
-    // C-04a: graceful restart は solo-standalone の owned DS4 child を停止するため、
-    // supervisor への参照を AppState に保持する。cluster 有効時は lifecycle owner
-    // (ProductionClusterRuntime) が child を所有するため graceful restart は拒否される。
+    // C-04a: graceful restart の fallback owner として supervisor への参照を保持する。
+    // cluster 有効時は ProductionClusterRuntime が優先され、distributed child を所有する。
     state.attach_supervisor(supervisor.clone());
     let role = boot.role;
     let runtime = spawn_runtime(&config, role, &state, &supervisor, restart).await?;
@@ -1158,6 +1176,12 @@ async fn run_servers(
         signal = termination_signal() => {
             signal?;
             info!("termination signal received; draining listeners and stopping owned child");
+            state.proxy.admission().block();
+            shutdown_sender.send_replace(true);
+            (&mut servers).await
+        }
+        _ = state.restart_requested.notified() => {
+            info!("graceful restart requested; draining listeners and stopping owned child");
             state.proxy.admission().block();
             shutdown_sender.send_replace(true);
             (&mut servers).await
@@ -1996,16 +2020,25 @@ async fn graceful_restart(
         );
     }
 
-    // cluster 有効・distributed 等で supervisor 不在の場合は graceful restart を拒否する。
-    let Some(supervisor) = state.supervisor() else {
+    // distributed は ProductionClusterRuntime、standalone は StandaloneSupervisor が
+    // child の lifecycle owner になる。どちらも無い場合だけ graceful restart を拒否する。
+    let supervisor = state.supervisor();
+    let production = state.production_runtime();
+    if supervisor.is_none() && production.is_none() {
         state.release_graceful_restart();
         return json_response(
             StatusCode::CONFLICT,
             json!({"error": "graceful_restart_unavailable"}),
         );
-    };
+    }
     let _ = admin;
-    perform_graceful_restart(&state, &supervisor, drain_timeout).await
+    perform_graceful_restart(
+        &state,
+        supervisor.as_ref(),
+        production.as_ref(),
+        drain_timeout,
+    )
+    .await
 }
 
 /// Resolve the drain timeout for `/admin/restart`: use the request's
@@ -2041,21 +2074,42 @@ enum GracefulRestartOutcome {
     ChildIdentityMismatch,
     /// The owned child could not be stopped.
     ChildStopFailed,
+    /// Distributed peer could not enter the planned-restart gate.
+    PeerPreparationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GracefulRestartOwner {
+    Standalone,
+    Distributed,
+}
+
+fn graceful_restart_owner(has_production_runtime: bool) -> GracefulRestartOwner {
+    if has_production_runtime {
+        GracefulRestartOwner::Distributed
+    } else {
+        GracefulRestartOwner::Standalone
+    }
 }
 
 /// C-04b: admission block → in-flight drain → owned DS4 child stop を実行する。
 ///
 /// - drain timeout 時は強制 kill せず `DrainTimeout` を返す。
 /// - owned child identity mismatch 時は強制 kill せず `ChildIdentityMismatch` を返す。
-/// - process exit は行わない（`perform_graceful_restart` が成功時に exit を予約する）。
+/// - process exit は行わない（`perform_graceful_restart` が成功時に server signal を予約する）。
 ///
 /// テストはこの sequence を直接呼び、exit 副作用なしで drain / timeout /
 /// identity mismatch を検証できる。
 async fn graceful_restart_sequence(
     state: &Arc<AppState>,
-    supervisor: &Arc<StandaloneSupervisor>,
+    supervisor: Option<&Arc<StandaloneSupervisor>>,
+    production: Option<&ProductionClusterRuntime>,
     drain_timeout: std::time::Duration,
 ) -> GracefulRestartOutcome {
+    if let Some(production) = production {
+        production.begin_planned_restart();
+    }
+
     // 1. admission block: 新規リクエストを受け付けない。
     state.proxy.admission().block();
 
@@ -2065,6 +2119,9 @@ async fn graceful_restart_sequence(
         state.proxy.admission().drain(0, drain_timeout).await,
         Err(DrainError::Timeout)
     ) {
+        if let Some(production) = production {
+            let _ = production.cancel_planned_restart().await;
+        }
         let in_flight = state.proxy.admission().snapshot().in_flight;
         return GracefulRestartOutcome::DrainTimeout {
             in_flight,
@@ -2072,17 +2129,65 @@ async fn graceful_restart_sequence(
         };
     }
 
-    // 3. owned DS4 child stop: supervisor が所有する child のみを停止する。
-    //    identity mismatch 時は強制 kill せず error を返す。cluster lifecycle
-    //    owner を迂回した signal や unknown PID の kill は行わない。
-    match crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await {
-        Ok(()) => GracefulRestartOutcome::Ready {
-            drain_timeout_ms: drain_timeout.as_millis(),
+    // 3. owned DS4 child stop: distributed runtime がある場合は production lifecycle owner
+    //    を使い、standalone の場合だけ standalone supervisor を使う。identity mismatch
+    //    時は強制 kill せず error を返す。cluster lifecycle owner を迂回した signal や
+    //    unknown PID の kill は行わない。
+    let mut peer_prepared = false;
+    if let Some(production) = production {
+        match production.prepare_peer_for_planned_restart().await {
+            Ok(prepared) => peer_prepared = prepared,
+            Err(error) => {
+                tracing::warn!(error = %error, "planned restart peer preparation failed");
+                let _ = production.cancel_peer_planned_restart().await;
+                let _ = production.cancel_planned_restart().await;
+                return GracefulRestartOutcome::PeerPreparationFailed;
+            }
+        }
+    }
+
+    let stop_result: anyhow::Result<()> = match graceful_restart_owner(production.is_some()) {
+        GracefulRestartOwner::Distributed => match production {
+            Some(production) => production.stop_for_planned_restart(drain_timeout).await,
+            None => Err(anyhow::anyhow!("distributed restart owner is unavailable")),
         },
+        GracefulRestartOwner::Standalone => match supervisor {
+            Some(supervisor) => {
+                crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await
+            }
+            None => Err(anyhow::anyhow!("standalone restart owner is unavailable")),
+        },
+    };
+    match stop_result {
+        Ok(()) => {
+            // Worker demotion may make admission serving again as part of its lifecycle
+            // transition. Keep the process unavailable until the server loop has completed
+            // listener cleanup and exited for LaunchAgent restart.
+            state.proxy.admission().block();
+            GracefulRestartOutcome::Ready {
+                drain_timeout_ms: drain_timeout.as_millis(),
+            }
+        }
         Err(error) if is_graceful_identity_mismatch(&error) => {
+            if peer_prepared {
+                if let Some(production) = production {
+                    let _ = production.cancel_peer_planned_restart().await;
+                }
+            }
+            if let Some(production) = production {
+                let _ = production.cancel_planned_restart().await;
+            }
             GracefulRestartOutcome::ChildIdentityMismatch
         }
         Err(error) => {
+            if peer_prepared {
+                if let Some(production) = production {
+                    let _ = production.cancel_peer_planned_restart().await;
+                }
+            }
+            if let Some(production) = production {
+                let _ = production.cancel_planned_restart().await;
+            }
             tracing::warn!(error = %error, "graceful restart child stop failed");
             GracefulRestartOutcome::ChildStopFailed
         }
@@ -2100,16 +2205,17 @@ fn is_graceful_identity_mismatch(error: &anyhow::Error) -> bool {
 }
 
 /// `/admin/restart` の graceful restart 処理。`graceful_restart_sequence` の
-/// 結果を HTTP response へ写像し、`Ready` 時のみ exit を予約する。exit は
-/// `spawn_process_restart` が 100ms 後に launchd KeepAlive 経由で新 binary を
-/// 起動する。response 返却前に exit しないことで、client へ曖昧な
+/// 結果を HTTP response へ写像し、`Ready` 時のみ server loop へ restart signal を予約する。
+/// signal は 100ms 後に送信され、run_servers が通常の child cleanup を行ってから戻る。
+/// response 返却前に server loop を止めないことで、client へ曖昧な
 /// transport error を見せない。失敗時は進行中フラグを解放して再試行可能にする。
 async fn perform_graceful_restart(
     state: &Arc<AppState>,
-    supervisor: &Arc<StandaloneSupervisor>,
+    supervisor: Option<&Arc<StandaloneSupervisor>>,
+    production: Option<&ProductionClusterRuntime>,
     drain_timeout: std::time::Duration,
 ) -> Response<Body> {
-    match graceful_restart_sequence(state, supervisor, drain_timeout).await {
+    match graceful_restart_sequence(state, supervisor, production, drain_timeout).await {
         GracefulRestartOutcome::Ready { drain_timeout_ms } => {
             let response = json_response(
                 StatusCode::ACCEPTED,
@@ -2118,7 +2224,7 @@ async fn perform_graceful_restart(
                     "drain_timeout_ms": drain_timeout_ms,
                 }),
             );
-            spawn_process_restart();
+            spawn_graceful_server_restart(state.clone());
             response
         }
         GracefulRestartOutcome::DrainTimeout {
@@ -2147,6 +2253,13 @@ async fn perform_graceful_restart(
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": "child_stop_failed"}),
+            )
+        }
+        GracefulRestartOutcome::PeerPreparationFailed => {
+            state.release_graceful_restart();
+            json_response(
+                StatusCode::CONFLICT,
+                json!({"error": "peer_prepare_restart_failed"}),
             )
         }
     }
@@ -2504,6 +2617,30 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn graceful_restart_owner_is_distributed_when_production_runtime_exists() {
+        assert_eq!(
+            graceful_restart_owner(true),
+            GracefulRestartOwner::Distributed
+        );
+        assert_eq!(
+            graceful_restart_owner(false),
+            GracefulRestartOwner::Standalone
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_restart_can_signal_server_shutdown_without_process_exit() {
+        let state = test_state(true);
+        let notified = state.restart_requested.notified();
+
+        state.request_graceful_restart();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("graceful restart signal should reach the server loop");
+    }
+
     fn test_state(serving: bool) -> Arc<AppState> {
         let proxy = Arc::new(
             ModeAwareProxyState::new(
@@ -2546,6 +2683,7 @@ mod tests {
             recovery: RecoveryService::new(),
             recovery_config: RecoveryConfig::default(),
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: Arc::new(tokio::sync::Notify::new()),
             default_drain_timeout: std::time::Duration::from_millis(5000),
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
@@ -3106,8 +3244,13 @@ mod tests {
         let state = test_state(true);
         attach_test_supervisor(&state);
         let supervisor = state.supervisor().unwrap();
-        let outcome =
-            graceful_restart_sequence(&state, &supervisor, std::time::Duration::from_secs(5)).await;
+        let outcome = graceful_restart_sequence(
+            &state,
+            Some(&supervisor),
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(
             outcome,
             GracefulRestartOutcome::Ready {
@@ -3134,9 +3277,13 @@ mod tests {
             .try_acquire(true)
             .expect("permit should be acquirable");
         let supervisor = state.supervisor().unwrap();
-        let outcome =
-            graceful_restart_sequence(&state, &supervisor, std::time::Duration::from_millis(10))
-                .await;
+        let outcome = graceful_restart_sequence(
+            &state,
+            Some(&supervisor),
+            None,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
         assert_eq!(
             outcome,
             GracefulRestartOutcome::DrainTimeout {

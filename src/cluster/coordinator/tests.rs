@@ -53,6 +53,7 @@ impl LocalStandaloneLifecycle for FakeStandalone {
 struct FakeDistributedCoordinator {
     running: Arc<AtomicBool>,
     start_hangs: Arc<AtomicBool>,
+    stop_fails: Arc<AtomicBool>,
     route_ready: Arc<AtomicBool>,
     route_lost: Arc<AtomicBool>,
     route_changed: Arc<tokio::sync::Notify>,
@@ -101,9 +102,13 @@ impl DistributedCoordinatorLifecycle for FakeDistributedCoordinator {
 
     fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>> {
         let running = self.running.clone();
+        let fails = self.stop_fails.clone();
         let stops = self.stops.clone();
         Box::pin(async move {
             stops.fetch_add(1, Ordering::SeqCst);
+            if fails.load(Ordering::SeqCst) {
+                anyhow::bail!("fake coordinator stop failed");
+            }
             running.store(false, Ordering::SeqCst);
             Ok(())
         })
@@ -126,6 +131,7 @@ struct FakePeer {
     drains: Arc<AtomicUsize>,
     stops: Arc<AtomicUsize>,
     drain_fails: Arc<AtomicBool>,
+    stop_fails: Arc<AtomicBool>,
 }
 
 impl CoordinatorPeerLifecycle for FakePeer {
@@ -143,8 +149,12 @@ impl CoordinatorPeerLifecycle for FakePeer {
 
     fn stop_worker(&self, _generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
         let stops = self.stops.clone();
+        let fails = self.stop_fails.clone();
         Box::pin(async move {
             stops.fetch_add(1, Ordering::SeqCst);
+            if fails.load(Ordering::SeqCst) {
+                anyhow::bail!("fake peer stop failed");
+            }
             Ok(())
         })
     }
@@ -218,6 +228,17 @@ fn ready_worker_control() -> CoordinatorControl {
         )
         .unwrap();
     control
+}
+
+#[test]
+fn planned_restart_message_is_only_available_while_peer_worker_is_ready() {
+    let control = ready_worker_control();
+    let message = control.prepare_restart_message("planned-restart").unwrap();
+    assert_eq!(message.command, ControlCommand::PrepareRestart);
+    assert_eq!(message.generation, 7);
+    assert_eq!(message.deployment_id.as_deref(), Some("deployment-a"));
+    let cancel = control.cancel_restart_message("cancel-restart").unwrap();
+    assert_eq!(cancel.command, ControlCommand::CancelRestart);
 }
 
 fn validated_hello() -> Ds4Hello {
@@ -763,6 +784,79 @@ async fn recovery_demotion_failure_does_not_stop_distributed_children() {
         proxy.admission().snapshot().state,
         crate::admission::AdmissionState::Blocked
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn planned_restart_stop_failure_restores_distributed_state() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.set_route_ready(true);
+    let (runtime, proxy, _, _, task) = promotion_runtime(coordinator.clone()).await;
+    runtime
+        .promote_after_hello(
+            validated_hello(),
+            &ready_worker_control(),
+            NOW + 5_000,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    coordinator.stop_fails.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        runtime.stop_for_planned_restart().await,
+        Err(CoordinatorLifecycleError::Coordinator(_))
+    ));
+    assert_eq!(
+        runtime.cluster.snapshot().state,
+        ClusterState::DistributedReady
+    );
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Serving
+    );
+    assert_eq!(coordinator.stops.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn planned_restart_peer_stop_failure_restores_paired_standalone_state() {
+    let coordinator = Arc::new(FakeDistributedCoordinator::default());
+    coordinator.set_route_ready(true);
+    let (runtime, proxy, _, peer, task) = promotion_runtime(coordinator.clone()).await;
+    runtime
+        .promote_after_hello(
+            validated_hello(),
+            &ready_worker_control(),
+            NOW + 5_000,
+            Arc::new(|| true),
+        )
+        .await
+        .unwrap();
+    peer.stop_fails.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        runtime.stop_for_planned_restart().await,
+        Err(CoordinatorLifecycleError::Peer(_))
+    ));
+    assert_eq!(
+        runtime.cluster.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    assert_eq!(
+        proxy.admission().snapshot().state,
+        crate::admission::AdmissionState::Serving
+    );
+    assert!(!coordinator.running.load(Ordering::SeqCst));
+    assert!(
+        runtime
+            .standalone
+            .is_running()
+            .await
+            .expect("standalone state should be readable")
+    );
+    assert_eq!(coordinator.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.stops.load(Ordering::SeqCst), 1);
     task.abort();
 }
 

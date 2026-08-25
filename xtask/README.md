@@ -2,6 +2,17 @@
 
 `cargo xtask <command>` でインストール・検証・アンインストールを自動化する。
 
+## v0.3.0 の提供方針
+
+v0.3.0 の公式提供物はソースコードであり、事前ビルド済みの `.app`、`.pkg`、DMG、
+`Siderostat Uninstaller.app` は配布しない。利用者向けの導入経路は、ソース checkout から
+`cargo xtask install --start` を実行する方法である。
+
+`app-dev`、`pkg-dev`、`dmg-dev`、`sign` は、各 Mac 上での bundle/package 構造確認、
+署名・公証の切り分け、または将来の任意バイナリ配布に備えた開発者向け workflow である。
+これらの artifact と Apple Developer ID、notary profile、secure timestamp は、v0.3.0 の
+ソースリリース受入条件ではない。
+
 ```sh
 cargo xtask install [options]
 cargo xtask fingerprint-models [options]
@@ -17,7 +28,7 @@ cargo xtask sign [options]
 
 ## install
 
-`docs/installation.md` 第5節と `contrib/launchd/README.md` の手順を1コマンドで実行する。
+`docs/internal-installation.md` 第5節と `contrib/launchd/README.md` の手順を1コマンドで実行する。
 
 実行順:
 
@@ -108,7 +119,9 @@ cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
 - staging は既定で `build/app-dev/`。毎回空の状態から再構築するため、同一入力なら
   file 一覧・plist 値・unsigned content digest が一致する。
 - `Contents/MacOS/Siderostat` は monitor、`Contents/Helpers/siderostat-runtime` は runtime。
-- bundle 内 LaunchAgent plist は `BundleProgram` 相対 path を使い、user home の絶対 pathを書かない。
+- bundle 内 LaunchAgent plist は固定インストール先 `/Applications/Siderostat.app` の
+  `Program` absolute path を使い、user home の絶対 pathを書かない。pkg の postinstall から
+  直接 bootstrap するためである。
 - helper → main app の順に ad-hoc 署名する。signing に `--deep` は使わない。
 - `AppIcon.icns` は既定で placeholder を自動生成する。`--icon <path>` で正式 icon を指定できる。
 - `--verify` 指定時は `plutil -lint`、`codesign --verify --deep --strict --verbose=4` を実行する。
@@ -116,18 +129,22 @@ cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
 
 ## pkg-dev
 
-`app-dev` で生成した bundle を flat `.pkg` にする（E-01）。インストール前に、既存の
-`/Applications/Siderostat.app/Contents/MacOS/Siderostat` が動作中であれば、その Monitor だけを
-終了する `preinstall` script と、インストール完了後にアクティブなコンソールユーザーの GUI
-セッションで `/Applications/Siderostat.app` を起動する `postinstall` script を含める。
-runtime、`ds4-server`、ユーザーデータは対象にしない。
+`app-dev` で生成した bundle を flat `.pkg` にする（E-01）。インストール前に、active console
+user の `gui/<uid>/dev.siderostat-ds4-proxy.runtime` だけを LaunchAgent から unload し、
+その後 `/Applications/Siderostat.app/Contents/MacOS/Siderostat` の完全一致した Monitor を終了する
+`preinstall` script を含める。runtime job または bundle 内の完全一致した runtime executable が
+残る場合、Monitor が通常終了しない場合だけ対象を限定して強制終了する。インストール完了後は
+アクティブなコンソールユーザーの GUI セッションで `/Applications/Siderostat.app` を起動する
+`postinstall` script を実行する。任意の process、`ds4-server`、ユーザーデータは対象にしない。
 
 ```sh
 cargo xtask pkg-dev --app-dir <staging> --version <semver> [--output-dir dist]
 ```
 
-payload は `/Applications/Siderostat.app` 一項目のみ。`postinstall` はアプリの起動要求に限定し、
-ログイン項目や Service Management の登録、設定・secret の変更はアプリ本体へ委ねる。
+payload は `/Applications/Siderostat.app` 一項目のみ。`postinstall` は、更新前に runtime が
+`enabled` だった場合に限り新しい bundle 内の LaunchAgent を同じ GUI domain へ bootstrap し、
+その後アプリを起動する。disabled、未登録、承認待ちの場合は bootstrap せず、ログイン項目や
+Service Management の承認・恒久登録、設定・secret の変更はアプリ本体へ委ねる。
 GUI ユーザーが存在しない場合は、インストールを失敗させずに起動をスキップする。
 
 通常の package は既存 app の bundle version を検査する。明示的な旧版復元が必要な場合だけ
@@ -212,10 +229,12 @@ cargo xtask sign \
   --output-dir dist/rollback-build10
 ```
 
-### DMG と Uninstaller.app
+### 任意のローカル DMG と Uninstaller.app 検証
 
-エンドユーザー向け配布物は `.pkg` 単体ではなく、`.pkg`、`Siderostat Uninstaller.app`、`README.html` だけを
-含む DMG とする。開発用の構造確認は次で実行する。
+公式のエンドユーザー配布物ではないローカル検証用 DMG を作成する場合は、`.pkg`、
+`Siderostat Uninstaller.app`、`README.html` だけを含める。これは bundle/package の構造、
+Uninstaller の挙動、または将来の任意バイナリ配布仕様を確認するためのものであり、
+v0.3.0 のリリース artifact にはならない。
 
 ```sh
 cargo xtask dmg-dev \
@@ -227,7 +246,8 @@ cargo xtask dmg-dev \
   --verify
 ```
 
-Developer ID 署名、公証、staple、Gatekeeper確認まで行うリリースでは、`sign` に `--with-dmg` を追加する。
+将来、公式バイナリ配布を別リリースで採用する場合に Developer ID 署名、公証、staple、Gatekeeper確認まで
+行うときは、`sign` に `--with-dmg` を追加する。
 既存の app/pkg の署名・公証に続けて Uninstaller を署名し、DMG を公証して `dist/notary/` と metadata に
 結果を保存する。Uninstaller は notarytool が受け付ける一時 zip として提出し、DMG は Developer ID
 Application 署名後に提出する。`Siderostat Uninstaller.app` は `.pkg` の payload や `/Applications` 配下には配置しない。
@@ -246,5 +266,5 @@ cargo xtask sign \
 
 Uninstaller の標準動作は、Service Management の解除、対象 process の停止、`Siderostat.app` の Trash 移動、
 正確な package receipt の整理である。Application Support、secret、manifest、cluster state、model、KV cacheは
-保持する。既存の `cargo xtask uninstall` は旧 LaunchAgent 構成の CI/診断用であり、リリース後のエンドユーザー
-導線には使用しない。
+保持する。v0.3.0 のソース導入では `cargo xtask uninstall` を使用する。Uninstaller.app を含む DMG の導線は、
+将来の任意バイナリ配布を採用した場合に別途定義する。

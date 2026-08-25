@@ -1,5 +1,11 @@
 # Siderostat macOS Application Bundle / Installer Package 仕様
 
+- **現行方針（2026-08-26）**: v0.3.0 はソース公開のみであり、公式のバイナリ、`.pkg`、DMG、
+  `Siderostat Uninstaller.app` は配布しない。本書は既存の macOS bundle/package 実装と実機検証を
+  説明する内部仕様、および将来の任意バイナリ配布・ローカル検証用の設計として保持する。
+  本書に記載された Developer ID 署名、公証、secure timestamp、staple、Gatekeeper の条件は、
+  v0.3.0 のソースリリース受入条件ではない。
+
 - 文書状態: 配布構成・アンインストール構成 合意済み（実装・実機受入済み）
 - 作成日: 2026-08-18
 - 対象: Siderostat 次期配布形式
@@ -50,10 +56,13 @@ runtime を main executable、monitor を別 LoginItem app とする案は採用
 Finder からの起動、初回承認、設定 UI、障害時の説明を UI のない process が背負う一方、
 結局 monitor 用の第二 bundle が必要になり、責務と署名単位が複雑になる。
 
-### 2.3 エンドユーザー向け配布単位
+### 2.3 将来の任意バイナリ配布単位
 
-通常のインストールは、従来どおり署名・公証済みの `Siderostat-<version>.pkg` で行う。
-リリース配布物は、次のファイルを収録した署名・公証済み DMG とする。
+この節は、将来 v0.4+ 以降で公式バイナリ配布を採用する場合、またはローカルで package
+workflow を検証する場合の設計である。v0.3.0 の公式導入は source checkout からの
+`cargo xtask install --start` であり、以下の DMG、`.pkg`、Uninstaller は配布しない。
+
+バイナリ配布を採用する場合の候補は、次のファイルを収録した署名・公証済み DMG とする。
 
 ```text
 Siderostat-<version>.dmg
@@ -210,7 +219,10 @@ capability check で macOS 26.2 以上に限定する。
 ### 5.4 LaunchAgent plist
 
 plist は署名済み app bundle の一部であり、install 時または first launch 時に書き換えない。
-`Program` の絶対 path ではなく、bundle からの相対 path を指定する `BundleProgram` を使う。
+配布先は `/Applications/Siderostat.app` に固定されるため、pkg の postinstall から
+`launchctl bootstrap` できるよう `Program` に固定 absolute path を指定する。
+`BundleProgram` は Service Management 経由の登録には適しているが、pkg script からの直接
+bootstrap では使用しない。
 
 概念上の plist は次のとおりである。最終 key set は target macOS 上で `plutil` と
 Service Management の実機試験を通す。
@@ -224,8 +236,8 @@ Service Management の実機試験を通す。
   <key>Label</key>
   <string>dev.siderostat-ds4-proxy.runtime</string>
 
-  <key>BundleProgram</key>
-  <string>Contents/Helpers/siderostat-runtime</string>
+  <key>Program</key>
+  <string>/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -434,19 +446,40 @@ relocation を許可しない。
 ### 9.2 installer script policy
 
 `preinstall` と `postinstall` の二つの controlled script だけを許可する。
-`preinstall` は `/Applications/Siderostat.app/Contents/MacOS/Siderostat` という完全一致した
-実行パスの既存 Monitor を bundle replacement 前に終了させる。通常は SIGTERM を送り、最大10秒
-待機する。終了しない場合だけ同じ完全一致の Monitor に SIGKILL を送り、他のプロセスへ波及させない。
-`postinstall` はアクティブな console user の GUI session で `/Applications/Siderostat.app` を
-起動する要求だけを行う。ログイン項目、Service Management、user data は変更しない。
+`preinstall` は次の順序で、bundle replacement 前に既存の製品プロセスを停止する。
+
+1. `/dev/console` から現在の GUI ユーザーの UID を解決する。
+2. `gui/<uid>/dev.siderostat-ds4-proxy.runtime` に限定して runtime LaunchAgent を
+   `launchctl bootout` する。job が未登録・未稼働の場合は安全な no-op とする。停止に失敗した
+   場合は同じ job target への `launchctl kill SIGKILL` と、bundle 内の
+   `/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime` という完全一致した
+   実行パスへの fallback を使う。
+3. runtime job と完全一致した runtime executable が消えるまで待機する。
+4. `/Applications/Siderostat.app/Contents/MacOS/Siderostat` という完全一致した実行パスの
+   Monitor に SIGTERM を送り、最大10秒待機する。終了しない場合だけ同じ完全一致の Monitor
+   に SIGKILL を送り、他のプロセスへ波及させない。
+
+runtime の停止を先に行うことで、旧 Monitor が停止中の runtime を検出して再操作する競合を
+避ける。`preinstall` は Service Management の登録状態、ユーザーの承認、plist ファイル、
+設定、secret、model、cache を変更・削除しない。`bootout` は bundle replacement のための
+一時的な job unload であり、インストール後に起動した新しい Siderostat が既存の登録・承認状態を
+読み取り、必要な runtime を復帰させる。
+
+`postinstall` は、`launchctl print-disabled gui/<uid>` で product-owned runtime が事前に
+`enabled` だった場合だけ、新しい bundle 内の LaunchAgent plist を同じ `gui/<uid>` domain へ
+bootstrap し、その後アクティブな console user の GUI session で `/Applications/Siderostat.app`
+を起動する。disabled、未登録、承認待ちの場合は bootstrap せず、アプリ側の Service Management
+承認導線へ委譲する。これにより upgrade 前に稼働していた runtime は、ユーザーの停止設定を変更
+せずにインストール直後から復帰する。
 
 installer process から次を行わない。
 
-- console user の推測や user session の変更
-- `launchctl bootstrap gui/<uid>`
+- console user 以外のユーザー・session の操作
+- `launchctl disable`、`SMAppService.unregister()`。`launchctl bootstrap gui/<uid>` は、
+  事前状態が `enabled` の product-owned runtime を復帰させる場合に限り許可する。
 - `~/Library/LaunchAgents` の変更
 - user config / secret の生成または上書き
-- active runtime / DS4 child の停止または強制終了
+- runtime job 以外のプロセス、任意の `ds4-server` child、未知 PID の停止または強制終了
 - Recovery での RDMA 有効化
 
 runtime と main app login start の登録は、install 後に postinstall が起動した Siderostat の

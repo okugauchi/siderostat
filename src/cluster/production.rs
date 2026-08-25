@@ -34,7 +34,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -271,6 +271,7 @@ struct ProductionInner {
     recovery: Arc<recovery::PeerLossRecovery>,
     recovery_owner_active: AtomicBool,
     automatic_pairing_blocked: AtomicBool,
+    planned_restart: PlannedRestartGate,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
     /// actual production input. Fail-closed until a fresh observation is applied.
@@ -278,6 +279,154 @@ struct ProductionInner {
     /// Test-support only: recorded pair-phase timings across pair sessions (Q-01).
     #[cfg(feature = "test-support")]
     pair_timings: std::sync::Mutex<Vec<PairTiming>>,
+}
+
+const PLANNED_RESTART_IDLE: u8 = 0;
+const PLANNED_RESTART_CHILD_RUNNING: u8 = 1;
+const PLANNED_RESTART_CHILD_STOPPED: u8 = 2;
+const PLANNED_RESTART_PAIR_PENDING: u8 = 3;
+const PLANNED_RESTART_PAIR_COMPLETING: u8 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedRestartPairAction {
+    Run,
+    RunAfterChildStop,
+    Defer,
+    AlreadyCompleting,
+}
+
+/// Serializes the worker-side planned-restart handoff. The control response for Demote is
+/// intentionally early, but Pair must not release the gate until the owned distributed child
+/// has actually stopped. A single atomic state avoids the race between Pair observing a running
+/// child and the stop effect recording completion.
+struct PlannedRestartGate {
+    state: AtomicU8,
+}
+
+impl Default for PlannedRestartGate {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(PLANNED_RESTART_IDLE),
+        }
+    }
+}
+
+impl PlannedRestartGate {
+    fn active(&self) -> bool {
+        self.state.load(Ordering::Acquire) != PLANNED_RESTART_IDLE
+    }
+
+    fn begin(&self) {
+        // Duplicate PrepareRestart effects must not erase a pending Pair/stop handoff.
+        let _ = self.state.compare_exchange(
+            PLANNED_RESTART_IDLE,
+            PLANNED_RESTART_CHILD_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn cancel(&self) {
+        self.state.store(PLANNED_RESTART_IDLE, Ordering::Release);
+    }
+
+    fn blocks_worker_prepare(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            PLANNED_RESTART_CHILD_RUNNING | PLANNED_RESTART_PAIR_PENDING
+        )
+    }
+
+    fn pair_action(&self) -> PlannedRestartPairAction {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                PLANNED_RESTART_IDLE => return PlannedRestartPairAction::Run,
+                PLANNED_RESTART_CHILD_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            PLANNED_RESTART_CHILD_RUNNING,
+                            PLANNED_RESTART_PAIR_PENDING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return PlannedRestartPairAction::Defer;
+                    }
+                }
+                PLANNED_RESTART_CHILD_STOPPED => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            PLANNED_RESTART_CHILD_STOPPED,
+                            PLANNED_RESTART_PAIR_COMPLETING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return PlannedRestartPairAction::RunAfterChildStop;
+                    }
+                }
+                PLANNED_RESTART_PAIR_PENDING => return PlannedRestartPairAction::Defer,
+                PLANNED_RESTART_PAIR_COMPLETING => {
+                    return PlannedRestartPairAction::AlreadyCompleting;
+                }
+                _ => unreachable!("invalid planned restart gate state"),
+            }
+        }
+    }
+
+    /// Records child-stop completion. Returns true only when a deferred Pair is now owned by
+    /// this stop task and its completion effect must be run here.
+    fn note_child_stopped(&self) -> bool {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                PLANNED_RESTART_IDLE
+                | PLANNED_RESTART_CHILD_STOPPED
+                | PLANNED_RESTART_PAIR_COMPLETING => return false,
+                PLANNED_RESTART_CHILD_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            PLANNED_RESTART_CHILD_RUNNING,
+                            PLANNED_RESTART_CHILD_STOPPED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                PLANNED_RESTART_PAIR_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            PLANNED_RESTART_PAIR_PENDING,
+                            PLANNED_RESTART_PAIR_COMPLETING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                _ => unreachable!("invalid planned restart gate state"),
+            }
+        }
+    }
+
+    fn retry_pair_after_failure(&self) {
+        let _ = self.state.compare_exchange(
+            PLANNED_RESTART_PAIR_COMPLETING,
+            PLANNED_RESTART_CHILD_STOPPED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 impl ProductionClusterRuntime {
@@ -424,6 +573,9 @@ impl ProductionClusterRuntime {
                 .cluster
                 .timeouts
                 .stop
+                .saturating_add(super::process::sigkill_reap_window(
+                    config.cluster.timeouts.stop,
+                ))
                 .saturating_add(config.cluster.timeouts.peer_request),
         )?;
         let lease = LeaseStatus::new();
@@ -468,6 +620,7 @@ impl ProductionClusterRuntime {
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
             recovery_owner_active: AtomicBool::new(false),
             automatic_pairing_blocked: AtomicBool::new(false),
+            planned_restart: PlannedRestartGate::default(),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
             pair_timings: std::sync::Mutex::new(Vec::new()),
@@ -658,6 +811,88 @@ impl ProductionClusterRuntime {
         self.inner.role
     }
 
+    pub fn planned_restart_active(&self) -> bool {
+        self.inner.planned_restart.active()
+    }
+
+    pub fn begin_planned_restart(&self) {
+        self.inner.planned_restart.begin();
+    }
+
+    pub async fn cancel_planned_restart(&self) -> anyhow::Result<()> {
+        self.inner.planned_restart.cancel();
+        Ok(())
+    }
+
+    pub async fn prepare_peer_for_planned_restart(&self) -> anyhow::Result<bool> {
+        if self.inner.role != LocalRole::Coordinator
+            || self.inner.mode.snapshot().state != ClusterState::DistributedReady
+        {
+            return Ok(false);
+        }
+        let message = {
+            let RoleControl::Coordinator(control) = &self.inner.control else {
+                anyhow::bail!("coordinator control unavailable")
+            };
+            control
+                .lock()
+                .await
+                .prepare_restart_message(uuid::Uuid::new_v4().to_string())?
+        };
+        self.inner.client.send(&message).await?;
+        Ok(true)
+    }
+
+    pub async fn cancel_peer_planned_restart(&self) -> anyhow::Result<()> {
+        if self.inner.role != LocalRole::Coordinator {
+            return Ok(());
+        }
+        let message = {
+            let RoleControl::Coordinator(control) = &self.inner.control else {
+                anyhow::bail!("coordinator control unavailable")
+            };
+            control
+                .lock()
+                .await
+                .cancel_restart_message(uuid::Uuid::new_v4().to_string())?
+        };
+        self.inner.client.send(&message).await?;
+        Ok(())
+    }
+
+    pub async fn stop_for_planned_restart(&self, _drain_timeout: Duration) -> anyhow::Result<()> {
+        if self.inner.role == LocalRole::Coordinator
+            && self.inner.mode.snapshot().state == ClusterState::DistributedReady
+        {
+            self.inner
+                .coordinator_runtime
+                .get()
+                .context("coordinator runtime unavailable")?
+                .stop_for_planned_restart()
+                .await
+                .map_err(anyhow::Error::new)?;
+            Ok(())
+        } else {
+            self.stop_distributed().await
+        }
+    }
+
+    pub(super) fn clear_planned_restart(&self) {
+        self.inner.planned_restart.cancel();
+    }
+
+    fn planned_restart_blocks_worker_prepare(&self) -> bool {
+        self.inner.planned_restart.blocks_worker_prepare()
+    }
+
+    fn planned_restart_pair_action(&self) -> PlannedRestartPairAction {
+        self.inner.planned_restart.pair_action()
+    }
+
+    fn note_planned_restart_child_stopped(&self) -> bool {
+        self.inner.planned_restart.note_child_stopped()
+    }
+
     pub fn try_claim_recovery_owner(&self) -> bool {
         self.inner
             .recovery_owner_active
@@ -737,6 +972,8 @@ impl ProductionClusterRuntime {
             .route("/v1/worker-event", post(control_worker_event))
             .route("/v1/distributed-ready", post(control_distributed_ready))
             .route("/v1/demote", post(control_demote))
+            .route("/v1/prepare-restart", post(control_prepare_restart))
+            .route("/v1/cancel-restart", post(control_cancel_restart))
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self.clone())
     }
@@ -1013,7 +1250,18 @@ fn effect_requires_ack(command: &ControlCommand) -> bool {
             | ControlCommand::CancelGeneration
             | ControlCommand::DistributedReady
             | ControlCommand::Demote
+            | ControlCommand::PrepareRestart
+            | ControlCommand::CancelRestart
     )
+}
+
+/// A planned process restart must not wait for the peer's child shutdown to finish before the
+/// coordinator can continue its own cleanup. The worker-side control phase is advanced before the
+/// effect is spawned, while the same lifecycle owner continues stopping the child asynchronously.
+/// Ordinary demotion keeps the completion acknowledgement barrier.
+fn effect_requires_ack_for_runtime(command: &ControlCommand, planned_restart_active: bool) -> bool {
+    effect_requires_ack(command)
+        && !(planned_restart_active && matches!(command, ControlCommand::Demote))
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a str, ControlHttpError> {
@@ -1069,6 +1317,16 @@ control_handler!(
     "POST"
 );
 control_handler!(control_demote, ControlEndpoint::Demote, "POST");
+control_handler!(
+    control_prepare_restart,
+    ControlEndpoint::PrepareRestart,
+    "POST"
+);
+control_handler!(
+    control_cancel_restart,
+    ControlEndpoint::CancelRestart,
+    "POST"
+);
 
 fn endpoint_path(endpoint: ControlEndpoint) -> &'static str {
     match endpoint {
@@ -1081,6 +1339,8 @@ fn endpoint_path(endpoint: ControlEndpoint) -> &'static str {
         ControlEndpoint::WorkerEvent => "/v1/worker-event",
         ControlEndpoint::DistributedReady => "/v1/distributed-ready",
         ControlEndpoint::Demote => "/v1/demote",
+        ControlEndpoint::PrepareRestart => "/v1/prepare-restart",
+        ControlEndpoint::CancelRestart => "/v1/cancel-restart",
     }
 }
 
@@ -1520,7 +1780,61 @@ mod tests {
         assert!(effect_requires_ack(&ControlCommand::Demote));
         assert!(effect_requires_ack(&ControlCommand::CancelGeneration));
         assert!(effect_requires_ack(&ControlCommand::DistributedReady));
+        assert!(effect_requires_ack(&ControlCommand::PrepareRestart));
+        assert!(effect_requires_ack(&ControlCommand::CancelRestart));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
+    }
+
+    #[test]
+    fn planned_restart_demote_does_not_wait_for_peer_child_shutdown() {
+        assert!(!effect_requires_ack_for_runtime(
+            &ControlCommand::Demote,
+            true,
+        ));
+        assert!(effect_requires_ack_for_runtime(
+            &ControlCommand::Demote,
+            false,
+        ));
+        assert!(effect_requires_ack_for_runtime(
+            &ControlCommand::PrepareRestart,
+            true,
+        ));
+    }
+
+    #[test]
+    fn planned_restart_gate_defers_pair_until_child_stop_and_serializes_completion() {
+        let gate = PlannedRestartGate::default();
+        gate.begin();
+
+        assert!(gate.active());
+        assert!(gate.blocks_worker_prepare());
+        assert_eq!(gate.pair_action(), PlannedRestartPairAction::Defer);
+        assert!(gate.blocks_worker_prepare());
+
+        // The stop task takes ownership of the deferred Pair atomically. A concurrent Pair
+        // effect can observe that completion is already in progress, but cannot run twice.
+        assert!(gate.note_child_stopped());
+        assert_eq!(
+            gate.pair_action(),
+            PlannedRestartPairAction::AlreadyCompleting
+        );
+        gate.cancel();
+        assert_eq!(gate.pair_action(), PlannedRestartPairAction::Run);
+    }
+
+    #[test]
+    fn planned_restart_gate_allows_pair_after_child_stop() {
+        let gate = PlannedRestartGate::default();
+        gate.begin();
+        assert!(!gate.note_child_stopped());
+        assert!(!gate.blocks_worker_prepare());
+        assert_eq!(
+            gate.pair_action(),
+            PlannedRestartPairAction::RunAfterChildStop
+        );
+        assert!(gate.active());
+        gate.cancel();
+        assert!(!gate.active());
     }
 }
 

@@ -5,8 +5,8 @@
   <key>Label</key>
   <string>dev.siderostat-ds4-proxy.runtime</string>
 
-  <key>BundleProgram</key>
-  <string>Contents/Helpers/siderostat-runtime</string>
+  <key>Program</key>
+  <string>/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime</string>
 
   <key>ProgramArguments</key>
   <array>

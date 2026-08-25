@@ -2,18 +2,21 @@
 //!
 //! `cargo xtask pkg-dev` turns an `app-dev` bundle into a component package
 //! and product archive with a single `/Applications/Siderostat.app` payload.
-//! The preinstall hook terminates only an existing Monitor executable at the
-//! exact `/Applications/Siderostat.app` path before the bundle is replaced;
-//! the postinstall hook only requests a launch in the active console user's GUI
-//! session. Runtime, ds4-server, and user data are not touched. The expanded
-//! package is inspected so unexpected scripts or forbidden payload paths fail
-//! the build.
+//! The preinstall hook unloads the existing product runtime LaunchAgent in the
+//! active console user's GUI domain, then terminates only the existing Monitor
+//! executable at the exact `/Applications/Siderostat.app` path before the
+//! bundle is replaced. The postinstall hook requests a launch in the active
+//! console user's GUI session. User data is not touched. The expanded package
+//! is inspected so unexpected scripts or forbidden payload paths fail the
+//! build.
 //!
 //! Identifier / version are fixed here (spec §9.1) so a later signed release
 //! shares the same receipt ID and version comparison for upgrade. A rollback
 //! package is opt-in and disables only the bundle version check; normal package
 //! generation remains version-checked.
-//! This module never touches user data, LaunchAgents, or config.
+//! The preinstall hook only unloads the product-owned runtime job for the
+//! duration of the bundle replacement; it does not edit the user's LaunchAgent
+//! files, registration preferences, or config.
 
 use crate::bundle::PkgDevArgs;
 use crate::util;
@@ -35,17 +38,28 @@ const PKG_STAGING_DIR: &str = "build/pkg-dev";
 const PREINSTALL_SCRIPT_NAME: &str = "preinstall";
 const POSTINSTALL_SCRIPT_NAME: &str = "postinstall";
 
-/// Installer runs this script as root before replacing the app bundle. It is
-/// deliberately restricted to the exact installed Monitor executable path;
-/// it does not stop the runtime helper or any ds4-server child.
+/// Installer runs this script as root before replacing the app bundle. It
+/// first unloads the product-owned runtime LaunchAgent from the active GUI
+/// user's `gui/<uid>` domain, then stops only the exact installed Monitor and
+/// runtime executable paths. It does not stop arbitrary processes, remove
+/// user data, or modify registration/preferences.
 const PREINSTALL_SCRIPT: &str = r##"#!/bin/sh
 set -eu
 
 APP_EXECUTABLE='/Applications/Siderostat.app/Contents/MacOS/Siderostat'
+RUNTIME_EXECUTABLE='/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime'
+RUNTIME_LABEL='dev.siderostat-ds4-proxy.runtime'
 WAIT_STEPS=50
+CONSOLE_UID=''
 
-running_monitor_pids() {
-    /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk -v expected="$APP_EXECUTABLE" '
+CONSOLE_USER=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != root ]; then
+    CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)
+fi
+
+running_pids_for_path() {
+    expected_path="$1"
+    /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk -v expected="$expected_path" '
         {
             pid = $1
             command = $0
@@ -57,46 +71,101 @@ running_monitor_pids() {
     '
 }
 
+running_monitor_pids() {
+    running_pids_for_path "$APP_EXECUTABLE"
+}
+
+running_runtime_pids() {
+    running_pids_for_path "$RUNTIME_EXECUTABLE"
+}
+
 log_message() {
     /usr/bin/logger -t SiderostatInstaller "$1" 2>/dev/null || true
 }
 
-pids=$(running_monitor_pids)
-if [ -z "$pids" ]; then
-    exit 0
-fi
+runtime_job_target() {
+    printf 'gui/%s/%s' "$CONSOLE_UID" "$RUNTIME_LABEL"
+}
 
-log_message 'terminating the existing Siderostat Monitor before upgrade'
-for pid in $pids; do
-    /bin/kill -TERM "$pid" 2>/dev/null || true
-done
+runtime_job_loaded() {
+    [ -n "$CONSOLE_UID" ] || return 1
+    /bin/launchctl print "$(runtime_job_target)" >/dev/null 2>&1
+}
 
-step=0
-while [ "$step" -lt "$WAIT_STEPS" ]; do
-    remaining=$(running_monitor_pids)
-    [ -z "$remaining" ] && exit 0
-    /bin/sleep 0.2
-    step=$((step + 1))
-done
+stop_runtime_job() {
+    [ -n "$CONSOLE_UID" ] || return 0
 
-remaining=$(running_monitor_pids)
-if [ -n "$remaining" ]; then
-    log_message 'Siderostat Monitor did not exit after TERM; forcing only the exact Monitor path'
-    for pid in $remaining; do
-        /bin/kill -KILL "$pid" 2>/dev/null || true
+    target=$(runtime_job_target)
+    if runtime_job_loaded; then
+        log_message "unloading existing runtime LaunchAgent $target before upgrade"
+        if ! /bin/launchctl bootout "$target" 2>/dev/null; then
+            log_message "runtime LaunchAgent $target did not unload cleanly; requesting SIGKILL"
+            /bin/launchctl kill SIGKILL "$target" 2>/dev/null || true
+            /bin/launchctl bootout "$target" 2>/dev/null || true
+        fi
+    fi
+
+    step=0
+    while runtime_job_loaded || [ -n "$(running_runtime_pids)" ]; do
+        if [ "$step" -eq 25 ]; then
+            /bin/launchctl kill SIGKILL "$target" 2>/dev/null || true
+            remaining=$(running_runtime_pids)
+            for pid in $remaining; do
+                /bin/kill -KILL "$pid" 2>/dev/null || true
+            done
+        fi
+        [ "$step" -lt "$WAIT_STEPS" ] || break
+        /bin/sleep 0.2
+        step=$((step + 1))
     done
-fi
 
-step=0
-while [ "$step" -lt "$WAIT_STEPS" ]; do
+    if runtime_job_loaded || [ -n "$(running_runtime_pids)" ]; then
+        log_message 'could not stop the existing Siderostat runtime'
+        exit 1
+    fi
+}
+
+stop_monitor() {
+    pids=$(running_monitor_pids)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+
+    log_message 'terminating the existing Siderostat Monitor before upgrade'
+    for pid in $pids; do
+        /bin/kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    step=0
+    while [ "$step" -lt "$WAIT_STEPS" ]; do
+        remaining=$(running_monitor_pids)
+        [ -z "$remaining" ] && return 0
+        /bin/sleep 0.2
+        step=$((step + 1))
+    done
+
     remaining=$(running_monitor_pids)
-    [ -z "$remaining" ] && exit 0
-    /bin/sleep 0.2
-    step=$((step + 1))
-done
+    if [ -n "$remaining" ]; then
+        log_message 'Siderostat Monitor did not exit after TERM; forcing only the exact Monitor path'
+        for pid in $remaining; do
+            /bin/kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
 
-log_message 'could not stop the existing Siderostat Monitor'
-exit 1
+    step=0
+    while [ "$step" -lt "$WAIT_STEPS" ]; do
+        remaining=$(running_monitor_pids)
+        [ -z "$remaining" ] && return 0
+        /bin/sleep 0.2
+        step=$((step + 1))
+    done
+
+    log_message 'could not stop the existing Siderostat Monitor'
+    exit 1
+}
+
+stop_runtime_job
+stop_monitor
 "##;
 
 /// Launch the newly installed app in the active console user's GUI session.
@@ -106,6 +175,7 @@ const POSTINSTALL_SCRIPT: &str = r##"#!/bin/sh
 set -eu
 
 APP='/Applications/Siderostat.app'
+RUNTIME_PLIST="$APP/Contents/Library/LaunchAgents/dev.siderostat-ds4-proxy.runtime.plist"
 CONSOLE_USER=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
 if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
     /usr/bin/logger -t SiderostatInstaller 'no active GUI user; skipping first launch' 2>/dev/null || true
@@ -116,6 +186,17 @@ CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)
 if [ -z "$CONSOLE_UID" ]; then
     /usr/bin/logger -t SiderostatInstaller 'could not resolve active GUI user; skipping first launch' 2>/dev/null || true
     exit 0
+fi
+
+runtime_was_enabled() {
+    /bin/launchctl print-disabled "gui/$CONSOLE_UID" 2>/dev/null \
+        | /usr/bin/grep -Eq '"dev.siderostat-ds4-proxy.runtime" => enabled'
+}
+
+if runtime_was_enabled; then
+    /usr/bin/logger -t SiderostatInstaller 'restoring the previously enabled runtime LaunchAgent' 2>/dev/null || true
+    /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$RUNTIME_PLIST" 2>/dev/null || \
+        /usr/bin/logger -t SiderostatInstaller 'runtime LaunchAgent bootstrap was deferred to Siderostat' 2>/dev/null || true
 fi
 
 /usr/bin/logger -t SiderostatInstaller 'launching Siderostat after installation' 2>/dev/null || true
@@ -612,22 +693,50 @@ mod tests {
     }
 
     #[test]
-    fn preinstall_script_is_scoped_to_the_installed_monitor_path() {
+    fn preinstall_script_stops_runtime_and_monitor_before_upgrade() {
         assert!(
             PREINSTALL_SCRIPT.contains("/Applications/Siderostat.app/Contents/MacOS/Siderostat")
         );
+        assert!(
+            PREINSTALL_SCRIPT
+                .contains("/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime")
+        );
+        assert!(PREINSTALL_SCRIPT.contains("dev.siderostat-ds4-proxy.runtime"));
+        assert!(PREINSTALL_SCRIPT.contains("CONSOLE_UID"));
+        assert!(PREINSTALL_SCRIPT.contains("/bin/launchctl bootout"));
+        assert!(PREINSTALL_SCRIPT.contains("/bin/launchctl kill SIGKILL"));
         assert!(PREINSTALL_SCRIPT.contains("/bin/kill -TERM"));
         assert!(PREINSTALL_SCRIPT.contains("/bin/kill -KILL"));
+        assert!(
+            PREINSTALL_SCRIPT.rfind("\nstop_runtime_job\n").unwrap()
+                < PREINSTALL_SCRIPT.rfind("\nstop_monitor\n").unwrap()
+        );
         assert!(!PREINSTALL_SCRIPT.contains("killall"));
         assert!(!PREINSTALL_SCRIPT.contains("pkill"));
-        assert!(!PREINSTALL_SCRIPT.contains("/Library/LaunchAgents"));
+        assert!(!PREINSTALL_SCRIPT.contains("Application Support"));
+        assert!(!PREINSTALL_SCRIPT.contains("pkgutil --forget"));
     }
 
     #[test]
     fn postinstall_launches_the_app_in_the_console_user_session() {
+        assert!(POSTINSTALL_SCRIPT.contains("dev.siderostat-ds4-proxy.runtime.plist"));
+        assert!(POSTINSTALL_SCRIPT.contains("/bin/launchctl print-disabled"));
+        assert!(POSTINSTALL_SCRIPT.contains("/bin/launchctl bootstrap"));
+        assert!(
+            POSTINSTALL_SCRIPT
+                .contains("/bin/launchctl bootstrap \"gui/$CONSOLE_UID\" \"$RUNTIME_PLIST\"")
+        );
+        assert!(
+            !POSTINSTALL_SCRIPT
+                .contains("/bin/launchctl asuser \"$CONSOLE_UID\" /bin/launchctl bootstrap")
+        );
         assert!(POSTINSTALL_SCRIPT.contains("launchctl asuser"));
         assert!(POSTINSTALL_SCRIPT.contains("/usr/bin/open"));
         assert!(POSTINSTALL_SCRIPT.contains("/Applications/Siderostat.app"));
+        assert!(
+            POSTINSTALL_SCRIPT.find("/bin/launchctl bootstrap").unwrap()
+                < POSTINSTALL_SCRIPT.find("/usr/bin/open -a").unwrap()
+        );
         assert!(!POSTINSTALL_SCRIPT.contains("Library/Application Support"));
     }
 

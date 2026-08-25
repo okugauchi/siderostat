@@ -109,7 +109,8 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
     );
     std::fs::copy(&runtime_bin, contents.join("Helpers/siderostat-runtime"))?;
 
-    // Bundle-internal LaunchAgent plist (bundle-relative helper path).
+    // Bundle-internal LaunchAgent plist. The fixed /Applications path is
+    // intentional: the installer postinstall bootstraps this plist directly.
     let runtime_plist = root.join("contrib/macos/dev.siderostat-ds4-proxy.runtime.plist");
     std::fs::copy(
         &runtime_plist,
@@ -462,5 +463,18 @@ mod tests {
             applications_app_existed
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_launch_agent_uses_program_for_pkg_bootstrap() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let plist = std::fs::read_to_string(
+            repo_root.join("contrib/macos/dev.siderostat-ds4-proxy.runtime.plist"),
+        )
+        .unwrap();
+
+        assert!(plist.contains("<key>Program</key>"));
+        assert!(plist.contains("/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime"));
+        assert!(!plist.contains("<key>BundleProgram</key>"));
     }
 }

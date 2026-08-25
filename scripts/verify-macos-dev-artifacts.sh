@@ -55,6 +55,18 @@ verify_bundle() {
     [[ -x "$helper" ]] || { fail "helper executable is missing or not executable: $helper"; return 1; }
     verify_plist "$info" || return 1
     verify_plist "$launch_agent" || return 1
+    grep -Fq '<key>Program</key>' "$launch_agent" || {
+        fail "runtime LaunchAgent must use Program for direct pkg bootstrap"
+        return 1
+    }
+    grep -Fq '/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime' "$launch_agent" || {
+        fail "runtime LaunchAgent is missing the fixed installed helper path"
+        return 1
+    }
+    if grep -Fq '<key>BundleProgram</key>' "$launch_agent"; then
+        fail "runtime LaunchAgent must not use BundleProgram for direct pkg bootstrap"
+        return 1
+    fi
     [[ -f "$icon" ]] || { fail "app icon is missing: $icon"; return 1; }
     file "$icon" | grep -Eq 'Mac OS X icon|Apple Icon' || {
         fail "app icon is not an ICNS file: $icon"
@@ -175,6 +187,33 @@ verify_expanded_package() {
         fail "preinstall script is missing the exact Monitor path"
         return 1
     }
+    grep -Fq "/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime" "$preinstall_script" || {
+        fail "preinstall script is missing the exact runtime path"
+        return 1
+    }
+    grep -Fq "dev.siderostat-ds4-proxy.runtime" "$preinstall_script" || {
+        fail "preinstall script is missing the product runtime LaunchAgent label"
+        return 1
+    }
+    grep -Fq "CONSOLE_UID" "$preinstall_script" || {
+        fail "preinstall script is missing GUI-session scoping"
+        return 1
+    }
+    grep -Fq "/bin/launchctl bootout" "$preinstall_script" || {
+        fail "preinstall script is missing runtime LaunchAgent stop"
+        return 1
+    }
+    grep -Fq "/bin/launchctl kill SIGKILL" "$preinstall_script" || {
+        fail "preinstall script is missing runtime force-stop fallback"
+        return 1
+    }
+    local runtime_stop_line monitor_stop_line
+    runtime_stop_line="$(grep -n '^stop_runtime_job$' "$preinstall_script" | tail -1 | cut -d: -f1)"
+    monitor_stop_line="$(grep -n '^stop_monitor$' "$preinstall_script" | tail -1 | cut -d: -f1)"
+    [[ -n "$runtime_stop_line" && -n "$monitor_stop_line" && "$runtime_stop_line" -lt "$monitor_stop_line" ]] || {
+        fail "preinstall script must stop runtime before Monitor"
+        return 1
+    }
     grep -Fq "/bin/kill -TERM" "$preinstall_script" || {
         fail "preinstall script is missing SIGTERM handling"
         return 1
@@ -183,12 +222,31 @@ verify_expanded_package() {
         fail "preinstall script is missing SIGKILL fallback"
         return 1
     }
-    if grep -Eq 'killall|pkill|LaunchAgents|launchctl|ds4-server|siderostat-runtime' "$preinstall_script"; then
-        fail "preinstall script contains an out-of-scope process or service operation"
+    if grep -Eq 'killall|pkill|pkgutil --forget|rm -rf|Application Support|/usr/local/bin' "$preinstall_script"; then
+        fail "preinstall script contains an unsafe broad process or user-data operation"
         return 1
     fi
     grep -Fq "/bin/launchctl asuser" "$postinstall_script" || {
         fail "postinstall script is missing the active-user launch request"
+        return 1
+    }
+    grep -Fq "/bin/launchctl print-disabled" "$postinstall_script" || {
+        fail "postinstall script is missing the runtime registration-state check"
+        return 1
+    }
+    grep -Fq "/bin/launchctl bootstrap" "$postinstall_script" || {
+        fail "postinstall script is missing the enabled runtime bootstrap"
+        return 1
+    }
+    grep -Fq "dev.siderostat-ds4-proxy.runtime.plist" "$postinstall_script" || {
+        fail "postinstall script is missing the runtime LaunchAgent plist"
+        return 1
+    }
+    local bootstrap_line app_launch_line
+    bootstrap_line="$(grep -n '/bin/launchctl bootstrap' "$postinstall_script" | tail -1 | cut -d: -f1)"
+    app_launch_line="$(grep -n '/usr/bin/open -a' "$postinstall_script" | tail -1 | cut -d: -f1)"
+    [[ -n "$bootstrap_line" && -n "$app_launch_line" && "$bootstrap_line" -lt "$app_launch_line" ]] || {
+        fail "postinstall script must bootstrap runtime before launching the app"
         return 1
     }
     grep -Fq "/usr/bin/open -a" "$postinstall_script" || {
@@ -199,7 +257,7 @@ verify_expanded_package() {
         fail "postinstall script is missing the exact app path"
         return 1
     }
-    if grep -Eq 'killall|pkill|ds4-server|siderostat-runtime|Application Support|LaunchAgents' "$postinstall_script"; then
+    if grep -Eq 'killall|pkill|ds4-server|Application Support|/usr/local/bin|pkgutil --forget|launchctl disable|SMAppService\.unregister' "$postinstall_script"; then
         fail "postinstall script contains an out-of-scope process, service, or user-data operation"
         return 1
     fi
@@ -249,12 +307,24 @@ run_fixture_tests() {
     printf '%s\n' \
         '#!/bin/sh' \
         "APP_EXECUTABLE='/Applications/Siderostat.app/Contents/MacOS/Siderostat'" \
+        "RUNTIME_EXECUTABLE='/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime'" \
+        "RUNTIME_LABEL='dev.siderostat-ds4-proxy.runtime'" \
+        'CONSOLE_UID="$(/usr/bin/id -u)"' \
+        'stop_runtime_job() { :; }' \
+        'stop_monitor() { :; }' \
+        '/bin/launchctl bootout "gui/$CONSOLE_UID/$RUNTIME_LABEL"' \
+        '/bin/launchctl kill SIGKILL "gui/$CONSOLE_UID/$RUNTIME_LABEL"' \
         '/bin/kill -TERM "$pid"' \
         '/bin/kill -KILL "$pid"' \
+        'stop_runtime_job' \
+        'stop_monitor' \
         > "$fixture/valid-package/Scripts/preinstall"
     printf '%s\n' \
         '#!/bin/sh' \
         "APP='/Applications/Siderostat.app'" \
+        'printf "%s\\n" "dev.siderostat-ds4-proxy.runtime => enabled"' \
+        '/bin/launchctl print-disabled "gui/$CONSOLE_UID"' \
+        '/bin/launchctl bootstrap "gui/$CONSOLE_UID" "$APP/Contents/Library/LaunchAgents/dev.siderostat-ds4-proxy.runtime.plist"' \
         '/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/open -a "$APP"' \
         'exit 0' \
         > "$fixture/valid-package/Scripts/postinstall"

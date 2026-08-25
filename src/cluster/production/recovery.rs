@@ -39,6 +39,9 @@ impl super::ProductionClusterRuntime {
         &self,
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.planned_restart_active() {
+            return Ok(self.inner.mode.snapshot());
+        }
         self.recover_to_solo(owner, ClusterEventKind::PeerLost, "peer-lost")
             .await
     }
@@ -65,6 +68,9 @@ impl super::ProductionClusterRuntime {
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
         let recovery = self.inner.recovery.clone();
         let _guard = recovery.lock().await;
+        if self.planned_restart_active() {
+            return Ok(self.inner.mode.snapshot());
+        }
         let current = self.inner.mode.snapshot();
 
         // Idempotent: an already-solo node has no distributed child to recover. A deployment
@@ -222,10 +228,16 @@ impl super::ProductionClusterRuntime {
             .context("coordinator supervisor unavailable")?
             .clone();
         loop {
+            if self.planned_restart_active() {
+                return Ok(self.inner.mode.snapshot());
+            }
             match coordinator.wait_route_loss().await {
                 Ok(()) => {}
                 Err(error) => {
                     let current = self.inner.mode.snapshot();
+                    if self.planned_restart_active() {
+                        return Ok(current);
+                    }
                     if current.state == ClusterState::SoloStandaloneReady {
                         return Ok(current);
                     }
@@ -241,12 +253,18 @@ impl super::ProductionClusterRuntime {
                 Ok(Ok(())) => continue, // transient blip: route recovered
                 Ok(Err(error)) => {
                     let current = self.inner.mode.snapshot();
+                    if self.planned_restart_active() {
+                        return Ok(current);
+                    }
                     if current.state == ClusterState::SoloStandaloneReady {
                         return Ok(current);
                     }
                     return Err(error);
                 }
                 Err(_) => {
+                    if self.planned_restart_active() {
+                        return Ok(self.inner.mode.snapshot());
+                    }
                     // Route stayed down past grace. Peer reachable -> graceful demote to Paired;
                     // peer lost -> solo recovery through the single owner.
                     let now = now_millis();
