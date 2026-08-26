@@ -1932,7 +1932,7 @@ commit/digest、fixture、ソースパスを除外した。英日各3文書の�
 ユーザーは 2026-08-26 に README と英日エンドユーザー文書、install、Background Items、recovery の文言と安全警告の変更を確認し、承認した。
 同日、公式バイナリを配布しない方針を指定したため、公開文書と release gate を source-only に更新した。R-01 は完了とする。
 
-### [ ] R-02 v0.3.0 source release candidate と supply-chain evidence を作る
+### [x] R-02 v0.3.0 source release candidate と supply-chain evidence を作る
 
 - Actor: user + agent
 - Depends on: R-01
@@ -1962,7 +1962,23 @@ R-01 承認後に `git status --short` を確認したところ、既存の sour
 その後、source-only 方針への変更に伴い、署名・公証 artifact の生成は v0.3.0 の R-02 から除外した。再開には、
 source-only の対象変更をレビュー可能な commit に確定し、clean tree を作る必要がある。
 
-### [ ] R-03 final acceptance と release 承認を完了する
+Evidence（R-02 完了、2026-08-26）:
+root、monitor、xtask と `Cargo.lock` の workspace version を `0.3.0` へ更新した。locked graph の
+third-party package 318件について name、version、license metadata、source、registry checksum を
+`docs/releases/v0.3.0-dependencies.md` に記録し、license metadata 不明が0件であることを確認した。
+`THIRD-PARTY-NOTICES.md` も provisional 文言を除いた確定版へ更新した。
+
+仮 commit 36件を精査して feature 単位の履歴へ再構成し、source candidate は
+`d9dd772bd68c7bb8cd743555a686733806a24b4a` として固定した。同 revision から
+`siderostat-v0.3.0-source.tar.gz` を生成し、archive は231 entries、764,489 bytes、SHA-256
+`13d761299f02ed8ddfd36cbc634c8d7e6dbf91fd8c2aa8580e6992efc7f6ad57`。tracked filename と content の
+混入検査で model、secret、credential、private key、DMG/pkg、runtime state、cache、log、user data を
+検出しなかった。archive は repository 外の `/private/tmp` に保持した。
+
+candidate revision で `cargo fmt --all -- --check`、workspace/all-target/all-feature Clippy、test、release build、
+`git diff --check` を再実行し、すべて PASS。R-02 を完了とし、R-03 のユーザー release 承認へ進む。
+
+### [x] R-03 final acceptance と release 承認を完了する
 
 - Actor: user + agent
 - Depends on: R-02
@@ -1980,6 +1996,13 @@ source-only の対象変更をレビュー可能な commit に確定し、clean 
 - Verification: source checksum を使った全 acceptance、`git status --short`、`git diff --check`
 - ユーザーレビュー・手作業: release note、source revision、2 node の source install/recovery、最終 source release 可否を承認する
 - 停止条件: acceptance 未実施、source rollback 不可、データ損失、orphan、restart loop が一件でもある
+
+Evidence（R-03 完了、2026-08-26）:
+`docs/releases/v0.3.0-acceptance.md` で本書 4.3 の8項目がすべて PASS した。final source revision は
+`d9dd772bd68c7bb8cd743555a686733806a24b4a`、source archive SHA-256 は
+`13d761299f02ed8ddfd36cbc634c8d7e6dbf91fd8c2aa8580e6992efc7f6ad57` で固定した。ユーザーは
+release note、source revision、archive checksum、受け入れ結果を確認し、v0.3.0 の最終 release 可否を
+承認した。annotated tag、merge、push は別の Git 操作として未実施である。
 
 ## 15. 共通停止・エスカレーション条件
 
