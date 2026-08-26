@@ -1990,7 +1990,7 @@ candidate revision で `cargo fmt --all -- --check`、workspace/all-target/all-f
   2. standalone/paired/distributed/reconnect、throughput recovery、notification dedup の回帰 gate を実行する。
   3. credential、secret、model、user data、配布不能なバイナリ artifact が source release evidence にないことを再確認する。
   4. known risk、TP/RDMA 延期、automatic recovery opt-in を release note へ明記する。
-  5. ユーザー承認後だけ、`CONTRIBUTING.md` に従う merge、tag、push を別操作として行う。
+  5. ユーザー承認後に、`CONTRIBUTING.md` に従う develop の履歴反映、annotated tag、push、GitHub Release 公開を行う。
 - 事後条件: v0.3.0 source release の可否、rollback 手順、既知制約が一意に判定される
 - 受入基準: 本書 4.3 の 8 項目が全て PASS。FAIL または未実施を waiver で暗黙に通さない
 - Verification: source checksum を使った全 acceptance、`git status --short`、`git diff --check`
@@ -2002,7 +2002,9 @@ Evidence（R-03 完了、2026-08-26）:
 `d9dd772bd68c7bb8cd743555a686733806a24b4a`、source archive SHA-256 は
 `13d761299f02ed8ddfd36cbc634c8d7e6dbf91fd8c2aa8580e6992efc7f6ad57` で固定した。ユーザーは
 release note、source revision、archive checksum、受け入れ結果を確認し、v0.3.0 の最終 release 可否を
-承認した。annotated tag、merge、push は別の Git 操作として未実施である。
+承認した。その後、annotated tag `v0.3.0`（source candidate `d9dd772` を指す）、develop の履歴再構成と push、
+GitHub Release 公開を完了した。source archive asset は SHA-256
+`13d761299f02ed8ddfd36cbc634c8d7e6dbf91fd8c2aa8580e6992efc7f6ad57` で公開した。
 
 ## 15. 共通停止・エスカレーション条件
 
