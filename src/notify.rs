@@ -1451,6 +1451,7 @@ mod tests {
                 let log = log.clone();
                 move || log.clone()
             })
+            .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .finish();
 
