@@ -171,7 +171,7 @@ async fn assert_distributed_consistent(coordinator: &Node, worker: &Node) {
         );
         assert_eq!(
             observed.stable_mode,
-            StableMode::DistributedMxfp4,
+            StableMode::DistributedLayerParallel,
             "distributed stable mode"
         );
         assert!(observed.distributed_running, "distributed child running");
@@ -895,6 +895,17 @@ async fn recovery_then_repromotion_uses_new_child_generation() {
         .identity()
         .expect("worker identity")
         .generation;
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .diagnostics()
+            .await
+            .control_session
+            .peer_distributed_child_generation,
+        Some(first_worker_gen),
+        "coordinator diagnostics must expose the worker child generation"
+    );
 
     // Recover both nodes to Solo through the single recovery owner while control HTTP stays up.
     harness
@@ -942,6 +953,17 @@ async fn recovery_then_repromotion_uses_new_child_generation() {
         .identity()
         .expect("worker identity")
         .generation;
+    assert_eq!(
+        harness
+            .coordinator
+            .production
+            .diagnostics()
+            .await
+            .control_session
+            .peer_distributed_child_generation,
+        Some(second_worker_gen),
+        "coordinator diagnostics must refresh the worker child generation"
+    );
     assert_ne!(
         second_coordinator_gen, first_coordinator_gen,
         "coordinator child generation must not be reused after recovery"
@@ -1505,6 +1527,103 @@ async fn coordinator_only_restart_converges_generation_without_orphan() {
 
     coordinator_child.child().stop();
     worker_child.child().stop();
+    harness.shutdown().await;
+}
+
+/// A planned coordinator restart must keep the worker in PairedStandaloneReady while the
+/// coordinator control endpoint is unavailable. The worker must not enter the ordinary PeerLost
+/// -> Solo recovery path; a new Pair after the coordinator process returns releases the gate.
+#[tokio::test]
+async fn planned_coordinator_restart_suppresses_peer_loss_recovery() {
+    let mut harness = TwoNode::boot().await.expect("boot two-node harness");
+    harness.pair().await.expect("initial pair");
+    harness
+        .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+        .await
+        .then_some(())
+        .expect("nodes did not pair");
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("promote to DistributedReady");
+
+    let persisted = harness
+        .coordinator
+        .production
+        .control_session_generation()
+        .await;
+    harness.coordinator.production.begin_planned_restart();
+    assert!(
+        harness
+            .coordinator
+            .production
+            .prepare_peer_for_planned_restart()
+            .await
+            .expect("prepare peer for planned restart")
+    );
+    assert!(harness.worker.production.planned_restart_active());
+
+    harness
+        .coordinator
+        .production
+        .stop_for_planned_restart(Duration::from_secs(1))
+        .await
+        .expect("demote for planned restart");
+    assert_eq!(
+        harness.coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    assert_eq!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    harness.coordinator.stop_serve().await;
+    harness
+        .worker
+        .production
+        .reconcile()
+        .await
+        .expect("planned restart must not enter peer-loss recovery");
+    assert_eq!(
+        harness.worker.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+    assert!(harness.worker.production.planned_restart_active());
+
+    harness
+        .coordinator
+        .restart_control_process(persisted)
+        .await
+        .expect("restart coordinator process");
+    harness.pair().await.expect("pair after planned restart");
+    assert!(
+        harness
+            .wait_until_both(ClusterState::PairedStandaloneReady, Duration::from_secs(10))
+            .await,
+        "planned restart did not return to paired state"
+    );
+    assert!(!harness.worker.production.planned_restart_active());
+
+    harness
+        .promote_to_distributed()
+        .await
+        .expect("re-promote after planned restart");
+    assert_distributed_consistent(&harness.coordinator, &harness.worker).await;
+    harness
+        .coordinator
+        .coordinator_child
+        .as_ref()
+        .expect("coordinator child")
+        .child()
+        .stop();
+    harness
+        .worker
+        .worker_child
+        .as_ref()
+        .expect("worker child")
+        .child()
+        .stop();
     harness.shutdown().await;
 }
 

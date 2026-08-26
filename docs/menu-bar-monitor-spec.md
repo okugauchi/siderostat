@@ -1,5 +1,8 @@
 # siderostat メニューバーモニター 仕様
 
+> v0.3.0 の公式提供物はソースコードのみである。本書の「配布版」および bundle 内 runtime の記述は、
+> ソースからの local install で生成される bundle と、将来の任意バイナリ配布を対象とする。
+
 - 文書状態: 実装済み (Phase 1〜4) / Phase 5 は実機確認待ち
 - 作成日: 2026-08-12
 - 対象baseline: `develop`（通知文言・monitor UI 実装後の `99efd5c` 系列）
@@ -11,7 +14,7 @@
 macOS のメニューバーに常駐するアイコン型モニターで、次を可視化する。
 
 - siderostat の cluster mode / state / target readiness
-- DS4 の prefill loading progress（チャンク進行・%・chunk/average token/s・経過秒・cached tokens）
+- DS4 の prefill loading progress（チャンク進行・%・current chunk/average token/s・経過秒・cached tokens・progress age）
 - KV cache hit / miss の状況（hit tokens、load 時間、累計）
 - generation（デコード）の直近 TPS
 
@@ -37,7 +40,7 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 
 ```text
 ┌──────────────────────────┐
-│ siderostat (本体)          │ LaunchAgent (gui/<uid> ドメイン)
+│ Siderostat.app (Monitor)  │ SMAppService / gui/<uid> domain
 │  - DS4 child stdout/stderr │
 │    をパイプで直接読取       │
 │  - parse_ds4_log_event で  │
@@ -50,7 +53,7 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
             │ HTTP (loopback, admin_listen)
             ▼
 ┌──────────────────────────┐
-│ siderostat-monitor        │ 別プロセス（ログイン項目 or 手動起動）
+│ siderostat-runtime helper │ bundle 内 LaunchAgent（Background Item）
 │  - tray-icon (NSStatusItem)│
 │  - admin API ポーリング   │
 │  - メニューバー表示        │
@@ -71,9 +74,11 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
   ポーリング間隔を 5 秒へバックオフする。本体復帰を自動検出する。
 - 現状の `/metrics` は認証なしで公開されているため、モニターはトークンなしで取得する。
   将来 `/metrics` に認証が付く場合は、admin token を Bearer で送る設定を追加する。
-- メニュー操作は `gui/<uid>` ドメインの LaunchAgent に委譲する。「Proxy 再起動」は
-  `local.siderostat.runtime`、「Monitor 再起動」は `local.siderostat.monitor` を
-  `launchctl kickstart -k` する。「終了」は両方のジョブを `launchctl bootout` する。
+- 配布版のメニュー操作は bundle runtime の管理 API と `SMAppService` に委譲する。
+  「siderostat-runtimeを再起動」は現在の runtime child を graceful restart する。
+  「siderostat-runtimeを起動して自動起動を有効化」／「siderostat-runtimeを停止して自動起動を無効化」は
+  runtime background item の登録状態と runtime child を連動させる。「Siderostatを終了」は Monitor
+  自身を終了する。配布版の通常操作で `local.siderostat.*` の LaunchAgent を直接操作しない。
   操作失敗時もモニターは継続し、結果をログに記録する。
 - 「設定ファイルを開く」は runtime の主設定
   `~/Library/Application Support/siderostat/config.toml` を macOS の既定アプリで開く。
@@ -109,10 +114,13 @@ macOS のメニューバーに常駐するアイコン型モニターで、次�
 | prefill chunk TPS | `ds4_proxy_ds4_prefill_chunk_tps` | gauge |
 | prefill average TPS | `ds4_proxy_ds4_prefill_avg_tps` | gauge |
 | prefill elapsed seconds | `ds4_proxy_ds4_prefill_elapsed_seconds` | gauge |
+| prefill last progress age seconds | `ds4_proxy_ds4_prefill_last_progress_age_seconds` | gauge |
 | KV cache hit 累計 | `ds4_proxy_ds4_kv_cache_hits_total` | counter |
 | 直近 KV cache hit tokens | `ds4_proxy_ds4_kv_cache_hit_tokens` | gauge |
 | 直近 KV cache load ms | `ds4_proxy_ds4_kv_cache_load_ms` | gauge |
 | Decode 進行中フラグ | `ds4_proxy_ds4_generation_active` | gauge |
+| Decode progress observed | `ds4_proxy_ds4_generation_progress_observed` | gauge |
+| Decode last progress age seconds | `ds4_proxy_ds4_generation_last_progress_age_seconds` | gauge |
 | Decode completion | `ds4_proxy_ds4_generation_completion` | gauge |
 | 直近 Decode chunk TPS | `ds4_proxy_ds4_generation_chunk_tps` | gauge |
 | Decode average TPS | `ds4_proxy_ds4_generation_avg_tps` | gauge |
@@ -158,19 +166,23 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
   - mode → 描画の対応:
     - `solo`（solo-standalone）: 上が緑・下が赤、2つの円は直線で接続されていない
     - `paired`（paired-standalone）: 2つとも緑、2つの円は直線で接続されていない
-    - `dist`（distributed-mxfp4）: 2つとも緑、2つの円を接続する縦線を描画
+    - `Distributed (layer-parallel)`（machine name: `distributed-layer-parallel`）: 2つとも緑、2つの円を接続する縦線を描画
     - offline / 不明: 2つとも赤、接続線なし
-- アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed の接続線は
+- アイコンは縦方向に並べた、従来より大きい2つの円で描画する。Distributed (layer-parallel) の接続線は
   視認できる太さにする。
 - アイコンのタイトル（または代替テキスト）には、設定した `live_metric` の値を優先して表示する。
-  既定値は `prefill-avg-tps` とする。選択した値が現在進行中でない場合は、進行中の
-  decode 平均 TPS（または chunk TPS）へ切り替える。これにより prefill 中は prefill の
-  スループット、decode 中は decode のスループットを表示する。
+  既定値は `prefill-chunk-tps` とする。選択した値が現在進行中でない場合は、進行中の
+  decode current chunk TPS（または average TPS）へ切り替える。これにより prefill 中は
+  prefill の直近チャンク、decode 中は decode の直近チャンクを優先して表示する。
   選択肢は `prefill-percent`、`prefill-chunk-tps`、`prefill-avg-tps`、`prefill-elapsed`、
   `decode-chunk-tps`、`decode-avg-tps`、`decode-elapsed`、`kv-cache`、`none` とし、
-  値がまだ取得できない場合は空表示にする。
+  値がまだ取得できない場合は空表示にする。ただし TPS を選択している間に progress age が
+  欠落している場合は `progress age unavailable`、60 秒以上の場合は `stalled` を表示し、
+  古い TPS を現在値として表示しない。
 - prefill のタイトル値は prefill 完了時にクリアする。メニュー内の詳細行も完了後は `Prefill: --` とする。
-- decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。
+- decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。最初の
+  progress event 前は `first-token waiting`、progress age 欠落時は `progress age unavailable`、
+  60 秒以上の場合は `stalled` とし、古い chunk/average TPS を表示しない。
 - offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 
@@ -184,27 +196,37 @@ State:   solo-standalone-ready
 Gen:     42
 Target:  local-standalone (ready)
 ────────────────────────
-Prefill: 4096/9005 (45.5%) chunk=123.4t/s avg=100.0t/s elapsed=10.0s cached=0
+Prefill: 4096/9005 (45.5%) chunk=123.4t/s avg=100.0t/s elapsed=10.0s cached=0 age=2.5s
 ────────────────────────
 KV cache: hit tokens=9005 load=12.3ms
   total hits: 7
 ────────────────────────
-Decode:  completion=42 chunk=32.1t/s avg=28.5t/s
+Decode:  completion=42 chunk=32.1t/s avg=28.5t/s age=1.0s
 ────────────────────────
 設定ファイルを開く
-Proxy 再起動
-Monitor 再起動
-終了
+siderostat-runtimeを再起動
+siderostat-runtimeを起動して自動起動を有効化／siderostat-runtimeを停止して自動起動を無効化
+ログイン項目を開く
+Siderostatを終了
 ```
 
 - セクションは状態に応じて動的に表示する（prefill 非進行中は prefill 行を出さない）。
+- メニュー操作、登録状態、非同期操作結果の文言は、App bundle 内の
+  `Resources/en.lproj/Localizable.strings` と `Resources/ja.lproj/Localizable.strings` から
+  `NSBundle` 経由で解決する。macOS の優先言語に対応するリソースを使用し、未解決時はソースの
+  日本語フォールバックを使用する。
+- `Mode`、`State`、`Prefill`、`KV cache`、`Decode` などのメトリクス名・単位は、ログやメトリクスと
+  対応する技術的な識別子として英語表記に固定する。
 - 「設定ファイルを開く」は `~/Library/Application Support/siderostat/config.toml` が存在すれば
   `/usr/bin/open` により既定アプリで開く。存在しない場合は、設定の保存場所を確認できるよう
   最寄りの既存親フォルダを開く。この操作で設定ファイルやディレクトリを暗黙に作成しない。
-- 「Proxy 再起動」は `gui/<uid>/local.siderostat.runtime` を `launchctl kickstart -k` する。
-- 「Monitor 再起動」は `gui/<uid>/local.siderostat.monitor` を `launchctl kickstart -k` する。
-- 「終了」は `local.siderostat.runtime` と `local.siderostat.monitor` の両方を `launchctl bootout`
-  する。siderostat 本体の管理外プロセスは対象にしない。
+- 「siderostat-runtimeを再起動」は runtime の現在 profile を graceful restart する。
+- 「siderostat-runtimeを起動して自動起動を有効化」／「siderostat-runtimeを停止して自動起動を無効化」は
+  runtime background item の登録・解除と managed runtime の起動・停止を行う。
+- 「ログイン項目を開く」は常に System Settings > General > Login Items を開く。
+- 「Siderostatを終了」は Siderostat Monitor のみを終了し、ユーザーが管理していない process は対象にしない。
+- `dev.siderostat-ds4-proxy.runtime` は Service Management の product identifier であり、UI の文言として
+  そのまま表示しない。`Mode`、`State`、`Quantization`、`Speculative support` は別項目として表示する。
 
 ### 5.3 offline 表示
 
@@ -221,12 +243,15 @@ admin_listen = "http://127.0.0.1:18081"   # 本体の admin_listen
 poll_interval_secs = 2                     # ポーリング間隔
 offline_backoff_secs = 5                   # offline 時のバックオフ
 show_decode_tps = true                     # generation TPS の表示有無
-live_metric = "prefill-avg-tps"            # メニューバーに優先表示する随時更新値
-admin_token = ""                           # /metrics に認証を設定する場合のみ使用
+live_metric = "prefill-chunk-tps"          # メニューバーに優先表示する随時更新値
+admin_token = ""                           # 指定時は hex 形式の Bearer token
+admin_token_file = ""                      # 省略時は共有 secrets/admin を使用
 ```
 
-- `admin_token` は将来 `/metrics` に認証を設定する場合に使用する。本仕様の LaunchAgent
-  操作は `launchctl` を使うため、再起動操作には使用しない。
+- `admin_token` は指定時に優先される hex 形式の Bearer token。省略時は `siderostat-runtime` と共有する
+  `~/Library/Application Support/siderostat/secrets/admin` を読み、`siderostat-runtime` と同じ hex 形式へ
+  変換して `/admin/restart` などの mutation に使用する。
+- `admin_token_file` は共有 token file の場所を変更する場合に指定する。
 
 - 設定が存在しない場合は既定値で動作する。
 - 設定変更は Monitor の再起動後に反映される。
@@ -234,7 +259,7 @@ admin_token = ""                           # /metrics に認証を設定する�
 
 ## 7. セキュリティ
 
-- admin token は設定ファイルまたは環境変数から読み、ログ・メニューへ出力しない。
+- admin token は設定値または `siderostat-runtime` と共有する secret file から読み、ログ・メニューへ出力しない。
 - monitor と本体の通信は loopback（admin_listen）限定とする。worker 本体と coordinator
   本体のメトリクス転送は、既存の source-pinned HMAC control plane に限定する。
 - モニターのログに API レスポンス本文（cluster 状態の JSON）をそのまま出力しない。
@@ -310,7 +335,7 @@ Phase 1〜4 は 2026-08-17 に実装済みとする。
 - Phase 3: `monitor/src/tray.rs`、`main.rs`（完了）
 - Phase 4: 本体の prefill / KV cache / generation イベントを `Metrics` の DS4 gauge として公開し、
   モニターの Decode 表示へ接続（完了）
-- worker の Paired/Distributed 時は、worker の loopback admin API から認証済み control plane
+- worker の Paired Standalone / Distributed (layer-parallel) 時は、worker の loopback admin API から認証済み control plane
   経由で coordinator metrics を取得する経路を追加（完了）
 - Phase 5: 実 DS4 での prefill 中の表示確認は実機が必要なため未実施。CI ではパーサー/状態ロジックの
   テストとコンパイルを検証済み（本体 189 tests、monitor 20 tests、xtask 2 tests、Required CI 成功）

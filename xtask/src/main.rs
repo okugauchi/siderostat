@@ -5,9 +5,16 @@
 //!   and LaunchAgent plist.
 //! - verify:  check the installed LaunchAgent and admin API.
 //! - uninstall: stop the LaunchAgent and disable its plist.
+//! - app-dev: build a deterministic ad-hoc signed `Siderostat.app` bundle.
+//! - pkg-dev: build a flat `.pkg` with a controlled Monitor preinstall hook.
+//! - sign: sign, notarize, staple, and verify a release package.
 
+mod bundle;
+mod dmg;
 mod install;
 mod manifest;
+mod package;
+mod signing;
 mod util;
 
 use anyhow::{Context, Result};
@@ -32,6 +39,14 @@ enum Command {
     Verify,
     /// Stop the LaunchAgent and disable its plist.
     Uninstall,
+    /// Build a deterministic ad-hoc signed Siderostat.app bundle (B-03).
+    AppDev(bundle::AppDevArgs),
+    /// Build a flat .pkg with a controlled Monitor preinstall hook (E-01).
+    PkgDev(bundle::PkgDevArgs),
+    /// Build an ad-hoc Uninstaller.app and development DMG (E-06).
+    DmgDev(dmg::DmgDevArgs),
+    /// Build, sign, notarize, staple, and verify a release package (E-02).
+    Sign(signing::SignArgs),
 }
 
 fn main() -> Result<()> {
@@ -41,6 +56,10 @@ fn main() -> Result<()> {
         Command::FingerprintModels(args) => install::fingerprint_models(&args),
         Command::Verify => verify(),
         Command::Uninstall => uninstall(),
+        Command::AppDev(args) => bundle::app_dev(&args),
+        Command::PkgDev(args) => package::pkg_dev(&args),
+        Command::DmgDev(args) => dmg::dmg_dev(&args),
+        Command::Sign(args) => signing::sign(&args),
     }
 }
 

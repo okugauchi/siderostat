@@ -1,5 +1,6 @@
 use crate::{
     admission::{AdmissionGate, AdmissionPermit},
+    canary::RECOVERY_CANARY_HEADER,
     error::{ProxyError, format_error_chain},
     metrics::{Metrics, RequestMetricGuard},
     target::ProxyTarget,
@@ -16,12 +17,19 @@ use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+struct RecoveryCanaryPermit {
+    recovery_id: String,
+    token: String,
+    expires_at: Instant,
+}
 
 fn build_upstream_headers(
     incoming: &HeaderMap,
@@ -234,6 +242,7 @@ pub struct ModeAwareProxyState {
     first_body_byte_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
     metrics: RwLock<Option<Arc<Metrics>>>,
+    recovery_canary: Mutex<Option<RecoveryCanaryPermit>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,6 +280,7 @@ impl ModeAwareProxyState {
             first_body_byte_timeout: options.first_body_byte_timeout,
             stream_idle_timeout: options.stream_idle_timeout,
             metrics: RwLock::new(None),
+            recovery_canary: Mutex::new(None),
         })
     }
 
@@ -283,6 +293,46 @@ impl ModeAwareProxyState {
 
     pub fn admission(&self) -> &AdmissionGate {
         &self.admission
+    }
+
+    /// Issue a short-lived, one-use permit for the recovery owner's fixed canary. The token is
+    /// never forwarded upstream and is consumed before admission acquisition.
+    pub(crate) fn issue_recovery_canary_permit(
+        &self,
+        recovery_id: &str,
+        lifetime: Duration,
+    ) -> String {
+        let token = Uuid::new_v4().simple().to_string();
+        *self
+            .recovery_canary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RecoveryCanaryPermit {
+            recovery_id: recovery_id.to_owned(),
+            token: token.clone(),
+            expires_at: Instant::now() + lifetime,
+        });
+        token
+    }
+
+    fn consume_recovery_canary_permit(&self, token: &str) -> bool {
+        let mut permit = self
+            .recovery_canary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        let valid = permit.as_ref().is_some_and(|permit| {
+            !permit.recovery_id.is_empty()
+                && permit.expires_at > now
+                && permit.token.as_bytes().ct_eq(token.as_bytes()).into()
+        });
+        if valid
+            || permit
+                .as_ref()
+                .is_some_and(|permit| permit.expires_at <= now)
+        {
+            permit.take();
+        }
+        valid
     }
 
     pub fn configure_peer_proxy(&self, token: PeerProxyToken, expected_source: IpAddr) {
@@ -411,7 +461,15 @@ pub async fn forward_mode_aware(
     request: Request<Body>,
 ) -> Response<Body> {
     let started = std::time::Instant::now();
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    let recovery_canary = parts
+        .headers
+        .remove(RECOVERY_CANARY_HEADER)
+        .and_then(|value| {
+            (context.ingress == ProxyIngress::Public)
+                .then(|| value.to_str().ok().map(ToOwned::to_owned))
+                .flatten()
+        });
     let request_id = request_id(&parts.headers);
     let fixed = state.fixed_target();
     let mut observation = state.begin_request_metrics(
@@ -444,7 +502,13 @@ pub async fn forward_mode_aware(
             );
         }
     };
-    let permit = match state.admission.try_acquire(fixed.ready) {
+    let permit_result = match recovery_canary {
+        Some(token) if state.consume_recovery_canary_permit(&token) => {
+            state.admission.try_acquire_recovery(fixed.ready)
+        }
+        _ => state.admission.try_acquire(fixed.ready),
+    };
+    let permit = match permit_result {
         Ok(permit) => permit,
         Err(_) => {
             return observed_error(
@@ -879,6 +943,41 @@ mod tests {
         assert_eq!(response["forwarded_for"], "127.0.0.1");
         assert_eq!(response["custom"], "preserved");
         assert_eq!(response["internal_headers_removed"], true);
+    }
+
+    #[tokio::test]
+    async fn recovery_canary_permit_is_consumed_once_without_serving_public_admission() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async { Response::new(Body::from("canary")) }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        state.admission().block();
+        let proxy = start_mode_aware_proxy(state.clone()).await;
+        let token = state.issue_recovery_canary_permit("recovery-test", Duration::from_secs(5));
+        let client = reqwest::Client::new();
+
+        let first = client
+            .get(format!("http://{}/v1/canary", proxy.address))
+            .header(RECOVERY_CANARY_HEADER, &token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.text().await.unwrap(), "canary");
+
+        let second = client
+            .get(format!("http://{}/v1/canary", proxy.address))
+            .header(RECOVERY_CANARY_HEADER, token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state.admission().snapshot().state,
+            crate::admission::AdmissionState::Blocked
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,11 @@
-# macOS user service draft
+# macOS user service draft（開発・診断用）
 
-`siderostat` runtime と `siderostat-monitor` を、それぞれ1つのLaunchAgentとして登録します。
+この文書は bundle 外の開発 binary を検証するための legacy 手順です。v0.3.0 の公式提供物は
+ソースコードのみであり、公式の DMG、`.pkg`、`Siderostat Uninstaller.app` は配布しません。
+利用者は README の source installation guide に従い、`cargo xtask install --start` を使用してください。
+この手順と source workflow を同じ Mac で併用してはいけません。
+
+開発時に限り、`siderostat` runtime と `siderostat-monitor` を、それぞれ1つのLaunchAgentとして登録します。
 DS4 childはproxyが所有・検証・停止するため、`ds4-server`用のplistや同じlisten portを使う別jobを作成しないでください。
 
 ## Install前の準備
@@ -30,8 +35,8 @@ launchctl kickstart -k "gui/$(id -u)/local.siderostat.runtime"
 `siderostat-monitor` も `local.siderostat.monitor` の LaunchAgent として登録します。
 モニターのメニューからは、次のジョブ操作を実行します。
 
-- `Proxy 再起動`: `gui/<uid>/local.siderostat.runtime` を kickstart
-- `Monitor 再起動`: `gui/<uid>/local.siderostat.monitor` を kickstart
+- `siderostat-runtimeを再起動`: `gui/<uid>/local.siderostat.runtime` を kickstart
+- 開発 Monitor の再起動: `gui/<uid>/local.siderostat.monitor` を kickstart
 - `終了`: runtime と monitor の両方を bootout
 
 monitor の plist は `cargo xtask install` で同じ `LaunchAgents` ディレクトリへ配置されます。
@@ -41,7 +46,7 @@ monitor の plist は `cargo xtask install` で同じ `LaunchAgents` ディレ�
 ## GUIドメイン必須
 
 このplistには `LimitLoadToSessionType = Aqua` を指定しています。デスクトップ通知
-(`osascript display notification`) はユーザーのAquaセッション内のNotification Centerで
+(UserNotifications) はユーザーのAquaセッション内のNotification Centerで
 表示されるため、LaunchAgentを `gui/<uid>` ドメインに載せる必要があります。
 
 - `system/` (LaunchDaemon) や `user/<uid>` ドメインへ誤ってロードすると、ロード自体が

@@ -6,7 +6,7 @@ use siderostat::{
         ControlRole, ControlSecret, Ds4Command, Ds4Profile, EventOwner, LocalStandaloneLifecycle,
         ModeRuntime, NodeDescriptor, StandaloneSupervisor, WorkerControl,
     },
-    config::{ModelVariant, Residency},
+    config::{Quantization, Residency},
     metrics::Metrics,
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
     target::{LocalRole, StableMode},
@@ -69,9 +69,9 @@ async fn real_fake_child_starts_stops_falls_back_and_recovers_after_crash() {
         ],
         profile: Ds4Profile {
             profile_id: "phase3-fake".into(),
-            model_variant: ModelVariant::Q2,
+            quantization: Quantization::Q2,
             residency: Residency::Resident,
-            dspark_required: true,
+            speculative_support: siderostat::config::SpeculativeSupport::Dspark,
         },
     };
     let models_url = url::Url::parse(&format!("http://{address}/v1/models")).unwrap();
@@ -185,9 +185,9 @@ async fn dspark_profile_without_activation_event_fails_readiness_and_reaps_child
         ],
         profile: Ds4Profile {
             profile_id: "phase3-dspark-missing-activation".into(),
-            model_variant: ModelVariant::Q2Q4,
+            quantization: Quantization::Q2Q4,
             residency: Residency::Resident,
-            dspark_required: true,
+            speculative_support: siderostat::config::SpeculativeSupport::Dspark,
         },
     };
     let supervisor = StandaloneSupervisor::new(

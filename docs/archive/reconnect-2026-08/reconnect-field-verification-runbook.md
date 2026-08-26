@@ -75,14 +75,14 @@ ifconfig bridge0
 
 | 項目 | 場所（既定） | 記録内容 | coordinator 記録 | worker 記録 |
 |---|---|---|---|---|
-| binary | `/usr/local/bin/siderostat` | 実パス + SHA-256 | `o@m4max-macstudio.local:/usr/local/bin/siderostat` / `a1ee8cb4a51cd7a8fe77d76c2e0da523b5bc54205e4479800c998323a516abde` | `/usr/local/bin/siderostat` / `21c855ec5831c6fad6f5a821323a518492662b87f30d1878723c8da00125c0cb` |
-| config | `$HOME/Library/Application Support/siderostat/config.toml` | 実パス（`sed` で確認） |  `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/config.toml` / `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` 　| `/Users/o/siderostat_backup/Users/o/Library/Application Support/siderostat/config.toml` / `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
-| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/secrets` | `/Users/o/Library/Application Support/siderostat/secrets` |
-| state file | config `cluster.state_path` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/Application Support/siderostat/cluster-state.json` | `/Users/o/Library/Application Support/siderostat/cluster-state.json` |
-| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | 実パス | `o@m4max-macstudio.local:/Users/o/Library/LaunchAgents/local.siderostat.runtime.plist` | `/Users/o/Library/LaunchAgents/local.siderostat.runtime.plist` |
+| binary | `/usr/local/bin/siderostat` | 実パス + SHA-256 | `coordinator:/usr/local/bin/siderostat` / `a1ee8cb4a51cd7a8fe77d76c2e0da523b5bc54205e4479800c998323a516abde` | `/usr/local/bin/siderostat` / `21c855ec5831c6fad6f5a821323a518492662b87f30d1878723c8da00125c0cb` |
+| config | `$HOME/Library/Application Support/siderostat/config.toml` | 実パス（`sed` で確認） | `coordinator:$HOME/Library/Application Support/siderostat/config.toml` / `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` | `$HOME/siderostat_backup/Library/Application Support/siderostat/config.toml` / `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
+| secret dir | `$HOME/Library/Application Support/siderostat/secrets` | 実パス | `coordinator:$HOME/Library/Application Support/siderostat/secrets` | `$HOME/Library/Application Support/siderostat/secrets` |
+| state file | config `cluster.state_path` | 実パス | `coordinator:$HOME/Library/Application Support/siderostat/cluster-state.json` | `$HOME/Library/Application Support/siderostat/cluster-state.json` |
+| LaunchAgent plist | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | 実パス | `coordinator:$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` | `$HOME/Library/LaunchAgents/local.siderostat.runtime.plist` |
 | LaunchAgent label | `gui/$(id -u)/local.siderostat.runtime` | plist の `Label` | `gui/$(id -u)/local.siderostat.runtime` | `gui/$(id -u)/local.siderostat.runtime` |
-| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | plist の `StandardOutPath`/`StandardErrorPath` が一致しているか | (旧仕様から変更されていないため分割出力) `o@m4max-macstudio.local:/Users/o/Library/Logs/siderostat/stdout.log`, `o@m4max-macstudio.local:/Users/o/Library/Logs/siderostat/stderr.log` | `/Users/o/Library/Logs/siderostat/ds4-siderostat.log` |
-| admin API | config `[proxy] admin_listen`（例 `127.0.0.1:18081`） | 実値 | `https://admin.siderostat.m4max-macstudio.home.arpa/` (`127.0.0.1:18081`) | `127.0.0.1:18081` |
+| 統合ログ | `$HOME/Library/Logs/siderostat/ds4-siderostat.log`（stdout/stderr を単一ファイルに統合） | plist の `StandardOutPath`/`StandardErrorPath` が一致しているか | (旧仕様から変更されていないため分割出力) `coordinator:$HOME/Library/Logs/siderostat/stdout.log`, `coordinator:$HOME/Library/Logs/siderostat/stderr.log` | `$HOME/Library/Logs/siderostat/ds4-siderostat.log` |
+| admin API | config `[proxy] admin_listen`（例 `127.0.0.1:18081`） | 実値 | `https://admin.siderostat.example.invalid/` (`127.0.0.1:18081`) | `127.0.0.1:18081` |
 | `bridge0` IP | coordinator `10.99.0.1` / worker `10.99.0.2` | `ifconfig bridge0` の inet | `inet 10.99.0.1 netmask 0xfffffffc broadcast 10.99.0.3` | `inet 10.99.0.2 netmask 0xfffffffc broadcast 10.99.0.3` |
 | control port | config `[cluster] control_port`（例 `9920`） | 実値 | `9920` | `9920` |
 | ds4 distributed port | config `[cluster] ds4_distributed_port`（例 `9911`） | 実値 | `9911` | `9911` |
@@ -92,7 +92,7 @@ ifconfig bridge0
 | 項目 | 記録内容 | coordinator 記録 |
 |---|---|---|
 | binary | 実パス + SHA-256 | `/usr/local/bin/siderostat` / `9f2d…（16 桁以上）` |
-| config | 実パス | `/Users/macstudio/Library/Application Support/siderostat/config.toml` |
+| config | 実パス | `$HOME/Library/Application Support/siderostat/config.toml` |
 | admin API | 実値 | `127.0.0.1:18081` |
 | `bridge0` IP | `ifconfig` の inet | `10.99.0.1` |
 | control port | 実値 | `9920` |
@@ -112,7 +112,7 @@ config を使う場合はその config を別途記録する。commit SHA は ag
 | 項目 | 記録内容 | coordinator candidate | worker candidate |
 |---|---|---|---|
 | commit SHA | agent が repository から提供（`git rev-parse HEAD` 等） | `6bde9c10c148b3a85da6c015a5951bf21f3e898e` | `6bde9c10c148b3a85da6c015a5951bf21f3e898e` |
-| candidate binary パス | 実際に LaunchAgent が起動する candidate の実パス | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） | `/Users/o/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `/Users/o/Projects/github/okugauchi/siderostat/target/release/siderostat`） |
+| candidate binary パス | 実際に LaunchAgent が起動する candidate の実パス | `$HOME/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `target/release/siderostat`） | `$HOME/Library/Application Support/siderostat/candidate-reconnect-20260816/siderostat`（build source: `target/release/siderostat`） |
 | candidate binary SHA-256 | 導入予定ファイルの `shasum -a 256`（導入前に取得） | `c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0` | `c21bd1934cb531f5f1abd729429c3800492004c7067a2a20f5d2e6a2542a66a0` |
 | config checksum | 現行 config を使う場合は 3.1 と同一。candidate 専用ならその config の checksum | `233cca9eab61faeb0c6e5544115ff7cf9675547cd2e2be1070f489085a23aa02` | `a94e778092470cb2fefd7ad91f76e0e6378b3a1f663ec2c40418d008f6444912` |
 
@@ -130,7 +130,7 @@ shasum -a 256 "$HOME/Library/Application Support/siderostat/config.toml"
 > 4. 問題が起きたら backup した現行 binary へ戻す（rollback）。
 
 **2026-08-15 read-only 再確認**: `launchctl print` の実際の stdout/stderr は両 node とも
-`/Users/o/Library/Logs/local.siderostat.runtime/ds4-server_siderostat.log` へ統合されていた。
+`$HOME/Library/Logs/local.siderostat.runtime/ds4-server_siderostat.log` へ統合されていた。
 3.1 表に記録された旧 worker の `ds4-siderostat.log` および coordinator の分割ログとは異なるため、
 導入前 baseline の log artifact には `launchctl` の実測値を使用する。coordinator は
 `solo-standalone-ready`（generation 330、admission serving）だったが、worker は admin API が
@@ -144,8 +144,8 @@ shasum -a 256 "$HOME/Library/Application Support/siderostat/config.toml"
 HTTP readiness 前に exit status 2 で終了し続けたため LaunchAgent を bootout して再試行を停止した。
 worker の plist は保全 backup と SHA-256 が一致する `/usr/local/bin/siderostat` 指定へ戻し、candidate は staged path に保持している。
 現行 binary/config/state/plist/log の rollback backup は worker の
-`/private/tmp/siderostat-reconnect-evidence-20260815/rollback/` と coordinator の
-`/Users/o/siderostat-reconnect-evidence-20260815/rollback/` に保持している。
+`$TMPDIR/siderostat-reconnect-evidence-20260815/rollback/` と coordinator の
+`$HOME/siderostat-reconnect-evidence-20260815/rollback/` に保持している。
 
 **2026-08-16 worker 起動失敗の原因調査**: worker の exit status 2 は DS4 instance lock 競合と判定した。
 保存ログでは、distributed worker PID 1482 が `2026-08-15T09:46:39Z` まで稼働ログを出した後も残留し、
@@ -170,7 +170,7 @@ worker `33f504...` / coordinator `a5b2e9...` と一致しない。lock 解消後
 worker `be5f52bf14b5a54a1e1efd378672f93cb5a8966b92096d612b55815711f216f9`、coordinator
 `7c61eadb67c783d03c16e79f14b98a183904cc327e0d6bf4ff7ff16e3c265977` である。
 
-両 node の LaunchAgent は candidate path を指し、重複 job はなく、operator 承認済み startup cleanup は worker/coordinator 各 1 件の stale DS4 process に対して実施された。最終状態は両 node とも `SoloStandaloneReady`、`/healthz=ok`、`/readyz=ready`、`cluster doctor` の `healthy=true`（`admission_serving=true`、`safe_state=true`、`target_ready=true`）で、active request は 0 件、standalone DS4 child は node ごとに 1 件、unknown/orphan process はない。最終 worker generation は 278、coordinator generation は 339。最終 evidence は worker `/private/tmp/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator `/Users/o/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。これは H-01 完了時点の記録であり、その時点では H-02 は両 node が DistributedReady ではないため未着手だった。
+両 node の LaunchAgent は candidate path を指し、重複 job はなく、operator 承認済み startup cleanup は worker/coordinator 各 1 件の stale DS4 process に対して実施された。最終状態は両 node とも `SoloStandaloneReady`、`/healthz=ok`、`/readyz=ready`、`cluster doctor` の `healthy=true`（`admission_serving=true`、`safe_state=true`、`target_ready=true`）で、active request は 0 件、standalone DS4 child は node ごとに 1 件、unknown/orphan process はない。最終 worker generation は 278、coordinator generation は 339。最終 evidence は worker `$TMPDIR/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `988ed4fcef3196d355878546adff2cabbb2f633e42d1696b18a68b61f02e70de`）および coordinator `$HOME/siderostat-reconnect-evidence-20260815/baseline/20260816-h01-*`（manifest SHA-256 `74e56ceee48c3a538c0d80b8f6ddbc4c82580cc961e3ae13396dde0fd19d3e81`）に保存した。これは H-01 完了時点の記録であり、その時点では H-02 は両 node が DistributedReady ではないため未着手だった。
 
 ## 4. 証跡ディレクトリと記録方法
 

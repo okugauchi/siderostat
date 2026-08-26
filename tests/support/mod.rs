@@ -150,9 +150,13 @@ pub struct RecordedChild {
 
 impl RecordedChild {
     pub fn start(&self, generation: u64, pid: u32, profile: impl Into<String>) {
-        self.starts.fetch_add(1, Ordering::SeqCst);
+        let start_number = self.starts.fetch_add(1, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
-        self.pid.store(pid, Ordering::SeqCst);
+        // Each start represents a new owned process. Keep the first PID stable for readable
+        // diagnostics, then advance it so recovery tests can assert process replacement as well
+        // as generation replacement without touching real processes.
+        self.pid
+            .store(pid.saturating_add(start_number as u32), Ordering::SeqCst);
         self.generation.store(generation, Ordering::SeqCst);
         *self.profile.lock().unwrap() = profile.into();
     }
@@ -513,7 +517,7 @@ fn proxy_state() -> anyhow::Result<Arc<ModeAwareProxyState>> {
 fn manifest() -> DistributedManifest {
     DistributedManifest {
         schema_version: 2,
-        profile: "distributed-mxfp4".into(),
+        profile: "distributed-layer-parallel".into(),
         ds4_binary_sha256: "11".repeat(32),
         compatible_ds4_binary_sha256: vec!["11".repeat(32), "44".repeat(32)],
         ds4_source_commit: "b0309611041655f4e45671cfd9c9886aff161406".into(),
@@ -521,7 +525,9 @@ fn manifest() -> DistributedManifest {
         model_size: 100,
         checkpoint: "flash-0731".into(),
         model_family: "deepseek-v4-flash".into(),
-        quantization: "mxfp4-experts".into(),
+        quantization: "mxfp4".into(),
+        topology: "layer-parallel".into(),
+        speculative_support: "none".into(),
         context_size: 262_144,
         coordinator_layers: "0:19".into(),
         worker_layers: "20:output".into(),
@@ -623,14 +629,14 @@ profile_id = "flash-standalone"
 model = "/nonexistent/standalone.gguf"
 model_manifest = "{manifest_cache}/standalone.json"
 checkpoint = "flash-0731"
-model_variant = "q2-q4"
+quantization = "q2-q4"
 residency = "resident"
 context_size = 262144
 kv_disk_dir = "{manifest_cache}/kv-standalone"
 kv_disk_space_mb = 262144
 extra_args = []
 
-[ds4.mxfp4]
+[ds4.distributed]
 model = "/nonexistent/mxfp4.gguf"
 model_manifest = "{manifest_cache}/mxfp4.json"
 checkpoint = "flash-0731"

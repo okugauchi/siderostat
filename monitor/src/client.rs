@@ -14,6 +14,15 @@ struct ClusterRoutingState {
     target: String,
 }
 
+/// Runtime build metadata from the read-only `/healthz` admin endpoint
+/// (B-01 / D-03).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RuntimeVersion {
+    pub version: String,
+    pub git_commit: String,
+    pub build_number: String,
+}
+
 #[derive(Clone)]
 pub struct MetricsClient {
     http: reqwest::Client,
@@ -36,7 +45,7 @@ impl MetricsClient {
                 .build()
                 .context("build admin API client")?,
             base_url,
-            admin_token: config.admin_token.clone(),
+            admin_token: config.effective_admin_token()?,
             poll_interval: config.poll_interval(),
             offline_backoff: config.offline_backoff(),
         })
@@ -91,6 +100,57 @@ impl MetricsClient {
             .context("read metrics response body")?;
         Ok(parse_metrics(&text))
     }
+
+    /// Request a graceful runtime restart via the authenticated `/admin/restart`
+    /// endpoint (C-04). Returns the HTTP status and response body. The body is
+    /// intentionally kept as text because an older runtime may acknowledge a
+    /// successful restart with an empty or non-JSON response.
+    pub async fn graceful_restart(&self) -> Result<(reqwest::StatusCode, String)> {
+        let url = format!("{}/admin/restart", self.base_url);
+        let mut request = self.http.post(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("read graceful restart response body")?;
+        Ok((status, body))
+    }
+
+    /// Fetch the runtime build metadata from the read-only `/healthz` endpoint
+    /// (B-01 / D-03). This is a non-mutating read and is used to compare the
+    /// app version against the running runtime's version.
+    pub async fn health(&self) -> Result<RuntimeVersion> {
+        let url = format!("{}/healthz", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("healthz endpoint returned {}", response.status()));
+        }
+        let version: RuntimeVersion = response.json().await.context("parse healthz response")?;
+        Ok(version)
+    }
+
+    /// Return whether the runtime is ready to serve model traffic. A 503 from
+    /// `/readyz` is an expected not-yet-ready result, not a client error.
+    pub async fn ready(&self) -> Result<bool> {
+        let url = format!("{}/readyz", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        Ok(response.status().is_success())
+    }
 }
 
 fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
@@ -138,5 +198,11 @@ mod tests {
             target: "local-standalone".into(),
         };
         assert_eq!(metrics_path(&routing), "/metrics");
+    }
+
+    #[test]
+    fn ready_endpoint_distinguishes_ready_from_not_ready() {
+        assert!(reqwest::StatusCode::OK.is_success());
+        assert!(!reqwest::StatusCode::SERVICE_UNAVAILABLE.is_success());
     }
 }

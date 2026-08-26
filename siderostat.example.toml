@@ -69,6 +69,18 @@ coordinator_startup = "600s"
 complete_route = "180s"
 standalone_startup = "900s"
 
+# Automatic throughput recovery is opt-in. Keep this disabled until the H-10
+# two-node change window and evidence review.
+[recovery]
+enabled = false
+admission_drain_timeout = "60s"
+cooldown = "3600s"
+max_attempts_12h = 2
+low_decode_tps = 5.0
+low_decode_duration = "30s"
+progress_stall = "60s"
+canary_deadline = "30s"
+
 [ds4]
 binary = "$HOME/LLM/ds4/PLACEHOLDER-ds4-server"
 working_directory = "$HOME/LLM/ds4"
@@ -89,14 +101,16 @@ profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-standalone.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-resident-dspark.json"
 checkpoint = "flash-0731"
-model_variant = "q2-q4"
+quantization = "q2-q4"
 residency = "resident"
 context_size = 384000
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 131072
 extra_args = []
 
-[ds4.mxfp4]
+[ds4.distributed]
+topology = "layer-parallel"
+quantization = "mxfp4"
 model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"

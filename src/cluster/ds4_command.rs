@@ -1,13 +1,13 @@
-use crate::config::{Ds4Config, ModelVariant, Residency, validate_extra_args};
+use crate::config::{Ds4Config, Quantization, Residency, SpeculativeSupport, validate_extra_args};
 use std::{ffi::OsString, net::IpAddr, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ds4Profile {
     pub profile_id: String,
-    pub model_variant: ModelVariant,
+    pub quantization: Quantization,
     pub residency: Residency,
-    pub dspark_required: bool,
+    pub speculative_support: SpeculativeSupport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,27 +46,27 @@ pub fn build_distributed_worker_command(
     coordinator_address: IpAddr,
     distributed_port: u16,
 ) -> Result<Ds4Command, Ds4CommandError> {
-    let mxfp4 = &config.mxfp4;
-    validate_distributed_extra_args(mxfp4)?;
+    let distributed = &config.distributed;
+    validate_distributed_extra_args(distributed)?;
 
     let mut argv = vec![
         OsString::from("-m"),
-        mxfp4.model.as_os_str().to_owned(),
+        distributed.model.as_os_str().to_owned(),
         OsString::from("--role"),
         OsString::from("worker"),
         OsString::from("--layers"),
-        OsString::from(&mxfp4.worker_layers),
+        OsString::from(&distributed.worker_layers),
         OsString::from("--coordinator"),
         OsString::from(coordinator_address.to_string()),
         OsString::from(distributed_port.to_string()),
         OsString::from("--ctx"),
-        OsString::from(mxfp4.context_size.to_string()),
+        OsString::from(distributed.context_size.to_string()),
         OsString::from("--kv-disk-dir"),
-        mxfp4.kv_disk_dir.as_os_str().to_owned(),
+        distributed.kv_disk_dir.as_os_str().to_owned(),
         OsString::from("--kv-disk-space-mb"),
-        OsString::from(mxfp4.kv_disk_space_mb.to_string()),
+        OsString::from(distributed.kv_disk_space_mb.to_string()),
     ];
-    argv.extend(mxfp4.extra_args.iter().map(OsString::from));
+    argv.extend(distributed.extra_args.iter().map(OsString::from));
 
     Ok(distributed_command(config, "worker", argv))
 }
@@ -76,15 +76,15 @@ pub fn build_distributed_coordinator_command(
     coordinator_address: IpAddr,
     distributed_port: u16,
 ) -> Result<Ds4Command, Ds4CommandError> {
-    let mxfp4 = &config.mxfp4;
-    validate_distributed_extra_args(mxfp4)?;
+    let distributed = &config.distributed;
+    validate_distributed_extra_args(distributed)?;
     let mut argv = vec![
         OsString::from("-m"),
-        mxfp4.model.as_os_str().to_owned(),
+        distributed.model.as_os_str().to_owned(),
         OsString::from("--role"),
         OsString::from("coordinator"),
         OsString::from("--layers"),
-        OsString::from(&mxfp4.coordinator_layers),
+        OsString::from(&distributed.coordinator_layers),
         OsString::from("--listen"),
         OsString::from(coordinator_address.to_string()),
         OsString::from(distributed_port.to_string()),
@@ -93,22 +93,22 @@ pub fn build_distributed_coordinator_command(
         OsString::from("--port"),
         OsString::from(config.http_port.to_string()),
         OsString::from("--ctx"),
-        OsString::from(mxfp4.context_size.to_string()),
+        OsString::from(distributed.context_size.to_string()),
         OsString::from("--kv-disk-dir"),
-        mxfp4.kv_disk_dir.as_os_str().to_owned(),
+        distributed.kv_disk_dir.as_os_str().to_owned(),
         OsString::from("--kv-disk-space-mb"),
-        OsString::from(mxfp4.kv_disk_space_mb.to_string()),
+        OsString::from(distributed.kv_disk_space_mb.to_string()),
     ];
-    argv.extend(mxfp4.extra_args.iter().map(OsString::from));
+    argv.extend(distributed.extra_args.iter().map(OsString::from));
     Ok(distributed_command(config, "coordinator", argv))
 }
 
 fn validate_distributed_extra_args(
-    mxfp4: &crate::config::Ds4Mxfp4Config,
+    distributed: &crate::config::Ds4DistributedConfig,
 ) -> Result<(), Ds4CommandError> {
-    validate_extra_args("ds4.mxfp4.extra_args", &mxfp4.extra_args)
+    validate_extra_args("ds4.distributed.extra_args", &distributed.extra_args)
         .map_err(|error| Ds4CommandError::InvalidExtraArguments(error.to_string()))?;
-    if !mxfp4
+    if !distributed
         .extra_args
         .iter()
         .any(|argument| argument == "--debug")
@@ -124,10 +124,10 @@ fn distributed_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> D
         working_directory: config.working_directory.clone(),
         argv,
         profile: Ds4Profile {
-            profile_id: format!("distributed-mxfp4-{role}"),
-            model_variant: ModelVariant::Mxfp4,
+            profile_id: format!("distributed-layer-parallel-{role}"),
+            quantization: config.distributed.quantization,
             residency: Residency::Resident,
-            dspark_required: false,
+            speculative_support: SpeculativeSupport::None,
         },
     }
 }
@@ -210,9 +210,13 @@ pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4Com
         argv,
         profile: Ds4Profile {
             profile_id: standalone.profile_id.clone(),
-            model_variant: standalone.model_variant,
+            quantization: standalone.quantization,
             residency: standalone.residency,
-            dspark_required: config.dspark.enabled,
+            speculative_support: if config.dspark.enabled {
+                SpeculativeSupport::Dspark
+            } else {
+                SpeculativeSupport::None
+            },
         },
     })
 }
@@ -227,10 +231,10 @@ fn push_option(argv: &mut Vec<OsString>, name: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Ds4DsparkConfig, Ds4Mxfp4Config, Ds4StandaloneConfig};
+    use crate::config::{Ds4DistributedConfig, Ds4DsparkConfig, Ds4StandaloneConfig};
     use std::{net::IpAddr, path::PathBuf};
 
-    fn config(variant: ModelVariant, residency: Residency) -> Ds4Config {
+    fn config(variant: Quantization, residency: Residency) -> Ds4Config {
         Ds4Config {
             binary: PathBuf::from("/opt/ds4/bin/ds4-server"),
             working_directory: PathBuf::from("/opt/ds4 working"),
@@ -243,7 +247,7 @@ mod tests {
                 model: PathBuf::from("/models/DeepSeek V4.gguf"),
                 model_manifest: PathBuf::from("/manifests/standalone.json"),
                 checkpoint: "flash-0731".into(),
-                model_variant: variant,
+                quantization: variant,
                 residency,
                 context_size: 262_144,
                 kv_disk_dir: PathBuf::from("/cache/standalone profile"),
@@ -254,9 +258,11 @@ mod tests {
                 ssd_cold: false,
                 extra_args: vec!["--quality".into()],
             },
-            mxfp4: Ds4Mxfp4Config {
-                model: PathBuf::from("/models/mxfp4.gguf"),
-                model_manifest: PathBuf::from("/manifests/mxfp4.json"),
+            distributed: Ds4DistributedConfig {
+                topology: crate::config::DistributedTopology::LayerParallel,
+                quantization: Quantization::Mxfp4,
+                model: PathBuf::from("/models/distributed.gguf"),
+                model_manifest: PathBuf::from("/manifests/distributed.json"),
                 checkpoint: "flash-0731".into(),
                 context_size: 262_144,
                 coordinator_layers: "0:19".into(),
@@ -278,11 +284,11 @@ mod tests {
 
     #[test]
     fn standalone_variant_and_residency_matrix_generates_one_complete_argv() {
-        for variant in [ModelVariant::Q2, ModelVariant::Q2Q4, ModelVariant::Mxfp4] {
+        for variant in [Quantization::Q2, Quantization::Q2Q4, Quantization::Mxfp4] {
             for residency in [Residency::Resident, Residency::SsdStreaming] {
                 let command = build_standalone_command(&config(variant, residency)).unwrap();
                 let values = argv(&command);
-                assert_eq!(command.profile.model_variant, variant);
+                assert_eq!(command.profile.quantization, variant);
                 assert_eq!(command.profile.residency, residency);
                 assert_eq!(
                     values[0..4],
@@ -308,7 +314,7 @@ mod tests {
 
     #[test]
     fn typed_ssd_options_are_emitted_once_and_zero_preload_is_omitted() {
-        let mut config = config(ModelVariant::Mxfp4, Residency::SsdStreaming);
+        let mut config = config(Quantization::Mxfp4, Residency::SsdStreaming);
         config.standalone.ssd_cache_experts = Some("32GB".into());
         config.standalone.ssd_full_layers = Some(0);
         config.standalone.ssd_preload_experts = Some(0);
@@ -340,14 +346,14 @@ mod tests {
 
     #[test]
     fn builder_rejects_generated_option_override_and_resident_ssd_tuning() {
-        let mut duplicate = config(ModelVariant::Q2, Residency::SsdStreaming);
+        let mut duplicate = config(Quantization::Q2, Residency::SsdStreaming);
         duplicate.standalone.extra_args.push("--ctx=1".into());
         assert!(matches!(
             build_standalone_command(&duplicate),
             Err(Ds4CommandError::InvalidExtraArguments(_))
         ));
 
-        let mut resident = config(ModelVariant::Q2Q4, Residency::Resident);
+        let mut resident = config(Quantization::Q2Q4, Residency::Resident);
         resident.standalone.ssd_cache_experts = Some("8".into());
         assert_eq!(
             build_standalone_command(&resident),
@@ -357,7 +363,7 @@ mod tests {
 
     #[test]
     fn standalone_dspark_argv_is_typed_and_emitted_once() {
-        let mut config = config(ModelVariant::Q2Q4, Residency::Resident);
+        let mut config = config(Quantization::Q2Q4, Residency::Resident);
         config.dspark = Ds4DsparkConfig {
             enabled: true,
             support_model: Some(PathBuf::from("/models/DSpark support.gguf")),
@@ -366,7 +372,10 @@ mod tests {
         };
         let command = build_standalone_command(&config).unwrap();
         let values = argv(&command);
-        assert!(command.profile.dspark_required);
+        assert_eq!(
+            command.profile.speculative_support,
+            SpeculativeSupport::Dspark
+        );
         assert_eq!(values.iter().filter(|value| *value == "--mtp").count(), 1);
         assert_eq!(
             values.iter().filter(|value| *value == "--dspark").count(),
@@ -393,14 +402,14 @@ mod tests {
 
     #[test]
     fn standalone_dspark_rejects_missing_support_and_ssd_streaming() {
-        let mut missing = config(ModelVariant::Q2, Residency::Resident);
+        let mut missing = config(Quantization::Q2, Residency::Resident);
         missing.dspark.enabled = true;
         assert_eq!(
             build_standalone_command(&missing),
             Err(Ds4CommandError::DsparkSupportModelRequired)
         );
 
-        let mut streaming = config(ModelVariant::Q2, Residency::SsdStreaming);
+        let mut streaming = config(Quantization::Q2, Residency::SsdStreaming);
         streaming.dspark.enabled = true;
         streaming.dspark.support_model = Some(PathBuf::from("/models/support.gguf"));
         assert_eq!(
@@ -412,7 +421,7 @@ mod tests {
     #[test]
     fn distributed_worker_argv_is_complete_and_has_no_http_listener() {
         let command = build_distributed_worker_command(
-            &config(ModelVariant::Q2, Residency::SsdStreaming),
+            &config(Quantization::Q2, Residency::SsdStreaming),
             IpAddr::from([10, 99, 0, 1]),
             9911,
         )
@@ -421,7 +430,7 @@ mod tests {
             argv(&command),
             [
                 "-m",
-                "/models/mxfp4.gguf",
+                "/models/distributed.gguf",
                 "--role",
                 "worker",
                 "--layers",
@@ -438,24 +447,27 @@ mod tests {
                 "--debug",
             ]
         );
-        assert_eq!(command.profile.profile_id, "distributed-mxfp4-worker");
-        assert_eq!(command.profile.model_variant, ModelVariant::Mxfp4);
+        assert_eq!(
+            command.profile.profile_id,
+            "distributed-layer-parallel-worker"
+        );
+        assert_eq!(command.profile.quantization, Quantization::Mxfp4);
         assert!(!command.argv.iter().any(|value| value == "--host"));
         assert!(!command.argv.iter().any(|value| value == "--port"));
     }
 
     #[test]
     fn distributed_worker_requires_debug_and_rejects_generated_overrides() {
-        let mut missing_debug = config(ModelVariant::Mxfp4, Residency::Resident);
-        missing_debug.mxfp4.extra_args.clear();
+        let mut missing_debug = config(Quantization::Mxfp4, Residency::Resident);
+        missing_debug.distributed.extra_args.clear();
         assert_eq!(
             build_distributed_worker_command(&missing_debug, IpAddr::from([10, 99, 0, 1]), 9911,),
             Err(Ds4CommandError::DistributedDebugRequired)
         );
 
-        let mut override_role = config(ModelVariant::Mxfp4, Residency::Resident);
+        let mut override_role = config(Quantization::Mxfp4, Residency::Resident);
         override_role
-            .mxfp4
+            .distributed
             .extra_args
             .push("--role=coordinator".into());
         assert!(matches!(
@@ -467,7 +479,7 @@ mod tests {
     #[test]
     fn distributed_coordinator_argv_owns_http_and_rendezvous_listeners() {
         let command = build_distributed_coordinator_command(
-            &config(ModelVariant::Q2Q4, Residency::SsdStreaming),
+            &config(Quantization::Q2Q4, Residency::SsdStreaming),
             IpAddr::from([10, 99, 0, 1]),
             9911,
         )
@@ -476,7 +488,7 @@ mod tests {
             argv(&command),
             [
                 "-m",
-                "/models/mxfp4.gguf",
+                "/models/distributed.gguf",
                 "--role",
                 "coordinator",
                 "--layers",
@@ -497,6 +509,9 @@ mod tests {
                 "--debug",
             ]
         );
-        assert_eq!(command.profile.profile_id, "distributed-mxfp4-coordinator");
+        assert_eq!(
+            command.profile.profile_id,
+            "distributed-layer-parallel-coordinator"
+        );
     }
 }

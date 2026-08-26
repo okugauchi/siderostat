@@ -1,6 +1,12 @@
 # Siderostat macOS Application Bundle / Installer Package 仕様
 
-- 文書状態: 推奨構成案
+- **現行方針（2026-08-26）**: v0.3.0 はソース公開のみであり、公式のバイナリ、`.pkg`、DMG、
+  `Siderostat Uninstaller.app` は配布しない。本書は既存の macOS bundle/package 実装と実機検証を
+  説明する内部仕様、および将来の任意バイナリ配布・ローカル検証用の設計として保持する。
+  本書に記載された Developer ID 署名、公証、secure timestamp、staple、Gatekeeper の条件は、
+  v0.3.0 のソースリリース受入条件ではない。
+
+- 文書状態: 配布構成・アンインストール構成 合意済み（実装・実機受入済み）
 - 作成日: 2026-08-18
 - 対象: Siderostat 次期配布形式
 - 配布チャネル: Mac App Store 外の Developer ID 配布
@@ -17,6 +23,7 @@ macOS の標準的な `.app` と署名済み `.pkg` に置き換える。
 - `Siderostat.app` の bundle layout
 - runtime の常駐、登録、停止、更新方法
 - `.pkg` の payload、署名、公証、upgrade 方針
+- リリース DMG と `Siderostat Uninstaller.app` の提供形態
 - 既存インストールからの移行
 - security と acceptance criteria
 
@@ -49,6 +56,32 @@ runtime を main executable、monitor を別 LoginItem app とする案は採用
 Finder からの起動、初回承認、設定 UI、障害時の説明を UI のない process が背負う一方、
 結局 monitor 用の第二 bundle が必要になり、責務と署名単位が複雑になる。
 
+### 2.3 将来の任意バイナリ配布単位
+
+この節は、将来 v0.4+ 以降で公式バイナリ配布を採用する場合、またはローカルで package
+workflow を検証する場合の設計である。v0.3.0 の公式導入は source checkout からの
+`cargo xtask install --start` であり、以下の DMG、`.pkg`、Uninstaller は配布しない。
+
+バイナリ配布を採用する場合の候補は、次のファイルを収録した署名・公証済み DMG とする。
+
+```text
+Siderostat-<version>.dmg
+├── Siderostat-<version>.pkg
+├── Siderostat Uninstaller.app
+└── README.html
+```
+
+- `.pkg` の payload は `/Applications/Siderostat.app` 一項目だけとする。
+- `Siderostat Uninstaller.app` は `.pkg` の payload に含めず、DMG から必要時に起動する。
+- Uninstaller は Finder から起動できる GUI application とし、Terminal で shell script を
+  実行させることを通常の利用者向け手順にしない。
+- Uninstaller.app は Developer ID Application で署名し、notarytool へ一時 zip として提出して
+  ticket を staple する。zip は配布 DMG には含めない。
+- DMG 自体も Developer ID Application で署名してから公証し、staple 後に
+  `spctl --assess --type open --context context:primary-signature` で検証する。
+- DMG は `/Applications/Siderostat/` のような新しいインストールフォルダを作らない。
+  既存の app bundle path、bundle identifier、upgrade/rollback 契約を維持する。
+
 ## 3. 適用範囲と非目標
 
 ### 3.1 対象
@@ -69,7 +102,7 @@ Finder からの起動、初回承認、設定 UI、障害時の説明を UI の
 - GGUF の同梱
 - DwarfStar executable の自動ダウンロードまたは自動更新
 - 自動 update framework
-- `.pkg` 単体による完全 uninstall
+- `.pkg` 自体に uninstall UI を埋め込むこと
 - Intel Mac 向け universal binary
 
 App Sandbox は Mac App Store 外では必須ではない。Siderostat runtime は user-selected model、
@@ -102,10 +135,11 @@ Hardened Runtime のみを有効にし、App Sandbox は無効とする。例外
 ~/Library/Logs/siderostat/
 ```
 
-monitor の crash または通常終了は runtime を終了させない。runtime の crash は launchd が
-再起動する。一方、利用者が menu の「バックグラウンド実行を停止」を選んだ場合は、runtime を
-quiesce して DS4 child を graceful stop した後に LaunchAgent を unregister する。
-`SMAppService.unregister()` が実行中の LaunchAgent を終了し、将来の起動も停止する。
+monitor の crash または通常終了は `siderostat-runtime` を終了させない。`siderostat-runtime` の crash は launchd が
+再起動する。一方、利用者が menu の「siderostat-runtimeを停止して自動起動を無効化」を選んだ場合は、
+`siderostat-runtime` を quiesce して `ds4-server` child を graceful stop した後に LaunchAgent を unregister する。
+`SMAppService.unregister()` が実行中の LaunchAgent を終了し、将来の起動も停止するため、
+この menu 操作は現在の `siderostat-runtime` と `ds4-server` の停止も伴う。
 
 ## 5. bundle 仕様
 
@@ -185,7 +219,10 @@ capability check で macOS 26.2 以上に限定する。
 ### 5.4 LaunchAgent plist
 
 plist は署名済み app bundle の一部であり、install 時または first launch 時に書き換えない。
-`Program` の絶対 path ではなく、bundle からの相対 path を指定する `BundleProgram` を使う。
+配布先は `/Applications/Siderostat.app` に固定されるため、pkg の postinstall から
+`launchctl bootstrap` できるよう `Program` に固定 absolute path を指定する。
+`BundleProgram` は Service Management 経由の登録には適しているが、pkg script からの直接
+bootstrap では使用しない。
 
 概念上の plist は次のとおりである。最終 key set は target macOS 上で `plutil` と
 Service Management の実機試験を通す。
@@ -199,8 +236,8 @@ Service Management の実機試験を通す。
   <key>Label</key>
   <string>dev.siderostat-ds4-proxy.runtime</string>
 
-  <key>BundleProgram</key>
-  <string>Contents/Helpers/siderostat-runtime</string>
+  <key>Program</key>
+  <string>/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -254,8 +291,9 @@ runtime の常駐許可と monitor の login start は別設定として表示�
 - runtime background service: 推論 service の稼働に必要
 - monitor login start: menu bar UI を login 時に表示する利用者設定
 
-初回 setup では両方を推奨値として提示するが、利用者の承認状態を偽装せず、System Settings の
-実状態を source of truth とする。
+初回 setup では両方を推奨値として `SMAppService` へ登録する。ただし利用者の承認状態を
+偽装せず、Runtime と main app の各 `status` がともに `enabled` になるまで完了扱いにしない。
+Runtime の開始／停止操作は Runtime の登録だけを変更し、main app の login start には影響させない。
 
 ### 6.3 menu 操作
 
@@ -263,12 +301,11 @@ runtime の常駐許可と monitor の login start は別設定として表示�
 
 | 操作 | 挙動 |
 |---|---|
-| Monitor を終了 | main app だけ終了。runtime は継続 |
+| Siderostatを終了 | main app だけ終了。runtime は継続 |
 | 設定ファイルを開く | `~/Library/Application Support/siderostat/config.toml` を既定アプリで開く。未作成時は最寄りの既存親フォルダを開く |
-| Runtime を再起動 | authenticated admin API で drain 後に self-restart。launchd が再起動 |
-| バックグラウンド実行を停止 | drain、DS4 child stop、runtime service unregister。unregister が runtime process を終了 |
-| バックグラウンド実行を開始 | runtime service register。approval が必要なら案内 |
-| Siderostat を終了 | monitor 終了前に runtime を止めるか継続するか、意味が明確な二操作へ分ける |
+| siderostat-runtimeを再起動 | authenticated admin API で drain 後に self-restart。launchd が再起動 |
+| siderostat-runtimeを停止して自動起動を無効化 | drain、`ds4-server` child stop、runtime service unregister。unregister が runtime process を終了 |
+| siderostat-runtimeを起動して自動起動を有効化 | runtime service register。LaunchAgent は登録時に起動し、approval が必要なら案内 |
 
 現行 monitor の `launchctl kickstart` / `bootout` 直接呼出しは互換 mode に限定し、新 bundle
 mode では Service Management と admin API に置き換える。runtime が応答しない場合の recovery は、
@@ -277,12 +314,12 @@ mode では Service Management と admin API に置き換える。runtime が応
 
 ### 6.4 background activity の可視性
 
-monitor を終了しても runtime を継続する設計であるため、利用者が次を常に確認・停止できなければ
+Siderostat のメニューバーアプリを終了しても runtime を継続する設計であるため、利用者が次を常に確認・停止できなければ
 ならない。
 
-- menu bar の runtime 稼働状態
+- menu bar の `siderostat-runtime` 稼働状態
 - System Settings > General > Login Items の Siderostat background item
-- menu の「バックグラウンド実行を停止」
+- menu の「siderostat-runtimeを停止して自動起動を無効化」
 - CPU、memory、model、cluster mode の概要
 
 これは、background process が main app 終了後も動く場合に利用者へ可視性と停止手段を与える
@@ -381,8 +418,12 @@ component package を `pkgbuild`、最終 product archive を `productbuild` で
 概念上の build flow は次である。
 
 ```sh
+ditto build/Siderostat.app build/payload-root/Siderostat.app
+
 pkgbuild \
-  --component build/Siderostat.app \
+  --root build/payload-root \
+  --component-plist build/component-plist.plist \
+  --scripts build/pkg-scripts \
   --install-location /Applications \
   --identifier dev.siderostat-ds4-proxy.pkg \
   --version "$VERSION" \
@@ -398,30 +439,61 @@ productbuild \
 ```
 
 実際の `productbuild` option と Distribution XML の要否は build implementation で固定し、
-同一 receipt ID と version 比較で upgrade 可能にする。
+同一 receipt ID と version 比較で upgrade 可能にする。component plist では
+`BundleIsRelocatable=false` を指定し、既存 bundle identifier による `/Applications` 外への
+relocation を許可しない。
 
 ### 9.2 installer script policy
 
-初期版は `preinstall` / `postinstall` script を持たない構成を第一選択とする。
+`preinstall` と `postinstall` の二つの controlled script だけを許可する。
+`preinstall` は次の順序で、bundle replacement 前に既存の製品プロセスを停止する。
 
-特に installer process から次を行わない。
+1. `/dev/console` から現在の GUI ユーザーの UID を解決する。
+2. `gui/<uid>/dev.siderostat-ds4-proxy.runtime` に限定して runtime LaunchAgent を
+   `launchctl bootout` する。job が未登録・未稼働の場合は安全な no-op とする。停止に失敗した
+   場合は同じ job target への `launchctl kill SIGKILL` と、bundle 内の
+   `/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime` という完全一致した
+   実行パスへの fallback を使う。
+3. runtime job と完全一致した runtime executable が消えるまで待機する。
+4. `/Applications/Siderostat.app/Contents/MacOS/Siderostat` という完全一致した実行パスの
+   Monitor に SIGTERM を送り、最大10秒待機する。終了しない場合だけ同じ完全一致の Monitor
+   に SIGKILL を送り、他のプロセスへ波及させない。
 
-- console user の推測
-- `launchctl bootstrap gui/<uid>`
+runtime の停止を先に行うことで、旧 Monitor が停止中の runtime を検出して再操作する競合を
+避ける。`preinstall` は Service Management の登録状態、ユーザーの承認、plist ファイル、
+設定、secret、model、cache を変更・削除しない。`bootout` は bundle replacement のための
+一時的な job unload であり、インストール後に起動した新しい Siderostat が既存の登録・承認状態を
+読み取り、必要な runtime を復帰させる。
+
+`postinstall` は、`launchctl print-disabled gui/<uid>` で product-owned runtime が事前に
+`enabled` だった場合だけ、新しい bundle 内の LaunchAgent plist を同じ `gui/<uid>` domain へ
+bootstrap し、その後アクティブな console user の GUI session で `/Applications/Siderostat.app`
+を起動する。disabled、未登録、承認待ちの場合は bootstrap せず、アプリ側の Service Management
+承認導線へ委譲する。これにより upgrade 前に稼働していた runtime は、ユーザーの停止設定を変更
+せずにインストール直後から復帰する。
+
+installer process から次を行わない。
+
+- console user 以外のユーザー・session の操作
+- `launchctl disable`、`SMAppService.unregister()`。`launchctl bootstrap gui/<uid>` は、
+  事前状態が `enabled` の product-owned runtime を復帰させる場合に限り許可する。
 - `~/Library/LaunchAgents` の変更
 - user config / secret の生成または上書き
-- active runtime / DS4 child の強制終了
+- runtime job 以外のプロセス、任意の `ds4-server` child、未知 PID の停止または強制終了
 - Recovery での RDMA 有効化
 
-runtime の登録は、install 後に利用者が Siderostat を起動した user session で
-`SMAppService` を通して行う。将来 script が必要になった場合は system-level file migration
-だけに限定し、idempotent、rollback-safe、user data preserving とする。
+runtime と main app login start の登録は、install 後に postinstall が起動した Siderostat の
+user session で `SMAppService` を通して行う。approval が必要な場合は app が Login Items の
+System Settings を開く。console user がいない場合、postinstall は install を失敗させず起動を
+スキップする。両 script は idempotent、rollback-safe、user data preserving とする。
 
 ### 9.3 installer UX
 
 - install 先は `/Applications`
 - package installation の管理者承認と、runtime background item の user approval は別物
-- install 完了後、Siderostat を初回起動して background service を登録する旨を明示
+- install 完了後、Siderostat を自動起動して background service と Siderostat の login start を
+  登録する。approval が必要な場合は Siderostat が System Settings > General > Login Items を開く
+  （許可状態はユーザーが管理する macOS の状態であり、package の管理者承認とは別物）
 - model は同梱されず、既存設定を検出するか setup で選択する旨を明示
 
 ## 10. notarization
@@ -447,10 +519,10 @@ notarization 対象であり、旧 `altool` ではなく `notarytool` を使う�
 1. app version、signature/build metadata を表示可能にする。
 2. legacy install を検出する。
 3. user config、secret、manifest を読み取り、schema と permission を検証する。
-4. runtime LaunchAgent の status を取得する。
-5. background service の目的を説明し、登録する。
+4. runtime LaunchAgent と main app login item の status を取得する。
+5. background service と monitor login start の目的を説明し、未登録のものを登録する。
 6. approval が不足する場合は System Settings を開く導線を示す。
-7. monitor の login start 設定を確認する。
+7. runtime と monitor login start の両 status が `enabled` になったことを確認する。
 8. runtime admin API readiness を待つ。
 9. DwarfStar/model manifest readiness を表示する。
 
@@ -493,7 +565,8 @@ child を競合させない。
 - user data、model、cache、secret を保持する。
 - LaunchAgent plist の label と bundle-relative helper path を安定させる。
 - active runtime は旧 executable image のまま動き得るため、monitor は app version と
-  runtime version を比較し、必要なら admin API で graceful restart を提案または実行する。
+  runtime version を比較し、不一致を macOS 通知で知らせる。runtime の再起動は
+  ユーザーが既存のメニュー項目から明示的に実行する。
 - plist schema または identifier を変える release は、明示的 unregister/register migration を持つ。
 
 ### 13.2 rollback
@@ -505,15 +578,39 @@ child を競合させない。
 
 ## 14. uninstall
 
-`.pkg` には標準 uninstall UI がないため、次を製品の uninstall 手順とする。
+`.pkg` には uninstall UI を埋め込まず、リリース DMG に同梱する
+`Siderostat Uninstaller.app` を製品の標準 uninstall 導線とする。
 
-1. Siderostat menu で background service を停止し、runtime を unregister する。
-2. monitor を終了する。
-3. `/Applications/Siderostat.app` を Trash へ移す。
-4. user data を残すか削除するかを別操作として選ぶ。
+Uninstaller は、エンドユーザーに Terminal 操作を要求せず、確認ダイアログの後に次を順序どおり
+実行する。
+
+1. `SMAppService` から runtime と Siderostat のログイン項目を unregister する。
+2. runtime、管理対象の `ds4-server` child、Monitor が停止したことを確認する。
+3. `/Applications/Siderostat.app` だけを Trash へ移す。
+4. package receipt を対象 identifier に限定して整理する。
+5. 処理結果を画面に表示する。
+
+Trash 移動と package receipt の整理は、一つの `osascript` 管理者承認トランザクション内で
+実行する。これにより Finder の移動操作と receipt 整理で管理者パスワードを二重に要求しない。
+Trash 内 bundle の所有者を後から `chown` で変更しない。macOS が Trash に付与する保護属性と
+衝突するためであり、Trash の所有ユーザーによる通常の管理に委ねる。既存の同名 bundle がある
+場合は `.1` 以降の一意な退避名を選び、既存項目を上書きしない。
+Uninstaller は `SMAppService.unregister()` で登録を解除するが、macOS が保持する Login Items /
+Background Items の承認履歴を強制的に消去しない。再インストール時に同じユーザーの承認を再利用
+できることを優先し、履歴を消去したい場合はユーザーが System Settings から明示的に変更する。
 
 既定では Application Support、secret、model、cache を残す。「すべてのデータを削除」は、
 対象 path を列挙し、再確認し、app bundle と Siderostat 管理下 data 以外を削除しない専用操作とする。
+
+Uninstaller は次の安全契約を満たす。
+
+- 初回実行済み・未実行・一部停止済みのいずれでも安全に再実行できる。
+- 未確認のプロセス、他のアプリ、他の LaunchAgent を停止しない。
+- `~/Library/Application Support/siderostat`、secret、manifest、cluster state、model、
+  `~/Library/Caches/ds4-kv` を既定操作で削除しない。
+- `sudo rm -rf` などの不可逆な一括削除を使用しない。
+- `uninstall-siderostat.sh` は CI・実機検証用の補助 CLI として扱い、エンドユーザー向けの正式な
+  導線にはしない。
 
 ## 15. build artifact
 
@@ -521,6 +618,8 @@ release job は少なくとも次を出力する。
 
 - `Siderostat.app` を格納した notarized distribution archive
 - `Siderostat-<version>.pkg`
+- `Siderostat-<version>.dmg`（上記 `.pkg`、`Siderostat Uninstaller.app`、README を収録）
+- `Siderostat Uninstaller.app`（Developer ID Application 署名・公証済み）
 - SHA-256 checksum
 - build metadata（git commit、Rust version、target、build number）
 - SBOM または dependency inventory
@@ -542,14 +641,20 @@ artifact、log に出力しない。
 - `pkgutil --check-signature` が package を受理する
 - `spctl --assess --type install` が package を受理する
 - `xcrun stapler validate` が package に成功する
+- DMG に想定した `.pkg`、`Siderostat Uninstaller.app`、README だけが含まれる
+- DMG の Developer ID 署名と `spctl --assess --type open --context context:primary-signature`
+  が成功する
+- `Siderostat Uninstaller.app` の署名、公証、Gatekeeper 検証が成功する
+- Uninstaller.app が独自の仮アイコンを同梱せず、macOS の標準アプリ表示になる
+- Uninstaller の app 移動と receipt 整理が一回の管理者承認で完了する
 - final checksum が release metadata と一致する
 
 ### 16.2 clean install
 
 - clean Mac へ `.pkg` を install できる
 - `/Applications` 以外に system payload を作らない
-- first launch まで runtime を勝手に登録しない
-- first launch で background item の説明と approval flow が動く
+- package install 完了後に Siderostat が自動起動し、first launch で background item と Siderostat の
+  login item の登録、説明、approval flow が動く
 - runtime と monitor が次回 login で設定どおり起動する
 - monitor を終了しても runtime が継続する
 - runtime crash 後に launchd が再起動する
@@ -571,6 +676,15 @@ artifact、log に出力しない。
 - runtime は manifest-approved DwarfStar executable/model だけを起動する
 - app bundle 内の code または plist を install 後に変更しない
 - Gatekeeper offline test でも stapled ticket を確認できる
+
+### 16.5 uninstall
+
+- DMG から `Siderostat Uninstaller.app` を起動して確認ダイアログを表示できる
+- runtime と Siderostat のログイン項目が unregister される
+- runtime、管理対象 `ds4-server` child、Monitor、app bundle が停止・削除される
+- package receipt が対象 identifier に限定して整理される
+- Application Support、secret、manifest、cluster state、model、KV cache が保持される
+- Uninstaller を再実行してもエラーやデータ削除が発生しない
 
 ## 17. 実装 milestone
 
@@ -603,6 +717,13 @@ artifact、log に出力しない。
 - failure injection
 - reproducible metadata、checksum、SBOM
 - user-facing installation、background service、uninstall documentation
+
+### Phase 5: distribution uninstall UX
+
+- release DMG に `.pkg` と `Siderostat Uninstaller.app` を同梱
+- Uninstaller の確認 UI、Service Management unregister、app bundle の Trash 移動
+- DMG、Uninstaller.app の署名、公証、Gatekeeper 検証
+- user data 保持と idempotent uninstall の実機受入
 
 ## 18. 保留事項
 

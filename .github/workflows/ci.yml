@@ -47,3 +47,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
       - run: cargo test --all-targets --all-features
+
+  macos-dev-artifacts:
+    name: macOS dev artifacts
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace
+      - run: bash scripts/verify-macos-dev-artifacts.sh

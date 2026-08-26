@@ -14,7 +14,8 @@ pub const PERSISTENT_STATE_SCHEMA_VERSION: u32 = 1;
 pub enum PersistentMode {
     SoloStandalone,
     PairedStandalone,
-    DistributedMxfp4,
+    #[serde(alias = "distributed-mxfp4")]
+    DistributedLayerParallel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,5 +381,20 @@ mod tests {
         drop(store);
         assert!(StateStore::acquire(&path).is_ok());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reads_the_legacy_distributed_mxfp4_mode_name_and_writes_the_canonical_name() {
+        let mut value = serde_json::to_value(state(1)).unwrap();
+        value["desired_mode"] = serde_json::Value::String("distributed-mxfp4".into());
+        value["last_stable_mode"] = serde_json::Value::String("distributed-mxfp4".into());
+        let decoded: PersistentClusterState = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.desired_mode,
+            PersistentMode::DistributedLayerParallel
+        );
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        assert!(encoded.contains("distributed-layer-parallel"));
+        assert!(!encoded.contains("distributed-mxfp4"));
     }
 }

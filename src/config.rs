@@ -3,7 +3,9 @@ use serde::Deserialize;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -86,6 +88,44 @@ pub struct ModeAwareConfig {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub startup_cleanup: StartupCleanupConfig,
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Automatic throughput recovery is deliberately opt-in.
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub admission_drain_timeout: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub cooldown: Duration,
+    pub max_attempts_12h: usize,
+    pub low_decode_tps: f64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub low_decode_duration: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub progress_stall: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub canary_deadline: Duration,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admission_drain_timeout: Duration::from_secs(60),
+            cooldown: Duration::from_secs(60 * 60),
+            max_attempts_12h: 2,
+            low_decode_tps: 5.0,
+            low_decode_duration: Duration::from_millis(
+                crate::recovery::RECOVERY_LOW_TPS_SUSTAINED_MILLIS,
+            ),
+            progress_stall: Duration::from_secs(60),
+            canary_deadline: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +253,8 @@ pub struct Ds4Config {
     #[serde(default)]
     pub dspark: Ds4DsparkConfig,
     pub standalone: Ds4StandaloneConfig,
-    pub mxfp4: Ds4Mxfp4Config,
+    #[serde(alias = "mxfp4")]
+    pub distributed: Ds4DistributedConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -232,7 +273,8 @@ pub struct Ds4StandaloneConfig {
     pub model: PathBuf,
     pub model_manifest: PathBuf,
     pub checkpoint: String,
-    pub model_variant: ModelVariant,
+    #[serde(alias = "model_variant")]
+    pub quantization: Quantization,
     pub residency: Residency,
     pub context_size: u32,
     pub kv_disk_dir: PathBuf,
@@ -251,18 +293,62 @@ pub struct Ds4StandaloneConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ModelVariant {
+pub enum Quantization {
     Q2,
     Q2Q4,
     Mxfp4,
 }
 
-impl ModelVariant {
+fn default_mxfp4() -> Quantization {
+    Quantization::Mxfp4
+}
+
+/// The distributed execution topology is independent of the model's
+/// quantization. Only layer-parallel is wired to ds4-server in this release;
+/// tensor-parallel remains a future topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DistributedTopology {
+    LayerParallel,
+    TensorParallel,
+}
+
+impl DistributedTopology {
     pub fn name(self) -> &'static str {
         match self {
-            ModelVariant::Q2 => "q2",
-            ModelVariant::Q2Q4 => "q2-q4",
-            ModelVariant::Mxfp4 => "mxfp4",
+            DistributedTopology::LayerParallel => "layer-parallel",
+            DistributedTopology::TensorParallel => "tensor-parallel",
+        }
+    }
+}
+
+fn default_layer_parallel() -> DistributedTopology {
+    DistributedTopology::LayerParallel
+}
+
+/// Speculative execution support is model/profile metadata, not a cluster
+/// mode. DSpark is the only supported strategy in the current integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeSupport {
+    None,
+    Dspark,
+}
+
+impl SpeculativeSupport {
+    pub fn name(self) -> &'static str {
+        match self {
+            SpeculativeSupport::None => "none",
+            SpeculativeSupport::Dspark => "dspark",
+        }
+    }
+}
+
+impl Quantization {
+    pub fn name(self) -> &'static str {
+        match self {
+            Quantization::Q2 => "q2",
+            Quantization::Q2Q4 => "q2-q4",
+            Quantization::Mxfp4 => "mxfp4",
         }
     }
 }
@@ -285,7 +371,11 @@ impl Residency {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Ds4Mxfp4Config {
+pub struct Ds4DistributedConfig {
+    #[serde(default = "default_layer_parallel")]
+    pub topology: DistributedTopology,
+    #[serde(default = "default_mxfp4")]
+    pub quantization: Quantization,
     pub model: PathBuf,
     pub model_manifest: PathBuf,
     pub checkpoint: String,
@@ -349,9 +439,10 @@ impl ModeAwareConfig {
         self.ds4.standalone.model_manifest =
             expand_config_path(&self.ds4.standalone.model_manifest)?;
         self.ds4.standalone.kv_disk_dir = expand_config_path(&self.ds4.standalone.kv_disk_dir)?;
-        self.ds4.mxfp4.model = expand_config_path(&self.ds4.mxfp4.model)?;
-        self.ds4.mxfp4.model_manifest = expand_config_path(&self.ds4.mxfp4.model_manifest)?;
-        self.ds4.mxfp4.kv_disk_dir = expand_config_path(&self.ds4.mxfp4.kv_disk_dir)?;
+        self.ds4.distributed.model = expand_config_path(&self.ds4.distributed.model)?;
+        self.ds4.distributed.model_manifest =
+            expand_config_path(&self.ds4.distributed.model_manifest)?;
+        self.ds4.distributed.kv_disk_dir = expand_config_path(&self.ds4.distributed.kv_disk_dir)?;
         Ok(())
     }
 
@@ -380,16 +471,23 @@ impl ModeAwareConfig {
         validate_dspark(self)?;
         validate_ssd_streaming(&self.ds4.standalone)?;
         anyhow::ensure!(
-            self.ds4.standalone.kv_disk_dir != self.ds4.mxfp4.kv_disk_dir,
+            self.ds4.distributed.topology == DistributedTopology::LayerParallel,
+            "ds4.distributed.topology is not supported yet; only 'layer-parallel' is available"
+        );
+        anyhow::ensure!(
+            self.ds4.standalone.kv_disk_dir != self.ds4.distributed.kv_disk_dir,
             "standalone and distributed kv_disk_dir must be different"
         );
         validate_layer_split(
-            &self.ds4.mxfp4.coordinator_layers,
-            &self.ds4.mxfp4.worker_layers,
+            &self.ds4.distributed.coordinator_layers,
+            &self.ds4.distributed.worker_layers,
         )?;
         validate_secret_files(&self.cluster.security)?;
         validate_extra_args("ds4.standalone.extra_args", &self.ds4.standalone.extra_args)?;
-        validate_extra_args("ds4.mxfp4.extra_args", &self.ds4.mxfp4.extra_args)?;
+        validate_extra_args(
+            "ds4.distributed.extra_args",
+            &self.ds4.distributed.extra_args,
+        )?;
         Ok(())
     }
 }
@@ -494,6 +592,34 @@ fn validate_durations(config: &ModeAwareConfig) -> anyhow::Result<()> {
         cluster.timeouts.standalone_startup,
     );
     anyhow::ensure!(
+        !config.recovery.admission_drain_timeout.is_zero(),
+        "recovery.admission_drain_timeout must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.cooldown.is_zero(),
+        "recovery.cooldown must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.low_decode_duration.is_zero(),
+        "recovery.low_decode_duration must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.progress_stall.is_zero(),
+        "recovery.progress_stall must be greater than zero"
+    );
+    anyhow::ensure!(
+        !config.recovery.canary_deadline.is_zero(),
+        "recovery.canary_deadline must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.recovery.max_attempts_12h > 0,
+        "recovery.max_attempts_12h must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.recovery.low_decode_tps.is_finite() && config.recovery.low_decode_tps >= 0.0,
+        "recovery.low_decode_tps must be finite and non-negative"
+    );
+    anyhow::ensure!(
         config.cluster.timeouts.rendezvous_hello >= config.cluster.timeouts.worker_startup,
         "cluster.timeouts.rendezvous_hello must not be shorter than worker_startup"
     );
@@ -516,10 +642,14 @@ fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
         &config.ds4.standalone.model_manifest,
         false,
     )?;
-    validate_regular_file("ds4.mxfp4.model", &config.ds4.mxfp4.model, false)?;
     validate_regular_file(
-        "ds4.mxfp4.model_manifest",
-        &config.ds4.mxfp4.model_manifest,
+        "ds4.distributed.model",
+        &config.ds4.distributed.model,
+        false,
+    )?;
+    validate_regular_file(
+        "ds4.distributed.model_manifest",
+        &config.ds4.distributed.model_manifest,
         false,
     )?;
     for (name, path) in [
@@ -532,7 +662,10 @@ fn validate_paths(config: &ModeAwareConfig) -> anyhow::Result<()> {
             "ds4.standalone.kv_disk_dir",
             &config.ds4.standalone.kv_disk_dir,
         ),
-        ("ds4.mxfp4.kv_disk_dir", &config.ds4.mxfp4.kv_disk_dir),
+        (
+            "ds4.distributed.kv_disk_dir",
+            &config.ds4.distributed.kv_disk_dir,
+        ),
     ] {
         validate_absolute_normalized(name, path)?;
     }
@@ -804,20 +937,42 @@ fn environment_config_path(name: &str, suffix: &str) -> anyhow::Result<PathBuf> 
     Ok(path)
 }
 
+/// `serve --config` 未指定時、または `SIDEROSTAT_CONFIG` も cwd の `siderostat.toml` も
+/// 使えない場合に、Application Support 配下の既定 `config.toml` を解決する純粋関数。
+/// caller から明示 path が渡された場合は従来どおり優先する。
 fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    resolve_config_path_pure(
+        explicit,
+        env::var_os("SIDEROSTAT_CONFIG").as_deref(),
+        env::var_os("HOME").as_deref(),
+        &|path| path.exists(),
+    )
+}
+
+/// env と file 存在判定を引数化した純粋な path 解決。`HOME` の不在・空は明示 error とし、
+/// user data を作成しない。並列 test で global env を汚さずに検証できる。
+fn resolve_config_path_pure(
+    explicit: Option<&Path>,
+    config_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = env::var_os("SIDEROSTAT_CONFIG") {
+    if let Some(path) = config_env {
+        if path.is_empty() {
+            anyhow::bail!("SIDEROSTAT_CONFIG is set but empty");
+        }
         return Ok(PathBuf::from(path));
     }
     let current = PathBuf::from(DEFAULT_CONFIG_FILE);
-    if current.exists() {
+    if exists(&current) {
         return Ok(current);
     }
-    let platform = platform_default_path();
+    let platform = platform_default_path_pure(home)?;
     anyhow::ensure!(
-        platform.exists(),
+        exists(&platform),
         "configuration not found; tried {}, SIDEROSTAT_CONFIG, {}, and {}",
         "--config",
         current.display(),
@@ -826,14 +981,20 @@ fn resolve_config_path(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(platform)
 }
 
-fn platform_default_path() -> PathBuf {
+/// プラットフォーム既定の config path。macOS では Application Support 配下の
+/// `config.toml` を `HOME` から解決する。`HOME` が存在しない、または空の場合は
+/// 明示 error を返す（user data を作成しない）。
+fn platform_default_path_pure(home: Option<&OsStr>) -> anyhow::Result<PathBuf> {
     if cfg!(target_os = "macos") {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("Library/Application Support/siderostat/config.toml")
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!("HOME is not set; cannot resolve default config path")
+        })?;
+        if home.is_empty() {
+            anyhow::bail!("HOME is set but empty; cannot resolve default config path");
+        }
+        Ok(PathBuf::from(home).join("Library/Application Support/siderostat/config.toml"))
     } else {
-        PathBuf::from("/etc/siderostat/config.toml")
+        Ok(PathBuf::from("/etc/siderostat/config.toml"))
     }
 }
 
@@ -901,6 +1062,11 @@ fn zero_duration_at(config: &mut ModeAwareConfig, path: &str) {
         "cluster.timeouts.coordinator_startup" => &mut config.cluster.timeouts.coordinator_startup,
         "cluster.timeouts.complete_route" => &mut config.cluster.timeouts.complete_route,
         "cluster.timeouts.standalone_startup" => &mut config.cluster.timeouts.standalone_startup,
+        "recovery.admission_drain_timeout" => &mut config.recovery.admission_drain_timeout,
+        "recovery.cooldown" => &mut config.recovery.cooldown,
+        "recovery.low_decode_duration" => &mut config.recovery.low_decode_duration,
+        "recovery.progress_stall" => &mut config.recovery.progress_stall,
+        "recovery.canary_deadline" => &mut config.recovery.canary_deadline,
         _ => unreachable!("unknown duration path {path}"),
     };
     *duration = Duration::ZERO;
@@ -992,14 +1158,16 @@ profile_id = "flash-0731-q2-q4-resident-dspark"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/standalone-flash-0731-q2-q4-ssd.json"
 checkpoint = "flash-0731"
-model_variant = "q2-q4"
+quantization = "q2-q4"
 residency = "resident"
 context_size = 262144
 kv_disk_dir = "$HOME/Library/Caches/ds4-kv/standalone/flash-0731-q2-q4-resident-dspark"
 kv_disk_space_mb = 262144
 extra_args = []
 
-[ds4.mxfp4]
+[ds4.distributed]
+topology = "layer-parallel"
+quantization = "mxfp4"
 model = "$HOME/LLM/ds4/gguf/DeepSeek-V4-Flash-MXFP4Experts-0731.gguf"
 model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
 checkpoint = "flash-0731"
@@ -1053,8 +1221,8 @@ auto_restart = true
                 Some(self.file("dspark-support.gguf", b"support", 0o600));
             config.ds4.standalone.model = self.file("standalone.gguf", b"model", 0o600);
             config.ds4.standalone.model_manifest = self.file("standalone.json", b"{}", 0o600);
-            config.ds4.mxfp4.model = self.file("mxfp4.gguf", b"model", 0o600);
-            config.ds4.mxfp4.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
+            config.ds4.distributed.model = self.file("mxfp4.gguf", b"model", 0o600);
+            config.ds4.distributed.model_manifest = self.file("mxfp4.json", b"{}", 0o600);
             config.cluster.security.control_secret_file =
                 self.file("cluster-control", &[1; 32], 0o600);
             config.cluster.security.peer_proxy_token_file =
@@ -1063,7 +1231,7 @@ auto_restart = true
             config.cluster.state_path = self.root.join("cluster-state.json");
             config.cluster.manifest_cache_dir = self.root.join("manifests");
             config.ds4.standalone.kv_disk_dir = self.root.join("standalone-kv");
-            config.ds4.mxfp4.kv_disk_dir = self.root.join("distributed-kv");
+            config.ds4.distributed.kv_disk_dir = self.root.join("distributed-kv");
             config
         }
     }
@@ -1093,7 +1261,7 @@ auto_restart = true
             config.cluster.discovery.mode,
             DiscoveryMode::BonjourWithStaticFallback
         );
-        assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
         assert_eq!(config.ds4.standalone.residency, Residency::Resident);
         assert!(config.ds4.dspark.enabled);
         assert_eq!(config.ds4.dspark.confidence, Some(0.7));
@@ -1104,6 +1272,17 @@ auto_restart = true
         assert!(config.notifications.enabled);
         assert!(config.notifications.sound);
         assert!(config.startup_cleanup.auto_restart);
+        assert!(!config.recovery.enabled);
+        assert_eq!(
+            config.recovery.admission_drain_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.recovery.cooldown, Duration::from_secs(3_600));
+        assert_eq!(config.recovery.max_attempts_12h, 2);
+        assert_eq!(config.recovery.low_decode_tps, 5.0);
+        assert_eq!(config.recovery.low_decode_duration, Duration::from_secs(30));
+        assert_eq!(config.recovery.progress_stall, Duration::from_secs(60));
+        assert_eq!(config.recovery.canary_deadline, Duration::from_secs(30));
     }
 
     #[test]
@@ -1123,12 +1302,39 @@ auto_restart = true
     }
 
     #[test]
+    fn recovery_section_defaults_are_backward_compatible() {
+        let input = mode_aware_config();
+        let config: ModeAwareConfig = toml::from_str(input).unwrap();
+        assert_eq!(config.recovery, RecoveryConfig::default());
+    }
+
+    #[test]
+    fn recovery_section_accepts_explicit_opt_in_policy() {
+        let input = format!(
+            "{}\n[recovery]\nenabled = true\nadmission_drain_timeout = \"45s\"\ncooldown = \"2h\"\nmax_attempts_12h = 3\nlow_decode_tps = 4.5\nlow_decode_duration = \"20s\"\nprogress_stall = \"55s\"\ncanary_deadline = \"25s\"\n",
+            mode_aware_config()
+        );
+        let config: ModeAwareConfig = toml::from_str(&input).unwrap();
+        assert!(config.recovery.enabled);
+        assert_eq!(
+            config.recovery.admission_drain_timeout,
+            Duration::from_secs(45)
+        );
+        assert_eq!(config.recovery.cooldown, Duration::from_secs(7_200));
+        assert_eq!(config.recovery.max_attempts_12h, 3);
+        assert_eq!(config.recovery.low_decode_tps, 4.5);
+        assert_eq!(config.recovery.low_decode_duration, Duration::from_secs(20));
+        assert_eq!(config.recovery.progress_stall, Duration::from_secs(55));
+        assert_eq!(config.recovery.canary_deadline, Duration::from_secs(25));
+    }
+
+    #[test]
     fn parses_repository_schema_v2_example() {
         let config = ModeAwareConfig::parse(include_str!("../siderostat.example.toml"))
             .expect("repository example must remain parseable");
         assert_eq!(config.schema_version, 2);
-        assert_eq!(config.ds4.standalone.model_variant, ModelVariant::Q2Q4);
-        assert_eq!(config.ds4.mxfp4.coordinator_layers, "0:19");
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
+        assert_eq!(config.ds4.distributed.coordinator_layers, "0:19");
         assert!(config.ds4.dspark.enabled);
         assert_eq!(
             config.proxy.timeouts.first_body_byte,
@@ -1144,6 +1350,23 @@ auto_restart = true
             config.ds4.allow_sigkill,
             "install-generated configs must allow identity-verified owned DS4 children to be reaped"
         );
+    }
+
+    #[test]
+    fn accepts_legacy_model_variant_and_mxfp4_section_names() {
+        let legacy = mode_aware_config()
+            .replace(
+                "[ds4.distributed]\ntopology = \"layer-parallel\"\nquantization = \"mxfp4\"",
+                "[ds4.mxfp4]",
+            )
+            .replace("quantization = \"q2-q4\"", "model_variant = \"q2-q4\"");
+        let config = ModeAwareConfig::parse(&legacy).expect("legacy config should still load");
+        assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
+        assert_eq!(
+            config.ds4.distributed.topology,
+            DistributedTopology::LayerParallel
+        );
+        assert_eq!(config.ds4.distributed.quantization, Quantization::Mxfp4);
     }
 
     #[test]
@@ -1270,9 +1493,9 @@ auto_restart = true
     }
 
     #[test]
-    fn rejects_unknown_model_variant_and_residency() {
+    fn rejects_unknown_quantization_and_residency() {
         let bad_variant =
-            mode_aware_config().replace("model_variant = \"q2-q4\"", "model_variant = \"q8\"");
+            mode_aware_config().replace("quantization = \"q2-q4\"", "quantization = \"q8\"");
         assert!(toml::from_str::<ModeAwareConfig>(&bad_variant).is_err());
         let bad_residency =
             mode_aware_config().replace("residency = \"resident\"", "residency = \"automatic\"");
@@ -1298,7 +1521,7 @@ auto_restart = true
     fn rejects_shared_standalone_and_distributed_kv_path() {
         let files = ConfigTestFiles::new();
         let mut config = files.config();
-        config.ds4.mxfp4.kv_disk_dir = config.ds4.standalone.kv_disk_dir.clone();
+        config.ds4.distributed.kv_disk_dir = config.ds4.standalone.kv_disk_dir.clone();
         assert!(
             config
                 .validate()
@@ -1312,7 +1535,7 @@ auto_restart = true
     fn rejects_layer_gap_overlap_or_missing_output() {
         let files = ConfigTestFiles::new();
         let mut gap = files.config();
-        gap.ds4.mxfp4.worker_layers = "21:output".into();
+        gap.ds4.distributed.worker_layers = "21:output".into();
         assert!(
             gap.validate()
                 .unwrap_err()
@@ -1321,7 +1544,7 @@ auto_restart = true
         );
 
         let mut missing_output = files.config();
-        missing_output.ds4.mxfp4.worker_layers = "20:42".into();
+        missing_output.ds4.distributed.worker_layers = "20:42".into();
         assert!(
             missing_output
                 .validate()
@@ -1372,6 +1595,30 @@ auto_restart = true
     }
 
     #[test]
+    fn rejects_invalid_recovery_policy() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.recovery.max_attempts_12h = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery.max_attempts_12h")
+        );
+
+        let mut config = files.config();
+        config.recovery.low_decode_tps = f64::NAN;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery.low_decode_tps")
+        );
+    }
+
+    #[test]
     fn rejects_every_duration_at_zero_with_dotted_path() {
         let files = ConfigTestFiles::new();
         let paths = [
@@ -1396,6 +1643,11 @@ auto_restart = true
             "cluster.timeouts.coordinator_startup",
             "cluster.timeouts.complete_route",
             "cluster.timeouts.standalone_startup",
+            "recovery.admission_drain_timeout",
+            "recovery.cooldown",
+            "recovery.low_decode_duration",
+            "recovery.progress_stall",
+            "recovery.canary_deadline",
         ];
         for path in paths {
             let mut config = files.config();
@@ -1490,11 +1742,111 @@ auto_restart = true
 
     #[test]
     fn enum_names_are_stable_metric_labels() {
-        assert_eq!(ModelVariant::Q2.name(), "q2");
-        assert_eq!(ModelVariant::Q2Q4.name(), "q2-q4");
-        assert_eq!(ModelVariant::Mxfp4.name(), "mxfp4");
+        assert_eq!(Quantization::Q2.name(), "q2");
+        assert_eq!(Quantization::Q2Q4.name(), "q2-q4");
+        assert_eq!(Quantization::Mxfp4.name(), "mxfp4");
 
         assert_eq!(Residency::Resident.name(), "resident");
         assert_eq!(Residency::SsdStreaming.name(), "ssd-streaming");
+    }
+
+    // ---- B-01: runtime default config path resolution ----
+
+    fn never_exists(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn config_path_explicit_argument_wins_over_env_and_default() {
+        let explicit = Path::new("/tmp/explicit/siderostat.toml");
+        let resolved = resolve_config_path_pure(
+            Some(explicit),
+            Some(OsStr::new("/tmp/env/siderostat.toml")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap();
+        assert_eq!(resolved, explicit);
+        // user data を作成しない（path 解決は file を touch しない）
+        assert!(!explicit.exists());
+    }
+
+    #[test]
+    fn config_path_uses_siderostat_config_env_when_no_explicit() {
+        let resolved = resolve_config_path_pure(
+            None,
+            Some(OsStr::new("/tmp/env/siderostat.toml")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/env/siderostat.toml"));
+    }
+
+    #[test]
+    fn config_path_rejects_empty_siderostat_config() {
+        let error = resolve_config_path_pure(
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("/tmp/home")),
+            &never_exists,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("SIDEROSTAT_CONFIG is set but empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_path_uses_cwd_default_when_present() {
+        let current = PathBuf::from(DEFAULT_CONFIG_FILE);
+        let resolved =
+            resolve_config_path_pure(None, None, Some(OsStr::new("/tmp/home")), &|path| {
+                path == current
+            })
+            .unwrap();
+        assert_eq!(resolved, current);
+    }
+
+    #[test]
+    fn config_path_falls_back_to_application_support_when_home_present() {
+        let resolved =
+            resolve_config_path_pure(None, None, Some(OsStr::new("/tmp/home")), &|path| {
+                path == Path::new("/tmp/home/Library/Application Support/siderostat/config.toml")
+            })
+            .unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/home/Library/Application Support/siderostat/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_path_errors_when_home_missing() {
+        let error = resolve_config_path_pure(None, None, None, &never_exists)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HOME is not set"), "{error}");
+    }
+
+    #[test]
+    fn config_path_errors_when_home_empty() {
+        let error = resolve_config_path_pure(None, None, Some(OsStr::new("")), &never_exists)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HOME is set but empty"), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_path_resolves_under_application_support() {
+        let path = platform_default_path_pure(Some(OsStr::new("/Users/tester"))).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/tester/Library/Application Support/siderostat/config.toml")
+        );
+        assert_eq!(path.file_name().unwrap(), OsStr::new("config.toml"));
     }
 }

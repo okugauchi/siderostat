@@ -82,7 +82,7 @@ impl super::ProductionClusterRuntime {
             RoleControl::Worker(control) => control
                 .lock()
                 .await
-                .worker_ready_message(uuid::Uuid::new_v4().to_string())?,
+                .worker_ready_message(uuid::Uuid::new_v4().to_string(), generation)?,
             RoleControl::Coordinator(_) => anyhow::bail!("prepare-worker received by coordinator"),
         };
         self.inner.client.send(&message).await?;
@@ -162,6 +162,12 @@ impl super::ProductionClusterRuntime {
             };
             self.inner.proxy.set_target(paired.target, true);
             self.inner.proxy.admission().start_serving();
+            if self.note_planned_restart_child_stopped() {
+                // Pair may have arrived while Demote was being acknowledged early. The stop
+                // task owns completion in that case, so the reciprocal Pair and stability gate
+                // run only after the child is actually gone.
+                self.complete_pair_effect(true).await?;
+            }
         }
         Ok(())
     }
@@ -182,8 +188,14 @@ impl super::ProductionClusterRuntime {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if runtime.planned_restart_active() {
+                    continue;
+                }
                 if let Err(error) = runtime.reconcile().await {
                     tracing::error!(error = %error, "production cluster reconcile failed");
+                }
+                if runtime.planned_restart_active() {
+                    continue;
                 }
                 let snapshot = runtime.inner.mode.snapshot();
                 if snapshot.state == ClusterState::SoloStandaloneReady
@@ -197,6 +209,7 @@ impl super::ProductionClusterRuntime {
                 } else if snapshot.state == ClusterState::PairedStandaloneReady
                     && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_promote
+                    && !runtime.recovery_owner_active()
                     && promotion_running
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()

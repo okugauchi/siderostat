@@ -5,8 +5,8 @@ archive である。実装済みの現行仕様・運用手順は、次の activ
 
 - [`../../spec.md`](../../spec.md): 製品 behavior と安全要件
 - [`../../connection-state-machine.md`](../../connection-state-machine.md): 現行実装に基づく状態機械
-- [`../../operations.md`](../../operations.md): 現行の運用手順
-- [`../../troubleshooting.md`](../../troubleshooting.md): 現行の障害対応手順
+- [`../../internal-operations.md`](../../internal-operations.md): 現行の運用手順
+- [`../../internal-troubleshooting.md`](../../internal-troubleshooting.md): 現行の障害対応手順
 - [`../../compatibility/reconnect-acceptance-2026-08-17.md`](../../compatibility/reconnect-acceptance-2026-08-17.md): 実機 acceptance と Release Candidate 判定
 
 この archive は検証の再実行手順を削除するものではなく、完了済みの判断経緯と証跡の参照先を整理

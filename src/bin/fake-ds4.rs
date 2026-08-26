@@ -26,6 +26,18 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     chunk_count: usize,
 
+    #[arg(long, default_value_t = 100)]
+    chunk_delay_ms: u64,
+
+    #[arg(long, default_value_t = 100)]
+    first_chunk_delay_ms: u64,
+
+    #[arg(long)]
+    stall_after_chunks: Option<usize>,
+
+    #[arg(long, default_value_t = 200)]
+    http_status: u16,
+
     #[arg(long)]
     mid_stream_close_after_chunks: Option<usize>,
 
@@ -45,6 +57,10 @@ struct Args {
 #[derive(Debug)]
 struct FakeState {
     chunk_count: usize,
+    chunk_delay: Duration,
+    first_chunk_delay: Duration,
+    stall_after_chunks: Option<usize>,
+    http_status: StatusCode,
     mid_stream_close_after_chunks: Option<usize>,
 }
 
@@ -66,6 +82,11 @@ async fn run() -> Result<u8> {
 
     let state = Arc::new(FakeState {
         chunk_count: args.chunk_count,
+        chunk_delay: Duration::from_millis(args.chunk_delay_ms),
+        first_chunk_delay: Duration::from_millis(args.first_chunk_delay_ms),
+        stall_after_chunks: args.stall_after_chunks,
+        http_status: StatusCode::from_u16(args.http_status)
+            .context("parse fake DS4 HTTP status")?,
         mid_stream_close_after_chunks: args.mid_stream_close_after_chunks,
     });
     let app = Router::new()
@@ -111,6 +132,13 @@ async fn models() -> Json<Value> {
 }
 
 async fn streaming_response(State(state): State<Arc<FakeState>>) -> Response<Body> {
+    if !state.http_status.is_success() {
+        return Response::builder()
+            .status(state.http_status)
+            .body(Body::empty())
+            .expect("valid fake DS4 error response");
+    }
+
     let stream = stream::unfold(0_usize, move |index| {
         let state = state.clone();
         async move {
@@ -122,7 +150,14 @@ async fn streaming_response(State(state): State<Arc<FakeState>>) -> Response<Bod
                 return None;
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if state.stall_after_chunks.is_some_and(|limit| index >= limit) {
+                std::future::pending().await
+            }
+            if index == 0 {
+                tokio::time::sleep(state.first_chunk_delay).await;
+            } else {
+                tokio::time::sleep(state.chunk_delay).await;
+            }
             let frame = if index == state.chunk_count {
                 Bytes::from_static(b"data: [DONE]\n\n")
             } else {

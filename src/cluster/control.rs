@@ -23,7 +23,8 @@ pub enum ControlRole {
 pub enum ControlMode {
     SoloStandalone,
     PairedStandalone,
-    DistributedMxfp4,
+    #[serde(alias = "distributed-mxfp4")]
+    DistributedLayerParallel,
     Transitioning,
 }
 
@@ -41,6 +42,12 @@ pub enum DistributedControlPhase {
 #[serde(rename_all = "kebab-case")]
 pub enum WorkerEventKind {
     Ready,
+    /// Ready notification carrying the generation of the worker child that was started for the
+    /// current distributed lifecycle. The legacy `Ready` variant remains accepted for peers that
+    /// do not provide this diagnostic field.
+    ReadyWithChildGeneration {
+        child_generation: u64,
+    },
     Exited,
     Reconnecting,
 }
@@ -67,6 +74,8 @@ pub enum ControlCommand {
     WorkerEvent { event: WorkerEventKind },
     DistributedReady,
     Demote,
+    PrepareRestart,
+    CancelRestart,
 }
 
 impl ControlCommand {
@@ -80,6 +89,8 @@ impl ControlCommand {
             Self::WorkerEvent { .. } => ControlEndpoint::WorkerEvent,
             Self::DistributedReady => ControlEndpoint::DistributedReady,
             Self::Demote => ControlEndpoint::Demote,
+            Self::PrepareRestart => ControlEndpoint::PrepareRestart,
+            Self::CancelRestart => ControlEndpoint::CancelRestart,
         }
     }
 
@@ -133,6 +144,8 @@ pub enum ControlError {
     IdempotencyConflict,
     #[error("command is not accepted by this role")]
     CommandNotAllowed,
+    #[error("worker planned restart is still in progress")]
+    PlannedRestartInProgress,
     #[error("control command is not valid in phase {phase:?}")]
     InvalidPhase { phase: DistributedControlPhase },
 }
@@ -144,6 +157,7 @@ impl ControlError {
             Self::GenerationMismatch { .. }
             | Self::IdempotencyConflict
             | Self::PeerNotPaired
+            | Self::PlannedRestartInProgress
             | Self::InvalidPhase { .. } => 409,
             Self::CommandNotAllowed => 403,
             Self::EndpointMismatch
@@ -499,6 +513,8 @@ pub enum ControlEndpoint {
     WorkerEvent,
     DistributedReady,
     Demote,
+    PrepareRestart,
+    CancelRestart,
 }
 
 impl ControlEndpoint {
@@ -513,6 +529,8 @@ impl ControlEndpoint {
             ("POST", "/v1/worker-event") => Some(Self::WorkerEvent),
             ("POST", "/v1/distributed-ready") => Some(Self::DistributedReady),
             ("POST", "/v1/demote") => Some(Self::Demote),
+            ("POST", "/v1/prepare-restart") => Some(Self::PrepareRestart),
+            ("POST", "/v1/cancel-restart") => Some(Self::CancelRestart),
             _ => None,
         }
     }
@@ -658,6 +676,22 @@ mod tests {
             ControlEndpoint::parse("POST", "/v1/prepare-worker"),
             Some(ControlEndpoint::PrepareWorker)
         );
+        assert_eq!(
+            ControlEndpoint::parse("POST", "/v1/prepare-restart"),
+            Some(ControlEndpoint::PrepareRestart)
+        );
+        assert_eq!(
+            ControlEndpoint::parse("POST", "/v1/cancel-restart"),
+            Some(ControlEndpoint::CancelRestart)
+        );
+        assert_eq!(
+            ControlCommand::PrepareRestart.endpoint(),
+            ControlEndpoint::PrepareRestart
+        );
+        assert_eq!(
+            ControlCommand::CancelRestart.endpoint(),
+            ControlEndpoint::CancelRestart
+        );
         assert_eq!(ControlEndpoint::parse("POST", "/v1/node"), None);
         assert_eq!(ControlEndpoint::parse("GET", "/v1/pair"), None);
     }
@@ -668,5 +702,15 @@ mod tests {
         body.extend(&vec![0; CONTROL_BODY_LIMIT]).unwrap();
         assert_eq!(body.extend(&[0]), Err(AuthError::BodyTooLarge));
         assert_eq!(body.as_bytes().len(), CONTROL_BODY_LIMIT);
+    }
+
+    #[test]
+    fn reads_the_legacy_distributed_mxfp4_control_mode_alias() {
+        let mode: ControlMode = serde_json::from_str("\"distributed-mxfp4\"").unwrap();
+        assert_eq!(mode, ControlMode::DistributedLayerParallel);
+        assert_eq!(
+            serde_json::to_string(&mode).unwrap(),
+            "\"distributed-layer-parallel\""
+        );
     }
 }

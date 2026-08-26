@@ -96,11 +96,41 @@ impl AdmissionGate {
         self.lock().state = AdmissionState::Blocked;
     }
 
+    /// Keeps admission blocked while retiring the generation marker from a completed drain.
+    ///
+    /// Recovery transitions intentionally remain blocked after reaching a stable state. Unlike
+    /// `start_serving`, that state must not clear admission by itself, but the next transition
+    /// still needs to establish a fresh drain generation.
+    pub fn reset_blocked_generation(&self) {
+        let mut inner = self.lock();
+        debug_assert_eq!(inner.state, AdmissionState::Blocked);
+        debug_assert_eq!(inner.in_flight, 0);
+        inner.drain_generation = None;
+    }
+
     pub fn try_acquire(&self, upstream_ready: bool) -> Result<AdmissionPermit, AdmissionError> {
         let mut inner = self.lock();
         if inner.state != AdmissionState::Serving {
             return Err(AdmissionError::NotServing);
         }
+        self.acquire_permit(&mut inner, upstream_ready)
+    }
+
+    /// Acquire the one internal recovery-canary slot without changing public admission state.
+    /// The caller must authenticate and consume the recovery permit before calling this method.
+    pub fn try_acquire_recovery(
+        &self,
+        upstream_ready: bool,
+    ) -> Result<AdmissionPermit, AdmissionError> {
+        let mut inner = self.lock();
+        self.acquire_permit(&mut inner, upstream_ready)
+    }
+
+    fn acquire_permit(
+        &self,
+        inner: &mut Inner,
+        upstream_ready: bool,
+    ) -> Result<AdmissionPermit, AdmissionError> {
         if !upstream_ready {
             return Err(AdmissionError::UpstreamNotReady);
         }
@@ -108,7 +138,6 @@ impl AdmissionGate {
             return Err(AdmissionError::AtCapacity);
         }
         inner.in_flight += 1;
-        drop(inner);
         Ok(AdmissionPermit {
             shared: self.shared.clone(),
         })
@@ -237,6 +266,37 @@ mod tests {
         assert_eq!(gate.snapshot().state, AdmissionState::Draining);
         drop(permit);
         gate.drain(9, Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[test]
+    fn recovery_permit_is_one_request_exception_while_blocked() {
+        let gate = AdmissionGate::new(1);
+        let permit = gate.try_acquire_recovery(true).unwrap();
+        assert_eq!(gate.snapshot().in_flight, 1);
+        assert_eq!(
+            gate.try_acquire_recovery(true).unwrap_err(),
+            AdmissionError::AtCapacity
+        );
+        drop(permit);
+        assert_eq!(gate.snapshot().state, AdmissionState::Blocked);
+        assert_eq!(gate.snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_blocked_generation_keeps_admission_blocked() {
+        let gate = AdmissionGate::new(1);
+        gate.start_serving();
+        gate.drain(9, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(gate.snapshot().drain_generation, Some(9));
+
+        gate.reset_blocked_generation();
+
+        assert_eq!(gate.snapshot().state, AdmissionState::Blocked);
+        assert_eq!(gate.snapshot().drain_generation, None);
+        assert_eq!(
+            gate.try_acquire(true).unwrap_err(),
+            AdmissionError::NotServing
+        );
     }
 
     #[test]

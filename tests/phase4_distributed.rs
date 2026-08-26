@@ -403,7 +403,10 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
             .promote_after_hello(hello, &control, 1_001, Arc::new(|| true))
             .await
             .unwrap();
-        assert_eq!(distributed.stable_mode, StableMode::DistributedMxfp4);
+        assert_eq!(
+            distributed.stable_mode,
+            StableMode::DistributedLayerParallel
+        );
         assert!(coordinator_child.running.load(Ordering::SeqCst));
         assert!(worker_child.running.load(Ordering::SeqCst));
 

@@ -9,6 +9,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorStatus {
     Online,
+    /// The runtime is reachable, but the selected metrics source is temporarily
+    /// unavailable. Keep this distinct from a runtime connection failure.
+    Degraded,
     Offline,
 }
 
@@ -22,6 +25,7 @@ pub struct PrefillState {
     pub chunk_tps: f64,
     pub avg_tps: f64,
     pub elapsed_secs: f64,
+    pub progress_age_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -34,10 +38,12 @@ pub struct KvCacheState {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DecodeState {
     pub active: bool,
+    pub progress_observed: bool,
     pub completion: u64,
     pub chunk_tps: f64,
     pub avg_tps: f64,
     pub elapsed_secs: f64,
+    pub progress_age_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -123,6 +129,10 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .get("ds4_proxy_ds4_prefill_elapsed_seconds")
                 .copied()
                 .unwrap_or(0.0),
+            progress_age_secs: samples
+                .get("ds4_proxy_ds4_prefill_last_progress_age_seconds")
+                .copied()
+                .filter(|age| age.is_finite() && *age >= 0.0),
         },
         kv_cache: KvCacheState {
             hits_total: samples
@@ -142,6 +152,9 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
             active: samples
                 .get("ds4_proxy_ds4_generation_active")
                 .is_some_and(|v| *v != 0.0),
+            progress_observed: samples
+                .get("ds4_proxy_ds4_generation_progress_observed")
+                .is_some_and(|v| *v != 0.0),
             completion: samples
                 .get("ds4_proxy_ds4_generation_completion")
                 .map(|v| *v as u64)
@@ -158,6 +171,10 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
                 .get("ds4_proxy_ds4_generation_elapsed_seconds")
                 .copied()
                 .unwrap_or(0.0),
+            progress_age_secs: samples
+                .get("ds4_proxy_ds4_generation_last_progress_age_seconds")
+                .copied()
+                .filter(|age| age.is_finite() && *age >= 0.0),
         },
     }
 }
@@ -260,6 +277,8 @@ ds4_proxy_ds4_prefill_chunk_tps 123.4
 ds4_proxy_ds4_prefill_avg_tps 100.0
 # TYPE ds4_proxy_ds4_prefill_elapsed_seconds gauge
 ds4_proxy_ds4_prefill_elapsed_seconds 10.0
+# TYPE ds4_proxy_ds4_prefill_last_progress_age_seconds gauge
+ds4_proxy_ds4_prefill_last_progress_age_seconds 2.5
 # TYPE ds4_proxy_ds4_kv_cache_hits_total counter
 ds4_proxy_ds4_kv_cache_hits_total 7
 # TYPE ds4_proxy_ds4_kv_cache_hit_tokens gauge
@@ -270,6 +289,10 @@ ds4_proxy_ds4_kv_cache_load_ms 12.3
 ds4_proxy_ds4_generation_completion 42
 # TYPE ds4_proxy_ds4_generation_active gauge
 ds4_proxy_ds4_generation_active 1
+# TYPE ds4_proxy_ds4_generation_progress_observed gauge
+ds4_proxy_ds4_generation_progress_observed 1
+# TYPE ds4_proxy_ds4_generation_last_progress_age_seconds gauge
+ds4_proxy_ds4_generation_last_progress_age_seconds 3.5
 # TYPE ds4_proxy_ds4_generation_chunk_tps gauge
 ds4_proxy_ds4_generation_chunk_tps 32.1
 # TYPE ds4_proxy_ds4_generation_avg_tps gauge
@@ -286,14 +309,32 @@ ds4_proxy_ds4_generation_elapsed_seconds 1.5
         assert_eq!(snapshot.prefill.chunk_tps, 123.4);
         assert_eq!(snapshot.prefill.avg_tps, 100.0);
         assert_eq!(snapshot.prefill.elapsed_secs, 10.0);
+        assert_eq!(snapshot.prefill.progress_age_secs, Some(2.5));
         assert_eq!(snapshot.kv_cache.hits_total, 7);
         assert_eq!(snapshot.kv_cache.hit_tokens, 9005);
         assert_eq!(snapshot.kv_cache.load_ms, 12.3);
         assert!(snapshot.decode.active);
+        assert!(snapshot.decode.progress_observed);
         assert_eq!(snapshot.decode.completion, 42);
         assert_eq!(snapshot.decode.chunk_tps, 32.1);
         assert_eq!(snapshot.decode.avg_tps, 28.5);
         assert_eq!(snapshot.decode.elapsed_secs, 1.5);
+        assert_eq!(snapshot.decode.progress_age_secs, Some(3.5));
+
+        let without_progress_age = parse_metrics(
+            "ds4_proxy_ds4_prefill_active 1\n\
+ds4_proxy_ds4_prefill_chunk_tps 123.4\n\
+ds4_proxy_ds4_generation_active 1\n",
+        );
+        assert_eq!(without_progress_age.prefill.progress_age_secs, None);
+        assert!(!without_progress_age.decode.progress_observed);
+        assert_eq!(without_progress_age.decode.progress_age_secs, None);
+
+        let invalid_progress_age = parse_metrics(
+            "ds4_proxy_ds4_prefill_active 1\n\
+ds4_proxy_ds4_prefill_last_progress_age_seconds NaN\n",
+        );
+        assert_eq!(invalid_progress_age.prefill.progress_age_secs, None);
     }
 
     #[test]
@@ -311,9 +352,13 @@ ds4_proxy_cluster_generation{node_id="macstudio"} not-a-number
 
     #[test]
     fn parses_labels_with_quoted_values() {
-        let text = r#"ds4_proxy_cluster_mode{node_id="node-a",mode="distributed-mxfp4"} 1"#;
+        let text =
+            r#"ds4_proxy_cluster_mode{node_id="node-a",mode="distributed-layer-parallel"} 1"#;
         let snapshot = parse_metrics(text);
-        assert_eq!(snapshot.cluster_mode.as_deref(), Some("distributed-mxfp4"));
+        assert_eq!(
+            snapshot.cluster_mode.as_deref(),
+            Some("distributed-layer-parallel")
+        );
         assert_eq!(snapshot.node_id.as_deref(), Some("node-a"));
     }
 }

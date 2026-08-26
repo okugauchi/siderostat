@@ -12,7 +12,7 @@
 
 - 単一 process 内の cluster state machine（`ClusterState` / `StableMode` / `ProxyTarget`）。
 - Peer 間の control plane（HMAC 認証、lease、pairing handshake）。
-- Paired Standalone 形成、MXFP4 Distributed への promotion / demotion。
+- Paired Standalone 形成、Distributed (layer-parallel) への promotion / demotion。MXFP4はmodel quantizationとして別管理する。
 - Peer 喪失からの復帰（re-pair）経路。
 - 永続 state と backoff / manual intervention。
 

@@ -1,6 +1,6 @@
 //! Small shared helpers for the xtask runner.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     env,
     ffi::OsStr,
@@ -62,6 +62,59 @@ pub fn sha256_hex(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex(&hasher.finalize()))
+}
+
+/// Compute a deterministic SHA-256 for a directory tree.
+///
+/// The digest includes each relative file path and its file digest in sorted
+/// order. Directory metadata, traversal order, and absolute staging paths do
+/// not affect the result.
+pub fn sha256_tree(root: &Path) -> Result<String> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "directory does not exist: {}",
+        root.display()
+    );
+    let mut files = Vec::new();
+    collect_tree_files(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (relative, path) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(sha256_hex(&path)?.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn collect_tree_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("read directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_tree_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("strip directory prefix from {}", path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            files.push((relative, path));
+        } else {
+            bail!("unsupported entry in directory tree: {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Compute a SHA-256 with a progress log line before and after, so long hashing
@@ -466,6 +519,25 @@ mod tests {
                 expected
             );
             assert!(cache.entries["model"].sample_sha256.is_some());
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn tree_digest_is_stable_and_changes_with_file_content() -> Result<()> {
+        let dir = temporary_directory("tree")?;
+        let result = (|| -> Result<()> {
+            std::fs::create_dir(dir.join("nested"))?;
+            std::fs::write(dir.join("z.txt"), b"z")?;
+            std::fs::write(dir.join("nested/a.txt"), b"a")?;
+            let first = sha256_tree(&dir)?;
+            let second = sha256_tree(&dir)?;
+            assert_eq!(first, second);
+
+            std::fs::write(dir.join("nested/a.txt"), b"changed")?;
+            assert_ne!(first, sha256_tree(&dir)?);
             Ok(())
         })();
         let _ = std::fs::remove_dir_all(&dir);

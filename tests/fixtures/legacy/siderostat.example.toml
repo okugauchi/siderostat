@@ -67,9 +67,9 @@ max_in_flight = 1
 heartbeat_path = "/v1/models"
 
 [[backends]]
-id = "macstudio-remote"
+id = "remote-node"
 kind = "standalone"
-url = "https://macstudio-ds4.home.arpa"
+url = "https://remote.example.invalid"
 local = false
 enabled = true
 priority = 50

@@ -1,7 +1,15 @@
 # 開発者向け開発手順
 
-この文書は、siderostatの変更、ビルド、テストを行う開発者向けの手順です。通常の利用者は
-[README](../README.md)と[導入ガイド](installation.md)を参照してください。
+この文書は、siderostatの変更、ビルド、テスト、macOS 配布 artifact を扱う開発者向けの手順です。通常の利用者は
+[README](../README.md)と[利用者向け導入ガイド](installation.md)を参照してください。
+
+v0.3.0 の公式提供物はソースコードです。公式の事前ビルド済み `.app`、`.pkg`、DMG、
+`Siderostat Uninstaller.app` は配布しません。利用者向けの導入経路も、ソース checkout で
+`cargo xtask install --start` を実行する方法を正本とします。
+
+`app-dev`、`pkg-dev`、`dmg-dev`、`sign` は macOS のローカル artifact 検証と将来の任意の
+バイナリ配布を対象とする開発者向け workflow です。これらの署名・公証・timestamp は、
+v0.3.0 のソースリリース受入条件ではありません。
 
 ## 必要な環境
 
@@ -34,8 +42,20 @@ cargo xtask install --ci
 ```
 
 `cargo xtask install` は実行ファイル、設定、秘密情報、モデルのマニフェスト、macOSの
-起動項目を扱います。実機へインストールする場合は、[導入ガイド](installation.md)の
+起動項目を扱います。実機へインストールする場合は、[利用者向け導入ガイド](installation.md)の
 手順と確認項目を先に確認してください。
+
+配布 artifact の開発検証は次の順序で行う。
+
+```sh
+cargo xtask app-dev --version 0.3.0 --build-number <build> --verify
+cargo xtask pkg-dev --app-dir build/app-dev --version 0.3.0 --output-dir dist
+cargo xtask dmg-dev --app-dir build/app-dev --package dist/Siderostat-0.3.0.pkg \
+  --version 0.3.0 --build-number <build> --output-dir dist --verify
+```
+
+Developer ID 署名、公証、staple は `cargo xtask sign` の承認済み手順だけを使う。
+`--timestamp-mode none` の成果物は internal diagnostic artifact であり、配布物にしない。
 
 ## テストの考え方
 
@@ -52,4 +72,4 @@ cargo test --test reconnect_production --features test-support -- --test-threads
 
 - [貢献ガイド](../CONTRIBUTING.md): ブランチ、コミット、レビュー、検証の運用方針
 - [詳細仕様](spec.md): 状態機械、通信、設定、互換性の仕様
-- [導入ガイド](installation.md): 実機導入と受け入れ確認
+- [内部導入・受け入れ手順](internal-installation.md): 開発者向けの実機導入と受け入れ確認
