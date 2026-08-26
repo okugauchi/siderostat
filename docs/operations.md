@@ -63,11 +63,8 @@ job.
 
 ## Recovery and canary checks
 
-Siderostat can perform a bounded canary check when recovery is requested. The check verifies a
-meaningful response and response time; it is limited in duration and does not bypass the inference
-service's normal request queue. It does not include your prompts, responses, credentials, or API keys
-in notifications or diagnostic output. A recovery attempt may also record a redacted diagnostic snapshot
-for the administrator; it contains operational state only.
+Siderostat checks service responsiveness when recovery is requested. It does not include your prompts,
+responses, credentials, or API keys in notifications or diagnostic output.
 
 Automatic degraded recovery is disabled by default. When it is enabled by an administrator, it remains
 bounded by an attempt limit and a cooldown period before another attempt is allowed. A failed recovery keeps admission closed rather than
@@ -82,6 +79,5 @@ state on both Macs. If a recovery notification is still present, do not start th
 
 - Do not add a second Siderostat or inference-service login item.
 - Do not delete files under Siderostat's application-support data while the service is running.
-- Use the supplied uninstaller instead of manually deleting the app or stopping unrelated processes.
+- Use `cargo xtask uninstall` instead of manually deleting files or stopping unrelated processes.
 - Inference content, credentials, and API keys are not intended to appear in Siderostat notifications.
-- The dedicated Thunderbolt link is the trust boundary for communication between the Macs.

@@ -6,9 +6,6 @@ Siderostat lets two Apple silicon Macs work together as a two-node inference set
 connected by Thunderbolt, and Siderostat changes between local and distributed operation as the
 connection becomes ready or unavailable.
 
-This repository publishes source code. It does not provide an official prebuilt binary, DMG, or pkg.
-To run Siderostat, build it locally on each Mac from a reviewed source revision.
-
 > [!NOTE]
 > The currently verified model is DeepSeek V4 Flash. Other models are not supported unless a release
 > explicitly says otherwise.
@@ -45,7 +42,7 @@ They are model details, not operating-state or topology names.
 - A Thunderbolt cable and Thunderbolt networking enabled on both Macs.
 - A compatible inference service and model obtained from an approved source.
 
-## Source installation
+## Installation
 
 Install the same reviewed source revision on both Macs. From the repository checkout on each Mac:
 
@@ -55,10 +52,9 @@ cargo xtask install --start
 ```
 
 The command builds the local runtime and menu bar monitor, installs the user services, and starts them.
-It does not publish or require an Apple Developer ID signature. Connect the Thunderbolt cable after both
-Macs reach a normal standalone state.
+Connect the Thunderbolt cable after both Macs reach a normal standalone state.
 
-For the complete source-installation procedure, see the [installation guide](docs/installation.md).
+For the complete procedure, see the [installation guide](docs/installation.md).
 
 ## Using Siderostat
 
@@ -79,14 +75,10 @@ client application must decide whether a retry is safe.
 - A short interruption can occur while the operating state changes or the inference service starts.
 - Automatic degraded recovery is disabled by default. When enabled, recovery is bounded and does not
   bypass the inference service's normal request queue.
-- Mac-to-Mac tensor parallelism, RDMA layer-parallel transport, and distributed DSpark are planned for
-  v0.4+ and are not v0.3.0 features.
+- Mac-to-Mac tensor parallelism, RDMA transport, and distributed DSpark are not supported.
 
 ## End-user documentation
 
 - [Installation guide](docs/installation.md) · [日本語](docs/installation.ja.md)
 - [Operations guide](docs/operations.md) · [日本語](docs/operations.ja.md)
 - [Troubleshooting guide](docs/troubleshooting.md) · [日本語](docs/troubleshooting.ja.md)
-
-Apple Developer ID signing, notarization, timestamp services, DMG, and pkg generation are optional local
-validation workflows, not part of the source release.

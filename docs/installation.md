@@ -1,7 +1,6 @@
-# Installing Siderostat from source
+# Installing Siderostat
 
-This repository publishes source code only. It does not provide an official prebuilt application,
-DMG, or pkg. For the Japanese guide, see [docs/installation.ja.md](installation.ja.md).
+For the Japanese guide, see [docs/installation.ja.md](installation.ja.md).
 
 ## Requirements
 
@@ -23,8 +22,7 @@ cargo xtask install --start
 ```
 
 The first command records the model fingerprints used by the local configuration. The second command
-builds the runtime and menu bar monitor, installs the user services, and starts them. It does not install
-an application bundle under `/Applications` and does not require Developer ID credentials.
+builds the runtime and menu bar monitor, installs the user services, and starts them.
 
 Do not run a second Siderostat installation method on the same Mac. The source installer owns the runtime,
 the menu bar monitor, and their user services.

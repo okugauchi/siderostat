@@ -5,9 +5,6 @@
 Siderostat は、2台の Apple シリコン搭載 Mac を Thunderbolt で接続し、2ノードの推論環境として
 利用するためのソフトウェアです。接続の準備状態に応じて、単独稼働と分散稼働を切り替えます。
 
-このリポジトリではソースコードだけを公開します。公式のビルド済みバイナリ、DMG、pkg は配布しません。
-利用する場合は、確認済みのソースリビジョンを各 Mac 上でビルドしてください。
-
 > [!NOTE]
 > 現在動作確認済みのモデルは DeepSeek V4 Flash です。リリースで明示されていない他のモデルには対応していません。
 
@@ -42,7 +39,7 @@ Siderostat は、2台の Apple シリコン搭載 Mac を Thunderbolt で接続�
 - Thunderbolt ケーブルと、両方の Mac で有効にした Thunderbolt ネットワーク
 - 承認済みの取得元から用意した、対応する推論サービスとモデル
 
-## ソースからのインストール
+## インストール
 
 両方の Mac に同じ確認済みソースリビジョンを導入します。各 Mac のリポジトリ checkout で次を実行します。
 
@@ -52,7 +49,7 @@ cargo xtask install --start
 ```
 
 このコマンドはローカルの runtime とメニューバーモニターをビルドし、ユーザーサービスを登録して起動します。
-Apple Developer ID の署名は必要ありません。両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。
+両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。
 
 詳細な手順は[導入ガイド](docs/installation.ja.md)を参照してください。
 
@@ -73,13 +70,10 @@ http://127.0.0.1:18080/v1
 - Mac とモデルの構成は、ソースリビジョンで定められた互換性条件を満たす必要があります。
 - 動作状態の切り替え中や推論サービスの起動中は、短い中断が発生することがあります。
 - 自動的な縮退復旧は既定で無効です。有効にした場合も、復旧回数に上限があり、推論サービスの通常の要求待ち行列を迂回しません。
-- Mac 間の tensor parallelism、RDMA による layer-parallel transport、distributed DSpark は v0.4+ で予定しており、v0.3.0 の機能ではありません。
+- Mac 間の tensor parallelism、RDMA transport、distributed DSpark には対応していません。
 
 ## エンドユーザー向け文書
 
 - [導入ガイド](docs/installation.ja.md) · [English](docs/installation.md)
 - [運用ガイド](docs/operations.ja.md) · [English](docs/operations.md)
 - [トラブルシューティング](docs/troubleshooting.ja.md) · [English](docs/troubleshooting.md)
-
-Apple Developer ID 署名、公証、timestamp service、DMG、pkg の生成はローカル検証用の任意手順であり、
-ソースリリースには含めません。

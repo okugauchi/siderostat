@@ -1,11 +1,10 @@
-# Troubleshooting Siderostat source installations
+# Troubleshooting Siderostat
 
-This guide is for users who built Siderostat from this repository. For the Japanese guide, see
-[docs/troubleshooting.ja.md](troubleshooting.ja.md).
+For the Japanese guide, see [docs/troubleshooting.ja.md](troubleshooting.ja.md).
 
 ## The menu bar monitor does not appear
 
-From the same source checkout, run the source installation command once:
+From the same checkout, run the installation command once:
 
 ```sh
 cargo xtask install --start
@@ -53,7 +52,7 @@ or authentication data.
 
 Confirm that the user service was installed with `cargo xtask install --start`. If macOS asks for a login-item
 approval, open System Settings > General > Login Items and approve the Siderostat entries. After changing an
-approval, run the source installation command once more so the current state is refreshed.
+approval, run the installation command once more so the current state is refreshed.
 
 ## Updating or uninstalling reports an error
 

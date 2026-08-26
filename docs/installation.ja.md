@@ -1,6 +1,4 @@
-# Siderostat ソース導入ガイド
-
-このリポジトリではソースコードだけを公開します。公式のビルド済みアプリケーション、DMG、pkg は配布しません。
+# Siderostat 導入ガイド
 
 英語版（正本）: [docs/installation.md](installation.md)
 
@@ -24,8 +22,7 @@ cargo xtask install --start
 ```
 
 最初のコマンドは、ローカル設定で使用するモデルの fingerprint を記録します。次のコマンドは runtime と
-メニューバーモニターをビルドし、ユーザーサービスを登録して起動します。`/Applications` にアプリケーション
-バンドルをインストールせず、Developer ID の認証情報も必要としません。
+メニューバーモニターをビルドし、ユーザーサービスを登録して起動します。
 
 同じ Mac に別の Siderostat インストール方法を併用しないでください。ソース導入が runtime、メニューバーモニター、
 ユーザーサービスを管理します。
