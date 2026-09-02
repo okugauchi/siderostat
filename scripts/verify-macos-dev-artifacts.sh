@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${VERSION:-0.3.0}"
+VERSION="${VERSION:-0.3.1}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 APP_STAGING="${APP_STAGING:-$ROOT_DIR/build/app-dev-ci}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/build/pkg-ci-output}"

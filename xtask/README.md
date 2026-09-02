@@ -2,15 +2,15 @@
 
 `cargo xtask <command>` でインストール・検証・アンインストールを自動化する。
 
-## v0.3.0 の提供方針
+## v0.3.1 の提供方針
 
-v0.3.0 の公式提供物はソースコードであり、事前ビルド済みの `.app`、`.pkg`、DMG、
+v0.3.1 の公式提供物はソースコードであり、事前ビルド済みの `.app`、`.pkg`、DMG、
 `Siderostat Uninstaller.app` は配布しない。利用者向けの導入経路は、ソース checkout から
 `cargo xtask install --start` を実行する方法である。
 
 `app-dev`、`pkg-dev`、`dmg-dev`、`sign` は、各 Mac 上での bundle/package 構造確認、
 署名・公証の切り分け、または将来の任意バイナリ配布に備えた開発者向け workflow である。
-これらの artifact と Apple Developer ID、notary profile、secure timestamp は、v0.3.0 の
+これらの artifact と Apple Developer ID、notary profile、secure timestamp は、v0.3.1 の
 ソースリリース受入条件ではない。
 
 ```sh
@@ -180,7 +180,7 @@ Developer ID Application / Installer 署名、公証、stapling、最終検証�
 ```sh
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --build-number 7 \
   --application-identity "Developer ID Application: Example (TEAMID)" \
   --installer-identity "Developer ID Installer: Example (TEAMID)" \
@@ -197,7 +197,7 @@ cargo xtask sign \
 ```sh
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --build-number 14 \
   --application-identity "Developer ID Application: Example (TEAMID)" \
   --installer-identity "Developer ID Installer: Example (TEAMID)" \
@@ -220,7 +220,7 @@ notary log は既定で `dist/notary/`、build metadata は `dist/Siderostat-<ve
 ```sh
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --build-number 10 \
   --rollback \
   --application-identity "Developer ID Application: Example (TEAMID)" \
@@ -234,13 +234,13 @@ cargo xtask sign \
 公式のエンドユーザー配布物ではないローカル検証用 DMG を作成する場合は、`.pkg`、
 `Siderostat Uninstaller.app`、`README.html` だけを含める。これは bundle/package の構造、
 Uninstaller の挙動、または将来の任意バイナリ配布仕様を確認するためのものであり、
-v0.3.0 のリリース artifact にはならない。
+v0.3.1 のリリース artifact にはならない。
 
 ```sh
 cargo xtask dmg-dev \
   --app-dir build/app-dev \
-  --package dist/Siderostat-0.3.0.pkg \
-  --version 0.3.0 \
+  --package dist/Siderostat-0.3.1.pkg \
+  --version 0.3.1 \
   --build-number 11 \
   --output-dir dist \
   --verify
@@ -255,7 +255,7 @@ Application 署名後に提出する。`Siderostat Uninstaller.app` は `.pkg` �
 ```sh
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --build-number 11 \
   --application-identity "Developer ID Application: Example (TEAMID)" \
   --installer-identity "Developer ID Installer: Example (TEAMID)" \
@@ -266,5 +266,5 @@ cargo xtask sign \
 
 Uninstaller の標準動作は、Service Management の解除、対象 process の停止、`Siderostat.app` の Trash 移動、
 正確な package receipt の整理である。Application Support、secret、manifest、cluster state、model、KV cacheは
-保持する。v0.3.0 のソース導入では `cargo xtask uninstall` を使用する。Uninstaller.app を含む DMG の導線は、
+保持する。v0.3.1 のソース導入では `cargo xtask uninstall` を使用する。Uninstaller.app を含む DMG の導線は、
 将来の任意バイナリ配布を採用した場合に別途定義する。
