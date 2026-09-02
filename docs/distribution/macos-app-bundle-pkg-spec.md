@@ -1,10 +1,10 @@
 # Siderostat macOS Application Bundle / Installer Package 仕様
 
-- **現行方針（2026-08-26）**: v0.3.0 はソース公開のみであり、公式のバイナリ、`.pkg`、DMG、
+- **現行方針（2026-08-26）**: v0.3.1 はソース公開のみであり、公式のバイナリ、`.pkg`、DMG、
   `Siderostat Uninstaller.app` は配布しない。本書は既存の macOS bundle/package 実装と実機検証を
   説明する内部仕様、および将来の任意バイナリ配布・ローカル検証用の設計として保持する。
   本書に記載された Developer ID 署名、公証、secure timestamp、staple、Gatekeeper の条件は、
-  v0.3.0 のソースリリース受入条件ではない。
+  v0.3.1 のソースリリース受入条件ではない。
 
 - 文書状態: 配布構成・アンインストール構成 合意済み（実装・実機受入済み）
 - 作成日: 2026-08-18
@@ -59,7 +59,7 @@ Finder からの起動、初回承認、設定 UI、障害時の説明を UI の
 ### 2.3 将来の任意バイナリ配布単位
 
 この節は、将来 v0.4+ 以降で公式バイナリ配布を採用する場合、またはローカルで package
-workflow を検証する場合の設計である。v0.3.0 の公式導入は source checkout からの
+workflow を検証する場合の設計である。v0.3.1 の公式導入は source checkout からの
 `cargo xtask install --start` であり、以下の DMG、`.pkg`、Uninstaller は配布しない。
 
 バイナリ配布を採用する場合の候補は、次のファイルを収録した署名・公証済み DMG とする。
