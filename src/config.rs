@@ -748,7 +748,7 @@ fn validate_dspark(config: &ModeAwareConfig) -> anyhow::Result<()> {
         );
         anyhow::ensure!(
             config.ds4.standalone.residency == Residency::Resident,
-            "DSpark requires standalone residency = 'resident'; current DS4 does not support --ssd-streaming with --mtp"
+            "DSpark requires standalone residency = 'resident'; current DS4 does not support --ssd-streaming with --mtp-model"
         );
     } else {
         anyhow::ensure!(
@@ -863,6 +863,7 @@ pub(crate) fn validate_extra_args(name: &str, arguments: &[String]) -> anyhow::R
         "--ssd-streaming-preload-experts",
         "--ssd-streaming-cold",
         "--mtp",
+        "--mtp-model",
         "--dspark",
         "--dspark-confidence",
         "--dspark-strict",
@@ -1724,6 +1725,7 @@ auto_restart = true
         let files = ConfigTestFiles::new();
         for argument in [
             "--mtp",
+            "--mtp-model",
             "--dspark",
             "--dspark-confidence=0",
             "--dspark-strict",

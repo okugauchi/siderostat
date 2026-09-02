@@ -1,6 +1,6 @@
 # macOS user service draft（開発・診断用）
 
-この文書は bundle 外の開発 binary を検証するための legacy 手順です。v0.3.0 の公式提供物は
+この文書は bundle 外の開発 binary を検証するための legacy 手順です。v0.3.1 の公式提供物は
 ソースコードのみであり、公式の DMG、`.pkg`、`Siderostat Uninstaller.app` は配布しません。
 利用者は README の source installation guide に従い、`cargo xtask install --start` を使用してください。
 この手順と source workflow を同じ Mac で併用してはいけません。

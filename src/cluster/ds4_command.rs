@@ -191,7 +191,7 @@ pub fn build_standalone_command(config: &Ds4Config) -> Result<Ds4Command, Ds4Com
             .support_model
             .as_ref()
             .ok_or(Ds4CommandError::DsparkSupportModelRequired)?;
-        argv.push(OsString::from("--mtp"));
+        argv.push(OsString::from("--mtp-model"));
         argv.push(support_model.as_os_str().to_owned());
         argv.push(OsString::from("--dspark"));
         if let Some(confidence) = config.dspark.confidence {
@@ -376,7 +376,14 @@ mod tests {
             command.profile.speculative_support,
             SpeculativeSupport::Dspark
         );
-        assert_eq!(values.iter().filter(|value| *value == "--mtp").count(), 1);
+        assert_eq!(values.iter().filter(|value| *value == "--mtp").count(), 0);
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| *value == "--mtp-model")
+                .count(),
+            1
+        );
         assert_eq!(
             values.iter().filter(|value| *value == "--dspark").count(),
             1
@@ -384,7 +391,7 @@ mod tests {
         assert!(
             values
                 .windows(2)
-                .any(|pair| pair == ["--mtp", "/models/DSpark support.gguf"])
+                .any(|pair| pair == ["--mtp-model", "/models/DSpark support.gguf"])
         );
         assert!(
             values
