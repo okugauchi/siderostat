@@ -1,5 +1,6 @@
 use super::{NetworkSnapshot, ThunderboltIpState};
-use std::sync::RwLock;
+use crate::target::LocalRole;
+use std::{net::Ipv4Addr, sync::RwLock};
 
 /// Shared, latest verified network snapshot for the production control plane (N-02).
 ///
@@ -76,6 +77,30 @@ impl NetworkEvidence {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot
     }
+
+    /// Seed the evidence with a synthetic `AuthenticatedPeer` snapshot for dry-run mode.
+    ///
+    /// Dry-run must not observe the host's live interfaces or processes, but the control plane
+    /// is fail-closed and rejects `establish`/`renew` with `RouteNotScoped` unless `route_scoped`
+    /// holds. A synthetic bridge0-scoped, authenticated peer keeps the production control plane
+    /// and state machine fully functional while never touching a real interface or process. The
+    /// epoch is `u64::MAX` so no later (dry-run) update is treated as stale.
+    pub fn apply_dry_run(
+        &self,
+        role: LocalRole,
+        local_address: Ipv4Addr,
+        expected_peer_address: Ipv4Addr,
+    ) {
+        let snapshot = NetworkSnapshot {
+            epoch: u64::MAX,
+            state: ThunderboltIpState::AuthenticatedPeer,
+            role,
+            local_address: Some(local_address),
+            expected_peer_address: Some(expected_peer_address),
+            peer_present: true,
+        };
+        self.update(snapshot);
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +126,29 @@ mod tests {
         assert!(!evidence.route_scoped());
         assert!(!evidence.peer_present());
         assert_eq!(evidence.snapshot().epoch, 0);
+    }
+
+    #[test]
+    fn apply_dry_run_seeds_an_authenticated_scoped_peer() {
+        let evidence = NetworkEvidence::new();
+        assert!(!evidence.route_scoped());
+        assert!(!evidence.peer_present());
+
+        evidence.apply_dry_run(
+            LocalRole::Coordinator,
+            Ipv4Addr::new(10, 99, 0, 1),
+            Ipv4Addr::new(10, 99, 0, 2),
+        );
+        assert!(evidence.route_scoped());
+        assert!(evidence.peer_present());
+        let snapshot = evidence.snapshot();
+        assert_eq!(snapshot.epoch, u64::MAX);
+        assert_eq!(snapshot.state, ThunderboltIpState::AuthenticatedPeer);
+        assert_eq!(snapshot.local_address, Some(Ipv4Addr::new(10, 99, 0, 1)));
+        assert_eq!(
+            snapshot.expected_peer_address,
+            Some(Ipv4Addr::new(10, 99, 0, 2))
+        );
     }
 
     #[test]

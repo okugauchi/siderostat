@@ -3,7 +3,8 @@ use super::{
     ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
     CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
     DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
-    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor, HEADER_NODE,
+    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor,
+    DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle, HEADER_NODE,
     HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
     LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
     NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
@@ -264,7 +265,7 @@ struct ProductionInner {
     standalone: Arc<dyn LocalStandaloneLifecycle>,
     worker_runtime: Option<WorkerDistributedRuntime>,
     coordinator_runtime: OnceLock<CoordinatorDistributedRuntime>,
-    distributed_coordinator: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+    distributed_coordinator: OnceLock<Arc<dyn DistributedCoordinatorLifecycle>>,
     distributed_worker: Option<Arc<dyn DistributedWorkerLifecycle>>,
     config: ModeAwareConfig,
     manifest: DistributedManifest,
@@ -279,6 +280,10 @@ struct ProductionInner {
     /// Test-support only: recorded pair-phase timings across pair sessions (Q-01).
     #[cfg(feature = "test-support")]
     pair_timings: std::sync::Mutex<Vec<PairTiming>>,
+    /// When set, the runtime never touches a real DS4 process: standalone and distributed
+    /// children are simulated, and startup/restart/state persistence are skipped at the app
+    /// layer. The clustering state machine and control plane are unchanged.
+    dry_run: bool,
 }
 
 const PLANNED_RESTART_IDLE: u8 = 0;
@@ -492,11 +497,90 @@ impl ProductionClusterRuntime {
             control_session_generation,
             worker_child,
             coordinator_child,
+            false,
         )?;
         // N-02: share verified network observations into the control plane so `route_scoped` is
         // measured, not hard-coded. The monitor runs only for production (`new`); tests inject
         // evidence directly via `new_with_lifecycles`.
         runtime.start_network_evidence_monitor();
+        Ok(runtime)
+    }
+
+    /// Build a dry-run runtime that exercises the clustering state machine and control plane
+    /// without spawning or stopping a real ds4-server process. The standalone supervisor is
+    /// simulated, the distributed worker sends a simulated DS4 HELLO to the coordinator's
+    /// rendezvous listener, and the distributed coordinator's route readiness is derived from
+    /// the control plane (worker-prepared phase and peer lease) instead of a real DS4 log.
+    /// No network-evidence monitor is started: dry-run must not observe or mutate the host's
+    /// live interfaces/processes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_dry_run(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<StandaloneSupervisor>,
+        metrics: Arc<Metrics>,
+        manifest: DistributedManifest,
+        control_secret: Vec<u8>,
+        peer_control_port: u16,
+        control_session_generation: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let coordinator_address = config.cluster.coordinator_address;
+        let worker_address = config.cluster.worker_address;
+        let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
+        {
+            let worker_start = config
+                .ds4
+                .distributed
+                .worker_layers
+                .split_once(':')
+                .context("invalid worker layer range")?
+                .0
+                .parse::<u32>()
+                .map_err(anyhow::Error::from)?;
+            Some(Arc::new(DryRunWorkerLifecycle::new(DryRunHello {
+                coordinator_address,
+                worker_address,
+                distributed_port: config.cluster.ds4_distributed_port,
+                layer_start: worker_start,
+                context_size: config.ds4.distributed.context_size,
+                model_name: manifest.model_family.clone(),
+                listen_port: config.cluster.ds4_distributed_port,
+            })))
+        } else {
+            None
+        };
+        let runtime = Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            metrics,
+            manifest,
+            control_secret,
+            peer_control_port,
+            control_session_generation,
+            worker_child,
+            // The dry-run coordinator lifecycle is built inside `finish_coordinator` so its
+            // route probe can observe the control plane through a `Weak<ProductionInner>`.
+            None,
+            true,
+        )?;
+        // The control plane is fail-closed: without a bridge0-scoped peer it rejects
+        // establish/renew. Seed a synthetic authenticated-peer snapshot so the production
+        // control plane and state machine run unchanged, without observing the host's live
+        // interfaces. Local/peer are swapped by role, matching `new_inner`'s assignment.
+        let (local_address, peer_address) = match role {
+            LocalRole::Coordinator => (coordinator_address, worker_address),
+            LocalRole::Worker => (worker_address, coordinator_address),
+            LocalRole::Unknown => unreachable!(),
+        };
+        let (IpAddr::V4(local_v4), IpAddr::V4(peer_v4)) = (local_address, peer_address) else {
+            anyhow::bail!("dry-run cluster addresses must be IPv4");
+        };
+        runtime.inner.network.apply_dry_run(role, local_v4, peer_v4);
         Ok(runtime)
     }
 
@@ -516,6 +600,7 @@ impl ProductionClusterRuntime {
         control_session_generation: Option<u64>,
         worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
         coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
+        dry_run: bool,
     ) -> anyhow::Result<Self> {
         ensure!(role != LocalRole::Unknown, "cluster role is unknown");
         manifest.validate()?;
@@ -613,7 +698,10 @@ impl ProductionClusterRuntime {
             standalone,
             worker_runtime,
             coordinator_runtime: OnceLock::new(),
-            distributed_coordinator: coordinator_child,
+            distributed_coordinator: match coordinator_child {
+                Some(child) => OnceLock::from(child),
+                None => OnceLock::new(),
+            },
             distributed_worker,
             config,
             manifest,
@@ -624,6 +712,7 @@ impl ProductionClusterRuntime {
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
             pair_timings: std::sync::Mutex::new(Vec::new()),
+            dry_run,
         };
         let runtime = Self {
             inner: Arc::new(inner),
@@ -664,6 +753,7 @@ impl ProductionClusterRuntime {
             control_session_generation,
             worker_child,
             coordinator_child,
+            false,
         )
     }
 
@@ -671,12 +761,27 @@ impl ProductionClusterRuntime {
         if self.inner.role != LocalRole::Coordinator {
             return Ok(());
         }
-        let coordinator = self
-            .inner
-            .distributed_coordinator
-            .as_ref()
-            .context("coordinator supervisor unavailable")?
-            .clone();
+        let coordinator: Arc<dyn DistributedCoordinatorLifecycle> = if self.inner.dry_run {
+            // Dry-run observes the route from the control plane: the route is complete while
+            // the coordinator control phase indicates the worker has prepared (WorkerReady /
+            // Drained) and the peer lease is present.
+            let coordinator = Arc::new(DryRunCoordinatorLifecycle::new(Arc::new(
+                CoordinatorControlProbe {
+                    inner: Arc::downgrade(&self.inner),
+                },
+            )));
+            // The dry-run lifecycle is built here (its route probe needs the inner), so store
+            // it in the shared slot so diagnostics reports the simulated coordinator child.
+            // The non-dry-run supervisor is stored at construction instead.
+            let _ = self.inner.distributed_coordinator.set(coordinator.clone());
+            coordinator
+        } else {
+            self.inner
+                .distributed_coordinator
+                .get()
+                .context("coordinator supervisor unavailable")?
+                .clone()
+        };
         let peer = Arc::new(PeerLifecycle {
             inner: Arc::downgrade(&self.inner),
         });
@@ -1014,7 +1119,7 @@ impl ProductionClusterRuntime {
                 inner.standalone.is_running().await.ok(),
                 Some(standalone_ready),
             )),
-            distributed_coordinator: match &inner.distributed_coordinator {
+            distributed_coordinator: match inner.distributed_coordinator.get() {
                 Some(supervisor) => Some(child_diagnostics(
                     supervisor.child_identity().await,
                     supervisor.is_running().await.ok(),
@@ -1130,6 +1235,40 @@ pub struct ChildDiagnostics {
 
 // This type is filled out together with coordinator promotion below; keeping transport lifecycle
 // behavior here makes it impossible for admin operations to bypass authenticated control.
+/// Dry-run route probe. Production derives route readiness from the coordinator DS4 log; a
+/// dry-run runtime has no real DS4 log, so the probe mirrors the coordinator's own
+/// `promote_after_hello` prerequisite (`phase == WorkerReady && peer_present(now)`) while also
+/// accepting the post-drain `Drained` phase: `promote_inner` runs `peer.begin_drain()` before it
+/// polls the coordinator lifecycle's `wait_ready`, so by the time the probe is consulted the
+/// control phase has already advanced from `WorkerReady` to `Drained`. Both mean the worker has
+/// prepared and the distributed route is up; the phase returns to `Paired` on demote/peer loss,
+/// which is what makes `wait_route_loss` resolve. The weak reference keeps the probe from
+/// extending the runtime's lifetime.
+struct CoordinatorControlProbe {
+    inner: Weak<ProductionInner>,
+}
+
+impl DryRunRouteProbe for CoordinatorControlProbe {
+    fn probe(&self) -> BoxFuture<'static, bool> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let Some(inner) = inner.upgrade() else {
+                return false;
+            };
+            let RoleControl::Coordinator(control) = &inner.control else {
+                return false;
+            };
+            let now = now_millis();
+            let control = control.lock().await;
+            let route_up = matches!(
+                control.phase(),
+                DistributedControlPhase::WorkerReady | DistributedControlPhase::Drained
+            );
+            route_up && control.peer_present(now)
+        })
+    }
+}
+
 struct PeerLifecycle {
     inner: Weak<ProductionInner>,
 }

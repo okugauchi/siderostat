@@ -200,7 +200,7 @@ impl super::ProductionClusterRuntime {
     async fn stop_distributed_child(&self) -> anyhow::Result<()> {
         match self.inner.role {
             LocalRole::Coordinator => {
-                if let Some(coordinator) = &self.inner.distributed_coordinator {
+                if let Some(coordinator) = self.inner.distributed_coordinator.get() {
                     DistributedCoordinatorLifecycle::stop(coordinator.as_ref()).await?;
                 }
             }
@@ -224,7 +224,7 @@ impl super::ProductionClusterRuntime {
         let coordinator = self
             .inner
             .distributed_coordinator
-            .as_ref()
+            .get()
             .context("coordinator supervisor unavailable")?
             .clone();
         loop {

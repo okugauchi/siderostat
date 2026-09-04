@@ -316,6 +316,38 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(raw)
 }
 
+/// Build a DS4 HELLO frame in the same network-order layout that `parse_hello_frame` reads.
+///
+/// This is used only by the cluster dry-run mode to simulate a worker DS4 HELLO without
+/// spawning a real ds4-server process. The model name must not exceed
+/// `HELLO_MAX_MODEL_NAME_BYTES`; otherwise the built frame cannot be parsed.
+pub fn build_hello_frame(hello: &Ds4Hello) -> Vec<u8> {
+    let name = hello.model_name.as_bytes();
+    let payload_bytes = HELLO_FIXED_BYTES + name.len();
+    let mut frame = Vec::with_capacity(HEADER_BYTES + payload_bytes);
+    frame.extend_from_slice(&DS4D_MAGIC.to_be_bytes());
+    frame.extend_from_slice(&DS4D_HELLO_KIND.to_be_bytes());
+    frame.extend_from_slice(&(payload_bytes as u32).to_be_bytes());
+    let mut fixed = [0_u8; HELLO_FIXED_BYTES];
+    put_u32(&mut fixed, 0, hello.model_id);
+    put_u32(&mut fixed, 4, hello.quant_bits);
+    put_u32(&mut fixed, 8, hello.layer_start);
+    put_u32(&mut fixed, 12, hello.layer_end);
+    put_u32(&mut fixed, 16, u32::from(hello.has_output));
+    put_u32(&mut fixed, 20, u32::from(hello.has_hidden));
+    put_u32(&mut fixed, 24, hello.context_size);
+    put_u32(&mut fixed, 28, hello.layer_count);
+    put_u32(&mut fixed, 32, u32::from(hello.listen_port));
+    put_u32(&mut fixed, 36, name.len() as u32);
+    frame.extend_from_slice(&fixed);
+    frame.extend_from_slice(name);
+    frame
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +391,24 @@ mod tests {
         assert_eq!(hello.layer_count, 43);
         assert_eq!(hello.listen_port, 8000);
         assert_eq!(hello.model_name, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn built_hello_frame_round_trips_through_the_parser() {
+        let hello = Ds4Hello {
+            model_id: 1,
+            quant_bits: 2,
+            layer_start: 20,
+            layer_end: 42,
+            has_output: true,
+            has_hidden: true,
+            context_size: 262_144,
+            layer_count: 43,
+            listen_port: 9911,
+            model_name: "deepseek-v4-flash".into(),
+        };
+        let frame = build_hello_frame(&hello);
+        assert_eq!(parse_hello_frame(&frame).unwrap(), hello);
     }
 
     #[test]

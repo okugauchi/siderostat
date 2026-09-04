@@ -29,6 +29,11 @@ enum Command {
         /// Decline startup cleanup when stale siderostat/DS4 processes are detected.
         #[arg(long)]
         decline_startup_cleanup: bool,
+        /// Exercise clustering only: never start/stop/restart a real ds4-server process.
+        /// Skips startup cleanup, restart reconcile, and persistent-state writes. Development
+        /// only; it does not serve real inference.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect or mutate the already-running process through its admin API.
     Cluster {
@@ -110,6 +115,7 @@ async fn run_with(args: Args) -> anyhow::Result<()> {
         }
         Some(Command::Serve {
             decline_startup_cleanup,
+            dry_run,
         }) => {
             initialize_logging(&config);
             info!(
@@ -124,6 +130,7 @@ async fn run_with(args: Args) -> anyhow::Result<()> {
                 config,
                 app::ServeOptions {
                     decline_startup_cleanup,
+                    dry_run,
                 },
             )
             .await
@@ -443,7 +450,35 @@ mod tests {
         assert!(matches!(
             explicit.command,
             Some(Command::Serve {
-                decline_startup_cleanup: false
+                decline_startup_cleanup: false,
+                dry_run: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn serve_can_select_dry_run_mode() {
+        let args = Args::try_parse_from(["siderostat", "serve", "--dry-run"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Serve {
+                decline_startup_cleanup: false,
+                dry_run: true
+            })
+        ));
+        // dry-run は decline_startup_cleanup と独立に指定できる。
+        let combined = Args::try_parse_from([
+            "siderostat",
+            "serve",
+            "--dry-run",
+            "--decline-startup-cleanup",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.command,
+            Some(Command::Serve {
+                decline_startup_cleanup: true,
+                dry_run: true
             })
         ));
     }
@@ -455,7 +490,8 @@ mod tests {
         assert!(matches!(
             args.command,
             Some(Command::Serve {
-                decline_startup_cleanup: true
+                decline_startup_cleanup: true,
+                dry_run: false,
             })
         ));
     }

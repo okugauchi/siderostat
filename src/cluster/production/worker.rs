@@ -231,7 +231,7 @@ impl super::ProductionClusterRuntime {
         if let Some(worker) = &self.inner.distributed_worker {
             DistributedWorkerLifecycle::stop(worker.as_ref()).await?;
         }
-        if let Some(coordinator) = &self.inner.distributed_coordinator {
+        if let Some(coordinator) = self.inner.distributed_coordinator.get() {
             DistributedCoordinatorLifecycle::stop(coordinator.as_ref()).await?;
         }
         Ok(())
@@ -239,7 +239,7 @@ impl super::ProductionClusterRuntime {
 
     pub async fn distributed_child_identity(&self) -> Option<ChildIdentity> {
         match self.inner.role {
-            LocalRole::Coordinator => match &self.inner.distributed_coordinator {
+            LocalRole::Coordinator => match self.inner.distributed_coordinator.get() {
                 Some(child) => child.child_identity().await,
                 None => None,
             },

@@ -4,6 +4,7 @@ mod bonjour;
 mod control;
 mod coordinator;
 mod discovery;
+mod dry_run;
 mod ds4_command;
 mod ds4_hello;
 mod ds4_log;
@@ -44,6 +45,9 @@ pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,
 };
+pub(crate) use dry_run::{
+    DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle,
+};
 pub use ds4_command::{
     Ds4Command, Ds4CommandError, Ds4Profile, build_distributed_coordinator_command,
     build_distributed_worker_command, build_standalone_command,
@@ -51,7 +55,8 @@ pub use ds4_command::{
 pub use ds4_hello::{
     DS4D_HELLO_KIND, DS4D_MAGIC, Ds4Hello, Ds4HelloError, HELLO_FIXED_BYTES,
     HELLO_MAX_MODEL_NAME_BYTES, RendezvousControlSnapshot, RendezvousListener,
-    WorkerHelloExpectation, parse_hello_frame, read_hello_frame, validate_worker_hello,
+    WorkerHelloExpectation, build_hello_frame, parse_hello_frame, read_hello_frame,
+    validate_worker_hello,
 };
 pub use ds4_log::{
     ChildLogForwarders, ChildLogRecord, ChildLogStream, Ds4LogEvent, MAX_CHILD_LOG_LINE_BYTES,

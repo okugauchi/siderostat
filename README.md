@@ -68,6 +68,20 @@ The menu bar monitor shows the current state and progress. During startup or a s
 may temporarily fail with HTTP 503 or HTTP 504. Siderostat does not replay a failed request, so the
 client application must decide whether a retry is safe.
 
+### Dry-run mode (development only)
+
+`serve --dry-run` runs the node-to-node clustering (discovery, control plane, pairing, promotion,
+demotion, recovery) without starting, stopping, or restarting a real ds4-server process. Startup
+cleanup, restart reconcile, and persistent-state reads/writes are skipped. It is intended for
+developing and validating the clustering logic itself.
+
+```text
+siderostat serve --dry-run
+```
+
+Dry-run mode is a development-only flag: it is never enabled by default and must be passed
+explicitly. It does **not** serve real inference requests, so it must not be used in production.
+
 ## Limitations
 
 - Only two Macs are supported.
@@ -76,6 +90,7 @@ client application must decide whether a retry is safe.
 - Automatic degraded recovery is disabled by default. When enabled, recovery is bounded and does not
   bypass the inference service's normal request queue.
 - Mac-to-Mac tensor parallelism, RDMA transport, and distributed DSpark are not supported.
+- `serve --dry-run` is a development-only clustering check and does not process real inference.
 
 ## End-user documentation
 

@@ -516,6 +516,9 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServeOptions {
     pub decline_startup_cleanup: bool,
+    /// Exercise clustering only: never start/stop/restart a real ds4-server process, never
+    /// touch startup cleanup, restart reconcile, or the persistent state store.
+    pub dry_run: bool,
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
@@ -526,41 +529,70 @@ pub async fn serve_with_options(
     config: ModeAwareConfig,
     options: ServeOptions,
 ) -> anyhow::Result<()> {
-    validate_dspark_binding(&config).await?;
+    let dry_run = options.dry_run;
+    // dry-run は standalone child を起動しないため、DSpark バインド検証（実 model の
+    // fingerprint を読む）はスキップする。control plane の HMAC に必要な secret /
+    // manifest の読み込みは BootInputs 側で引き続き行う。
+    if !dry_run {
+        validate_dspark_binding(&config).await?;
+    }
     let boot = BootInputs::load(&config).await?;
-    match crate::startup_cleanup::cleanup_startup_processes(
-        std::process::id(),
-        &config.ds4.binary,
-        &platform_process_controller(),
-        config.cluster.timeouts.stop,
-        crate::startup_cleanup::StartupCleanupOptions {
-            decline: options.decline_startup_cleanup,
-            auto_restart: config.startup_cleanup.auto_restart,
-            notifications_enabled: config.notifications.enabled,
-            notification_sound: config.notifications.sound,
-        },
-    )
-    .await?
-    {
-        crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
-        | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
-        crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
-            anyhow::bail!(
-                "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
-            );
+    // dry-run は実プロセスに一切触れない: startup cleanup と restart reconcile をスキップし、
+    // 実 StateStore の読み書きもしない。クラスタリング本体（state machine / control plane /
+    // discovery / pairing / promotion / demotion / recovery）は production と同一の経路を動かす。
+    if dry_run {
+        tracing::info!(
+            "dry-run: skipping startup cleanup, restart reconcile, and state persistence"
+        );
+    } else {
+        match crate::startup_cleanup::cleanup_startup_processes(
+            std::process::id(),
+            &config.ds4.binary,
+            &platform_process_controller(),
+            config.cluster.timeouts.stop,
+            crate::startup_cleanup::StartupCleanupOptions {
+                decline: options.decline_startup_cleanup,
+                auto_restart: config.startup_cleanup.auto_restart,
+                notifications_enabled: config.notifications.enabled,
+                notification_sound: config.notifications.sound,
+            },
+        )
+        .await?
+        {
+            crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
+            | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
+            crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
+                anyhow::bail!(
+                    "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
+                );
+            }
         }
     }
-    let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
-    let persisted = load_persisted_state(&state_store)?;
+    let state_store = if dry_run {
+        None
+    } else {
+        Some(Arc::new(StateStore::acquire(&config.cluster.state_path)?))
+    };
+    let persisted = match &state_store {
+        Some(store) => load_persisted_state(store)?,
+        None => None,
+    };
     let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
-    let restart = reconcile_restart(
-        persisted.as_ref(),
-        &platform_process_controller(),
-        config.cluster.timeouts.stop,
-        config.ds4.allow_sigkill,
-        || required_port_available(local_address),
-    )
-    .await?;
+    let restart = if dry_run {
+        // dry-run は過去の永続状態を無視し、常に solo から開始する。
+        RestartDecision::StartSolo {
+            baseline_generation: 0,
+        }
+    } else {
+        reconcile_restart(
+            persisted.as_ref(),
+            &platform_process_controller(),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            || required_port_available(local_address),
+        )
+        .await?
+    };
     let state = AppState::from_config(config.clone())?;
     state.proxy.admission().block();
     state.proxy.set_target(
@@ -569,7 +601,7 @@ pub async fn serve_with_options(
         },
         false,
     );
-    let supervisor = build_standalone_supervisor(&config, &state)?;
+    let supervisor = build_standalone_supervisor(&config, &state, dry_run)?;
     // C-04a: graceful restart の fallback owner として supervisor への参照を保持する。
     // cluster 有効時は ProductionClusterRuntime が優先され、distributed child を所有する。
     state.attach_supervisor(supervisor.clone());
@@ -585,6 +617,7 @@ pub async fn serve_with_options(
         &runtime,
         &supervisor,
         control_session_generation,
+        dry_run,
     )?;
     let notifier = build_notifier(
         config.notifications.enabled,
@@ -600,24 +633,26 @@ pub async fn serve_with_options(
     state.attach_notification_service(notification_service.clone());
     let transition_monitor = spawn_transition_monitor(
         &state,
-        &state_store,
+        state_store.clone(),
         &runtime,
         &supervisor,
         production.as_ref(),
         &config.ds4.standalone.profile_id,
     );
-    persist_runtime_state(
-        &state_store,
-        &runtime,
-        &supervisor,
-        production.as_ref(),
-        &config.ds4.standalone.profile_id,
-    )
-    .await?;
+    if let Some(store) = &state_store {
+        persist_runtime_state(
+            store,
+            &runtime,
+            &supervisor,
+            production.as_ref(),
+            &config.ds4.standalone.profile_id,
+        )
+        .await?;
+    }
     let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
     let local_monitor = spawn_local_monitor(
         &state,
-        &state_store,
+        state_store.clone(),
         &runtime,
         &supervisor,
         &config.ds4.standalone.profile_id,
@@ -625,7 +660,12 @@ pub async fn serve_with_options(
     );
     // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
     // role が起動時の初期値から変化したらプロセス全体を再起動する。
-    let (_role_change_task, _role_change_watcher) = spawn_role_change_monitor(&config, role);
+    // dry-run は実プロセス再起動を伴うためこの監視は起動しない。
+    let (_role_change_task, _role_change_watcher) = if dry_run {
+        (None, None)
+    } else {
+        spawn_role_change_monitor(&config, role)
+    };
     run_servers(
         &config,
         state,
@@ -717,21 +757,34 @@ fn load_persisted_state(
 fn build_standalone_supervisor(
     config: &ModeAwareConfig,
     state: &Arc<AppState>,
+    dry_run: bool,
 ) -> anyhow::Result<Arc<StandaloneSupervisor>> {
     let command = build_standalone_command(&config.ds4)?;
     let models_url = url::Url::parse(&format!(
         "http://{}:{}/v1/models",
         config.ds4.http_host, config.ds4.http_port
     ))?;
-    Ok(Arc::new(StandaloneSupervisor::new(
-        command,
-        models_url,
-        config.cluster.timeouts.standalone_startup,
-        std::time::Duration::from_millis(250),
-        config.cluster.timeouts.stop,
-        config.ds4.allow_sigkill,
-        state.metrics.clone(),
-    )))
+    Ok(Arc::new(if dry_run {
+        StandaloneSupervisor::new_dry_run(
+            command,
+            models_url,
+            config.cluster.timeouts.standalone_startup,
+            std::time::Duration::from_millis(250),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            state.metrics.clone(),
+        )
+    } else {
+        StandaloneSupervisor::new(
+            command,
+            models_url,
+            config.cluster.timeouts.standalone_startup,
+            std::time::Duration::from_millis(250),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            state.metrics.clone(),
+        )
+    }))
 }
 
 async fn spawn_runtime(
@@ -778,24 +831,42 @@ fn attach_control_plane(
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     control_session_generation: Option<u64>,
+    dry_run: bool,
 ) -> anyhow::Result<Option<ProductionClusterRuntime>> {
     // detect_cluster_role は対象 interface に IPv4 が無い場合などに
     // LocalRole::Unknown を返す。Unknown は standalone 運用として想定済み
     // なので、production を生成せず起動を継続する。
     let production = if config.cluster.enabled && boot.role != LocalRole::Unknown {
-        Some(ProductionClusterRuntime::new(
-            config.clone(),
-            boot.role,
-            runtime.clone(),
-            state.proxy.clone(),
-            supervisor.clone(),
-            state.metrics.clone(),
-            boot.distributed_manifest
-                .context("distributed manifest is unavailable")?,
-            boot.control_secret
-                .context("control secret is unavailable")?,
-            control_session_generation,
-        )?)
+        if dry_run {
+            Some(ProductionClusterRuntime::new_dry_run(
+                config.clone(),
+                boot.role,
+                runtime.clone(),
+                state.proxy.clone(),
+                supervisor.clone(),
+                state.metrics.clone(),
+                boot.distributed_manifest
+                    .context("distributed manifest is unavailable")?,
+                boot.control_secret
+                    .context("control secret is unavailable")?,
+                config.cluster.control_port,
+                control_session_generation,
+            )?)
+        } else {
+            Some(ProductionClusterRuntime::new(
+                config.clone(),
+                boot.role,
+                runtime.clone(),
+                state.proxy.clone(),
+                supervisor.clone(),
+                state.metrics.clone(),
+                boot.distributed_manifest
+                    .context("distributed manifest is unavailable")?,
+                boot.control_secret
+                    .context("control secret is unavailable")?,
+                control_session_generation,
+            )?)
+        }
     } else {
         None
     };
@@ -841,7 +912,7 @@ pub async fn admin_http_reconcile(
         vec![0x42; 32],
     )?;
     let state = AppState::from_config(config.clone())?;
-    let supervisor = build_standalone_supervisor(config, &state)?;
+    let supervisor = build_standalone_supervisor(config, &state, false)?;
     state.attach_cluster(runtime.cluster_handle());
     if let Some(production) = &production {
         state.attach_production((**production).clone());
@@ -902,7 +973,7 @@ pub async fn admin_http_reconcile(
 
 fn spawn_transition_monitor(
     state: &Arc<AppState>,
-    state_store: &Arc<StateStore>,
+    state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     production: Option<&ProductionClusterRuntime>,
@@ -929,16 +1000,19 @@ fn spawn_transition_monitor(
             );
             previous = current;
             transition_started = std::time::Instant::now();
-            if let Err(error) = persist_runtime_state(
-                &transition_store,
-                &transition_runtime,
-                &transition_supervisor,
-                transition_production.as_ref(),
-                &transition_profile,
-            )
-            .await
-            {
-                tracing::error!(error = %error, "persistent cluster transition write failed");
+            // dry-run では永続化先が無いためスキップする（実 state を汚染しない）。
+            if let Some(store) = &transition_store {
+                if let Err(error) = persist_runtime_state(
+                    store,
+                    &transition_runtime,
+                    &transition_supervisor,
+                    transition_production.as_ref(),
+                    &transition_profile,
+                )
+                .await
+                {
+                    tracing::error!(error = %error, "persistent cluster transition write failed");
+                }
             }
         }
     })
@@ -975,7 +1049,7 @@ fn spawn_desktop_notifier(
 
 fn spawn_local_monitor(
     state: &Arc<AppState>,
-    state_store: &Arc<StateStore>,
+    state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     profile: &str,
@@ -1000,16 +1074,19 @@ fn spawn_local_monitor(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .observe_child_restart();
-                    if let Err(error) = persist_runtime_state(
-                        &local_monitor_store,
-                        &local_monitor_runtime,
-                        &local_monitor_supervisor,
-                        None,
-                        &local_monitor_profile,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %error, "persistent cluster state write failed");
+                    // dry-run では永続化先が無いためスキップする。
+                    if let Some(store) = &local_monitor_store {
+                        if let Err(error) = persist_runtime_state(
+                            store,
+                            &local_monitor_runtime,
+                            &local_monitor_supervisor,
+                            None,
+                            &local_monitor_profile,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %error, "persistent cluster state write failed");
+                        }
                     }
                 }
                 Ok(_) => {}
