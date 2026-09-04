@@ -1,0 +1,7 @@
+interface:
+  display_name: "Siderostat Review"
+  short_description: "実装完了報告前のコードレビュー"
+  default_prompt: "Use $siderostat-review to review the current development item before reporting it complete."
+
+policy:
+  allow_implicit_invocation: true
