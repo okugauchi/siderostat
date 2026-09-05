@@ -37,6 +37,12 @@ const ICON_SIZE: u32 = 18;
 const ICON_SUB: f32 = 4.0; // supersample factor for smooth circles
 const PROGRESS_STALL_AGE_SECS: f64 = 60.0;
 
+/// How long a proxy-external decode (generation_active=0 but the ds4 is
+/// generating) stays live after its last observed completion advance. The
+/// runtime leaves the ds4-side progress gauges populated after such a decode,
+/// so the tray uses this window to avoid showing a finished request forever.
+const DECODE_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct MonitorTray {
     _tray: TrayIcon,
     header: MenuItem,
@@ -592,15 +598,29 @@ fn menu_bar_title(
     String::new()
 }
 
+fn decode_live(display: &DisplayState) -> bool {
+    // An active generation (proxy-tracked, generation_active=1) is always
+    // meaningful: the user needs to see the first-token wait in progress
+    // rather than inherit a stale value from the previous request.
+    if display.decode_active {
+        return true;
+    }
+    // A proxy-external decode (generation_active=0 but the ds4 is generating)
+    // is only surfaced while its progress is fresh. The runtime leaves the
+    // ds4-side gauges populated after such a decode, so fall back to the last
+    // observed completion advance to avoid showing a finished request forever.
+    display.decode_progress_observed
+        && display
+            .decode_last_advance_at
+            .is_some_and(|at| at.elapsed() < DECODE_FRESH_WINDOW)
+}
+
 fn has_decode_values(display: &DisplayState) -> bool {
-    // An active generation with no observed token is still meaningful: the
-    // user needs to see that the first-token wait is in progress rather than
-    // inherit a stale value from the previous request.
-    display.decode_active
+    decode_live(display)
 }
 
 fn decode_throughput_title(display: &DisplayState) -> String {
-    if !display.decode_active {
+    if !decode_live(display) {
         String::new()
     } else if !display.decode_progress_observed {
         "decode waiting".to_string()
@@ -704,7 +724,7 @@ fn prefill_detail_text(display: &DisplayState) -> String {
 }
 
 fn decode_detail_text(display: &DisplayState) -> String {
-    if !display.decode_active {
+    if !decode_live(display) {
         return "Decode: --".to_string();
     }
     if !display.decode_progress_observed {
@@ -808,6 +828,7 @@ fn on_connector(x: f32, y: f32, top_cy: f32, bottom_cy: f32, cx: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn pixel(rgba: &[u8], px: u32, py: u32) -> [u8; 4] {
         let idx = ((py * ICON_SIZE + px) as usize) * 4;
@@ -989,6 +1010,55 @@ mod tests {
             menu_bar_title(&display, true, LiveMetric::PrefillAvgTps),
             ""
         );
+    }
+
+    #[test]
+    fn proxy_external_decode_is_surfaced_while_fresh() {
+        // generation_active=0 (no proxy tracking) but the ds4 is generating:
+        // completion has advanced within the freshness window.
+        let display = DisplayState {
+            decode_active: false,
+            decode_progress_observed: true,
+            decode_completion: 42,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            decode_progress_age_secs: Some(0.0),
+            decode_last_advance_at: Some(Instant::now()),
+            decode_last_completion: Some(42),
+            ..DisplayState::default()
+        };
+        assert!(has_decode_values(&display));
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillChunkTps),
+            "decode 32.1t/s"
+        );
+        assert_eq!(
+            decode_detail_text(&display),
+            "Decode: completion=42 chunk=32.1t/s avg=28.5t/s age=0.0s"
+        );
+    }
+
+    #[test]
+    fn stale_proxy_external_decode_is_hidden_after_freshness_window() {
+        // A finished proxy-external decode leaves the gauges populated but no
+        // longer advances; it must not be shown indefinitely.
+        let display = DisplayState {
+            decode_active: false,
+            decode_progress_observed: true,
+            decode_completion: 42,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            decode_progress_age_secs: Some(0.0),
+            decode_last_advance_at: Some(Instant::now() - Duration::from_secs(100)),
+            decode_last_completion: Some(42),
+            ..DisplayState::default()
+        };
+        assert!(!has_decode_values(&display));
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillChunkTps),
+            ""
+        );
+        assert_eq!(decode_detail_text(&display), "Decode: --");
     }
 
     #[test]
