@@ -53,8 +53,10 @@ pub struct PersistentChild {
 pub struct PersistentClusterState {
     pub schema_version: u32,
     pub generation: u64,
-    /// Control session generation (P0-B, `docs/control-session-negotiation.md` §7). Kept
-    /// separate from the cluster `generation` so a negotiated session survives a restart.
+    /// Control session generation (P0-B, Obsidian record
+    /// `Projects/siderostat/docs/archive/reconnect-2026-08/control-session-negotiation.md`
+    /// §7). Kept separate from the cluster `generation` so a negotiated session survives a
+    /// restart.
     /// `#[serde(default)]` lets older schema-version-1 state files (without this field) still
     /// load; callers fall back to the cluster generation when absent.
     #[serde(default)]

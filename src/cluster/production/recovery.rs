@@ -1,5 +1,6 @@
 //! Single PeerLost recovery owner shared by the control-reconcile path and the route-loss
-//! demotion monitor. See `docs/reconnect-peer-loss-design.md`.
+//! demotion monitor. See the Obsidian record
+//! `Projects/siderostat/docs/archive/reconnect-2026-08/reconnect-peer-loss-design.md`.
 
 use super::{RoleControl, now_millis};
 use crate::{

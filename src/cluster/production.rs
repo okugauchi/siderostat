@@ -1084,8 +1084,10 @@ impl ProductionClusterRuntime {
     }
 
     /// Read-only diagnostics snapshot for the reconnect diagnostics contract
-    /// (`docs/reconnect-diagnostics-contract.md`). Never mutates the runtime and never exposes
-    /// secrets, signatures, nonces, or full deployment IDs.
+    /// (Obsidian record
+    /// `Projects/siderostat/docs/archive/reconnect-2026-08/reconnect-diagnostics-contract.md`).
+    /// Never mutates the runtime and never exposes secrets, signatures, nonces, or full
+    /// deployment IDs.
     pub async fn diagnostics(&self) -> ProductionDiagnostics {
         let inner = &self.inner;
         let now = now_millis();
@@ -1183,7 +1185,9 @@ fn child_diagnostics(
 }
 
 /// Read-only reconnect diagnostics. Field semantics are fixed by
-/// `docs/reconnect-diagnostics-contract.md`; only additive changes are allowed.
+/// Obsidian record
+/// `Projects/siderostat/docs/archive/reconnect-2026-08/reconnect-diagnostics-contract.md`;
+/// only additive changes are allowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionDiagnostics {
     pub control_session: ControlSessionDiagnostics,

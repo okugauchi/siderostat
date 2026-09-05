@@ -2612,8 +2612,9 @@ fn valid_authenticated_evidence(role: LocalRole, epoch: u64) -> NetworkSnapshot 
 
 #[tokio::test]
 async fn network_evidence_truth_table_maps_every_state_to_route_and_peer_present() {
-    // N-03 completion: every ThunderboltIpState maps to the P2 truth table (docs/
-    // pairing-network-gate.md §8) route/peer-present outcome. `PeerCandidateFound` and
+    // N-03 completion: every ThunderboltIpState maps to the P2 truth table (Obsidian record
+    // Projects/siderostat/docs/archive/reconnect-2026-08/pairing-network-gate.md §8)
+    // route/peer-present outcome. `PeerCandidateFound` and
     // `AuthenticatedPeer` are the only route-scoped states; only `AuthenticatedPeer` is
     // peer present.
     let harness = TwoNode::boot().await.expect("boot two-node harness");

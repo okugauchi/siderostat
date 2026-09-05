@@ -28,7 +28,7 @@ cargo xtask sign [options]
 
 ## install
 
-`docs/internal-installation.md` 第5節と `contrib/launchd/README.md` の手順を1コマンドで実行する。
+Obsidian Vault の `Projects/siderostat/docs/internal-installation.md` 第5節と `contrib/launchd/README.md` の手順を1コマンドで実行する。
 
 実行順:
 

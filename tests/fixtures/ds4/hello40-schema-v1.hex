@@ -1,4 +1,5 @@
-# Synthetic DS4D HELLO frame derived from docs/spec.md section 17.2.
+# Synthetic DS4D HELLO frame derived from section 17.2 of the Siderostat specification
+# maintained in Obsidian.
 # This is not an actual DS4 capture and must not be used as actual acceptance evidence.
 # header: magic=DS4D kind=1 bytes=57
 44 53 34 44 00 00 00 01 00 00 00 39

@@ -460,7 +460,8 @@ impl DistributedCoordinatorLifecycle for FakeCoordinatorChild {
 
 /// Synthetic DS4D HELLO frame bytes used to satisfy the coordinator rendezvous listener during
 /// promotion. Matches the WorkerHelloExpectation in `test_config` (layer_start 20, output
-/// layer, context 262144, model deepseek-v4-flash) per docs/spec.md section 17.2.
+/// layer, context 262144, model deepseek-v4-flash) per section 17.2 of the Siderostat specification
+/// maintained in the Obsidian Vault.
 pub fn fake_worker_hello_bytes() -> Vec<u8> {
     include_str!("../fixtures/ds4/hello40-schema-v1.hex")
         .lines()

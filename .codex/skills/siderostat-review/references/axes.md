@@ -3,7 +3,7 @@
 CONTRIBUTING.md の Review 基準と、これまでの開発項目（cluster dry-run 等）のレビューから一般化した 7 つの観点。どの開発項目にも適用する。
 
 ## 軸1: Target behavior と仕様書の整合
-- 変更が仕様書（docs/spec.md 等）の対象動作と一致するか
+- 変更が仕様書（Obsidian Vault の `Projects/siderostat/docs/spec.md` 等）の対象動作と一致するか
 - 新設の CLI フラグ / 設定が正しく配線され、ServeOptions 等を経由して実体へ到達するか
 - 目的を production 実装の書き換えなしで実現しているか（専用の別経路を不必要に新設していないか）
 

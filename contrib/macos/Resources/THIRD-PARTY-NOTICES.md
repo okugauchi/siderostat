@@ -1,8 +1,9 @@
 # Third-party notices
 
 Siderostat uses third-party Rust packages. The v0.3.1 dependency graph is unchanged from v0.3.0;
-the complete inventory is recorded in
-`docs/releases/v0.3.0-dependencies.md` and is derived from the repository's locked dependency graph.
+the complete inventory is recorded in the Siderostat project knowledge base at
+`Projects/siderostat/docs/releases/v0.3.0-dependencies.md` in the Obsidian Vault and is derived from
+the repository's locked dependency graph.
 
 The inventory records each package name, exact version, SPDX license expression or license-file
 declaration, package source, and crates.io checksum. It covers normal, build, development,
