@@ -183,6 +183,10 @@ MMDD HH:MM:SS ds4-server: chat ctx=... gen=42 ... decoding chunk=... t/s avg=...
 - decode のタイトル値と詳細行は推論リクエスト中だけ表示し、応答完了後はクリアする。最初の
   progress event 前は `first-token waiting`、progress age 欠落時は `progress age unavailable`、
   60 秒以上の場合は `stalled` とし、古い chunk/average TPS を表示しない。
+- 本体の proxy を経由しない推論（`ds4_proxy_ds4_generation_active` が立たず、ds4 側の
+  progress gauge のみが更新されるケース）でも、直近の progress 進行（completion 増加）が確認
+  できている間は decode タイトル値・詳細行を表示する。応答後に progress が止まって一定時間
+  （既定 15 秒）経過するとクリアし、終了済みリクエストの値を残さない。
 - offline: `offline`
 - ツールチップに詳細（node_id、state）を表示する（mode 短縮名は含めない）。
 

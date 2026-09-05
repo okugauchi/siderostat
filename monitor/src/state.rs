@@ -9,6 +9,7 @@ use crate::{
     metrics::{MetricsSnapshot, MonitorStatus},
     service_management::ServiceStatus,
 };
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayState {
@@ -37,6 +38,15 @@ pub struct DisplayState {
     pub decode_avg_tps: f64,
     pub decode_elapsed_secs: f64,
     pub decode_progress_age_secs: Option<f64>,
+    /// When the ds4-side completion gauge last increased. Used to surface a
+    /// proxy-external decode (generation_active=0) while it is live and hide it
+    /// once a finished request leaves a stale value behind.
+    pub decode_last_advance_at: Option<Instant>,
+    /// Last observed ds4-side generation completion value. None until the
+    /// first metrics sample establishes a baseline, so a stale value left by a
+    /// proxy-external decode before this monitor started is not mistaken for
+    /// an in-progress decode on the very first poll.
+    pub decode_last_completion: Option<u64>,
 }
 
 impl Default for DisplayState {
@@ -67,6 +77,8 @@ impl Default for DisplayState {
             decode_avg_tps: 0.0,
             decode_elapsed_secs: 0.0,
             decode_progress_age_secs: None,
+            decode_last_advance_at: None,
+            decode_last_completion: None,
         }
     }
 }
@@ -95,6 +107,16 @@ impl DisplayState {
         self.decode_active = snapshot.decode.active;
         self.decode_progress_observed = snapshot.decode.progress_observed;
         self.decode_completion = snapshot.decode.completion;
+        let completion = snapshot.decode.completion;
+        // A stale value left by a proxy-external decode before this monitor
+        // started must not count as an advance on the first sample.
+        let advanced = self
+            .decode_last_completion
+            .is_some_and(|previous| completion > previous);
+        if snapshot.decode.active || (snapshot.decode.progress_observed && advanced) {
+            self.decode_last_advance_at = Some(Instant::now());
+        }
+        self.decode_last_completion = Some(completion);
         self.decode_chunk_tps = snapshot.decode.chunk_tps;
         self.decode_avg_tps = snapshot.decode.avg_tps;
         self.decode_elapsed_secs = snapshot.decode.elapsed_secs;
@@ -408,6 +430,46 @@ mod tests {
         assert_eq!(state.decode_completion, 42);
         assert_eq!(state.decode_elapsed_secs, 1.5);
         assert_eq!(state.decode_progress_age_secs, Some(3.5));
+    }
+
+    #[test]
+    fn apply_metrics_tracks_proxy_external_completion_advance() {
+        let mut state = DisplayState::default();
+        state.apply_metrics(&snapshot()); // decode active=true, completion=42
+        assert!(state.decode_active);
+        assert!(state.decode_last_advance_at.is_some());
+        assert_eq!(state.decode_last_completion, Some(42));
+
+        // Proxy-external decode: generation_active=0 but the ds4 is generating.
+        let mut external = snapshot();
+        external.decode.active = false;
+        external.decode.progress_observed = true;
+        external.decode.completion = 90;
+        state.apply_metrics(&external);
+        assert!(!state.decode_active);
+        assert!(state.decode_last_advance_at.is_some());
+        assert_eq!(state.decode_last_completion, Some(90));
+
+        // A stale poll (completion unchanged, not active) must not refresh the
+        // last-advance timestamp so the tray can age it out.
+        let stale_before = state.decode_last_advance_at;
+        state.apply_metrics(&external);
+        assert_eq!(state.decode_last_advance_at, stale_before);
+        assert_eq!(state.decode_last_completion, Some(90));
+    }
+
+    #[test]
+    fn first_poll_does_not_count_stale_completion_as_advance() {
+        // A stale proxy-external completion from before this monitor started
+        // must not surface as an in-progress decode on the very first poll.
+        let mut state = DisplayState::default();
+        let mut stale = snapshot();
+        stale.decode.active = false;
+        stale.decode.progress_observed = true;
+        stale.decode.completion = 5000;
+        state.apply_metrics(&stale);
+        assert!(state.decode_last_advance_at.is_none());
+        assert_eq!(state.decode_last_completion, Some(5000));
     }
 
     #[test]
