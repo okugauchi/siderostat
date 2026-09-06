@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repo": "https://github.com/antirez/ds4.git",
+    "branch": "main",
+    "tracked_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "tracked_commit_date": "2026-09-05",
+    "tracked_commit_subject": "Record long GLM quality controls and Spark decode gains",
+    "ancestry_proof": {
+      "method": "git rev-parse main origin/main (local clone at /Users/o/LLM/ds4)",
+      "main": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+      "origin_main": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+      "equal": true,
+      "note": "追跡対象は単一 commit に固定せず、upstream main 更新時に再検証・更新する。TP protocol 更新時は coordinator/worker を同一追跡対象で揃える。"
+    },
+    "protocol_version": 10,
+    "tp_magic": "0x44533454",
+    "tp_magic_label": "\"DS4T\"",
+    "source_digests": {
+      "README.md": "bfeaba2c53ed4ad681f6308c7fecb636becf0859ab7411e51142051a6a73beb4",
+      "ds4.c": "218a81f9bde26b2dceff2370a0c2343c07e38fdc068264d151d450f1b8a6a8d3",
+      "ds4_tp.c": "5ef79dfc260222c09388c388555c5ecd0b2fe791f7f62ae751909734fa9677d2",
+      "ds4_server.c": "2886bb615d340a6a1ccf7525bdceda7d68dcd4ad80bd9057f4f8febde4367375",
+      "ds4_agent.c": "95fd4230e1093e1727e468d646c24d3236813ececba10c1e8297827562f174f3",
+      "ds4_cli.c": "13876351b52d84c16a4d98155242131ec7bb6408cace66179040c0a836a557f4",
+      "ds4_distributed.c": "08ff11e22f2c5791de72cc910d94a6817c7a8310bde4b9cee57379f3be75e0f2",
+      "Makefile": "70703cd50026220b71acd8ddfd5cd2f707194fcf528dce7bab8425b363af5658"
+    }
+  },
+  "role_argv": {
+    "coordinator": {
+      "description": "HTTP/coordinator role; runs on the model owner machine.",
+      "executable_kind": ["ds4", "ds4-agent", "ds4-server", "ds4-bench"],
+      "argv": ["-m", "MODEL", "--tensor-parallel", "--role", "coordinator", "--listen", "HOST", "PORT", "--transport", "auto|rdma|tcp"],
+      "required": ["--listen HOST PORT"],
+      "prohibited": ["--coordinator", "--layers", "--dist-*"],
+      "evidence": [
+        "ds4_tp.c:465-473 (coordinator requires --listen HOST PORT, must not use --coordinator)",
+        "ds4_tp.c:486-491 (--role coordinator --tensor-parallel requires --listen HOST PORT; coordinator must not use --coordinator)",
+        "ds4_tp.c:302-317 (tp_listen), 1802-1809 (leader listens, waits for worker)",
+        "ds4_server.c:14396-14397 (ds4-server: listening on http://%s:%d after model load and session worker startup)",
+        "docs/DISTRIBUTED.md:75-76 (coordinator example: --listen 10.99.0.2 9911 --transport rdma --ctx 8192)",
+        "docs/DISTRIBUTED.md:88-89 (coordinator can be ds4/ds4-agent/ds4-server/ds4-bench; workers run ds4)"
+      ]
+    },
+    "worker": {
+      "description": "Worker role; runs ds4 only.",
+      "executable_kind": ["ds4"],
+      "argv": ["-m", "MODEL", "--tensor-parallel", "--role", "worker", "--coordinator", "HOST", "PORT", "--transport", "auto|rdma|tcp"],
+      "required": ["--coordinator HOST PORT"],
+      "prohibited": ["--listen", "--layers", "--dist-*"],
+      "evidence": [
+        "ds4_tp.c:479-489 (worker requires --coordinator HOST PORT)",
+        "ds4_tp.c:500-505 (--role worker --tensor-parallel requires --coordinator HOST PORT; worker must not use --listen)",
+        "ds4_tp.c:329-365 (worker tp_dial retries 200ms; logs every ~10s / 50 attempts while peer loads)",
+        "ds4_agent.c:903, ds4_server.c:14148-14150, ds4_bench.c:434, ds4_eval.c:1674 (worker role is ds4 only)",
+        "docs/DISTRIBUTED.md:71-72 (worker example: --coordinator 10.99.0.2 9911 --transport rdma --ctx 8192)",
+        "docs/DISTRIBUTED.md:88-89 (workers run ds4)"
+      ]
+    }
+  },
+  "cli_validation": {
+    "evidence": [
+      "ds4_tp.c:455-460 (--tensor-parallel selects its role through --role; tp.role must be DS4_TP_NONE)",
+      "ds4_tp.c:462-468 (requires --role coordinator or --role worker)",
+      "ds4_tp.c:471-476 (TP always uses one 50/50 worker; omit --layers)",
+      "ds4_tp.c:477-484 (--dist-* and distributed debug options cannot be used with --tensor-parallel)",
+      "ds4_tp.c:517-519 (tensor parallelism requires the Metal backend)",
+      "ds4_tp.c:526-531 (tensor-parallel options require --tensor-parallel and --role)",
+      "ds4_tp.c:537-540 (TP and --role distributed modes are exclusive)"
+    ]
+  },
+  "transport": {
+    "values": ["auto", "rdma", "tcp"],
+    "default": "auto",
+    "evidence": [
+      "ds4_tp.c:391-408 (usage: --transport <auto|rdma|tcp> Gate transport (default auto))",
+      "ds4_tp.c:1753-1760 (tp hello transport decision: RDMA only when both sides can; --transport rdma with missing device fails)",
+      "ds4_tp.c:1759-1762 (tp: --transport rdma but %s side has no active device)",
+      "docs/DISTRIBUTED.md:80-82 (use --transport tcp on both peers when RDMA unavailable)"
+    ],
+    "no_silent_tcp_fallback_for_rdma": "tp: --transport rdma but <peer/this> side has no active device (ds4_tp.c:1759)"
+  },
+  "rdma": {
+    "requirement": "active verbs device with IPv4-mapped GID on the cabled member interface; a working ping alone does not establish RDMA.",
+    "member_interface_ipv4": "required (bridge IP is not usable)",
+    "gid_form": "IPv4-mapped GID (e.g. ::ffff:10.99.0.2)",
+    "device_check": ["rdma_ctl status", "ibv_devinfo -v"],
+    "optional_argv": ["--rdma-device <name>", "--rdma-gid-index <n>"],
+    "evidence": [
+      "docs/DISTRIBUTED.md:25-33 (RDMA requires active verbs device with IPv4-mapped GID; ping alone insufficient)",
+      "docs/DISTRIBUTED.md:38-51 (member interface IPv4 aliases; example 10.99.0.2/30 and 10.99.0.1/30)",
+      "ds4_tp.c:391-408 (--rdma-device / --rdma-gid-index)",
+      "ds4_tp.c:122-127, 672-698 (member interface IPv4 / GID handling)"
+    ],
+    "os_changes_are_explicit": "OS 設定変更（ifconfig alias / sysctl iogpu.wired_limit_mb / rdma_ctl）は自動 probe に含めず、H01 の人間 packet に集約する。"
+  },
+  "startup_order": {
+    "order": [
+      "worker spawn first (Prepared/生存を確認)",
+      "coordinator spawn (worker Connected を先に待たない)",
+      "worker retries connection to coordinator while coordinator loads model",
+      "coordinator listens and accepts; does not wait for worker Connected to become HTTP ready"
+    ],
+    "worker_connect_retry": {
+      "interval_ms": 200,
+      "log_every_attempts": 50,
+      "log_interval_note": "約10s毎に接続試行ログ",
+      "evidence": "ds4_tp.c:329-365"
+    },
+    "coordinator_listen": "tp_listen (ds4_tp.c:302-317); leader prints 'ds4-tp: waiting for worker on %s:%d ...' (ds4_tp.c:1803-1805)",
+    "evidence": [
+      "docs/DISTRIBUTED.md:67-76 (Start the worker first; it retries while the coordinator loads)",
+      "ds4_tp.c:312-344 (worker retry loop)",
+      "ds4_tp.c:1802-1809 (leader accepts, does not block HTTP readiness on worker Connected)"
+    ]
+  },
+  "handshake_and_readiness": {
+    "protocol": {
+      "name": "TP hello (control channel)",
+      "magic": "DS4T (0x44533454)",
+      "version": 10,
+      "exchange": "ds4_tp_hello_fixed exchanged over control_fd (write_full + read_full)",
+      "fields": [
+        "magic", "version", "role", "rdma_ok", "gguf_bytes", "model_id",
+        "n_layer", "n_embd", "n_vocab", "quant_bits", "ctx_size",
+        "gate_slot_start", "gate_slot_step", "gates_per_token", "pad",
+        "gate_slot_mask[DS4_TP_GATE_MASK_WORDS]"
+      ],
+      "mismatch_rejection": {
+        "bad_magic": "mixed byte order or wrong peer (ds4_tp.c:1711-1716)",
+        "version_mismatch": "protocol version mismatch (ds4_tp.c:1718-1723)",
+        "same_role": "both sides claim role (ds4_tp.c:1725-1729)",
+        "model_mismatch": "gguf_bytes/model_id/n_layer/n_embd/n_vocab/quant_bits/gate schedule mismatch (ds4_tp.c:1731-1745)"
+      },
+      "evidence": "ds4_tp.c:40-57, 1312-1371, 1685-1745"
+    },
+    "model_identity_fields": [
+      "ds4_engine_model_bytes (gguf_bytes)",
+      "model_id",
+      "layer_count (n_layer)",
+      "embd_dim (n_embd)",
+      "vocab_size (n_vocab)",
+      "routed_quant_bits (quant_bits)",
+      "ctx_size",
+      "ds4_engine_tp_gate_schedule (gate_slot_start/step/gates_per_token/mask)"
+    ],
+    "http_readiness_observable": "ds4-server leader: 'ds4-server: listening on http://%s:%d' (ds4_server.c:14396-14397) after model load and session worker startup",
+    "worker_ready_observable": "ds4 worker: 'tp worker ready for mirrored sessions' (ds4_tp.c:2799)",
+    "prohibited": "TP socket への能動 probe / 独自 hello 送信・generic TCP connect や旧 DS4D HELLO を TP ready と誤認しない。handshake の成功のみを HTTP ready としない。"
+  },
+  "model_requirement": {
+    "same_tree_commit_gguf_path": "両 machine で同一 tree / commit / GGUF path が必要 (ds4_server.c:14234-14270, docs/DISTRIBUTED.md:15-16)",
+    "same_model_both_machines": "Download the same model on both machines (docs/DISTRIBUTED.md:64-65)",
+    "vision": "Pass the same --vision FILE to both for image input (docs/DISTRIBUTED.md:89-90)",
+    "speculative": "GLM MTP: enable --mtp on both. DeepSeek DSpark: both need matching support model and DSpark options (docs/DISTRIBUTED.md:91-93)"
+  },
+  "unsupported_conditions": {
+    "not_on_main": "main に未統合の PR は Reference 扱い（TP は本 main に統合済み）",
+    "help_tp_only_no_transport": "help に --transport が無い場合は Unsupported（本 main の usage には --transport あり: ds4_tp.c:391-408）",
+    "source_help_mismatch": "source と help 不一致は Candidate 拒否（現状 usage/parser/README は一致）",
+    "non_metal_backend": "tensor parallelism requires the Metal backend (ds4_tp.c:517-519)",
+    "no_active_rdma_device_with_rdma_transport": "tp: --transport rdma but <peer/this> side has no active device (ds4_tp.c:1759-1762)"
+  },
+  "verification_commands": [
+    "git -C /Users/o/LLM/ds4 rev-parse main origin/main",
+    "jq empty tests/fixtures/ds4/v040/contract.json"
+  ],
+  "review_notes": [
+    "generic TCP connect や旧 DS4D HELLO を TP ready と誤認しないこと。",
+    "source の準備完了観測（ds4-server: listening on http:// 行）を HTTP readiness として固定。handshake 成功のみを ready としない。",
+    "worker Connected を coordinator 起動前に待たない。",
+    "追跡対象 commit (9ab70534) は upstream main 更新時に再検証・更新する。protocol v10 固定ではない。"
+  ]
+}
