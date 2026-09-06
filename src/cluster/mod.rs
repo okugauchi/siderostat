@@ -34,7 +34,10 @@ pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };
 pub use bonjour::{BonjourFailure, BonjourLifecycle, BonjourRegistration};
-pub use capability::CapabilityStatus;
+pub use capability::{
+    CAPABILITY_MANIFEST_SCHEMA_VERSION, CapabilityAssessment, CapabilityError, CapabilityStatus,
+    Ds4CapabilityManifest, ExecutableKind, MainAncestryProof, RoleArtifact, RoleKind, Verification,
+};
 pub use control::{
     BoundedControlBody, ControlCommand, ControlEndpoint, ControlError, ControlMessage, ControlMode,
     ControlRequest, ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase,

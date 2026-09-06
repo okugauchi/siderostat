@@ -536,12 +536,12 @@ async fn fingerprint_metadata(path: &Path) -> io::Result<FileMetadata> {
     }
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     // serde_json's default map is a BTreeMap, so recursively serialized object keys are sorted.
     serde_json::to_vec(&serde_json::to_value(value)?)
 }
 
-fn validate_sha256(value: &str) -> Result<(), ManifestError> {
+pub(crate) fn validate_sha256(value: &str) -> Result<(), ManifestError> {
     if value.len() == 64
         && value
             .bytes()
@@ -553,7 +553,7 @@ fn validate_sha256(value: &str) -> Result<(), ManifestError> {
     }
 }
 
-fn validate_source_commit(value: &str) -> Result<(), ManifestError> {
+pub(crate) fn validate_source_commit(value: &str) -> Result<(), ManifestError> {
     if matches!(value.len(), 40 | 64)
         && value
             .bytes()
@@ -565,7 +565,7 @@ fn validate_source_commit(value: &str) -> Result<(), ManifestError> {
     }
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
