@@ -2401,9 +2401,13 @@ fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
                 )
             }
         },
-        Err(profile) => json_response(
+        Err(crate::cluster::AdminStartError::FingerprintBusy(profile)) => json_response(
             StatusCode::CONFLICT,
             json!({"error": format!("fingerprint job already running for {}", profile.as_str())}),
+        ),
+        Err(crate::cluster::AdminStartError::LeaseBusy(error)) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": format!("another lifecycle operation is in progress: {error}")}),
         ),
     }
 }
@@ -3151,7 +3155,10 @@ mod tests {
             assert_eq!(status, StatusCode::ACCEPTED, "{path}: {body}");
             let body: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["state"], "running");
-            assert!(body["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+            let job_id = body["job_id"].as_str().unwrap().to_string();
+            // P02 / C03: lifecycle 操作は単一オーナー lease で排他される。次の操作を
+            // 投げる前に現在の job が terminal になるのを待つ（各 job の認証+非同期形状を検証）。。
+            wait_for_job(&state, &job_id).await;
         }
         assert_eq!(missing, StatusCode::UNAUTHORIZED);
         assert_eq!(wrong, StatusCode::UNAUTHORIZED);
@@ -3159,6 +3166,33 @@ mod tests {
         let (malformed_unauthorized, _) =
             post(state, "/cluster/fingerprint", None, "not-json").await;
         assert_eq!(malformed_unauthorized, StatusCode::UNAUTHORIZED);
+    }
+
+    /// job が terminal（complete/failed）になるのを待つ。P02 の lease 解放を確認するために
+    /// 用いる。。。
+    async fn wait_for_job(state: &Arc<AppState>, job_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = state
+                .admin_controller()
+                .and_then(|admin| admin.job(job_id))
+                .map(|job| {
+                    matches!(
+                        job.state,
+                        crate::cluster::AdminJobState::Complete
+                            | crate::cluster::AdminJobState::Failed
+                    )
+                })
+                .unwrap_or(false);
+            if done {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job_id} did not reach terminal state in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

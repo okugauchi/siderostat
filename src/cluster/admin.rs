@@ -1,3 +1,4 @@
+use super::operation::{OperationId, OperationKind, OperationLease};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -9,6 +10,15 @@ use std::{
 use subtle::ConstantTimeEq;
 
 pub type AdminFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
+
+/// AdminController::start の開始失敗理由。P02 / C03 の排他・冪等性違反。。。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminStartError {
+    /// 同一 fingerprint profile の job が進行中。。
+    FingerprintBusy(FingerprintProfile),
+    /// lifecycle lease が他操作に占有されている（または Force による promotion 禁止）。。
+    LeaseBusy(super::operation::OperationLeaseError),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminAction {
@@ -64,6 +74,9 @@ pub struct AdminController {
     executor: Arc<dyn AdminExecutor>,
     jobs: Arc<Mutex<HashMap<String, AdminJob>>>,
     active_fingerprints: Arc<Mutex<HashSet<FingerprintProfile>>>,
+    /// 全 lifecycle 操作の単一オーナー lease（P02 / C03）。データ取得 job（fingerprint）は
+    /// 不要で、activation のみ排他。fingerprint 専用 HashSet だけで済ませない。
+    lease: OperationLease,
 }
 
 impl AdminController {
@@ -74,6 +87,7 @@ impl AdminController {
             executor,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             active_fingerprints: Arc::new(Mutex::new(HashSet::new())),
+            lease: OperationLease::new(),
         })
     }
 
@@ -87,7 +101,7 @@ impl AdminController {
         supplied.len() == self.token.len() && supplied.ct_eq(self.token.as_slice()).into()
     }
 
-    pub fn start(&self, action: AdminAction) -> Result<AdminJob, FingerprintProfile> {
+    pub fn start(&self, action: AdminAction) -> Result<AdminJob, AdminStartError> {
         let fingerprint_profile = match action {
             AdminAction::Fingerprint { profile } => Some(profile),
             _ => None,
@@ -98,7 +112,22 @@ impl AdminController {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !active.insert(profile) {
-                return Err(profile);
+                return Err(AdminStartError::FingerprintBusy(profile));
+            }
+        }
+        // P02 / C03: lifecycle 操作は OperationLease で単一オーナーを確保する。
+        // データ取得 job（fingerprint）は lease 不要。pair/promote は同一 Promotion lease。
+        let lease_kind = operation_kind(&action);
+        let operation_id = OperationId(uuid::Uuid::new_v4());
+        if let Some(kind) = lease_kind {
+            if let Err(error) = self.lease.try_acquire(kind, operation_id) {
+                if let Some(profile) = fingerprint_profile {
+                    self.active_fingerprints
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&profile);
+                }
+                return Err(AdminStartError::LeaseBusy(error));
             }
         }
         let job_id = uuid::Uuid::new_v4().to_string();
@@ -118,8 +147,13 @@ impl AdminController {
         let executor = self.executor.clone();
         let jobs = self.jobs.clone();
         let active_fingerprints = self.active_fingerprints.clone();
+        let lease = self.lease.clone();
         tokio::spawn(async move {
             let result = executor.execute(action).await;
+            // 完了時に lease を解放する（future drop を cancel に使わない）。。。
+            if let Some(kind) = lease_kind {
+                lease.release(kind, operation_id);
+            }
             let mut jobs = jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(job) = jobs.get_mut(&job_id) else {
                 return;
@@ -179,5 +213,17 @@ fn action_name(action: &AdminAction) -> &'static str {
         AdminAction::Demote { .. } => "demote",
         AdminAction::Restart => "restart",
         AdminAction::Fingerprint { .. } => "fingerprint",
+    }
+}
+
+/// lifecycle 操作を OperationKind へ対応付ける。データ取得（fingerprint）は None。。。
+/// pair/promote は同一 Promotion lease を共有する（同時進行しない）。。。。
+fn operation_kind(action: &AdminAction) -> Option<OperationKind> {
+    match action {
+        AdminAction::Reconcile => Some(OperationKind::Restart),
+        AdminAction::Pair | AdminAction::Promote => Some(OperationKind::Promotion),
+        AdminAction::Demote { .. } => Some(OperationKind::Demotion),
+        AdminAction::Restart => Some(OperationKind::Restart),
+        AdminAction::Fingerprint { .. } => None,
     }
 }

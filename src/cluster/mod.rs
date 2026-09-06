@@ -28,7 +28,7 @@ mod worker;
 
 pub use admin::{
     AdminAction, AdminController, AdminExecutor, AdminFuture, AdminJob, AdminJobState,
-    FingerprintProfile, encode_token,
+    AdminStartError, FingerprintProfile, encode_token,
 };
 pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
@@ -81,7 +81,10 @@ pub use network_snapshot::{
     InterfaceObservation, Ipv4Assignment, NetworkObservation, NetworkServiceObservation,
     NetworkSnapshot, PeerObservation, ThunderboltIpState,
 };
-pub use operation::{OperationId, PolicyEpoch, TpSessionId};
+pub use operation::{
+    IdempotencyOutcome, OperationEnvelope, OperationId, OperationKind, OperationLease,
+    OperationLeaseError, PolicyEpoch, TpSessionId, canonical_body_hash,
+};
 #[cfg(target_os = "macos")]
 pub use platform::{
     bonjour::{BonjourPlatformEvent, MacOsBonjourOperation, bridge0_interface_index},
