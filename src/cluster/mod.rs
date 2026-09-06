@@ -1,4 +1,5 @@
 mod admin;
+mod artifacts;
 mod auth;
 mod bonjour;
 mod capability;
@@ -30,6 +31,7 @@ pub use admin::{
     AdminAction, AdminController, AdminExecutor, AdminFuture, AdminJob, AdminJobState,
     AdminStartError, FingerprintProfile, encode_token,
 };
+pub use artifacts::{ResolveError, ResolvedDs4Profile, convert_layer_parallel};
 pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };
@@ -73,7 +75,8 @@ pub use ds4_log::{
 pub use manifest::{
     DEPLOYMENT_MANIFEST_SCHEMA_VERSION, DistributedManifest, FileFingerprint, FingerprintCache,
     FingerprintCacheState, FingerprintJob, FingerprintJobError, FingerprintJobStatus,
-    FingerprintJobs, ManifestError, StandaloneManifest, fingerprint_file,
+    FingerprintJobs, ManifestError, ModelIdentity, StandaloneManifest,
+    TP_DEPLOYMENT_MANIFEST_SCHEMA_VERSION, TpDeploymentManifest, fingerprint_file,
 };
 pub use network_events::{
     NetworkEvent, NetworkEventHandle, NetworkEventKind, RescanReason, RescanRequest,

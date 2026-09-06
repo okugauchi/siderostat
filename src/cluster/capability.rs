@@ -61,8 +61,10 @@ pub struct RoleArtifact {
     pub source_commit: String,
     pub arch: String,
     pub backend: String,
-    /// `--help` 出力の digest。help だけから全 capability を推測しない。
-    pub help_sha256: String,
+    /// `--help` 出力の digest。未検証（旧 LP 変換等）は None で表現し、捏造しない。
+    /// help だけから全 capability を推測しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help_sha256: Option<String>,
 }
 
 /// main ancestry の証明。追跡対象 commit が upstream main の祖先である証跡。
@@ -136,7 +138,9 @@ impl Ds4CapabilityManifest {
                 return Err(CapabilityError::DuplicateRole(artifact.role));
             }
             validate_sha256(&artifact.binary_sha256)?;
-            validate_sha256(&artifact.help_sha256)?;
+            if let Some(help) = &artifact.help_sha256 {
+                validate_sha256(help)?;
+            }
             validate_source_commit(&artifact.source_commit)?;
             if artifact.path.trim().is_empty()
                 || artifact.arch.trim().is_empty()
@@ -249,7 +253,7 @@ mod tests {
             source_commit: COMMIT.into(),
             arch: "aarch64".into(),
             backend: "metal".into(),
-            help_sha256: DIGEST.into(),
+            help_sha256: Some(DIGEST.into()),
         }
     }
 
@@ -329,7 +333,7 @@ mod tests {
             source_commit: COMMIT.into(),
             arch: "aarch64".into(),
             backend: "metal".into(),
-            help_sha256: DIGEST.into(),
+            help_sha256: Some(DIGEST.into()),
         };
         let mut m = manifest();
         m.role_artifacts = vec![worker, coord];

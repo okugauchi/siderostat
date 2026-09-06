@@ -22,7 +22,7 @@ fn worker_artifact() -> RoleArtifact {
         source_commit: COMMIT.into(),
         arch: "aarch64".into(),
         backend: "metal".into(),
-        help_sha256: DIGEST.into(),
+        help_sha256: Some(DIGEST.into()),
     }
 }
 
@@ -82,7 +82,7 @@ fn different_digest_per_role_resolved_by_role_specific_set() {
         source_commit: COMMIT.into(),
         arch: "aarch64".into(),
         backend: "metal".into(),
-        help_sha256: OTHER_DIGEST.into(),
+        help_sha256: Some(OTHER_DIGEST.into()),
     };
     let mut m = manifest();
     m.role_artifacts = vec![worker, coord];

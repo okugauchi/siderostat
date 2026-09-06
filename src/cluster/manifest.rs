@@ -10,6 +10,8 @@ use std::{
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
+use super::capability::{ExecutableKind, RoleArtifact, RoleKind};
+
 pub const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,6 +577,165 @@ fn default_layer_parallel_name() -> String {
 
 fn default_none_name() -> String {
     "none".into()
+}
+
+/// TP deployment manifest の schema version（C01 / T02）。schema3。
+pub const TP_DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 3;
+
+/// model の identity。任意 encoder/support/prefix_file digest は Option で保持する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelIdentity {
+    pub catalog_id: String,
+    pub sha256: String,
+    pub size: u64,
+    pub family: String,
+    pub quantization: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_file_digest: Option<String>,
+}
+
+impl ModelIdentity {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        validate_sha256(&self.sha256)?;
+        for value in [&self.catalog_id, &self.family, &self.quantization] {
+            if value.trim().is_empty() {
+                return Err(ManifestError::EmptyField);
+            }
+        }
+        if self.size == 0 {
+            return Err(ManifestError::ZeroSize);
+        }
+        for digest in [
+            &self.encoder_digest,
+            &self.support_digest,
+            &self.prefix_file_digest,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_sha256(digest)?;
+        }
+        Ok(())
+    }
+}
+
+/// TP deployment manifest（schema3）。role 別 binary 互換集合を保持し、
+/// host 固有 path は共有 deployment digest に含めない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpDeploymentManifest {
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub source_commit: String,
+    /// role 別 binary 互換集合。両 role の digest は同じでなくてよい。
+    pub role_artifacts: Vec<RoleArtifact>,
+    pub model: ModelIdentity,
+    pub transport: String,
+    pub context_size: u64,
+    /// argv 契約の ID。argv を共有 digest に混ぜるための固定参照。
+    pub argv_contract_id: String,
+}
+
+impl TpDeploymentManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.schema_version != TP_DEPLOYMENT_MANIFEST_SCHEMA_VERSION {
+            return Err(ManifestError::UnsupportedSchema(self.schema_version));
+        }
+        for value in [&self.profile_id, &self.transport, &self.argv_contract_id] {
+            if value.trim().is_empty() {
+                return Err(ManifestError::EmptyField);
+            }
+        }
+        validate_source_commit(&self.source_commit)?;
+        self.model.validate()?;
+        if self.context_size == 0 {
+            return Err(ManifestError::ZeroSize);
+        }
+        if self.role_artifacts.is_empty() {
+            return Err(ManifestError::EmptyField);
+        }
+        let mut roles = std::collections::BTreeSet::new();
+        for artifact in &self.role_artifacts {
+            if !roles.insert(artifact.role) {
+                return Err(ManifestError::EmptyField);
+            }
+            // role と executable_kind の整合性（worker → ds4、coordinator → ds4-server）。
+            let expected = match artifact.role {
+                RoleKind::Worker => ExecutableKind::Ds4,
+                RoleKind::Coordinator => ExecutableKind::Ds4Server,
+            };
+            if artifact.executable_kind != expected {
+                return Err(ManifestError::EmptyField);
+            }
+            // 同一 deployment 内で source_commit が揃っていること（source 差の拒否）。
+            if artifact.source_commit != self.source_commit {
+                return Err(ManifestError::InvalidSourceCommit);
+            }
+            validate_sha256(&artifact.binary_sha256)?;
+            if let Some(help) = &artifact.help_sha256 {
+                validate_sha256(help)?;
+            }
+            if artifact.compatible_binary_sha256.is_empty()
+                || artifact.compatible_binary_sha256.len() > 8
+                || !artifact
+                    .compatible_binary_sha256
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            {
+                return Err(ManifestError::InvalidBinaryCompatibilitySet);
+            }
+            for digest in &artifact.compatible_binary_sha256 {
+                validate_sha256(digest)?;
+            }
+            if artifact
+                .compatible_binary_sha256
+                .binary_search(&artifact.binary_sha256)
+                .is_err()
+            {
+                return Err(ManifestError::BinaryNotApproved);
+            }
+        }
+        Ok(())
+    }
+
+    /// 共有 deployment identity。source/model/role binary/transport/context/argv 契約の
+    /// canonical から digest を生成し、host 固有 path は含めない。
+    pub fn deployment_id(&self) -> Result<String, ManifestError> {
+        self.validate()?;
+        let mut role_binaries: Vec<&str> = self
+            .role_artifacts
+            .iter()
+            .map(|a| a.binary_sha256.as_str())
+            .collect();
+        role_binaries.sort_unstable();
+        #[derive(Serialize)]
+        struct DeploymentIdentity<'a> {
+            schema_version: u32,
+            profile_id: &'a str,
+            source_commit: &'a str,
+            role_binaries: &'a [&'a str],
+            model_sha256: &'a str,
+            transport: &'a str,
+            context_size: u64,
+            argv_contract_id: &'a str,
+        }
+        let identity = DeploymentIdentity {
+            schema_version: self.schema_version,
+            profile_id: &self.profile_id,
+            source_commit: &self.source_commit,
+            role_binaries: &role_binaries,
+            model_sha256: &self.model.sha256,
+            transport: &self.transport,
+            context_size: self.context_size,
+            argv_contract_id: &self.argv_contract_id,
+        };
+        Ok(lower_hex(&Sha256::digest(canonical_json(&identity)?)))
+    }
 }
 
 #[cfg(test)]
