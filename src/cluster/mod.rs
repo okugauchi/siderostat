@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod bonjour;
+mod capability;
 mod control;
 mod coordinator;
 mod discovery;
@@ -12,7 +13,9 @@ mod manifest;
 mod network_events;
 mod network_evidence;
 mod network_snapshot;
+mod operation;
 mod platform;
+mod policy;
 mod process;
 mod production;
 mod restart;
@@ -30,6 +33,7 @@ pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };
 pub use bonjour::{BonjourFailure, BonjourLifecycle, BonjourRegistration};
+pub use capability::CapabilityStatus;
 pub use control::{
     BoundedControlBody, ControlCommand, ControlEndpoint, ControlError, ControlMessage, ControlMode,
     ControlRequest, ControlResponse, ControlResponseStatus, ControlRole, DistributedControlPhase,
@@ -76,12 +80,14 @@ pub use network_snapshot::{
     InterfaceObservation, Ipv4Assignment, NetworkObservation, NetworkServiceObservation,
     NetworkSnapshot, PeerObservation, ThunderboltIpState,
 };
+pub use operation::{OperationId, PolicyEpoch, TpSessionId};
 #[cfg(target_os = "macos")]
 pub use platform::{
     bonjour::{BonjourPlatformEvent, MacOsBonjourOperation, bridge0_interface_index},
     macos::MacOsDynamicStoreWatcher,
     process::{MacOsProcessInspector, MacOsProcessSignaler},
 };
+pub use policy::OperationPolicy;
 pub use process::platform_process_controller;
 pub use process::{
     ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
