@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 
 mod effects;
 mod pairing;
+pub(crate) mod policy;
 mod reconcile;
 mod recovery;
 mod worker;

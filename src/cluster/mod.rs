@@ -103,6 +103,11 @@ pub use process::{
 };
 #[cfg(feature = "test-support")]
 pub use production::PairTiming;
+pub use production::policy::{
+    POLICY_CONTROL_PROTOCOL_VERSION, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
+    PolicyControlResponse, PolicyControlState, PolicyControlStatus, PolicyControlVerdict,
+    canonical_request_hash,
+};
 pub use production::{
     ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
     OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
