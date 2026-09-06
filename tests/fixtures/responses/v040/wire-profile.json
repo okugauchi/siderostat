@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "client": {
+    "name": "Codex (codex-cli)",
+    "installed_version": "0.153.4",
+    "source_repo": "https://github.com/openai/codex.git",
+    "tracked_tag": "rust-v0.153.4",
+    "tracked_tag_object_sha": "042fb41b7c813ac7999105e886b2b7aa715b5081",
+    "tracked_commit": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+    "tracked_commit_date": "2026-09-04",
+    "ancestry_proof": {
+      "method": "git clone --depth 1 --branch rust-v0.153.4 https://github.com/openai/codex.git; git rev-parse HEAD",
+      "head": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+      "note": "対象版は単一 commit に固定せず、Codex 版更新時に fixture を再取得・再検証する。"
+    },
+    "source_digests": {
+      "codex-rs/core/src/tools/hosted_spec.rs": "add42354c1662ced395898ba4b8bac9b4546ee5b5963cd40bc3f542fc950765c",
+      "codex-rs/core/tests/suite/web_search.rs": "7c837c64586b81ef3cac982ba33a719efbdd4c1ff3c5fb44b5cf880f09533af9",
+      "codex-rs/core/tests/common/responses.rs": "2d82f8b2287b178d1bb68b3cd021e5c0ad9e67d0811398a468140c973e266fee",
+      "codex-rs/protocol/src/models.rs": "22c4496e666cb3078abb8f82ce623c21695bd639cf38f7a33f93fb6d8d280190",
+      "codex-rs/protocol/src/config_types.rs": "96b4050a2498275ba5a11da0021bc75d5fb2fd2c50802f0930629aa7716a282a",
+      "codex-rs/ext/items/src/web_search.rs": "f4b11081a91a0c305fc79aaaba113a14ab314cf694a7a4e0b257fafe9a43a1c3",
+      "codex-rs/core/src/web_search.rs": "7029c8ad137965387cba1b499d653913110d6b10e209689bea0c78a891854d37",
+      "codex-rs/ext/web-search/src/tool.rs": "779bf921c096ca8cfad311342df1b76972790c497067e467064d01d58110a6d1"
+    }
+  },
+  "key_finding": {
+    "url_citation_annotation": {
+      "present": false,
+      "detail": "Codex 0.153.4 の ContentItem::OutputText は `{text: String}` のみで url_citation annotation field を持たない (models.rs:869-872)。codex リポジトリのツリー全体に url_citation は存在しない。provider は検索引用を url_citation annotation ではなく、web_search_call item（query/action）と model 自身の回答 text で伝える。",
+      "implication": "DwarfStar 調査文書の url_citation 再現は 0.153.4 の parser では非対応。概念例を完全 schema とは扱わない。URL citation は model 回答 text 内の文字として扱い、byte/scalar/UTF16 境界は W06 で固定する。"
+    }
+  },
+  "request_wire": {
+    "web_search_tool": {
+      "type": "web_search",
+      "fields": ["external_web_access", "indexed_web_access", "filters", "user_location", "search_context_size", "search_content_types"],
+      "mode_mapping": {
+        "disabled": "tool を送らない (hosted_spec.rs:19)",
+        "cached": "sent=true, external=false, indexed=null (hosted_spec.rs:16)",
+        "indexed": "sent=true, external=true, indexed=true (hosted_spec.rs:17)",
+        "live": "sent=true, external=true, indexed=null (hosted_spec.rs:18)",
+        "default_when_unset": "cached (config_types.rs:375-385, WebSearchMode default Cached)"
+      },
+      "exact_request_tool_example": {
+        "type": "web_search",
+        "external_web_access": true,
+        "indexed_web_access": true,
+        "filters": {"allowed_domains": ["example.com"]},
+        "user_location": {
+          "type": "approximate",
+          "country": "US",
+          "region": "California",
+          "city": "San Francisco",
+          "timezone": "America/Los_Angeles"
+        },
+        "search_context_size": "high",
+        "search_content_types": ["text", "image"]
+      },
+      "evidence": [
+        "hosted_spec.rs:14-46 (create_web_search_tool mode mapping + config passthrough)",
+        "hosted_spec_tests.rs:10-55 (WebSearchToolOptions preserves configured options)",
+        "tool_spec.rs:40-48 (ToolSpec::WebSearch fields)",
+        "tool_spec_tests.rs:344-385 (web_search_tool_spec_serializes_expected_wire_shape exact JSON)",
+        "config_types.rs:375-385 (WebSearchMode enum), 492-499 (WebSearchConfig)"
+      ]
+    },
+    "search_context_size": {
+      "values": ["low", "high"],
+      "note": "WebSearchContextSize::Low / High (hosted_spec_tests.rs:5, tool_spec_tests.rs:363)"
+    },
+    "user_location_type": "approximate (WebSearchUserLocationType::Approximate; hosted_spec_tests.rs:16, tool_spec_tests.rs:353)",
+    "filters": {"allowed_domains": "Option<Vec<String>>"}
+  },
+  "response_wire": {
+    "web_search_call_item": {
+      "added": {
+        "type": "response.output_item.added",
+        "item": {"type": "web_search_call", "id": "<id>", "status": "in_progress"}
+      },
+      "done": {
+        "type": "response.output_item.done",
+        "item": {"type": "web_search_call", "id": "<id>", "status": "completed", "action": {"type": "search", "query": "<q>"}}
+      },
+      "evidence": "responses.rs:892-913 (ev_web_search_call_added_partial / ev_web_search_call_done)"
+    },
+    "web_search_action_variants": {
+      "tag": "type",
+      "rename": "snake_case",
+      "search": {"query": "Option<String>", "queries": "Option<Vec<String>>"},
+      "open_page": {"url": "Option<String>"},
+      "find_in_page": {"url": "Option<String>", "pattern": "Option<String>"},
+      "other": "未知 variant は Other に fallback (serde(other))",
+      "evidence": "models.rs:1909-1932 (WebSearchAction), ext/items/src/web_search.rs:26-46 (standalone action, camelCase)"
+    },
+    "assistant_text": {
+      "message_item": {"type": "message", "role": "assistant", "id": "<id>", "content": [{"type": "output_text", "text": "<text>"}]},
+      "streaming": {"type": "response.output_text.delta", "delta": "<delta>"},
+      "evidence": "responses.rs:785-830 (ev_assistant_message / ev_message_item_added / ev_output_text_delta), models.rs:869-872 (OutputText { text })"
+    },
+    "non_streaming_object": "web_search_call と message の両方を含む completed response object を返す（W07 で SSE 再構成と nonstreaming object の一致を検証）",
+    "completed_event": {
+      "type": "response.completed",
+      "response": {"id": "<id>", "usage": {"input_tokens": 0, "input_tokens_details": null, "output_tokens": 0, "output_tokens_details": null, "total_tokens": 0}},
+      "evidence": "responses.rs:737-756 (ev_completed / ev_response_created)"
+    }
+  },
+  "acceptance_mapping": {
+    "cached_indexed_filter": {
+      "case": "cached/indexed/filter → 明示 unsupported",
+      "result": "cached (external=false) は受信可能。indexed (indexed=true) は unsupported。filters は受信のみ。MVP では明示 unsupported と返す"
+    },
+    "search_plus_client_function": {
+      "case": "search + client function → 両方保持",
+      "result": "web_search hosted tool と client function を同時受信可能。W03/W05 で往復変換"
+    },
+    "japanese_emoji_citation": {
+      "case": "日本語/絵文字 citation → 対象 parser の範囲と一致",
+      "result": "0.153.4 は url_citation 非保持。引用は model text 内の文字として扱う。byte/scalar/UTF16 境界は W06 で固定"
+    },
+    "mandatory_custom_tool": {
+      "case": "必須 custom tool 形式 → 対応タスクへ追加し scope から隠さない",
+      "result": "client function / custom tool の実形式は W02/W03 で固定。本 A03 では web_search hosted tool の wire のみ固定"
+    }
+  },
+  "verification_commands": [
+    "git -C /Users/o/LLM/codex-v040-tmp rev-parse HEAD",
+    "jq empty tests/fixtures/responses/v040/wire-profile.json"
+  ],
+  "review_notes": [
+    "簡単な検索 fixture だけで Codex backend 全体の互換を主張していないこと（W01〜W09 で通常会話・client tool・tool output・再ターンを扱う）。",
+    "ネット取得不能時は関連 W タスクのみ保留し、本 task の fixture 固定は完了と区別する。",
+    "対象版 rust-v0.153.4 は Codex 更新時に再検証・更新する。url_citation 非対応の判断を固定値として扱わない。"
+  ]
+}
