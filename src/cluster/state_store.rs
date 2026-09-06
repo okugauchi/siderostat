@@ -1,3 +1,4 @@
+use crate::cluster::policy::OperationPolicy;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -7,7 +8,9 @@ use std::{
 };
 use thiserror::Error;
 
-pub const PERSISTENT_STATE_SCHEMA_VERSION: u32 = 1;
+pub const PERSISTENT_STATE_SCHEMA_VERSION: u32 = 2;
+/// v1 からの移行元 schema バージョン。
+pub const PERSISTENT_STATE_SCHEMA_VERSION_V1: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +51,32 @@ pub struct PersistentChild {
     pub process_start_micros: u64,
 }
 
+/// 進行中の lifecycle 操作（policy 適用など）の journal エントリ。C03 の
+/// PolicyJournal.pending_operation に対応する。phase は副作用の進行に合わせて
+/// IntentSaved → PeerPrepared → Draining → StartingLocal → Applied / Failed と進む。
+/// intent は effect 前に fsync + atomic rename で永続化する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentPendingOperation {
+    pub id: uuid::Uuid,
+    pub kind: String,
+    pub phase: PersistentOperationPhase,
+    pub desired: OperationPolicy,
+    pub peer_ack: bool,
+    pub last_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PersistentOperationPhase {
+    IntentSaved,
+    PeerPrepared,
+    Draining,
+    StartingLocal,
+    Applied,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistentClusterState {
@@ -68,6 +97,18 @@ pub struct PersistentClusterState {
     pub active_profile: Option<String>,
     pub child: Option<PersistentChild>,
     pub last_failure: Option<PersistentFailureCode>,
+    /// 操作方針（C03）。v1 移行時は Automatic。`#[serde(default)]` で旧 field なしを許容。
+    #[serde(default)]
+    pub operator_policy: OperationPolicy,
+    /// 最後に applied された方針。intent と applied は別に保持する。
+    #[serde(default)]
+    pub applied_policy: OperationPolicy,
+    /// policy の世代。stale な control/peer を拒否するために用いる。
+    #[serde(default)]
+    pub policy_epoch: u64,
+    /// 進行中 operation の journal。intent は effect 前に永続化される。
+    #[serde(default)]
+    pub pending_operation: Option<PersistentPendingOperation>,
 }
 
 impl PersistentClusterState {
@@ -161,10 +202,25 @@ impl StateStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let state: PersistentClusterState = match serde_json::from_slice(&bytes) {
+        let mut state: PersistentClusterState = match serde_json::from_slice(&bytes) {
             Ok(state) => state,
             Err(error) => return Err(self.preserve_corrupt(error.to_string())?),
         };
+        // v1 → v2 移行（P01 / C03）: v1 正常時だけ backup して Automatic 方針へ移行する。
+        // 破損・未知 version は上書きしない。v1 には policy journal が無いため、移行時は
+        // operator_policy / applied_policy を Automatic、policy_epoch を 0 に設定する。
+        if state.schema_version == PERSISTENT_STATE_SCHEMA_VERSION_V1 {
+            state.schema_version = PERSISTENT_STATE_SCHEMA_VERSION;
+            state.operator_policy = OperationPolicy::Automatic;
+            state.applied_policy = OperationPolicy::Automatic;
+            state.policy_epoch = 0;
+            state.pending_operation = None;
+            if let Err(error) = state.validate() {
+                return Err(self.preserve_corrupt(error.to_string())?);
+            }
+            self.preserve_v1_backup(&bytes)?;
+            self.save(&state)?;
+        }
         if let Err(error) = state.validate() {
             return Err(self.preserve_corrupt(error.to_string())?);
         }
@@ -226,6 +282,25 @@ impl StateStore {
             path: preserved,
             reason,
         })
+    }
+
+    /// v1 → v2 移行時に元 v1 内容を backup して保持する（C03: 旧 binary へ rollback する際の
+    /// v1 backup を保持）。rename 後に parent を fsync して永続化を保証する。
+    fn preserve_v1_backup(&self, bytes: &[u8]) -> Result<(), StateStoreError> {
+        let backup = sibling_path(&self.path, &format!("v1-backup-{}", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&backup)?;
+        set_private_permissions(&file)?;
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -291,6 +366,10 @@ mod tests {
                 process_start_micros: 200,
             }),
             last_failure: None,
+            operator_policy: OperationPolicy::Automatic,
+            applied_policy: OperationPolicy::Automatic,
+            policy_epoch: 0,
+            pending_operation: None,
         }
     }
 

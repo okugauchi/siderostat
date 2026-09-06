@@ -124,8 +124,9 @@ fn decode_hash(value: &str) -> Result<[u8; 32], RestartReconcileError> {
 mod tests {
     use super::*;
     use crate::cluster::{
-        ObservedProcess, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentMode,
-        PersistentProxyTarget, ProcessInspector, ProcessSignal, ProcessSignaler, argv_sha256,
+        ObservedProcess, OperationPolicy, PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild,
+        PersistentMode, PersistentProxyTarget, ProcessInspector, ProcessSignal, ProcessSignaler,
+        argv_sha256,
     };
     use std::{
         ffi::OsString,
@@ -182,6 +183,10 @@ mod tests {
                 process_start_micros: observed.start_time_micros,
             }),
             last_failure: None,
+            operator_policy: OperationPolicy::Automatic,
+            applied_policy: OperationPolicy::Automatic,
+            policy_epoch: 0,
+            pending_operation: None,
         };
         (state, observed)
     }

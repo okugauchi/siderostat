@@ -4,10 +4,13 @@
 
 /// クラスタの操作方針。メニューバーから自動接続（Automatic）と
 /// Standalone 強制（ForcedStandalone）を切り替える。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OperationPolicy {
+    /// 既定。peer 発見・pair・promotion を自動で行う。。
+    #[default]
     Automatic,
+    /// Standalone を強制。TP/pair/promote/retry を禁止し local Standalone を維持する。
     ForcedStandalone,
 }
 

@@ -1351,6 +1351,19 @@ async fn persist_runtime_state(
         Some(production) => production.control_session_generation().await,
         None => snapshot.generation,
     };
+    // P01 / C03: policy journal（operator_policy / applied_policy / policy_epoch /
+    // pending_operation）は runtime の再保存で自動に戻さない。既存 state から引き継ぐ。
+    let prior = store.load()?;
+    let operator_policy = prior
+        .as_ref()
+        .map(|state| state.operator_policy)
+        .unwrap_or_default();
+    let applied_policy = prior
+        .as_ref()
+        .map(|state| state.applied_policy)
+        .unwrap_or_default();
+    let policy_epoch = prior.as_ref().map(|state| state.policy_epoch).unwrap_or(0);
+    let pending_operation = prior.and_then(|state| state.pending_operation);
     store.save(&PersistentClusterState {
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
@@ -1372,6 +1385,10 @@ async fn persist_runtime_state(
         ),
         child,
         last_failure: None,
+        operator_policy,
+        applied_policy,
+        policy_epoch,
+        pending_operation,
     })?;
     Ok(())
 }

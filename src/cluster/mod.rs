@@ -16,6 +16,7 @@ mod network_snapshot;
 mod operation;
 mod platform;
 mod policy;
+mod policy_journal;
 mod process;
 mod production;
 mod restart;
@@ -88,6 +89,7 @@ pub use platform::{
     process::{MacOsProcessInspector, MacOsProcessSignaler},
 };
 pub use policy::OperationPolicy;
+pub use policy_journal::{PolicyJournal, PolicyJournalView};
 pub use process::platform_process_controller;
 pub use process::{
     ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
@@ -116,8 +118,9 @@ pub use state::{
     PromotionTrackerError, TransitionError, failure_action, spawn_state_machine,
 };
 pub use state_store::{
-    PERSISTENT_STATE_SCHEMA_VERSION, PersistentChild, PersistentClusterState,
-    PersistentFailureCode, PersistentMode, PersistentProxyTarget, StateStore, StateStoreError,
+    PERSISTENT_STATE_SCHEMA_VERSION, PERSISTENT_STATE_SCHEMA_VERSION_V1, PersistentChild,
+    PersistentClusterState, PersistentFailureCode, PersistentMode, PersistentOperationPhase,
+    PersistentPendingOperation, PersistentProxyTarget, StateStore, StateStoreError,
 };
 pub use worker::{
     DistributedWorkerLifecycle, WorkerControl, WorkerDistributedRuntime, WorkerLeaseStatus,
