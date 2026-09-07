@@ -25,6 +25,7 @@ mod role;
 mod runtime;
 mod state;
 mod state_store;
+mod tp;
 mod worker;
 
 pub use admin::{
@@ -141,6 +142,7 @@ pub use state_store::{
     PersistentClusterState, PersistentFailureCode, PersistentMode, PersistentOperationPhase,
     PersistentPendingOperation, PersistentProxyTarget, StateStore, StateStoreError,
 };
+pub use tp::{TpReadiness, TpReadinessEvent, TpSessionState};
 pub use worker::{
     DistributedWorkerLifecycle, WorkerControl, WorkerDistributedRuntime, WorkerLeaseStatus,
     WorkerLifecycleError,

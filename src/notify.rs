@@ -1263,6 +1263,7 @@ mod tests {
             .apply(crate::cluster::ClusterEvent {
                 expected_generation: 0,
                 kind: crate::cluster::ClusterEventKind::BeginSoloStandalone,
+                tp_session: None,
             })
             .await
             .unwrap();
@@ -1270,6 +1271,7 @@ mod tests {
             .apply(crate::cluster::ClusterEvent {
                 expected_generation: 1,
                 kind: crate::cluster::ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await
             .unwrap();
@@ -1502,6 +1504,7 @@ mod tests {
             },
             local_standalone_ready,
             last_failure: None,
+            tp: None,
         }
     }
 

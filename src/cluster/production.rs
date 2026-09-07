@@ -907,6 +907,7 @@ impl ProductionClusterRuntime {
                 .apply(ClusterEvent {
                     expected_generation: current.generation,
                     kind: ClusterEventKind::OperatorReconcile,
+                    tp_session: None,
                 })
                 .await?;
         }

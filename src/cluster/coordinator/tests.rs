@@ -288,6 +288,7 @@ async fn awaiting_hello_cluster() -> (ClusterHandle, tokio::task::JoinHandle<()>
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind,
+                tp_session: None,
             })
             .await
             .unwrap()
@@ -1082,6 +1083,7 @@ async fn third_same_promotion_failure_stops_auto_retry_but_keeps_serving() {
                 .apply(ClusterEvent {
                     expected_generation: paired.generation,
                     kind: ClusterEventKind::BeginPromotion,
+                    tp_session: None,
                 })
                 .await
                 .unwrap();

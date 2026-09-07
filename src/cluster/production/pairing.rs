@@ -149,6 +149,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginPromotion,
+                tp_session: None,
             })
             .await?;
         let hello = match self.prepare_and_accept_hello(awaiting).await {
@@ -410,6 +411,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::PromotionFailed,
+                tp_session: None,
             })
             .await
         {
@@ -462,6 +464,7 @@ impl super::ProductionClusterRuntime {
             StableMode::SoloStandalone => ControlMode::SoloStandalone,
             StableMode::PairedStandalone => ControlMode::PairedStandalone,
             StableMode::DistributedLayerParallel => ControlMode::DistributedLayerParallel,
+            StableMode::DistributedTensorParallel => ControlMode::DistributedTensorParallel,
         };
         descriptor
     }

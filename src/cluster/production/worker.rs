@@ -43,6 +43,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginPromotion,
+                tp_session: None,
             })
             .await?;
         let generation = awaiting.generation;
@@ -57,6 +58,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind: ClusterEventKind::WorkerHelloAccepted,
+                tp_session: None,
             })
             .await?;
         let starting = self
@@ -66,6 +68,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: promoting.generation,
                 kind: ClusterEventKind::DistributedChildStarted,
+                tp_session: None,
             })
             .await?;
         let ready = self
@@ -75,6 +78,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::DistributedRouteReady,
+                tp_session: None,
             })
             .await?;
         self.inner.proxy.set_target(ready.target, true);
@@ -125,6 +129,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: current.generation,
                             kind: ClusterEventKind::BeginDemotion,
+                            tp_session: None,
                         })
                         .await?;
                     self.inner
@@ -133,6 +138,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: demoting.generation,
                             kind: ClusterEventKind::PairingReady,
+                            tp_session: None,
                         })
                         .await?
                 }
@@ -154,6 +160,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: current.generation,
                             kind: ClusterEventKind::PromotionFailed,
+                            tp_session: None,
                         })
                         .await?
                 }

@@ -209,6 +209,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::WorkerHelloAccepted,
+                tp_session: None,
             })
             .await?;
         self.block_transition();
@@ -277,6 +278,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: promoting.generation,
                 kind: ClusterEventKind::DistributedChildStarted,
+                tp_session: None,
             })
             .await?;
         match tokio::time::timeout(self.complete_route_timeout, self.coordinator.wait_ready()).await
@@ -293,6 +295,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::DistributedRouteReady,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(ready.target, true);
@@ -394,6 +397,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginDemotion,
+                tp_session: None,
             })
             .await?;
         let paired = self
@@ -401,6 +405,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: demoting.generation,
                 kind: ClusterEventKind::PairingReady,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(paired.target, true);
@@ -420,6 +425,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind: ClusterEventKind::BeginDemotion,
+                tp_session: None,
             })
             .await?;
         let paired = self
@@ -427,6 +433,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: demoting.generation,
                 kind: ClusterEventKind::PairingReady,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(paired.target, true);
@@ -445,6 +452,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginDemotion,
+                tp_session: None,
             })
             .await?;
         self.block_transition();
@@ -478,6 +486,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: demoting.generation,
                 kind: ClusterEventKind::PairingReady,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(paired.target, true);
@@ -511,6 +520,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BackoffElapsed,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(ready.target, true);
@@ -529,6 +539,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::OperatorReconcile,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(ready.target, true);
@@ -577,6 +588,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind: ClusterEventKind::PromotionFailed,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(paired.target, true);
@@ -602,6 +614,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind: ClusterEventKind::PeerLost,
+                tp_session: None,
             })
             .await?;
         self.standalone
@@ -613,6 +626,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await?;
         self.proxy.set_target(ready.target, true);
@@ -641,6 +655,7 @@ impl CoordinatorDistributedRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind,
+                tp_session: None,
             })
             .await?;
         let ready = !matches!(next.target, ProxyTarget::Unavailable { .. });

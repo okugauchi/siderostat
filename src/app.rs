@@ -1398,6 +1398,7 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
         StableMode::SoloStandalone => PersistentMode::SoloStandalone,
         StableMode::PairedStandalone => PersistentMode::PairedStandalone,
         StableMode::DistributedLayerParallel => PersistentMode::DistributedLayerParallel,
+        StableMode::DistributedTensorParallel => PersistentMode::DistributedTensorParallel,
     }
 }
 
@@ -3041,6 +3042,7 @@ mod tests {
             .apply(crate::cluster::ClusterEvent {
                 expected_generation: 12,
                 kind: crate::cluster::ClusterEventKind::RequireManualIntervention,
+                tp_session: None,
             })
             .await
             .unwrap();

@@ -1,3 +1,5 @@
+use crate::cluster::operation::TpSessionId;
+use crate::cluster::tp::{TpReadinessEvent, TpSessionState};
 use crate::target::{ClusterState, LocalRole, ProxyTarget, StableMode, resolve_target};
 use std::time::Duration;
 use thiserror::Error;
@@ -12,6 +14,8 @@ pub struct ClusterSnapshot {
     pub target: ProxyTarget,
     pub local_standalone_ready: bool,
     pub last_failure: Option<ClusterFailure>,
+    /// TP セッションの準備状態。TP 中のみ Some（C02）。
+    pub tp: Option<TpSessionState>,
 }
 
 impl ClusterSnapshot {
@@ -26,6 +30,7 @@ impl ClusterSnapshot {
             StableMode::SoloStandalone,
             ClusterState::Booting,
             false,
+            None,
         )
     }
 
@@ -35,6 +40,7 @@ impl ClusterSnapshot {
         stable_mode: StableMode,
         state: ClusterState,
         local_standalone_ready: bool,
+        tp: Option<TpSessionState>,
     ) -> Self {
         Self {
             generation,
@@ -44,6 +50,7 @@ impl ClusterSnapshot {
             target: resolve_target(role, stable_mode, state, local_standalone_ready),
             local_standalone_ready,
             last_failure: None,
+            tp,
         }
     }
 }
@@ -67,6 +74,18 @@ pub enum ClusterEventKind {
     BackoffElapsed,
     RequireManualIntervention,
     OperatorReconcile,
+    /// TP: BeginTP 受理（Solo/Paired ready + Automatic + preflight 後）。
+    BeginTensorParallel,
+    /// TP: worker の Prepared（child 開始と生存のみ）。
+    TensorParallelWorkerPrepared,
+    /// TP: coordinator の child 起動。
+    TensorParallelCoordinatorStarted,
+    /// TP: 同 session の handshake + HTTP ready 観測。
+    TensorParallelHandshakeHttpReady,
+    /// TP: bounded warm-up 完了。
+    TensorParallelWarmupDone,
+    /// TP: Force/fault で demotion。新規閉。
+    BeginTensorParallelDemotion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +289,28 @@ pub enum PromotionTrackerError {
 pub struct ClusterEvent {
     pub expected_generation: u64,
     pub kind: ClusterEventKind,
+    /// TP セッション ID。TP 専用イベントのみ Some（C02: control generation と別型）。
+    pub tp_session: Option<TpSessionId>,
+}
+
+impl ClusterEvent {
+    /// 非 TP イベントのコンストラクタ。
+    pub fn new(expected_generation: u64, kind: ClusterEventKind) -> Self {
+        Self {
+            expected_generation,
+            kind,
+            tp_session: None,
+        }
+    }
+
+    /// TP 専用イベントのコンストラクタ。セッション ID を付与する。
+    pub fn tp(expected_generation: u64, kind: ClusterEventKind, session: TpSessionId) -> Self {
+        Self {
+            expected_generation,
+            kind,
+            tp_session: Some(session),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +445,18 @@ fn transition(
             current: current.generation,
         });
     }
+    // TP セッション照合（C02）: TP イベントはセッション ID で照合する。旧セッション/
+    // 未開始セッションへの TP イベントは受理しない（無視・診断対象）。control
+    // generation とは別型（TpSessionId）として扱う。セッション開始イベント
+    // （BeginTensorParallel）のみ例外で、それ自体が新しいセッションを開始する。
+    if let Some(session) = event.tp_session {
+        if event.kind != ClusterEventKind::BeginTensorParallel {
+            let active = current.tp.map(|t| t.session);
+            if active != Some(session) {
+                return Ok(current);
+            }
+        }
+    }
     let (mode, state, local_ready) = match (current.state, event.kind) {
         (ClusterState::Booting, ClusterEventKind::BeginSoloStandalone)
         | (ClusterState::Backoff, ClusterEventKind::BeginSoloStandalone) => (
@@ -505,6 +558,85 @@ fn transition(
             ClusterState::SoloStandaloneStarting,
             false,
         ),
+        // ---- TP transitions (C02) ----
+        // Solo/Paired ready | BeginTP (Automatic+preflight は caller 側で gate) → TensorParallelStarting、drain。
+        (
+            ClusterState::SoloStandaloneReady | ClusterState::PairedStandaloneReady,
+            ClusterEventKind::BeginTensorParallel,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelStarting,
+            false,
+        ),
+        // TensorParallelStarting | worker Prepared → AwaitingTensorParallelWorkerHello、coordinator spawn。
+        (ClusterState::TensorParallelStarting, ClusterEventKind::TensorParallelWorkerPrepared) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            false,
+        ),
+        // AwaitingTensorParallelWorkerHello | coordinator started。
+        (
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            ClusterEventKind::TensorParallelCoordinatorStarted,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            false,
+        ),
+        // AwaitingTensorParallelWorkerHello | handshake+HTTP ready。
+        (
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            ClusterEventKind::TensorParallelHandshakeHttpReady,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            false,
+        ),
+        // AwaitingTensorParallelWorkerHello | warm-up 完了 → TensorParallelReady。route 公開。
+        (
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            ClusterEventKind::TensorParallelWarmupDone,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelReady,
+            current.role != LocalRole::Worker,
+        ),
+        // TP ready/starting | Force/fault → DemotingTensorParallel。新規閉。
+        (
+            ClusterState::TensorParallelReady
+            | ClusterState::TensorParallelStarting
+            | ClusterState::AwaitingTensorParallelWorkerHello
+            | ClusterState::DemotingTensorParallel,
+            ClusterEventKind::BeginTensorParallelDemotion,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::DemotingTensorParallel,
+            false,
+        ),
+        // DemotingTensorParallel | fallback ready → Solo/Paired ready。検証済 fallback。
+        (ClusterState::DemotingTensorParallel, ClusterEventKind::PairingReady) => (
+            StableMode::PairedStandalone,
+            ClusterState::PairedStandaloneReady,
+            current.role != LocalRole::Worker,
+        ),
+        // TP transient 失敗 → TensorParallelBackoff。fallback のみ。
+        (
+            ClusterState::TensorParallelReady
+            | ClusterState::TensorParallelStarting
+            | ClusterState::AwaitingTensorParallelWorkerHello
+            | ClusterState::DemotingTensorParallel,
+            ClusterEventKind::EnterBackoff,
+        ) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelBackoff,
+            current.local_standalone_ready,
+        ),
+        // TensorParallelBackoff からの回復（reconcile）→ TP 再開準備。Automatic のみ。
+        (ClusterState::TensorParallelBackoff, ClusterEventKind::BackoffElapsed) => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelStarting,
+            false,
+        ),
         (_, ClusterEventKind::EnterBackoff) => (
             current.stable_mode,
             ClusterState::Backoff,
@@ -534,7 +666,39 @@ fn transition(
         mode,
         state,
         local_ready,
+        current.tp,
     );
+    // TP セッション状態の更新（C02）: BeginTP でセッション開始、準備イベントで要素を
+    // 進める。TP 以外の遷移では現在のセッション状態を維持する。
+    next.tp = match event.kind {
+        ClusterEventKind::BeginTensorParallel => event.tp_session.map(TpSessionState::new),
+        ClusterEventKind::TensorParallelWorkerPrepared => current.tp.and_then(|t| {
+            t.apply_event(
+                event.tp_session.unwrap_or(TpSessionId(0)),
+                TpReadinessEvent::WorkerPrepared,
+            )
+        }),
+        ClusterEventKind::TensorParallelCoordinatorStarted => current.tp.and_then(|t| {
+            t.apply_event(
+                event.tp_session.unwrap_or(TpSessionId(0)),
+                TpReadinessEvent::CoordinatorStarted,
+            )
+        }),
+        ClusterEventKind::TensorParallelHandshakeHttpReady => current.tp.and_then(|t| {
+            t.apply_event(
+                event.tp_session.unwrap_or(TpSessionId(0)),
+                TpReadinessEvent::HandshakeHttpReady,
+            )
+        }),
+        ClusterEventKind::TensorParallelWarmupDone => current.tp.and_then(|t| {
+            t.apply_event(
+                event.tp_session.unwrap_or(TpSessionId(0)),
+                TpReadinessEvent::WarmupDone,
+            )
+        }),
+        ClusterEventKind::BeginTensorParallelDemotion => current.tp,
+        _ => current.tp,
+    };
     next.last_failure = match event.kind {
         ClusterEventKind::DeploymentMismatch => Some(ClusterFailure::DeploymentMismatch),
         ClusterEventKind::LocalStandaloneReady
@@ -552,6 +716,7 @@ fn stable_ready_state(mode: StableMode) -> ClusterState {
         StableMode::SoloStandalone => ClusterState::SoloStandaloneReady,
         StableMode::PairedStandalone => ClusterState::PairedStandaloneReady,
         StableMode::DistributedLayerParallel => ClusterState::DistributedReady,
+        StableMode::DistributedTensorParallel => ClusterState::TensorParallelReady,
     }
 }
 
@@ -560,10 +725,14 @@ mod tests {
     use super::*;
 
     fn event(generation: u64, kind: ClusterEventKind) -> ClusterEvent {
-        ClusterEvent {
-            expected_generation: generation,
-            kind,
-        }
+        ClusterEvent::new(generation, kind)
+    }
+
+    fn route_published(snapshot: &ClusterSnapshot) -> bool {
+        matches!(
+            snapshot.target,
+            ProxyTarget::LocalStandalone | ProxyTarget::Coordinator
+        )
     }
 
     #[tokio::test]
@@ -710,5 +879,144 @@ mod tests {
             transition_name(ClusterState::Booting, ClusterState::SoloStandaloneStarting),
             "reconcile"
         );
+    }
+
+    #[tokio::test]
+    async fn tp_lifecycle_publishes_route_only_after_all_readiness() {
+        let (handle, task) =
+            spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 16);
+        // Solo ready まで。
+        handle
+            .apply(event(0, ClusterEventKind::BeginSoloStandalone))
+            .await
+            .unwrap();
+        handle
+            .apply(event(1, ClusterEventKind::LocalStandaloneReady))
+            .await
+            .unwrap();
+        let sid = TpSessionId(7);
+        // BeginTP。
+        let starting = handle
+            .apply(ClusterEvent::tp(
+                2,
+                ClusterEventKind::BeginTensorParallel,
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(starting.state, ClusterState::TensorParallelStarting);
+        assert!(!route_published(&starting));
+        // worker Prepared。
+        let hello = handle
+            .apply(ClusterEvent::tp(
+                3,
+                ClusterEventKind::TensorParallelWorkerPrepared,
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hello.state, ClusterState::AwaitingTensorParallelWorkerHello);
+        assert!(!route_published(&hello));
+        // coordinator started。
+        let with_coord = handle
+            .apply(ClusterEvent::tp(
+                4,
+                ClusterEventKind::TensorParallelCoordinatorStarted,
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            with_coord.state,
+            ClusterState::AwaitingTensorParallelWorkerHello
+        );
+        assert!(!route_published(&with_coord));
+        // handshake+HTTP ready。
+        let with_http = handle
+            .apply(ClusterEvent::tp(
+                5,
+                ClusterEventKind::TensorParallelHandshakeHttpReady,
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert!(!route_published(&with_http));
+        // warm-up 完了 → ready 公開。
+        let ready = handle
+            .apply(ClusterEvent::tp(
+                6,
+                ClusterEventKind::TensorParallelWarmupDone,
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ready.state, ClusterState::TensorParallelReady);
+        assert!(route_published(&ready));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn tp_old_session_event_is_ignored() {
+        let (handle, task) =
+            spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 16);
+        handle
+            .apply(event(0, ClusterEventKind::BeginSoloStandalone))
+            .await
+            .unwrap();
+        handle
+            .apply(event(1, ClusterEventKind::LocalStandaloneReady))
+            .await
+            .unwrap();
+        let sid = TpSessionId(9);
+        let starting = handle
+            .apply(ClusterEvent::tp(
+                2,
+                ClusterEventKind::BeginTensorParallel,
+                sid,
+            ))
+            .await
+            .unwrap();
+        // 旧セッションの warm-up 完了は受理されない（無視・世代不変）。
+        let old = handle
+            .apply(ClusterEvent::tp(
+                3,
+                ClusterEventKind::TensorParallelWarmupDone,
+                TpSessionId(8),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(old.state, starting.state);
+        assert_eq!(old.generation, starting.generation);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lp_ready_event_is_rejected_in_tp_states() {
+        let (handle, task) =
+            spawn_state_machine(ClusterSnapshot::booting(LocalRole::Coordinator), 16);
+        handle
+            .apply(event(0, ClusterEventKind::BeginSoloStandalone))
+            .await
+            .unwrap();
+        handle
+            .apply(event(1, ClusterEventKind::LocalStandaloneReady))
+            .await
+            .unwrap();
+        let sid = TpSessionId(11);
+        handle
+            .apply(ClusterEvent::tp(
+                2,
+                ClusterEventKind::BeginTensorParallel,
+                sid,
+            ))
+            .await
+            .unwrap();
+        // TP 中に LP の DistributedRouteReady を受理しない。
+        let err = handle
+            .apply(event(3, ClusterEventKind::DistributedRouteReady))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidTransition { .. }));
+        task.abort();
     }
 }

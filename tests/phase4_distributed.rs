@@ -330,10 +330,7 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
         ClusterEventKind::PairingReady,
     ] {
         generation = cluster
-            .apply(ClusterEvent {
-                expected_generation: generation,
-                kind,
-            })
+            .apply(ClusterEvent::new(generation, kind))
             .await
             .unwrap()
             .generation;
@@ -386,10 +383,10 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
 
     for cycle in 0..10 {
         let awaiting = cluster
-            .apply(ClusterEvent {
-                expected_generation: cluster.snapshot().generation,
-                kind: ClusterEventKind::BeginPromotion,
-            })
+            .apply(ClusterEvent::new(
+                cluster.snapshot().generation,
+                ClusterEventKind::BeginPromotion,
+            ))
             .await
             .unwrap();
         worker_runtime
@@ -417,10 +414,10 @@ async fn fake_two_node_distributed_cycles_and_failure_recovery() {
     }
 
     let awaiting = cluster
-        .apply(ClusterEvent {
-            expected_generation: cluster.snapshot().generation,
-            kind: ClusterEventKind::BeginPromotion,
-        })
+        .apply(ClusterEvent::new(
+            cluster.snapshot().generation,
+            ClusterEventKind::BeginPromotion,
+        ))
         .await
         .unwrap();
     worker_runtime

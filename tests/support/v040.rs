@@ -163,8 +163,34 @@ impl FakeCluster {
     // ---- TP lifecycle（T06〜T08 で実装。A04 では未実装プレースホルダ） ----
     // 常時成功 stub を production に接続しない。実装は本番 reducer/OS adapter を経由する。
 
+    /// T06: TP worker の Prepared（child 開始と生存のみ）を reducer 経由で生成する。
+    /// ForcedStandalone では spawn 抑止（effect なし）。
     pub async fn prepare_worker(&self) {
-        todo!("T06: TP worker spawn / Prepared 生成")
+        use siderostat::cluster::{ClusterEventKind, TpSessionId};
+        if self.policy() != OperationPolicy::Automatic {
+            // ForcedStandalone: TP spawn 抑止、effect なし。
+            return;
+        }
+        self.recorder.record_tp_spawn();
+        let g0 = self.handle.snapshot().generation;
+        let session = TpSessionId(1);
+        let _ = self
+            .handle
+            .apply(ClusterEvent::tp(
+                g0,
+                ClusterEventKind::BeginTensorParallel,
+                session,
+            ))
+            .await;
+        let g1 = self.handle.snapshot().generation;
+        let _ = self
+            .handle
+            .apply(ClusterEvent::tp(
+                g1,
+                ClusterEventKind::TensorParallelWorkerPrepared,
+                session,
+            ))
+            .await;
     }
 
     pub async fn start_coordinator(&self) {

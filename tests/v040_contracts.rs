@@ -10,10 +10,7 @@ use support::v040::FakeCluster;
 
 /// 生成イベントを generation 付きで構築するヘルパ。
 fn event(generation: u64, kind: ClusterEventKind) -> ClusterEvent {
-    ClusterEvent {
-        expected_generation: generation,
-        kind,
-    }
+    ClusterEvent::new(generation, kind)
 }
 
 /// 受入 case 1: fake mode → 実 PID 生成/既存 state アクセス 0。

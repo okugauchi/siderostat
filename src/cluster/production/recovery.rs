@@ -86,6 +86,7 @@ impl super::ProductionClusterRuntime {
                     .apply(ClusterEvent {
                         expected_generation: current.generation,
                         kind: recovery_event,
+                        tp_session: None,
                     })
                     .await?;
                 self.inner.proxy.set_target(marked.target, true);
@@ -145,6 +146,7 @@ impl super::ProductionClusterRuntime {
                 .apply(ClusterEvent {
                     expected_generation: current.generation,
                     kind: recovery_event,
+                    tp_session: None,
                 })
                 .await?
         };
@@ -178,6 +180,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await?;
 

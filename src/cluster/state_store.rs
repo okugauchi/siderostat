@@ -19,6 +19,7 @@ pub enum PersistentMode {
     PairedStandalone,
     #[serde(alias = "distributed-mxfp4")]
     DistributedLayerParallel,
+    DistributedTensorParallel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -680,6 +680,7 @@ fn control_mode_name(mode: ControlMode) -> &'static str {
         ControlMode::SoloStandalone => "solo-standalone",
         ControlMode::PairedStandalone => "paired-standalone",
         ControlMode::DistributedLayerParallel => "distributed-layer-parallel",
+        ControlMode::DistributedTensorParallel => "distributed-tensor-parallel",
         ControlMode::Transitioning => "transitioning",
     }
 }
