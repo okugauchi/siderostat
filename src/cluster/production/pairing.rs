@@ -300,6 +300,8 @@ impl super::ProductionClusterRuntime {
             .ds4
             .distributed
             .worker_layers
+            .as_deref()
+            .context("invalid worker layer range")?
             .split_once(':')
             .context("invalid worker layer range")?
             .0

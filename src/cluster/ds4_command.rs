@@ -39,6 +39,8 @@ pub enum Ds4CommandError {
     DsparkSupportModelRequired,
     #[error("DSpark is not compatible with standalone SSD streaming")]
     DsparkSsdStreaming,
+    #[error("distributed DS4 layer-parallel command requires {0}")]
+    MissingLayerRange(&'static str),
 }
 
 pub fn build_distributed_worker_command(
@@ -55,7 +57,12 @@ pub fn build_distributed_worker_command(
         OsString::from("--role"),
         OsString::from("worker"),
         OsString::from("--layers"),
-        OsString::from(&distributed.worker_layers),
+        OsString::from(
+            distributed
+                .worker_layers
+                .as_deref()
+                .ok_or(Ds4CommandError::MissingLayerRange("worker_layers"))?,
+        ),
         OsString::from("--coordinator"),
         OsString::from(coordinator_address.to_string()),
         OsString::from(distributed_port.to_string()),
@@ -84,7 +91,12 @@ pub fn build_distributed_coordinator_command(
         OsString::from("--role"),
         OsString::from("coordinator"),
         OsString::from("--layers"),
-        OsString::from(&distributed.coordinator_layers),
+        OsString::from(
+            distributed
+                .coordinator_layers
+                .as_deref()
+                .ok_or(Ds4CommandError::MissingLayerRange("coordinator_layers"))?,
+        ),
         OsString::from("--listen"),
         OsString::from(coordinator_address.to_string()),
         OsString::from(distributed_port.to_string()),
@@ -261,15 +273,22 @@ mod tests {
             distributed: Ds4DistributedConfig {
                 topology: crate::config::DistributedTopology::LayerParallel,
                 quantization: Quantization::Mxfp4,
+                transport: crate::config::Transport::Tcp,
                 model: PathBuf::from("/models/distributed.gguf"),
                 model_manifest: PathBuf::from("/manifests/distributed.json"),
                 checkpoint: "flash-0731".into(),
                 context_size: 262_144,
-                coordinator_layers: "0:19".into(),
-                worker_layers: "20:output".into(),
+                coordinator_layers: Some("0:19".into()),
+                worker_layers: Some("20:output".into()),
                 kv_disk_dir: PathBuf::from("/cache/distributed"),
                 kv_disk_space_mb: 262_144,
                 extra_args: vec!["--debug".into()],
+                role_artifact: None,
+                capability_manifest: None,
+                rdma_member_interface: None,
+                rdma_address: None,
+                rdma_device: None,
+                rdma_gid: None,
             },
         }
     }

@@ -121,6 +121,25 @@ kv_disk_dir = "$HOME/Library/Caches/ds4-kv/distributed/mxfp4-0731"
 kv_disk_space_mb = 131072
 extra_args = ["--debug"]
 
+# v0.4.0 TP example: transport must be rdma and layer ranges must be omitted.
+# [ds4.distributed]
+# topology = "tensor-parallel"
+# transport = "rdma"
+# model = "$HOME/Library/Application Support/siderostat/models/PLACEHOLDER-mxfp4.gguf"
+# model_manifest = "$HOME/Library/Application Support/siderostat/manifests/mxfp4-0731.json"
+# checkpoint = "flash-0731"
+# context_size = 384000
+# # No coordinator_layers / worker_layers for tensor-parallel.
+# kv_disk_dir = "$HOME/Library/Caches/ds4-kv/distributed/tp-rdma"
+# kv_disk_space_mb = 131072
+# role_artifact = "$HOME/Library/Application Support/siderostat/bin"
+# capability_manifest = "$HOME/Library/Application Support/siderostat/manifests/capability.json"
+# rdma_member_interface = "enp5s0"
+# rdma_address = "10.0.0.5"
+# rdma_device = "mlx5_0"
+# rdma_gid = "3"
+# extra_args = []
+
 [logging]
 format = "json"
 level = "info"
