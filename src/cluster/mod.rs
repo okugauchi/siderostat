@@ -97,6 +97,10 @@ pub use platform::{
     bonjour::{BonjourPlatformEvent, MacOsBonjourOperation, bridge0_interface_index},
     macos::MacOsDynamicStoreWatcher,
     process::{MacOsProcessInspector, MacOsProcessSignaler},
+    rdma::{
+        RdmaCommandRunner, RdmaDeviceInfo, RdmaObservation, RdmaProbe, RdmaProbeError,
+        RdmaProbeRequest, is_stale_epoch,
+    },
 };
 pub use policy::OperationPolicy;
 pub use policy_journal::{PolicyJournal, PolicyJournalView};

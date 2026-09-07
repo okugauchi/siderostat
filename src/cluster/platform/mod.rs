@@ -4,3 +4,5 @@ pub mod bonjour;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod process;
+#[cfg(target_os = "macos")]
+pub mod rdma;
