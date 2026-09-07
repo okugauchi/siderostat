@@ -152,6 +152,11 @@ impl FakeCluster {
         self.recorder.policy()
     }
 
+    /// OS 接触・実 PID 生成の合計（C02 harness: `h.real_process_operations()`）。。
+    pub fn real_process_operations(&self) -> usize {
+        self.recorder.real_process_operations()
+    }
+
     /// 本番 snapshot の target を読んで route 公開状態を判定する。
     pub fn route_is_published(&self) -> bool {
         use siderostat::target::ProxyTarget;
@@ -164,7 +169,7 @@ impl FakeCluster {
     // 常時成功 stub を production に接続しない。実装は本番 reducer/OS adapter を経由する。
 
     /// T06: TP worker の Prepared（child 開始と生存のみ）を reducer 経由で生成する。
-    /// ForcedStandalone では spawn 抑止（effect なし）。
+    /// ForcedStandalone では spawn 抑止（effect なし）。TP 開始前の Solo ready も投入する。
     pub async fn prepare_worker(&self) {
         use siderostat::cluster::{ClusterEventKind, TpSessionId};
         if self.policy() != OperationPolicy::Automatic {
@@ -172,6 +177,20 @@ impl FakeCluster {
             return;
         }
         self.recorder.record_tp_spawn();
+        // TP は Solo/Paired ready からしか開始できない（reducer の遷移表）。まず Solo ready。
+        let _ = self
+            .handle
+            .apply(ClusterEvent::new(0, ClusterEventKind::BeginSoloStandalone))
+            .await;
+        let g_solo = self.handle.snapshot().generation;
+        let _ = self
+            .handle
+            .apply(ClusterEvent::new(
+                g_solo,
+                ClusterEventKind::LocalStandaloneReady,
+            ))
+            .await;
+        // TP 開始 → worker Prepared。
         let g0 = self.handle.snapshot().generation;
         let session = TpSessionId(1);
         let _ = self
@@ -193,16 +212,59 @@ impl FakeCluster {
             .await;
     }
 
+    /// T08: TP coordinator spawn（ChildStarted）。session 付きイベントを reducer 経由で投入する。
     pub async fn start_coordinator(&self) {
-        todo!("T07: TP coordinator spawn / handshake")
+        use siderostat::cluster::{ClusterEventKind, TpSessionId};
+        if self.policy() != OperationPolicy::Automatic {
+            return;
+        }
+        self.recorder.record_tp_spawn();
+        let g = self.handle.snapshot().generation;
+        let session = TpSessionId(1);
+        let _ = self
+            .handle
+            .apply(ClusterEvent::tp(
+                g,
+                ClusterEventKind::TensorParallelCoordinatorStarted,
+                session,
+            ))
+            .await;
     }
 
+    /// T08: A02 session 付き handshake + HTTP ready 観測。warm-up 前なので route 非公開のまま。
     pub async fn observe_handshake_and_http_ready(&self) {
-        todo!("T08: A02 session 付き handshake + HTTP ready 観測")
+        use siderostat::cluster::{ClusterEventKind, TpSessionId};
+        if self.policy() != OperationPolicy::Automatic {
+            return;
+        }
+        let g = self.handle.snapshot().generation;
+        let session = TpSessionId(1);
+        let _ = self
+            .handle
+            .apply(ClusterEvent::tp(
+                g,
+                ClusterEventKind::TensorParallelHandshakeHttpReady,
+                session,
+            ))
+            .await;
     }
 
+    /// T08: bounded warm-up 完了（canary 成功）。route を公開する。
     pub async fn finish_warmup(&self) {
-        todo!("T08: bounded warm-up 完了")
+        use siderostat::cluster::{ClusterEventKind, TpSessionId};
+        if self.policy() != OperationPolicy::Automatic {
+            return;
+        }
+        let g = self.handle.snapshot().generation;
+        let session = TpSessionId(1);
+        let _ = self
+            .handle
+            .apply(ClusterEvent::tp(
+                g,
+                ClusterEventKind::TensorParallelWarmupDone,
+                session,
+            ))
+            .await;
     }
 }
 

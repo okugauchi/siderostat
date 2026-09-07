@@ -93,7 +93,9 @@ pub enum ClusterFailure {
     PeerAbsent,
     BridgeUnavailable,
     BridgeAddressInvalid,
-    BonjourUnavailable { static_fallback: bool },
+    BonjourUnavailable {
+        static_fallback: bool,
+    },
     UnauthenticatedDiscovery,
     InvalidControlHmac,
     InvalidPeerProxyToken,
@@ -107,7 +109,11 @@ pub enum ClusterFailure {
     ChildIdentityUnknown,
     StandaloneStartFailed,
     DrainTimeout,
-    StateCorrupt { standalone_safe: bool },
+    /// TP: first prefill / bulk round timeout。ready 失効・専用 failure。
+    FirstPrefillTimeout,
+    StateCorrupt {
+        standalone_safe: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +180,9 @@ pub fn failure_action(failure: ClusterFailure) -> FailureAction {
         ClusterFailure::ChildIdentityUnknown => FailureAction::ManualIntervention,
         ClusterFailure::StandaloneStartFailed => FailureAction::Unavailable,
         ClusterFailure::DrainTimeout => FailureAction::ManualIntervention,
+        // TP: first prefill/bulk timeout → ready 失効・専用 failure。Automatic で有限 retry、
+        // 上限後 manual は TP recovery（T10）が扱う。ここでは fallback のみを保証する。
+        ClusterFailure::FirstPrefillTimeout => FailureAction::PairedStandalone,
         ClusterFailure::StateCorrupt {
             standalone_safe: true,
         } => FailureAction::SoloStandalone,
