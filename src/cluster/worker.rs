@@ -32,6 +32,148 @@ where
     }
 }
 
+/// TP worker のライフサイクル。Prepared（child 開始と生存のみ）と Connected（DS4
+/// の session 完了観測）を分離して公開する（C02）。coordinator 起動を待たない。
+pub trait TpWorkerLifecycle: Send + Sync + 'static {
+    /// worker child を起動し、生成と生存だけの Prepared を返す。coordinator は不要。
+    /// `worker_connected=true` 固定値は返さない。
+    fn prepare(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<TpWorkerPrepared>>;
+    /// DS4 の session 完了観測（例: Ds4LogEvent::WorkerRegistered / CompleteRouteReady）を
+    /// Connected として記録する。実観測がなければ Connected にならない。
+    fn observe_connected(
+        &self,
+        observation: TpConnectedObservation,
+    ) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn stop(&self) -> BoxFuture<'static, anyhow::Result<()>>;
+    fn is_running(&self) -> BoxFuture<'static, anyhow::Result<bool>>;
+    /// Optional child identity for diagnostics. Defaults to `None`。
+    fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
+        Box::pin(async { None })
+    }
+}
+
+/// TP worker の Prepared 結果。child 生成・生存のみを表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpWorkerPrepared {
+    /// 起動した child の generation。
+    pub generation: u64,
+    /// child identity（あれば）。PID 再利用・identity 不一致の検出に用いる。
+    pub identity: Option<ChildIdentity>,
+}
+
+/// Connected 観測の種類。DS4 の実ログ観測に由来する。固定値禁止（C02）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpConnectedObservation {
+    /// Ds4LogEvent::WorkerRegistered 等の worker session 完了観測。
+    WorkerSessionReady,
+    /// Ds4LogEvent::CompleteRouteReady 等の route 完了観測。
+    CompleteRouteReady,
+}
+
+/// TP worker の純粋状態機械。Prepared / Connected / Failed / Cancelled を追跡する。
+/// 実プロセス操作は行わず、状態遷移の判定のみを提供する（C02）。reducer と同じく
+/// 第二の実装経路を作らず、fake でも本番でも同じ判定を使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpWorkerPhase {
+    /// まだ起動していない。
+    Idle,
+    /// child 生成・生存のみ確認済み。coordinator 起動は未完了でもよい。
+    Prepared,
+    /// DS4 の session 完了観測あり。route 公開可能。
+    Connected,
+    /// early exit / identity 不明などの失敗。
+    Failed,
+    /// cancel 済み。後続の late ready は無視。
+    Cancelled,
+}
+
+impl TpWorkerPhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            TpWorkerPhase::Idle => "idle",
+            TpWorkerPhase::Prepared => "prepared",
+            TpWorkerPhase::Connected => "connected",
+            TpWorkerPhase::Failed => "failed",
+            TpWorkerPhase::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// TP worker の状態遷移を表す。不変値ベースで、`transition` が新状態を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpWorkerTracker {
+    phase: TpWorkerPhase,
+    /// 現在の session 世代。旧 session の late ready を無視するために用いる。
+    generation: u64,
+    cancelled: bool,
+}
+
+impl TpWorkerTracker {
+    pub fn new() -> Self {
+        Self {
+            phase: TpWorkerPhase::Idle,
+            generation: 0,
+            cancelled: false,
+        }
+    }
+
+    pub fn phase(&self) -> TpWorkerPhase {
+        self.phase
+    }
+
+    /// worker の Prepared を記録する。coordinator 起動を待たずに Prepared になる。
+    pub fn note_prepared(&mut self, generation: u64) -> TpWorkerPhase {
+        if self.cancelled {
+            self.phase = TpWorkerPhase::Cancelled;
+            return self.phase;
+        }
+        self.generation = generation;
+        self.phase = TpWorkerPhase::Prepared;
+        self.phase
+    }
+
+    /// DS4 の session 完了観測を Connected として記録する。
+    /// Prepared 前・cancel 後・世代不一致の観測は無視して現在状態を返す。
+    pub fn note_connected(&mut self, generation: u64) -> TpWorkerPhase {
+        if self.cancelled || self.phase != TpWorkerPhase::Prepared {
+            return self.phase;
+        }
+        if generation != self.generation {
+            // 旧世代の late ready は無視。
+            return self.phase;
+        }
+        self.phase = TpWorkerPhase::Connected;
+        self.phase
+    }
+
+    /// early exit / identity 不明などの失敗。cancel 済みなら失敗にしない。
+    pub fn note_failed(&mut self) -> TpWorkerPhase {
+        if self.cancelled {
+            self.phase = TpWorkerPhase::Cancelled;
+            return self.phase;
+        }
+        self.phase = TpWorkerPhase::Failed;
+        self.phase
+    }
+
+    /// cancel。後続の late ready は無視される。既に Connected なら維持する。
+    pub fn cancel(&mut self) -> TpWorkerPhase {
+        self.cancelled = true;
+        if self.phase == TpWorkerPhase::Connected {
+            self.phase
+        } else {
+            self.phase = TpWorkerPhase::Cancelled;
+            self.phase
+        }
+    }
+}
+
+impl Default for TpWorkerTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WorkerLifecycleError {
     #[error("worker lifecycle timeouts must be positive")]
@@ -400,6 +542,56 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+
+    #[test]
+    fn tp_worker_prepared_does_not_require_coordinator() {
+        let mut tracker = TpWorkerTracker::new();
+        assert_eq!(tracker.phase(), TpWorkerPhase::Idle);
+        // coordinator 未起動でも Prepared になる（C02: worker spawn + 生存のみ）。
+        assert_eq!(tracker.note_prepared(7), TpWorkerPhase::Prepared);
+        assert_eq!(tracker.phase(), TpWorkerPhase::Prepared);
+    }
+
+    #[test]
+    fn tp_worker_connected_only_after_observation() {
+        let mut tracker = TpWorkerTracker::new();
+        // Prepared 前に Connected 観測は無視。
+        assert_eq!(tracker.note_connected(1), TpWorkerPhase::Idle);
+        tracker.note_prepared(1);
+        // 世代不一致の観測は無視。
+        assert_eq!(tracker.note_connected(2), TpWorkerPhase::Prepared);
+        // 同世代の実観測で Connected。
+        assert_eq!(tracker.note_connected(1), TpWorkerPhase::Connected);
+        assert_eq!(tracker.phase(), TpWorkerPhase::Connected);
+    }
+
+    #[test]
+    fn tp_worker_early_exit_is_failed() {
+        let mut tracker = TpWorkerTracker::new();
+        tracker.note_prepared(3);
+        assert_eq!(tracker.note_failed(), TpWorkerPhase::Failed);
+        assert_eq!(tracker.phase(), TpWorkerPhase::Failed);
+    }
+
+    #[test]
+    fn tp_worker_cancel_ignores_late_ready() {
+        let mut tracker = TpWorkerTracker::new();
+        tracker.note_prepared(5);
+        assert_eq!(tracker.cancel(), TpWorkerPhase::Cancelled);
+        // cancel 後の late ready は無視（Connected に進まない）。
+        assert_eq!(tracker.note_connected(5), TpWorkerPhase::Cancelled);
+        // cancel 後の note_prepared も Cancelled のまま。
+        assert_eq!(tracker.note_prepared(6), TpWorkerPhase::Cancelled);
+    }
+
+    #[test]
+    fn tp_worker_phase_names_are_stable() {
+        assert_eq!(TpWorkerPhase::Idle.name(), "idle");
+        assert_eq!(TpWorkerPhase::Prepared.name(), "prepared");
+        assert_eq!(TpWorkerPhase::Connected.name(), "connected");
+        assert_eq!(TpWorkerPhase::Failed.name(), "failed");
+        assert_eq!(TpWorkerPhase::Cancelled.name(), "cancelled");
+    }
 
     #[derive(Clone, Copy)]
     enum StartBehavior {

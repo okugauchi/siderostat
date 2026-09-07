@@ -110,8 +110,8 @@ pub use process::{
     ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
     ObservedProcess, ProcessControlError, ProcessController, ProcessIdentity, ProcessInspector,
     ProcessSignal, ProcessSignaler, StandaloneSupervisor, StartupProcessCandidate,
-    StartupProcessKind, VerifiedProcess, argv_sha256, discover_startup_processes,
-    wait_for_http_readiness,
+    StartupProcessKind, TpWorkerSupervisor, VerifiedProcess, argv_sha256,
+    discover_startup_processes, wait_for_http_readiness,
 };
 #[cfg(feature = "test-support")]
 pub use production::PairTiming;
@@ -144,6 +144,7 @@ pub use state_store::{
 };
 pub use tp::{TpReadiness, TpReadinessEvent, TpSessionState};
 pub use worker::{
-    DistributedWorkerLifecycle, WorkerControl, WorkerDistributedRuntime, WorkerLeaseStatus,
+    DistributedWorkerLifecycle, TpConnectedObservation, TpWorkerLifecycle, TpWorkerPhase,
+    TpWorkerPrepared, TpWorkerTracker, WorkerControl, WorkerDistributedRuntime, WorkerLeaseStatus,
     WorkerLifecycleError,
 };
