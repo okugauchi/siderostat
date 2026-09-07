@@ -60,7 +60,8 @@ pub(crate) use dry_run::{
 };
 pub use ds4_command::{
     Ds4Command, Ds4CommandError, Ds4Profile, build_distributed_coordinator_command,
-    build_distributed_worker_command, build_standalone_command,
+    build_distributed_worker_command, build_standalone_command, build_tp_coordinator_command,
+    build_tp_worker_command,
 };
 pub use ds4_hello::{
     DS4D_HELLO_KIND, DS4D_MAGIC, Ds4Hello, Ds4HelloError, HELLO_FIXED_BYTES,

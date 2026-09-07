@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "upstream_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+  "source": "tests/fixtures/ds4/v040/contract.json (role_argv)",
+  "golden": {
+    "tp_worker": {
+      "description": "A02 worker argv contract (ds4_tp.c:479-489, 500-505). Worker runs ds4 only. No HTTP publishing args.",
+      "argv": [
+        "-m",
+        "MODEL",
+        "--tensor-parallel",
+        "--role",
+        "worker",
+        "--coordinator",
+        "HOST",
+        "PORT",
+        "--transport",
+        "rdma"
+      ],
+      "required": ["--coordinator", "HOST", "PORT"],
+      "prohibited": ["--listen", "--layers", "--host", "--port", "--dist-*"],
+      "counts": { "--tensor-parallel": 1, "--role": 1, "--transport": 1 }
+    },
+    "tp_coordinator": {
+      "description": "A02 coordinator argv contract (ds4_tp.c:465-473, 486-491). Coordinator owns the HTTP port (--host/--port).",
+      "argv": [
+        "-m",
+        "MODEL",
+        "--tensor-parallel",
+        "--role",
+        "coordinator",
+        "--listen",
+        "HOST",
+        "PORT",
+        "--transport",
+        "rdma",
+        "--host",
+        "HTTP_HOST",
+        "--port",
+        "HTTP_PORT"
+      ],
+      "required": ["--listen", "HOST", "PORT", "--host", "--port"],
+      "prohibited": ["--coordinator", "--layers", "--dist-*"],
+      "counts": { "--tensor-parallel": 1, "--role": 1, "--transport": 1 }
+    }
+  }
+}

@@ -41,6 +41,8 @@ pub enum Ds4CommandError {
     DsparkSsdStreaming,
     #[error("distributed DS4 layer-parallel command requires {0}")]
     MissingLayerRange(&'static str),
+    #[error("tensor-parallel DS4 command must not override managed argument: {0}")]
+    TpManagedArgumentOverride(String),
 }
 
 pub fn build_distributed_worker_command(
@@ -128,6 +130,100 @@ fn validate_distributed_extra_args(
         return Err(Ds4CommandError::DistributedDebugRequired);
     }
     Ok(())
+}
+
+/// TP の transport を argv の kebab-case 値（rdma|tcp）にする。auto は既定。
+fn tp_transport_name(config: &Ds4Config) -> &'static str {
+    config.distributed.transport.name()
+}
+
+/// TP の extra_args 検証。source 未対応 flag（--layers / --transport / --coordinator /
+/// --listen / --debug）を spawn 前に拒否する。TP の argv は builder が管理し、override を許さない。
+fn validate_tp_extra_args(
+    distributed: &crate::config::Ds4DistributedConfig,
+) -> Result<(), Ds4CommandError> {
+    // override 検査を先に行い、--layers 等を TpManagedArgumentOverride で明示する。
+    for argument in &distributed.extra_args {
+        let normalized = argument.split('=').next().unwrap_or(argument);
+        if matches!(
+            normalized,
+            "--role" | "--transport" | "--layers" | "--coordinator" | "--listen" | "--debug"
+        ) {
+            return Err(Ds4CommandError::TpManagedArgumentOverride(argument.clone()));
+        }
+    }
+    validate_extra_args("ds4.distributed.extra_args", &distributed.extra_args)
+        .map_err(|error| Ds4CommandError::InvalidExtraArguments(error.to_string()))?;
+    Ok(())
+}
+
+fn tp_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> Ds4Command {
+    Ds4Command {
+        executable: config.binary.clone(),
+        working_directory: config.working_directory.clone(),
+        argv,
+        profile: Ds4Profile {
+            profile_id: format!("distributed-tensor-parallel-{role}"),
+            quantization: config.distributed.quantization,
+            residency: Residency::Resident,
+            speculative_support: SpeculativeSupport::None,
+        },
+    }
+}
+
+/// TP worker（ds4）の command。A02 contract: `-m MODEL --tensor-parallel --role worker
+/// --coordinator HOST PORT --transport <name>`。worker に HTTP 公開引数を持たせない。
+pub fn build_tp_worker_command(
+    config: &Ds4Config,
+    coordinator_address: IpAddr,
+    distributed_port: u16,
+) -> Result<Ds4Command, Ds4CommandError> {
+    let distributed = &config.distributed;
+    validate_tp_extra_args(distributed)?;
+    let mut argv = vec![
+        OsString::from("-m"),
+        distributed.model.as_os_str().to_owned(),
+        OsString::from("--tensor-parallel"),
+        OsString::from("--role"),
+        OsString::from("worker"),
+        OsString::from("--coordinator"),
+        OsString::from(coordinator_address.to_string()),
+        OsString::from(distributed_port.to_string()),
+        OsString::from("--transport"),
+        OsString::from(tp_transport_name(config)),
+    ];
+    argv.extend(distributed.extra_args.iter().map(OsString::from));
+    Ok(tp_command(config, "worker", argv))
+}
+
+/// TP coordinator（ds4-server 等）の command。A02 contract: `-m MODEL --tensor-parallel
+/// --role coordinator --listen HOST PORT --transport <name>`。coordinator だけ HTTP
+/// 公開引数（--host / --port）を持つ。
+pub fn build_tp_coordinator_command(
+    config: &Ds4Config,
+    listen_address: IpAddr,
+    distributed_port: u16,
+) -> Result<Ds4Command, Ds4CommandError> {
+    let distributed = &config.distributed;
+    validate_tp_extra_args(distributed)?;
+    let mut argv = vec![
+        OsString::from("-m"),
+        distributed.model.as_os_str().to_owned(),
+        OsString::from("--tensor-parallel"),
+        OsString::from("--role"),
+        OsString::from("coordinator"),
+        OsString::from("--listen"),
+        OsString::from(listen_address.to_string()),
+        OsString::from(distributed_port.to_string()),
+        OsString::from("--transport"),
+        OsString::from(tp_transport_name(config)),
+        OsString::from("--host"),
+        OsString::from(config.http_host.to_string()),
+        OsString::from("--port"),
+        OsString::from(config.http_port.to_string()),
+    ];
+    argv.extend(distributed.extra_args.iter().map(OsString::from));
+    Ok(tp_command(config, "coordinator", argv))
 }
 
 fn distributed_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> Ds4Command {
