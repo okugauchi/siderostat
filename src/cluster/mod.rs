@@ -20,6 +20,7 @@ mod policy;
 mod policy_journal;
 mod process;
 mod production;
+mod recovery_tp;
 mod restart;
 mod role;
 mod runtime;
@@ -125,6 +126,7 @@ pub use production::{
     OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
     ProductionDiagnostics, detect_cluster_role,
 };
+pub use recovery_tp::{TpFailureKind, TpRecoveryDecision, TpRecoveryOwner, TpRecoveryTracker};
 pub use restart::{
     RestartDecision, RestartManualReason, RestartReconcileError, reconcile_restart,
     required_port_available,
