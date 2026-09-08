@@ -14,7 +14,7 @@ use super::{
 #[cfg(feature = "test-support")]
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
-    cluster::{ClusterEvent, ClusterEventKind},
+    cluster::{ClusterEvent, ClusterEventKind, OperationPolicy, TpStartVerdict},
     config::{ModeAwareConfig, SpeculativeSupport},
     metrics::{MetricSnapshot, Metrics},
     proxy::ModeAwareProxyState,
@@ -46,6 +46,7 @@ mod pairing;
 pub(crate) mod policy;
 mod reconcile;
 mod recovery;
+pub(crate) mod tp;
 mod worker;
 
 const CONTROL_METRICS_PATH: &str = "/v1/metrics";
@@ -842,6 +843,18 @@ impl ProductionClusterRuntime {
     pub async fn promotion_failure_status(&self) -> Option<PromotionFailureStatus> {
         let runtime = self.inner.coordinator_runtime.get()?;
         Some(runtime.promotion_failure_status().await)
+    }
+
+    /// TP 本番配線の開始 gate（T11）。全 TP 開始点（worker 先行 / coordinator 起動 /
+    /// retry 再開）がこの判定を確認する。ForcedStandalone（保護ラッチ）または
+    /// 交渉不一致の旧 peer では TP を開始せず、旧 LP 経路 / local Standalone を維持する。
+    /// 判定は純粋（副作用なし）で、実 child 起動・OS 接触を行わない。
+    pub fn tp_start_verdict(
+        &self,
+        operator_policy: OperationPolicy,
+        peer_protocol_version: Option<u16>,
+    ) -> TpStartVerdict {
+        tp::check_tp_start(operator_policy, peer_protocol_version)
     }
 
     #[cfg(feature = "test-support")]

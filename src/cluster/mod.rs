@@ -121,6 +121,7 @@ pub use production::policy::{
     PolicyControlResponse, PolicyControlState, PolicyControlStatus, PolicyControlVerdict,
     canonical_request_hash,
 };
+pub use production::tp::{TP_PRODUCTION_PROTOCOL_VERSION, TpStartVerdict, check_tp_start};
 pub use production::{
     ChildDiagnostics, ChildrenDiagnostics, ControlSessionDiagnostics, LeaseDiagnostics,
     OperatorReconcileOutcome, PeerDiagnostics, ProductionClusterRuntime, ProductionControlClient,
