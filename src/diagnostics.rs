@@ -117,6 +117,47 @@ mod tests {
     fn fixture(recovery_id: Uuid, captured_at_millis: u64) -> DiagnosticSnapshot {
         DiagnosticSnapshot::fixture(recovery_id, captured_at_millis)
     }
+
+    #[test]
+    fn tensor_parallel_diagnostics_are_redacted_finite_labels() {
+        use crate::cluster::{TpSessionId, TpSessionState};
+        use crate::target::{ClusterState, LocalRole, StableMode};
+        // 全準備要素が揃った TP ready snapshot を構築する。
+        let mut tp = TpSessionState::new(TpSessionId(7));
+        for ev in [
+            crate::cluster::TpReadinessEvent::WorkerPrepared,
+            crate::cluster::TpReadinessEvent::CoordinatorStarted,
+            crate::cluster::TpReadinessEvent::HandshakeHttpReady,
+            crate::cluster::TpReadinessEvent::WarmupDone,
+        ] {
+            tp = tp.apply_event(TpSessionId(7), ev).unwrap();
+        }
+        let snapshot = ClusterSnapshot {
+            generation: 3,
+            role: LocalRole::Coordinator,
+            stable_mode: StableMode::DistributedTensorParallel,
+            state: ClusterState::TensorParallelReady,
+            target: crate::target::ProxyTarget::LocalStandalone,
+            local_standalone_ready: true,
+            last_failure: None,
+            tp: Some(tp),
+        };
+        let value = serde_json::to_value(crate::diagnostics::tensor_parallel_snapshot(
+            snapshot.tp.unwrap(),
+        ))
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        // 有限ラベルのみ。セッション ID 等の識別子は公開しない。
+        assert_eq!(obj["route_ready"], json!(true));
+        assert_eq!(obj["worker_prepared"], json!(true));
+        assert_eq!(obj["coordinator_started"], json!(true));
+        assert_eq!(obj["handshake_http_ready"], json!(true));
+        assert_eq!(obj["warmup_done"], json!(true));
+        let encoded = value.to_string();
+        for forbidden in FORBIDDEN_SNAPSHOT_KEYS {
+            assert!(!encoded.contains(forbidden), "forbidden field: {forbidden}");
+        }
+    }
 }
 use crate::{
     admission::{AdmissionSnapshot, AdmissionState},
@@ -191,6 +232,20 @@ pub struct ClusterDiagnosticSnapshot {
     pub target_ready: bool,
     pub local_standalone_ready: bool,
     pub last_failure: Option<String>,
+    /// TP セッションの準備状態（C02）。TP 中のみ Some。有限ラベルのみを公開する。
+    pub tensor_parallel: Option<TensorParallelDiagnosticSnapshot>,
+}
+
+/// TP の redacted 診断。セッション ID・port・UUID は公開しない。有限ラベルのみ。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TensorParallelDiagnosticSnapshot {
+    /// 全準備要素が揃ったか（route 公開の許可）。C02 の route gate。
+    pub route_ready: bool,
+    /// 各準備要素の有限ラベル。全て true のときのみ route_ready。
+    pub worker_prepared: bool,
+    pub coordinator_started: bool,
+    pub handshake_http_ready: bool,
+    pub warmup_done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -430,6 +485,7 @@ impl DiagnosticSnapshot {
             last_failure: cluster_snapshot
                 .last_failure
                 .map(|failure| format!("{failure:?}")),
+            tensor_parallel: cluster_snapshot.tp.map(tensor_parallel_snapshot),
         };
         let control_session =
             production.map(|diagnostics| control_snapshot(&diagnostics.control_session));
@@ -475,6 +531,7 @@ impl DiagnosticSnapshot {
                 target_ready: true,
                 local_standalone_ready: true,
                 last_failure: None,
+                tensor_parallel: None,
             },
             control_session: Some(ControlDiagnosticSnapshot {
                 generation: 7,
@@ -658,6 +715,18 @@ fn progress_from_metrics(progress: MetricsProgressSnapshot) -> ProgressDiagnosti
 
 fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
+}
+
+fn tensor_parallel_snapshot(
+    tp: crate::cluster::TpSessionState,
+) -> TensorParallelDiagnosticSnapshot {
+    TensorParallelDiagnosticSnapshot {
+        route_ready: tp.route_ready(),
+        worker_prepared: tp.readiness.worker_prepared,
+        coordinator_started: tp.readiness.coordinator_started,
+        handshake_http_ready: tp.readiness.handshake_http_ready,
+        warmup_done: tp.readiness.warmup_done,
+    }
 }
 
 fn proxy_target_name(target: ProxyTarget) -> &'static str {
