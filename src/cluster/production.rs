@@ -47,6 +47,7 @@ pub(crate) mod policy;
 mod reconcile;
 mod recovery;
 pub(crate) mod tp;
+mod tp_runtime;
 mod worker;
 
 const CONTROL_METRICS_PATH: &str = "/v1/metrics";
@@ -855,6 +856,46 @@ impl ProductionClusterRuntime {
         peer_protocol_version: Option<u16>,
     ) -> TpStartVerdict {
         tp::check_tp_start(operator_policy, peer_protocol_version)
+    }
+
+    /// TP 本番配線の開始点（T11）。開始 gate（operator_policy 保護ラッチ + v1 交渉）を
+    /// 確認してから `tp_runtime::drive_tp_ready` で TP 準備要素を reducer へ投入し、
+    /// `TensorParallelReady` で route を公開する。実 child 起動・OS 接触は行わない
+    /// （dry-run / fake 境界で駆動）。gate が TP 開始を許さない場合は TP を開始せず、
+    /// 旧 LP 経路 / local Standalone を維持する。
+    pub async fn promote_tp(
+        &self,
+        operator_policy: OperationPolicy,
+        peer_protocol_version: Option<u16>,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        use crate::cluster::TpSessionId;
+        use crate::target::ClusterState;
+        let verdict = self.tp_start_verdict(operator_policy, peer_protocol_version);
+        if !verdict.allows_tp() {
+            anyhow::bail!(
+                "TP 開始 gate が TP を許可しない（verdict={}, policy={:?}, peer_protocol={:?}）",
+                verdict.name(),
+                operator_policy,
+                peer_protocol_version
+            );
+        }
+        // 現在の snapshot が TP 開始可能な状態（Solo/Paired ready）かを確認。
+        let current = self.inner.mode.snapshot();
+        if !matches!(
+            current.state,
+            ClusterState::PairedStandaloneReady | ClusterState::SoloStandaloneReady
+        ) {
+            anyhow::bail!(
+                "TP は Solo/Paired ready からしか開始できない: {:?}",
+                current.state
+            );
+        }
+        tp_runtime::drive_tp_ready(
+            &self.inner.mode.cluster_handle(),
+            self.inner.proxy.clone(),
+            TpSessionId(1),
+        )
+        .await
     }
 
     #[cfg(feature = "test-support")]

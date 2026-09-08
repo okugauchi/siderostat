@@ -255,3 +255,68 @@ async fn v040_tp_production_start_gate_labels_stable() {
         "tp-start-unsupported-peer"
     );
 }
+
+/// 受入 case: 本番 runtime（ProductionClusterRuntime::promote_tp）が開始 gate を確認し、
+/// TP 設定で本番経路（reducer）を TP Ready まで駆動する。実 child 起動は fake 境界で
+/// 行われない（real_process_operations は 0）。
+#[tokio::test]
+async fn v040_tp_production_runtime_promote_tp_reaches_ready() {
+    // 本番相当の二 node（fake child lifecycle + 実 control HTTP）を構築。pair で
+    // PairedStandaloneReady へ。
+    let cluster = support::TwoNode::boot().await.expect("two-node boot");
+    cluster.pair().await.expect("pair");
+    assert_eq!(
+        cluster.coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    // Automatic + v1 交渉一致で本番 TP 開始点を呼び、TP Ready へ。
+    let ready = cluster
+        .coordinator
+        .production
+        .promote_tp(OperationPolicy::Automatic, Some(1))
+        .await
+        .expect("promote_tp should reach TP ready");
+    assert_eq!(ready.state, ClusterState::TensorParallelReady);
+    assert_eq!(
+        ready.stable_mode,
+        siderostat::target::StableMode::DistributedTensorParallel
+    );
+    assert_eq!(
+        cluster.coordinator.mode.snapshot().state,
+        ClusterState::TensorParallelReady
+    );
+
+    // 本番 TP 開始点は実 child 起動を行わない（fake 境界。PID 生成なし）。
+    // FakeStandalone はシミュレート identity を報告するため、実 PID 生成の検証は
+    // dry-run（recorder）で行う。ここでは TP Ready 到達を確認済み。
+
+    cluster.shutdown().await;
+}
+
+/// 受入 case: 本番 runtime の開始 gate は ForcedStandalone（保護ラッチ）で TP を拒否し、
+/// 旧 LP / local Standalone を維持する。
+#[tokio::test]
+async fn v040_tp_production_runtime_forced_standalone_rejects_promote_tp() {
+    let cluster = support::TwoNode::boot().await.expect("two-node boot");
+    cluster.pair().await.expect("pair");
+    assert_eq!(
+        cluster.coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    // ForcedStandalone では本番 TP 開始点が拒否し、PairedStandaloneReady のまま。
+    let err = cluster
+        .coordinator
+        .production
+        .promote_tp(OperationPolicy::ForcedStandalone, Some(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("gate"), "unexpected error: {err}");
+    assert_eq!(
+        cluster.coordinator.mode.snapshot().state,
+        ClusterState::PairedStandaloneReady
+    );
+
+    cluster.shutdown().await;
+}
