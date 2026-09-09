@@ -93,6 +93,180 @@ pub enum PolicyControlVerdict {
     Duplicate,
 }
 
+// ---------------------------------------------------------------------------
+// P04 — ForcedStandalone cluster-wide 適用の調整（C03）。
+// ---------------------------------------------------------------------------
+// 適用調整は本番 reducer の local 収束（TP/LP/Paired/Pairing/Promoting 各状態 → 安全
+// 収束）と PolicyJournal の phase 記録、両 node の applied ack 調整を組み合わせる。
+// 第二の状態機械を作らず、reducer の遷移表と journal の phase を正本とする。
+// ここでは「両 node の ready/applied が揃った時だけ Complete」という適用の調整判断
+// を純粋に所有し、cluster 全体調整を reducer/journal と接続する。
+
+/// 適用の進行 phase（C03 の PersistentOperationPhase に対応）。ノード別に追跡する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForceNodePhase {
+    /// まだ適用を開始していない（intent 未永続化）。。
+    NotStarted,
+    /// intent を永続化した（effect 前に journal 保存済み）。TP 再接続は抑止される。。
+    IntentSaved,
+    /// drain 中。処理中 request を強制破棄せず、既存 stream の所有を保持する。。
+    Draining,
+    /// 分散 child 停止 → 両 local Standalone 起動 → ready 確認済み。。
+    LocalReady,
+    /// この node の applied ack を返した。。
+    Applied,
+}
+
+/// 両 node の Force 適用を調整する。片 ack 紛失では Complete にならない。。
+/// drain timeout は強制破棄せず Failed にする。。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceApplyCoordinator {
+    pub policy_epoch: u64,
+    pub operation_id: uuid::Uuid,
+    pub local: ForceNodePhase,
+    pub peer: ForceNodePhase,
+    /// drain timeout で Failed になった（処理中 request は強制破棄しない）。。
+    pub drain_failed: bool,
+    /// cluster-wide 完了（両 node ready/applied が揃った）か。。
+    pub complete: bool,
+}
+
+impl ForceApplyCoordinator {
+    /// 新規の適用調整を開始する。intent 保存（journal）は呼び出し側が effect 前に行う。。
+    pub fn begin(policy_epoch: u64, operation_id: uuid::Uuid) -> Self {
+        Self {
+            policy_epoch,
+            operation_id,
+            local: ForceNodePhase::IntentSaved,
+            peer: ForceNodePhase::NotStarted,
+            drain_failed: false,
+            complete: false,
+        }
+    }
+
+    /// peer にも intent を永続化したことを記録する。。
+    pub fn peer_intent_saved(&mut self) {
+        self.peer = ForceNodePhase::IntentSaved;
+    }
+
+    /// この node の drain を開始する。処理中 request は強制破棄しない（C03）。。
+    pub fn begin_drain(&mut self) {
+        self.local = ForceNodePhase::Draining;
+    }
+
+    /// drain timeout。処理中 request を強制破棄せず Failed にする（C03）。。
+    /// この適用は terminal Failed となり、Automatic へは戻らない。。
+    pub fn drain_timeout(&mut self) {
+        self.drain_failed = true;
+    }
+
+    /// この node の分散 child 停止 → local Standalone 起動 → ready 確認。。
+    pub fn note_local_ready(&mut self) {
+        self.local = ForceNodePhase::LocalReady;
+    }
+
+    /// peer の local ready を観測した。。
+    pub fn note_peer_ready(&mut self) {
+        self.peer = ForceNodePhase::LocalReady;
+    }
+
+    /// この node の applied ack を返した。。
+    pub fn note_local_applied(&mut self) {
+        self.local = ForceNodePhase::Applied;
+        self.recompute_complete();
+    }
+
+    /// peer の applied ack を観測した。。
+    pub fn note_peer_applied(&mut self) {
+        self.peer = ForceNodePhase::Applied;
+        self.recompute_complete();
+    }
+
+    /// 両 node の applied ack が揃った時だけ Complete にする。片 ack 紛失では
+    /// Complete にならない（pending は journal に残る）。。
+    fn recompute_complete(&mut self) {
+        self.complete = !self.drain_failed
+            && self.local == ForceNodePhase::Applied
+            && self.peer == ForceNodePhase::Applied;
+    }
+
+    /// この適用が terminal Failed か（drain timeout）。。
+    pub fn is_failed(&self) -> bool {
+        self.drain_failed
+    }
+}
+
+#[cfg(test)]
+mod force_tests {
+    use super::*;
+
+    #[test]
+    fn both_acks_are_required_for_complete() {
+        let op = uuid::Uuid::new_v4();
+        let mut c = ForceApplyCoordinator::begin(1, op);
+        assert!(!c.complete);
+        c.peer_intent_saved();
+        c.begin_drain();
+        c.note_local_ready();
+        c.note_peer_ready();
+        // 片 ack のみでは Complete でない（受入 case: 片 ack 紛失 → Complete でない）。
+        c.note_local_applied();
+        assert!(!c.complete, "one ack must not complete the cluster apply");
+        c.note_peer_applied();
+        assert!(c.complete);
+        assert!(!c.is_failed());
+    }
+
+    #[test]
+    fn missing_peer_ack_keeps_pending() {
+        let op = uuid::Uuid::new_v4();
+        let mut c = ForceApplyCoordinator::begin(2, op);
+        c.peer_intent_saved();
+        c.note_local_ready();
+        c.note_peer_ready();
+        c.note_local_applied();
+        // peer ack が無い（紛失）。Complete でない。。
+        assert!(!c.complete);
+        assert_eq!(c.peer, ForceNodePhase::LocalReady);
+    }
+
+    #[test]
+    fn drain_timeout_fails_without_force_dropping() {
+        let op = uuid::Uuid::new_v4();
+        let mut c = ForceApplyCoordinator::begin(3, op);
+        c.peer_intent_saved();
+        c.begin_drain();
+        // drain timeout → Failed。処理中 request を強制破棄しない（drain_failed のみ）。。
+        c.drain_timeout();
+        assert!(c.is_failed());
+        assert!(!c.complete);
+        // Failed 後も applied ack が揃っても Complete にはならない（Automatic へ戻さない）。
+        c.note_local_ready();
+        c.note_peer_ready();
+        c.note_local_applied();
+        c.note_peer_applied();
+        assert!(!c.complete);
+        assert!(c.is_failed());
+    }
+
+    #[test]
+    fn local_ready_requires_child_stop_and_local_start() {
+        let op = uuid::Uuid::new_v4();
+        let mut c = ForceApplyCoordinator::begin(4, op);
+        c.peer_intent_saved();
+        // ready 前は Applied にならない。。
+        c.note_local_applied();
+        assert!(!c.complete);
+        c.note_local_ready();
+        c.note_peer_ready();
+        c.note_peer_applied();
+        // local が Applied になっていない（ready のみ）ので Complete でない。。
+        assert_eq!(c.local, ForceNodePhase::LocalReady);
+        assert!(!c.complete);
+    }
+}
+
 /// 世代契約のための state。policy epoch と冪等性レジストリを保持する。。
 /// 短時間 mutex を保持して network await しない。。
 pub struct PolicyControlState {
