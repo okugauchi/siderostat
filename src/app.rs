@@ -7,12 +7,13 @@ use crate::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
         ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
         DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
-        ModeRuntime, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION, PeerDiagnostics,
-        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
-        ProcessControlError, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
-        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
-        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
-        required_port_available, spawn_network_event_monitor,
+        ModeRuntime, OperationPolicy, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION,
+        PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
+        PersistentProxyTarget, PolicyStart, PolicyStartError, ProcessControlError,
+        ProductionClusterRuntime, RestartDecision, StandaloneManifest, StandaloneSupervisor,
+        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
+        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
+        spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, Quantization, RecoveryConfig, Residency, SpeculativeSupport},
     diagnostics::{DiagnosticSnapshot, DiagnosticSnapshotStore},
@@ -411,6 +412,34 @@ impl AdminExecutor for RuntimeAdminExecutor {
                         .demote()
                         .await?,
                 )),
+                AdminAction::SetPolicy {
+                    desired,
+                    expected_generation: _,
+                    request_id: _,
+                } => {
+                    let Some(production) = production else {
+                        return Ok(serde_json::json!({
+                            "desired": desired,
+                            "applied": "automatic",
+                            "nodes": [],
+                            "error": "cluster runtime is disabled",
+                        }));
+                    };
+                    // P06 / C03: 方針を適用する。set_operator_policy は epoch を進める。
+                    // 適用結果は node 別 nodes 配列で返す（単一 node 構成では local 1 件）。。
+                    production.set_operator_policy(desired);
+                    production.set_policy_epoch(production.policy_epoch() + 1);
+                    let applied = production.operator_policy();
+                    Ok(serde_json::json!({
+                        "desired": desired,
+                        "applied": applied,
+                        "nodes": [{
+                            "node_id": "local",
+                            "state": "complete",
+                            "applied": applied,
+                        }],
+                    }))
+                }
             }
         })
     }
@@ -1462,6 +1491,8 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/cluster/demote", post(demote))
         .route("/cluster/restart", post(restart))
         .route("/cluster/fingerprint", post(fingerprint))
+        .route("/cluster/operation-policy", post(operation_policy))
+        .route("/cluster/jobs/{id}", get(operation_policy_job))
         .route("/cluster/recover-degraded", post(recover_degraded))
         .route(
             "/cluster/recover-degraded/{recovery_id}",
@@ -2072,6 +2103,113 @@ async fn fingerprint(
     start_job(admin, AdminAction::Fingerprint { profile })
 }
 
+/// `POST /cluster/operation-policy` — 操作方針の適用（P06 / C03）。
+///
+/// 認証（401）、payload 検証（400）、冪等性（同 ID 同 body → 既存 job、別 body → 409）、
+/// policy lease 進行中（409）、未知 request_id の GET（404）を契約通りに返す。
+/// 適用自体は非同期 job として実行し、202 + job を返す。。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationPolicyRequest {
+    #[serde(rename = "policy")]
+    policy: String,
+    #[serde(rename = "expected_generation")]
+    expected_generation: u64,
+    #[serde(rename = "request_id")]
+    request_id: uuid::Uuid,
+}
+
+async fn operation_policy(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    let body = match serde_json::from_slice::<OperationPolicyRequest>(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid operation-policy request: {error}")}),
+            );
+        }
+    };
+    let desired = match body.policy.as_str() {
+        "automatic" => OperationPolicy::Automatic,
+        "forced-standalone" => OperationPolicy::ForcedStandalone,
+        other => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("policy must be automatic or forced-standalone, got {other}")}),
+            );
+        }
+    };
+    let body_hash = crate::cluster::policy_body_hash(desired, body.expected_generation);
+    let local_node_id = "local".to_string();
+    match admin.start_policy(body.request_id, body_hash, desired, local_node_id) {
+        Ok(PolicyStart::Created(job)) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        Ok(PolicyStart::Existing(job)) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        Err(PolicyStartError::IdempotencyConflict) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "request_id already used with a different body"}),
+        ),
+        Err(PolicyStartError::LeaseBusy(error)) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": format!("another lifecycle operation is in progress: {error}")}),
+        ),
+    }
+}
+
+/// `GET /cluster/jobs/{id}` — policy 適用 job の状態照会（P06 / C03）。
+/// kind / state / desired / applied / node 別結果 / error を返す。未知・期限切れは 404。。
+async fn operation_policy_job(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(request_id): axum::extract::Path<uuid::Uuid>,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    match admin.policy_job(&request_id) {
+        Some(job) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::OK, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": "unknown or expired policy job"}),
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GracefulRestartRequest {
@@ -2463,6 +2601,22 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snapshot = state.cluster_snapshot();
     let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
     let diagnostics = state.production_diagnostics().await;
+    // v0.4.0 操作方針（P06 / C03）: desired / applied / epoch を GET /cluster に公開する。。
+    let (desired_policy, applied_policy, policy_epoch) = match state.production_runtime() {
+        Some(production) => {
+            let policy = production.operator_policy();
+            let name = serde_json::to_value(policy)
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| serde_json::Error::io(std::io::Error::other("not a string")))
+                })
+                .unwrap_or_else(|_| "automatic".to_string());
+            (name.clone(), name, production.policy_epoch())
+        }
+        None => ("automatic".to_string(), "automatic".to_string(), 0),
+    };
     let (control_session, children) = match &diagnostics {
         Some(diagnostics) => (
             control_session_json(&diagnostics.control_session),
@@ -2477,6 +2631,11 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
         "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| snapshot.state.name()),
         "generation": generation,
         "cluster_generation": generation,
+        "operation_policy": {
+            "desired": desired_policy,
+            "applied": applied_policy,
+            "epoch": policy_epoch,
+        },
         "target": target_name(target.target),
         "target_ready": target.ready,
         "admission": admission_json(admission),

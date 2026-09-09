@@ -86,6 +86,19 @@ enum ClusterCommand {
         #[arg(long, value_enum)]
         profile: Profile,
     },
+    /// Apply the operator policy (P06 / C03). `automatic` re-enables automatic
+    /// pairing/promotion; `standalone` forces standalone (ForcedStandalone).
+    /// Calls the same `POST /cluster/operation-policy` API as the GUI.
+    Mode {
+        #[arg(value_enum)]
+        policy: PolicyMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PolicyMode {
+    Automatic,
+    Standalone,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -198,6 +211,19 @@ fn cluster_request(
                 Profile::Standalone => "standalone",
                 Profile::Distributed => "distributed",
             }})),
+            Output::Json,
+        ),
+        ClusterCommand::Mode { policy } => (
+            reqwest::Method::POST,
+            "/cluster/operation-policy",
+            Some(json!({
+                "policy": match policy {
+                    PolicyMode::Automatic => "automatic",
+                    PolicyMode::Standalone => "forced-standalone",
+                },
+                "expected_generation": 0,
+                "request_id": uuid::Uuid::new_v4(),
+            })),
             Output::Json,
         ),
     }
@@ -567,5 +593,29 @@ mod tests {
         }));
         assert_eq!(report["healthy"], false);
         assert_eq!(report["checks"]["safe_state"], false);
+    }
+
+    #[test]
+    fn cluster_mode_selects_operation_policy_route_and_encodes_policy() {
+        // P06 / C03: CLI cluster mode automatic/standalone は GUI と同じ
+        // `POST /cluster/operation-policy` API を呼ぶ。policy は kebab-case で body に載る。
+        let (method, path, body, output) = cluster_request(ClusterCommand::Mode {
+            policy: PolicyMode::Automatic,
+        });
+        assert_eq!(method, reqwest::Method::POST);
+        assert_eq!(path, "/cluster/operation-policy");
+        let body = body.unwrap();
+        assert_eq!(body["policy"], "automatic");
+        assert!(
+            body["request_id"].is_string(),
+            "request_id は UUID 文字列であるべき"
+        );
+        assert!(matches!(output, Output::Json));
+
+        let (_, _, body, _) = cluster_request(ClusterCommand::Mode {
+            policy: PolicyMode::Standalone,
+        });
+        let body = body.unwrap();
+        assert_eq!(body["policy"], "forced-standalone");
     }
 }

@@ -31,7 +31,8 @@ mod worker;
 
 pub use admin::{
     AdminAction, AdminController, AdminExecutor, AdminFuture, AdminJob, AdminJobState,
-    AdminStartError, FingerprintProfile, encode_token,
+    AdminStartError, FingerprintProfile, PolicyJob, PolicyJobState, PolicyNodeResult, PolicyStart,
+    PolicyStartError, encode_token, policy_body_hash,
 };
 pub use artifacts::{ResolveError, ResolvedDs4Profile, convert_layer_parallel};
 pub use auth::{

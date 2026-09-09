@@ -1,5 +1,6 @@
 use super::operation::{OperationId, OperationKind, OperationLease};
-use serde::Serialize;
+use super::policy::OperationPolicy;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -25,9 +26,21 @@ pub enum AdminAction {
     Reconcile,
     Pair,
     Promote,
-    Demote { reason: Option<String> },
+    Demote {
+        reason: Option<String>,
+    },
     Restart,
-    Fingerprint { profile: FingerprintProfile },
+    Fingerprint {
+        profile: FingerprintProfile,
+    },
+    /// v0.4.0 操作方針の適用（P06 / C03）。desired / expected_generation / request_id を
+    /// 受け、両 node の ready/applied を調整して Complete にする。job 完了は方針の適用を
+    /// 示し、TP ready とは区別される（CLI が混同しない）。。
+    SetPolicy {
+        desired: OperationPolicy,
+        expected_generation: u64,
+        request_id: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,12 +81,77 @@ pub struct AdminJob {
     pub error: Option<String>,
 }
 
+/// v0.4.0 policy 適用 job の状態（P06 / C03）。GET /cluster/jobs/{id} が返す。。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyJobState {
+    Running,
+    Complete,
+    Failed,
+}
+
+/// node 別の適用結果。partial（片側失敗）では失敗 node の error を保持し、
+/// 成功 node の applied は維持する。。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyNodeResult {
+    pub node_id: String,
+    pub state: PolicyJobState,
+    pub applied: OperationPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// policy 適用 job。kind=operation-policy、desired/applied/node 別結果/error を返す。。
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyJob {
+    pub job_id: String,
+    pub kind: &'static str,
+    pub state: PolicyJobState,
+    pub desired: OperationPolicy,
+    pub applied: OperationPolicy,
+    pub nodes: Vec<PolicyNodeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// policy 適用 job の開始結果（P06 / C03）。。
+#[derive(Debug, Clone)]
+pub enum PolicyStart {
+    /// 新規作成。202 + job。。
+    Created(PolicyJob),
+    /// 冪等重複（同 ID 同 body）。既存 job を返す（同時 GUI 二箇所 → 一 job）。。
+    Existing(PolicyJob),
+}
+
+/// policy 適用 job の開始失敗理由（P06 / C03）。。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyStartError {
+    /// 同 ID 別 body。409。。
+    IdempotencyConflict,
+    /// policy lease が進行中の他操作に占有されている。409。。
+    LeaseBusy(super::operation::OperationLeaseError),
+}
+
+/// 冪等性のための canonical body hash。request の正規形から計算する（C03: 同 ID 同
+/// canonical body は同 job、別内容は 409）。。
+pub fn policy_body_hash(desired: OperationPolicy, expected_generation: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    desired.hash(&mut hasher);
+    expected_generation.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Clone)]
 pub struct AdminController {
     token: Arc<Vec<u8>>,
     executor: Arc<dyn AdminExecutor>,
     jobs: Arc<Mutex<HashMap<String, AdminJob>>>,
     active_fingerprints: Arc<Mutex<HashSet<FingerprintProfile>>>,
+    /// policy 適用 job の store。GET /cluster/jobs/{id} が読む。。
+    policy_jobs: Arc<Mutex<HashMap<uuid::Uuid, PolicyJob>>>,
+    /// policy 冪等性（request_id → body_hash）。同 ID 同 body は同 job、別 body は 409。。
+    policy_idempotency: Arc<Mutex<HashMap<uuid::Uuid, u64>>>,
     /// 全 lifecycle 操作の単一オーナー lease（P02 / C03）。データ取得 job（fingerprint）は
     /// 不要で、activation のみ排他。fingerprint 専用 HashSet だけで済ませない。
     lease: OperationLease,
@@ -87,6 +165,8 @@ impl AdminController {
             executor,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             active_fingerprints: Arc::new(Mutex::new(HashSet::new())),
+            policy_jobs: Arc::new(Mutex::new(HashMap::new())),
+            policy_idempotency: Arc::new(Mutex::new(HashMap::new())),
             lease: OperationLease::new(),
         })
     }
@@ -185,6 +265,119 @@ impl AdminController {
             .get(job_id)
             .cloned()
     }
+
+    /// policy 適用 job を開始する（P06 / C03）。冪等性（request_id → body_hash）と
+    /// 単一オーナー（OperationKind::Policy lease）を検査し、同 ID 同 body は既存 job、
+    /// 別 body は Conflict、policy lease 進行中は Busy を返す。。
+    pub fn start_policy(
+        &self,
+        request_id: uuid::Uuid,
+        body_hash: u64,
+        desired: OperationPolicy,
+        local_node_id: String,
+    ) -> Result<PolicyStart, PolicyStartError> {
+        let mut idem = self
+            .policy_idempotency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match idem.get(&request_id) {
+            // 同 ID 同 body → 既存 job を返す（同時 GUI 二箇所 → 一 job）。。
+            Some(existing) if *existing == body_hash => {
+                let job_id = self
+                    .policy_jobs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&request_id)
+                    .cloned();
+                match job_id {
+                    Some(job) => Ok(PolicyStart::Existing(job)),
+                    None => Err(PolicyStartError::IdempotencyConflict),
+                }
+            }
+            // 同 ID 別 body → 409。。
+            Some(_) => Err(PolicyStartError::IdempotencyConflict),
+            None => {
+                idem.insert(request_id, body_hash);
+                let operation_id = OperationId(uuid::Uuid::new_v4());
+                if let Err(error) = self.lease.try_acquire(OperationKind::Policy, operation_id) {
+                    idem.remove(&request_id);
+                    return Err(PolicyStartError::LeaseBusy(error));
+                }
+                let job_id = uuid::Uuid::new_v4();
+                let job = PolicyJob {
+                    job_id: job_id.to_string(),
+                    kind: "operation-policy",
+                    state: PolicyJobState::Running,
+                    desired,
+                    applied: OperationPolicy::Automatic,
+                    nodes: vec![PolicyNodeResult {
+                        node_id: local_node_id.clone(),
+                        state: PolicyJobState::Running,
+                        applied: OperationPolicy::Automatic,
+                        error: None,
+                    }],
+                    error: None,
+                };
+                self.policy_jobs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(request_id, job.clone());
+                drop(idem);
+                let executor = self.executor.clone();
+                let policy_jobs = self.policy_jobs.clone();
+                let lease = self.lease.clone();
+                tokio::spawn(async move {
+                    let result = executor
+                        .execute(AdminAction::SetPolicy {
+                            desired,
+                            expected_generation: 0,
+                            request_id,
+                        })
+                        .await;
+                    lease.release(OperationKind::Policy, operation_id);
+                    let mut store = policy_jobs
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(entry) = store.get_mut(&request_id) else {
+                        return;
+                    };
+                    match result {
+                        Ok(value) => {
+                            entry.state = PolicyJobState::Complete;
+                            entry.applied = desired;
+                            if let Some(node) = entry.nodes.first_mut() {
+                                node.state = PolicyJobState::Complete;
+                                node.applied = desired;
+                            }
+                            // node 別結果（peer 分）は executor の戻りに含める。。
+                            if let Some(nodes) = value.get("nodes").and_then(Value::as_array) {
+                                entry.nodes = serde_json::from_value(serde_json::json!(nodes))
+                                    .unwrap_or_else(|_| entry.nodes.clone());
+                            }
+                        }
+                        Err(error) => {
+                            entry.state = PolicyJobState::Failed;
+                            entry.error = Some(error.to_string());
+                            if let Some(node) = entry.nodes.first_mut() {
+                                node.state = PolicyJobState::Failed;
+                                node.error = Some(error.to_string());
+                            }
+                        }
+                    }
+                });
+                Ok(PolicyStart::Created(job))
+            }
+        }
+    }
+
+    /// policy 適用 job を返す（GET /cluster/jobs/{id}）。未知 ID は None。。
+    pub fn policy_job(&self, request_id: &uuid::Uuid) -> Option<PolicyJob> {
+        self.policy_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(request_id)
+            .cloned()
+    }
 }
 
 pub fn encode_token(token: &[u8]) -> String {
@@ -213,6 +406,7 @@ fn action_name(action: &AdminAction) -> &'static str {
         AdminAction::Demote { .. } => "demote",
         AdminAction::Restart => "restart",
         AdminAction::Fingerprint { .. } => "fingerprint",
+        AdminAction::SetPolicy { .. } => "operation-policy",
     }
 }
 
@@ -225,5 +419,6 @@ fn operation_kind(action: &AdminAction) -> Option<OperationKind> {
         AdminAction::Demote { .. } => Some(OperationKind::Demotion),
         AdminAction::Restart => Some(OperationKind::Restart),
         AdminAction::Fingerprint { .. } => None,
+        AdminAction::SetPolicy { .. } => Some(OperationKind::Policy),
     }
 }
