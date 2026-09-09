@@ -117,9 +117,10 @@ pub use process::{
 #[cfg(feature = "test-support")]
 pub use production::PairTiming;
 pub use production::policy::{
-    ForceApplyCoordinator, ForceNodePhase, POLICY_CONTROL_PROTOCOL_VERSION, PolicyControlError,
-    PolicyControlPhase, PolicyControlRequest, PolicyControlResponse, PolicyControlState,
-    PolicyControlStatus, PolicyControlVerdict, canonical_request_hash,
+    AutomaticPromotionVerdict, ForceApplyCoordinator, ForceNodePhase,
+    POLICY_CONTROL_PROTOCOL_VERSION, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
+    PolicyControlResponse, PolicyControlState, PolicyControlStatus, PolicyControlVerdict,
+    automatic_promotion_verdict, canonical_request_hash,
 };
 pub use production::tp::{TP_PRODUCTION_PROTOCOL_VERSION, TpStartVerdict, check_tp_start};
 pub use production::{

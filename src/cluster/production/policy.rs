@@ -197,6 +197,157 @@ impl ForceApplyCoordinator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P05 — Automatic 復帰と全自動経路の policy gate（C03 PolicyEpoch equality）。
+// ---------------------------------------------------------------------------
+// Automatic 変更は prepare/commit で同 epoch を両 node に保存し、pair/promote の各
+// 自動経路（discovery callback / periodic tick / operator promote / recovery / route
+// monitor）で「両端の policy epoch 一致」を検証する。片側 commit/ack 不明（部分
+// commit）では昇格しない。auto_promote=false / peer 不在 / deployment mismatch
+// latch でも Standalone を維持する。job 完了は方針の適用を示し、TP ready とは区別
+// される。Automatic を選んでも保護ラッチ（ForcedStandalone）を解除しない。
+
+/// 全自動経路（pair/promote）の policy gate 判定。純粋な決定を所有する。。
+/// 各自動経路はこの判定を共有し、gate 漏れを作らない。。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticPromotionVerdict {
+    /// 昇格を許可する。両端の policy epoch が一致し、auto_promote=true、
+    /// deployment mismatch latch が立っていない。。
+    Allow,
+    /// auto_promote=false。構成上 promotion は無効。。
+    AutoPromoteDisabled,
+    /// peer 不在（epoch 不明）。Standalone を維持する。。
+    PeerAbsent,
+    /// 両端の policy epoch が不一致（部分 commit / 片側 ack 不明）。昇格しない。。
+    EpochMismatch,
+    /// deployment mismatch latch 保持中。promotion を抑止する。。
+    DeploymentMismatchLatch,
+    /// ForcedStandalone 保護ラッチ保持中。promotion / pair を禁止する。。
+    ForcedStandaloneLatch,
+}
+
+impl AutomaticPromotionVerdict {
+    pub fn allows_promotion(&self) -> bool {
+        matches!(self, AutomaticPromotionVerdict::Allow)
+    }
+
+    /// ラベル（診断・受入テスト用の安定識別子）。。
+    pub fn name(&self) -> &'static str {
+        match self {
+            AutomaticPromotionVerdict::Allow => "auto-promote-allowed",
+            AutomaticPromotionVerdict::AutoPromoteDisabled => "auto-promote-disabled",
+            AutomaticPromotionVerdict::PeerAbsent => "auto-promote-peer-absent",
+            AutomaticPromotionVerdict::EpochMismatch => "auto-promote-epoch-mismatch",
+            AutomaticPromotionVerdict::DeploymentMismatchLatch => {
+                "auto-promote-deployment-mismatch-latch"
+            }
+            AutomaticPromotionVerdict::ForcedStandaloneLatch => {
+                "auto-promote-forced-standalone-latch"
+            }
+        }
+    }
+}
+
+/// 全自動経路の policy gate 判定関数。pair/promote を開始する前に必ず呼ぶ。。
+///
+/// - `operator_policy`: 現在の操作方針。ForcedStandalone は保護ラッチで、Automatic を
+///   選んでも解除されない（C03）。。
+/// - `auto_promote`: config の自動昇格フラグ。。
+/// - `deployment_mismatch_latch`: deployment mismatch の独立ラッチ。。
+/// - `peer_present`: peer が到達可能か。不在なら epoch 不明で Standalone を維持。。
+/// - `local_policy_epoch` / `peer_policy_epoch`: 両端の policy epoch。一致しない場合は
+///   部分 commit / 片側 ack 不明として昇格しない。。
+pub fn automatic_promotion_verdict(
+    operator_policy: OperationPolicy,
+    auto_promote: bool,
+    deployment_mismatch_latch: bool,
+    peer_present: bool,
+    local_policy_epoch: u64,
+    peer_policy_epoch: u64,
+) -> AutomaticPromotionVerdict {
+    // ForcedStandalone 保護ラッチが最優先。Automatic を選んでも解除しない。。
+    if operator_policy == OperationPolicy::ForcedStandalone {
+        return AutomaticPromotionVerdict::ForcedStandaloneLatch;
+    }
+    if !auto_promote {
+        return AutomaticPromotionVerdict::AutoPromoteDisabled;
+    }
+    if deployment_mismatch_latch {
+        return AutomaticPromotionVerdict::DeploymentMismatchLatch;
+    }
+    if !peer_present {
+        return AutomaticPromotionVerdict::PeerAbsent;
+    }
+    if local_policy_epoch != peer_policy_epoch {
+        return AutomaticPromotionVerdict::EpochMismatch;
+    }
+    AutomaticPromotionVerdict::Allow
+}
+
+#[cfg(test)]
+mod automatic_policy_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_with_peer_present_and_equal_epoch_allows() {
+        let v = automatic_promotion_verdict(OperationPolicy::Automatic, true, false, true, 7, 7);
+        assert_eq!(v, AutomaticPromotionVerdict::Allow);
+        assert!(v.allows_promotion());
+    }
+
+    #[test]
+    fn auto_promote_false_blocks_promotion() {
+        let v = automatic_promotion_verdict(OperationPolicy::Automatic, false, false, true, 7, 7);
+        assert_eq!(v, AutomaticPromotionVerdict::AutoPromoteDisabled);
+        assert!(!v.allows_promotion());
+    }
+
+    #[test]
+    fn partial_commit_epoch_mismatch_blocks_promotion() {
+        // 片側 commit/ack 不明（部分 commit）→ epoch 不一致で昇格しない。。
+        let v = automatic_promotion_verdict(OperationPolicy::Automatic, true, false, true, 7, 8);
+        assert_eq!(v, AutomaticPromotionVerdict::EpochMismatch);
+        assert!(!v.allows_promotion());
+    }
+
+    #[test]
+    fn peer_absent_keeps_standalone() {
+        let v = automatic_promotion_verdict(OperationPolicy::Automatic, true, false, false, 7, 7);
+        assert_eq!(v, AutomaticPromotionVerdict::PeerAbsent);
+        assert!(!v.allows_promotion());
+    }
+
+    #[test]
+    fn deployment_mismatch_latch_blocks_promotion() {
+        let v = automatic_promotion_verdict(OperationPolicy::Automatic, true, true, true, 7, 7);
+        assert_eq!(v, AutomaticPromotionVerdict::DeploymentMismatchLatch);
+        assert!(!v.allows_promotion());
+    }
+
+    #[test]
+    fn forced_standalone_latch_wins_over_automatic() {
+        // Automatic を選んでも ForcedStandalone 保護ラッチは解除しない（C03）。。
+        let v =
+            automatic_promotion_verdict(OperationPolicy::ForcedStandalone, true, false, true, 7, 7);
+        assert_eq!(v, AutomaticPromotionVerdict::ForcedStandaloneLatch);
+        assert!(!v.allows_promotion());
+    }
+
+    #[test]
+    fn labels_are_stable() {
+        assert_eq!(
+            automatic_promotion_verdict(OperationPolicy::Automatic, true, false, true, 1, 1,)
+                .name(),
+            "auto-promote-allowed"
+        );
+        assert_eq!(
+            automatic_promotion_verdict(OperationPolicy::Automatic, true, false, false, 1, 1,)
+                .name(),
+            "auto-promote-peer-absent"
+        );
+    }
+}
+
 #[cfg(test)]
 mod force_tests {
     use super::*;

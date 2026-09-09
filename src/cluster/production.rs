@@ -14,7 +14,10 @@ use super::{
 #[cfg(feature = "test-support")]
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
-    cluster::{ClusterEvent, ClusterEventKind, OperationPolicy, TpStartVerdict},
+    cluster::{
+        AutomaticPromotionVerdict, ClusterEvent, ClusterEventKind, OperationPolicy, TpStartVerdict,
+        automatic_promotion_verdict,
+    },
     config::{ModeAwareConfig, SpeculativeSupport},
     metrics::{MetricSnapshot, Metrics},
     proxy::ModeAwareProxyState,
@@ -275,6 +278,12 @@ struct ProductionInner {
     recovery: Arc<recovery::PeerLossRecovery>,
     recovery_owner_active: AtomicBool,
     automatic_pairing_blocked: AtomicBool,
+    /// 現在の操作方針（C03）。ForcedStandalone 保護ラッチを含む。P01 journal から
+    /// 復元され、適用調整（P04/P05）で更新される。Automatic を選んでも保護ラッチは
+    /// 解除しない。全自動経路（pair/promote）の gate が参照する。。
+    operator_policy: std::sync::Mutex<OperationPolicy>,
+    /// 現在の policy epoch（C03）。両端 pair/promote は peer epoch 一致を検証する。。
+    policy_epoch: AtomicU64,
     planned_restart: PlannedRestartGate,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
@@ -713,6 +722,8 @@ impl ProductionClusterRuntime {
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
             recovery_owner_active: AtomicBool::new(false),
             automatic_pairing_blocked: AtomicBool::new(false),
+            operator_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
+            policy_epoch: AtomicU64::new(0),
             planned_restart: PlannedRestartGate::default(),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
@@ -1081,6 +1092,57 @@ impl ProductionClusterRuntime {
 
     pub(super) fn automatic_pairing_blocked(&self) -> bool {
         self.inner.automatic_pairing_blocked.load(Ordering::Acquire)
+    }
+
+    /// 現在の操作方針（C03）。P01 journal から復元され、適用調整（P04/P05）で更新される。
+    pub fn operator_policy(&self) -> OperationPolicy {
+        *self
+            .inner
+            .operator_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// operator_policy を更新する。Automatic を選んでも ForcedStandalone 保護ラッチの
+    /// 解除は適用調整（P05 Automatic prepare/commit）経由でのみ行う。ここでは値を
+    /// 保持するだけ（適用の cluster-wide 調整は P05 が所有する）。P06 の policy apply が
+    /// この write hook を呼ぶため、本タスク時点では未使用（dead_code 抑止）。。
+    #[allow(dead_code)]
+    pub(crate) fn set_operator_policy(&self, policy: OperationPolicy) {
+        *self
+            .inner
+            .operator_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+
+    /// 現在の policy epoch（C03）。両端 pair/promote は peer epoch 一致を検証する。
+    pub fn policy_epoch(&self) -> u64 {
+        self.inner.policy_epoch.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_policy_epoch(&self, epoch: u64) {
+        self.inner.policy_epoch.store(epoch, Ordering::Release);
+    }
+
+    /// 全自動経路（periodic tick / operator promote / recovery / route monitor）が共有する
+    /// policy gate 判定。`peer_present` と `peer_policy_epoch` を引数で受け、現在の
+    /// operator_policy / config auto_promote / deployment mismatch latch と組み合わせて
+    /// 決定する。各自動経路はこの判定を必ず呼ぶ（gate 漏れを作らない、C03）。。
+    pub fn automatic_promotion_gate(
+        &self,
+        peer_present: bool,
+        peer_policy_epoch: u64,
+    ) -> AutomaticPromotionVerdict {
+        automatic_promotion_verdict(
+            self.operator_policy(),
+            self.inner.config.cluster.policy.auto_promote,
+            self.automatic_pairing_blocked(),
+            peer_present,
+            self.policy_epoch(),
+            peer_policy_epoch,
+        )
     }
 
     /// Fetch the coordinator's Prometheus metrics through the authenticated control plane.
