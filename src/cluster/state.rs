@@ -466,6 +466,17 @@ fn transition(
             }
         }
     }
+    // TP 準備要素の前段（warm-up 前）が揃っているか。warm-up 完了による route 公開は、
+    // worker Prepared / coordinator 起動 / handshake+HTTP が全て揃っている場合のみ（C02）。
+    // いずれかが欠落していると、warm-up 完了でも route は公開しない（各欠落 → 公開0）。
+    let tp_pre_warmup_complete = current
+        .tp
+        .map(|t| {
+            t.readiness.worker_prepared
+                && t.readiness.coordinator_started
+                && t.readiness.handshake_http_ready
+        })
+        .unwrap_or(false);
     let (mode, state, local_ready) = match (current.state, event.kind) {
         (ClusterState::Booting, ClusterEventKind::BeginSoloStandalone)
         | (ClusterState::Backoff, ClusterEventKind::BeginSoloStandalone) => (
@@ -602,13 +613,24 @@ fn transition(
             false,
         ),
         // AwaitingTensorParallelWorkerHello | warm-up 完了 → TensorParallelReady。route 公開。
+        // ただし、前段（worker Prepared / coordinator 起動 / handshake+HTTP）が揃って
+        // いない場合は route を公開しない（各欠落 → 公開0、C02）。その場合 warm-up は
+        // 受理されるが状態は Awaiting のまま。。
+        (
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            ClusterEventKind::TensorParallelWarmupDone,
+        ) if tp_pre_warmup_complete => (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelReady,
+            current.role != LocalRole::Worker,
+        ),
         (
             ClusterState::AwaitingTensorParallelWorkerHello,
             ClusterEventKind::TensorParallelWarmupDone,
         ) => (
             StableMode::DistributedTensorParallel,
-            ClusterState::TensorParallelReady,
-            current.role != LocalRole::Worker,
+            ClusterState::AwaitingTensorParallelWorkerHello,
+            false,
         ),
         // TP ready/starting | Force/fault → DemotingTensorParallel。新規閉。
         (
