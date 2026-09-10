@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod chat_client;
+pub mod citation;
 pub mod config;
 pub mod engine;
 pub mod history;
