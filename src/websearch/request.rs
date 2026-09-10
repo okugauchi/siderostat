@@ -13,10 +13,7 @@
 //! - 入力: oversize chunked body → 413
 //! - 入力: 検索なし → 検索通信0
 
-use super::wire::{
-    ContentItem, ResponseInput, ResponseInputItem, ResponseTool, ResponsesRequest, ToolChoice,
-    WebSearchAction,
-};
+use super::wire::{ResponseInput, ResponseTool, ResponsesRequest, ToolChoice};
 
 /// 受入 body の上限（C05: body2MiB）。
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -44,11 +41,37 @@ impl std::fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 /// Chat message（DS4 Chat Completions へ送る形式）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// - `role`: system / developer / user / assistant / tool。
+/// - `content`: テキスト内容。
+/// - `tool_calls`: assistant の tool call 一覧（順序保持）。client tool の
+///   call_id を保持し、次ターンの output と照合する。W03。
+/// - `tool_call_id`: role=tool の場合の対応 call_id。W03。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
+
+/// Chat tool call（Chat Completions の tool_calls 要素）。W03。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChatToolCall {
+    /// 対応 call_id（Responses function_call の call_id と一致）。W03。
+    pub id: String,
+    /// tool 名。
+    pub name: String,
+    /// arguments（JSON 文字列）。DS4 から返る形式。
+    pub arguments: String,
+}
+
+/// 内部検索 tool の予約名（C05 のネストした function 形式）。W03。
+///
+/// user tool と予約名の衝突は拒否する（受入 case: tool name 衝突 → 400）。
+pub const INTERNAL_SEARCH_TOOL_NAME: &str = "siderostat_web_search";
 
 /// 検索要求の検証結果。
 ///
@@ -201,6 +224,11 @@ impl ResponsesRequest {
             }
         }
 
+        // user tool と内部検索 tool 名の衝突を拒否（受入 case: tool name 衝突 → 400）。W03。
+        if let Some(tools) = &self.tools {
+            super::history::HistoryAdapter::check_tool_name_conflict(tools)?;
+        }
+
         // 検索要求を判定する。
         let required = search_required(&self.tool_choice);
         let forbidden = search_forbidden(&self.tool_choice);
@@ -262,13 +290,12 @@ impl ResponsesRequest {
         })
     }
 
-    /// input と instructions を Chat messages へ順序保持で変換する。
+    /// input と instructions を Chat messages へ順序保持で変換する。W03。
     ///
     /// - instructions → 先頭に system message。
     /// - input string → 単一 user message。
-    /// - input items → 順序保持で各 message を変換（system/developer/user/
-    ///   assistant を role 保持）。image/audio は 400。open_page/find_in_page
-    ///   の履歴は 400（MVP unsupported）。
+    /// - input items → HistoryAdapter で順序保持・call_id 照合・round-trip
+    ///   変換（function call ↔ tool_calls、output ↔ tool role）。W03。。
     fn to_chat_messages(&self) -> Result<Vec<ChatMessage>, RequestError> {
         let mut messages = Vec::new();
 
@@ -277,6 +304,7 @@ impl ResponsesRequest {
                 messages.push(ChatMessage {
                     role: "system".into(),
                     content: instructions.clone(),
+                    ..ChatMessage::default()
                 });
             }
         }
@@ -287,75 +315,12 @@ impl ResponsesRequest {
                 messages.push(ChatMessage {
                     role: "user".into(),
                     content: text.clone(),
+                    ..ChatMessage::default()
                 });
             }
             ResponseInput::Items(items) => {
-                for item in items {
-                    match item {
-                        ResponseInputItem::Message { role, content } => {
-                            // role は system/developer/user/assistant を保持。
-                            let mut text = String::new();
-                            for part in content {
-                                match part {
-                                    ContentItem::InputText { text: t }
-                                    | ContentItem::OutputText { text: t } => {
-                                        if !text.is_empty() {
-                                            text.push('\n');
-                                        }
-                                        text.push_str(t);
-                                    }
-                                    ContentItem::InputImage { .. }
-                                    | ContentItem::InputAudio { .. } => {
-                                        return Err(RequestError::BadRequest(
-                                            "image/audio input is unsupported in this bridge"
-                                                .into(),
-                                        ));
-                                    }
-                                }
-                            }
-                            messages.push(ChatMessage {
-                                role: role.clone(),
-                                content: text,
-                            });
-                        }
-                        ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                            // client function 結果。W03 で往復変換。W02 では
-                            // 通常 function 結果として user 側へ保持する。
-                            messages.push(ChatMessage {
-                                role: "function".into(),
-                                content: format!("call_id={call_id} {output}"),
-                            });
-                        }
-                        ResponseInputItem::CustomToolCallOutput { call_id, output } => {
-                            messages.push(ChatMessage {
-                                role: "function".into(),
-                                content: format!("call_id={call_id} {output}"),
-                            });
-                        }
-                        ResponseInputItem::WebSearchCall { action, .. } => {
-                            // web_search_call 履歴は再検索しない。open_page /
-                            // find_in_page は MVP unsupported → 400。
-                            match action {
-                                Some(WebSearchAction::Search { .. }) => {
-                                    // 履歴として保持。再検索はしない。
-                                    messages.push(ChatMessage {
-                                        role: "assistant".into(),
-                                        content: "[web search performed]".into(),
-                                    });
-                                }
-                                Some(WebSearchAction::OpenPage { .. })
-                                | Some(WebSearchAction::FindInPage { .. })
-                                | Some(WebSearchAction::Other)
-                                | None => {
-                                    return Err(RequestError::BadRequest(
-                                        "web_search open_page/find_in_page is unsupported in this bridge"
-                                            .into(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+                let converted = super::history::HistoryAdapter::to_chat_messages(items)?;
+                messages.extend(converted);
             }
         }
 

@@ -9,8 +9,10 @@
 //! 既定 disabled: 設定だけで検索や既存 runtime 停止は起きない。
 
 pub mod config;
+pub mod history;
 pub mod request;
 pub mod wire;
 
 pub use config::BridgeConfig;
-pub use request::{RequestError, ValidatedResponseRequest};
+pub use history::HistoryAdapter;
+pub use request::{ChatMessage, ChatToolCall, RequestError, ValidatedResponseRequest};

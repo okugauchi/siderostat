@@ -79,10 +79,47 @@ pub enum ResponseInputItem {
         role: String,
         content: Vec<ContentItem>,
     },
+    /// assistant の function call（client tool 呼び出し）。Bridge は実行しない。
+    /// call_id を保持し、次ターンの output と照合する。W03。
+    FunctionCall {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        /// arguments は JSON 文字列。parse/validate する。
+        arguments: String,
+        call_id: String,
+    },
+    /// assistant の custom tool call。Bridge は実行しない。W03。
+    CustomToolCall {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        /// input は JSON 文字列。
+        input: String,
+        call_id: String,
+    },
     /// function_call_output（client function の結果）。W03 で往復変換。
-    FunctionCallOutput { call_id: String, output: Value },
+    /// call_id は先行 function_call と照合する。
+    FunctionCallOutput {
+        #[serde(default)]
+        name: Option<String>,
+        call_id: String,
+        output: Value,
+    },
     /// custom tool call output。W03 で往復変換。
-    CustomToolCallOutput { call_id: String, output: Value },
+    CustomToolCallOutput {
+        #[serde(default)]
+        name: Option<String>,
+        call_id: String,
+        output: Value,
+    },
+    /// reasoning 履歴。encrypted_content は MVP 非対応 → 400。W03。
+    Reasoning {
+        #[serde(default)]
+        summary: Vec<Value>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+    },
     /// web_search_call 履歴。検索自体は再実行しない（W06）。
     WebSearchCall {
         id: String,
