@@ -13,3 +13,4 @@ pub mod proxy;
 pub mod recovery;
 mod startup_cleanup;
 pub mod target;
+pub mod websearch;
