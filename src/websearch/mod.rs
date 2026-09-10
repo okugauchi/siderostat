@@ -8,9 +8,11 @@
 //! 契約: CONTRACTS.md C05 / BridgeConfig。
 //! 既定 disabled: 設定だけで検索や既存 runtime 停止は起きない。
 
+pub mod backend;
 pub mod config;
 pub mod history;
 pub mod request;
+pub mod searxng;
 pub mod wire;
 
 pub use config::BridgeConfig;
