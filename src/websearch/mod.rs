@@ -9,12 +9,17 @@
 //! 既定 disabled: 設定だけで検索や既存 runtime 停止は起きない。
 
 pub mod backend;
+pub mod chat_client;
 pub mod config;
+pub mod engine;
 pub mod history;
 pub mod request;
 pub mod searxng;
 pub mod wire;
 
 pub use config::BridgeConfig;
+pub use engine::{
+    EngineError, EngineOutcome, WebSearchEngine, parse_search_arguments, search_tool_definition,
+};
 pub use history::HistoryAdapter;
 pub use request::{ChatMessage, ChatToolCall, RequestError, ValidatedResponseRequest};
