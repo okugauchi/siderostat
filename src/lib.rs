@@ -7,6 +7,7 @@ pub mod config;
 pub mod diagnostics;
 mod error;
 mod localization;
+pub mod manager;
 pub mod metrics;
 pub mod notify;
 pub mod proxy;
