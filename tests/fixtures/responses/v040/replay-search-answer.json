@@ -1,0 +1,24 @@
+{
+  "description": "W09 replay fixture — search→citation→answer の SSE item 列。A03 wire-profile に基づく。実 Codex parser (codex_protocol::ResponseItem) が各 item を受理することを検証する。",
+  "items": [
+    {
+      "type": "web_search_call",
+      "id": "item_0",
+      "status": "in_progress"
+    },
+    {
+      "type": "web_search_call",
+      "id": "item_0",
+      "status": "completed",
+      "action": {"type": "search", "query": "siderostat"}
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "id": "item_1",
+      "content": [
+        {"type": "output_text", "text": "日本語🙂e\u0301 [1] を参照。"}
+      ]
+    }
+  ]
+}
