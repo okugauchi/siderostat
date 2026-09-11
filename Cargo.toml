@@ -16,6 +16,10 @@ name = "fake-ds4"
 path = "src/bin/fake-ds4.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "ds4-websearch-proxy"
+path = "src/bin/ds4-websearch-proxy.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"

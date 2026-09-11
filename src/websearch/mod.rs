@@ -17,6 +17,7 @@ pub mod history;
 pub mod request;
 pub mod response;
 pub mod searxng;
+pub mod server;
 pub mod sse;
 pub mod wire;
 
