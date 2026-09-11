@@ -26,8 +26,17 @@ pub struct EngineOutcome {
     pub text: String,
     /// 実行された検索結果（untrusted tool data）。W05。
     pub search_results: Vec<SearchResult>,
+    /// 実行された検索の query（順序保持、search_results と対応）。W07。
+    ///
+    /// web_search_call item は query を保持する。検索を実行した順序で記録する。W07。
+    pub search_queries: Vec<String>,
     /// 消費した model turn 数。W05。
     pub model_turns: usize,
+    /// Bridge が実行せず外へ返す client tool call 一覧（順序保持）。W07。
+    ///
+    /// W05 は client tool を実行せず tool call として保持していたが、W07 で
+    /// Responses function_call として返すため、ここへ収集して返す。W07。
+    pub client_calls: Vec<super::request::ChatToolCall>,
 }
 
 /// engine エラー。受入 case に対応。W05。
@@ -134,16 +143,16 @@ pub fn search_tool_definition() -> serde_json::Value {
 pub struct WebSearchEngine<'a> {
     chat: &'a dyn ChatClient,
     search: &'a dyn SearchBackend,
-    /// 残り検索回数（初期3）。W05。/
+    /// 残り検索回数（初期3）。W05。
     searches_left: usize,
-    /// 残り model turn（初期6）。W05。/
+    /// 残り model turn（初期6）。W05。
     turns_left: usize,
-    /// 総 deadline（600s）の開始時刻。W05。/
+    /// 総 deadline（600s）の開始時刻。W05。
     deadline: std::time::Instant,
 }
 
 impl<'a> WebSearchEngine<'a> {
-    /// 新しい engine を構築する。W05。/
+    /// 新しい engine を構築する。W05。
     pub fn new(chat: &'a dyn ChatClient, search: &'a dyn SearchBackend) -> Self {
         Self {
             chat,
@@ -154,16 +163,18 @@ impl<'a> WebSearchEngine<'a> {
         }
     }
 
-    /// 実行する。W05。/
+    /// 実行する。W05。
     pub async fn run(
         &mut self,
         initial_messages: &[ChatMessage],
     ) -> Result<EngineOutcome, EngineError> {
         let mut messages: Vec<ChatMessage> = initial_messages.to_vec();
         let mut search_results: Vec<SearchResult> = Vec::new();
+        let mut search_queries: Vec<String> = Vec::new();
+        let mut client_calls: Vec<super::request::ChatToolCall> = Vec::new();
 
         loop {
-            // model turn 上限。W05。/
+            // model turn 上限。W05。
             if self.turns_left == 0 {
                 return Err(EngineError::TooManyTurns);
             }
@@ -184,7 +195,9 @@ impl<'a> WebSearchEngine<'a> {
                 return Ok(EngineOutcome {
                     text: turn.text.clone(),
                     search_results,
+                    search_queries,
                     model_turns: super::chat_client::MAX_MODEL_TURNS - self.turns_left,
+                    client_calls,
                 });
             }
 
@@ -200,9 +213,11 @@ impl<'a> WebSearchEngine<'a> {
 
                     // 引数を JSON schema で検証。W05。
                     let args = parse_search_arguments(&call.arguments)?;
+                    // 実行した検索の query を記録する。W07。
+                    search_queries.push(args.query.clone());
 
-                    // 検索を実行する（untrusted tool data として取得）。W05。/
-                    // 検索は SearchBackend 経由。fake 境界で応答注入。W05。/
+                    // 検索を実行する（untrusted tool data として取得）。W05。
+                    // 検索は SearchBackend 経由。fake 境界で応答注入。W05。
                     let results = self
                         .search
                         .search(&args.query)
@@ -224,8 +239,12 @@ impl<'a> WebSearchEngine<'a> {
                     search_results.extend(results);
                 } else {
                     // client tool。Bridge は実行しない。外へ返す。
-                    // W05 では最終回答に含めず、tool call として保持する。
-                    // 実際の返却は W07（Responses function_call）で行う。W05。
+                    // W07 で Responses function_call として返すため収集する。W07。
+                    client_calls.push(super::request::ChatToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
                     messages.push(ChatMessage {
                         role: "assistant".into(),
                         content: String::new(),

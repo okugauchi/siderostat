@@ -15,7 +15,9 @@ pub mod config;
 pub mod engine;
 pub mod history;
 pub mod request;
+pub mod response;
 pub mod searxng;
+pub mod sse;
 pub mod wire;
 
 pub use config::BridgeConfig;
