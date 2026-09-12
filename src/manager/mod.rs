@@ -17,6 +17,7 @@
 //! 自動化しない。
 
 pub mod build;
+pub mod catalog;
 pub mod jobs;
 pub mod process;
 pub mod registry;
@@ -25,6 +26,10 @@ pub mod source;
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
     is_approved_role, is_approved_target,
+};
+pub use catalog::{
+    CapabilityStatus, CatalogError, ModelCatalogEntry, compute_status, load_and_validate,
+    validate_entry,
 };
 pub use jobs::{JobKind, ManagerJob, ManagerJobError};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
