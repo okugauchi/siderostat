@@ -23,6 +23,7 @@ pub mod jobs;
 pub mod process;
 pub mod registry;
 pub mod source;
+pub mod verify;
 
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
@@ -43,3 +44,6 @@ pub use registry::{
     RegistryError, SourceRecord,
 };
 pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
+pub use verify::{
+    VerifiedArtifact, VerifyError, hex_sha256, publish_verified, recheck_verified, verify_artifact,
+};

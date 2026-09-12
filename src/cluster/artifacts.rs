@@ -1,13 +1,17 @@
-//! v0.4.0 外部 artifact の role 別解決と resolved profile（C01 / T02）。
+//! v0.4.0 外部 artifact の role 別解決と resolved profile（C01 / T02 / M06）。
 //!
 //! `ResolvedDs4Profile` は外部 binary（worker ds4 / HTTP coordinator ds4-server）を
 //! role 別に解決し、source/model/role/context/transport から共有 deployment identity を
 //! 生成する。host 固有 path は共有 digest に混ぜない。role と executable_kind の
 //! 整合（worker → ds4、coordinator → ds4-server）を検証し、不整合は拒否する。
+//! M06: managed（verify 済み）と external（既存 binary）を共通
+//! `ResolvedDs4Profile` へ変換する。managed は Verified のみ（partial を
+//! 返さない）。external 既存 path は変更しない（コピー/削除しない）。
 
 use super::capability::{ExecutableKind, RoleArtifact, RoleKind};
 use super::manifest::{ManifestError, ModelIdentity, TpDeploymentManifest};
 use crate::config::{Residency, SpeculativeSupport};
+use crate::manager::verify::VerifiedArtifact;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -142,6 +146,33 @@ pub fn convert_layer_parallel(
         context_size: manifest.context_size,
         argv_contract_id: manifest.argv_profile_sha256.clone(),
     })
+}
+
+/// M06: verify 済み managed artifact を `RoleArtifact` へ変換する。M06。
+///
+/// external 既存 path は変更せず、既存 `RoleArtifact` をそのまま共通
+/// `ResolvedDs4Profile` へ渡す（本関数は managed のみ）。partial を返さない
+/// （VerifiedArtifact は verify 済み）。M06。
+pub fn role_artifact_from_verified(
+    role: RoleKind,
+    executable_kind: ExecutableKind,
+    verified: VerifiedArtifact,
+    source_commit: String,
+    arch: String,
+    backend: String,
+) -> RoleArtifact {
+    let sha = verified.sha256.clone();
+    RoleArtifact {
+        role,
+        executable_kind,
+        path: verified.rel_path.to_string_lossy().to_string(),
+        binary_sha256: sha.clone(),
+        compatible_binary_sha256: vec![sha],
+        source_commit,
+        arch,
+        backend,
+        help_sha256: None,
+    }
 }
 
 #[derive(Debug, Error)]

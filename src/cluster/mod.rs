@@ -34,7 +34,9 @@ pub use admin::{
     AdminStartError, FingerprintProfile, PolicyJob, PolicyJobState, PolicyNodeResult, PolicyStart,
     PolicyStartError, encode_token, policy_body_hash,
 };
-pub use artifacts::{ResolveError, ResolvedDs4Profile, convert_layer_parallel};
+pub use artifacts::{
+    ResolveError, ResolvedDs4Profile, convert_layer_parallel, role_artifact_from_verified,
+};
 pub use auth::{
     AuthError, AuthenticatedPeer, ControlAuthenticator, ControlSecret, SignedControlHeaders,
 };
