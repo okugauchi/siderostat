@@ -18,6 +18,7 @@
 
 pub mod build;
 pub mod catalog;
+pub mod download;
 pub mod jobs;
 pub mod process;
 pub mod registry;
@@ -30,6 +31,10 @@ pub use build::{
 pub use catalog::{
     CapabilityStatus, CatalogError, ModelCatalogEntry, compute_status, load_and_validate,
     validate_entry,
+};
+pub use download::{
+    Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
+    HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
 };
 pub use jobs::{JobKind, ManagerJob, ManagerJobError};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
