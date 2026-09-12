@@ -16,11 +16,18 @@
 //! レビュー重点: フォルダ名だけで trusted と扱わない。削除は本 release で
 //! 自動化しない。
 
+pub mod build;
 pub mod jobs;
+pub mod process;
 pub mod registry;
 pub mod source;
 
+pub use build::{
+    APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
+    is_approved_role, is_approved_target,
+};
 pub use jobs::{JobKind, ManagerJob, ManagerJobError};
+pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
 pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,
     RegistryError, SourceRecord,
