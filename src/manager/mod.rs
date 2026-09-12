@@ -18,9 +18,11 @@
 
 pub mod jobs;
 pub mod registry;
+pub mod source;
 
 pub use jobs::{JobKind, ManagerJob, ManagerJobError};
 pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,
     RegistryError, SourceRecord,
 };
+pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
