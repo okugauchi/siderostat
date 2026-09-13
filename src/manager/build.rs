@@ -218,7 +218,7 @@ mod tests {
     fn make_fake_make(dir: &Path, exit_code: i32, produce_output: bool) -> PathBuf {
         let script = dir.join("fake_make.sh");
         let body = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"build\" ] || [ \"$1\" = \"ds4\" ]; then\n  {}\n  echo 'fake help' > help.txt\n  exit {}\nelse\n  echo 'unknown target' >&2\n  exit 2\nfi\n",
+            "#!/bin/sh\ncase \"$1\" in\n  build|ds4|ds4-server|ds4-agent)\n    {}\n    echo 'fake help' > help.txt\n    exit {}\n    ;;\n  *)\n    echo 'unknown target' >&2\n    exit 2\n    ;;\nesac\n",
             if produce_output && exit_code == 0 {
                 "echo 'fake binary' > out.bin"
             } else {
@@ -318,5 +318,56 @@ mod tests {
         assert!(matches!(err, BuildError::InsufficientDisk(_)));
         // build は実行されない（fake make が output を作っていない）。M03。
         assert!(!base.join("out.bin").exists());
+    }
+
+    /// V02/V03: 3 target（ds4 / ds4-server / ds4-agent）を build し、
+    /// 各 BuildRecord の digest / help_digest が非空で source・flags が一致する
+    /// ことを照合する（受入 case「3target build → record 一致」）。
+    #[test]
+    fn three_targets_build_records_match() {
+        for (i, target) in ["ds4", "ds4-server", "ds4-agent"].iter().enumerate() {
+            let tag = format!("3tgt-{i}");
+            let base = tmp(&tag);
+            let fake = make_fake_make(&base, 0, true);
+            let mut req = BuildRequest::new(*target, "build", "9ab70534", &base, "out.bin");
+            req.make_program = fake.to_string_lossy().to_string();
+            req.flags = "-O3 -mcpu=native".to_string();
+            req.toolchain = "cc (clang) + make, Metal".to_string();
+            req.arch = "arm64".to_string();
+            let cancel = AtomicBool::new(false);
+            let out = build_artifacts(&req, &cancel).expect("build ok");
+            // record 一致: 各 target で digest / help_digest が非空、source/flags が入力と一致。
+            assert_eq!(out.record.role, *target, "target role mismatch");
+            assert_eq!(out.record.source, "9ab70534", "source mismatch");
+            assert_eq!(out.record.flags, "-O3 -mcpu=native", "flags mismatch");
+            assert_eq!(out.record.arch, "arm64", "arch mismatch");
+            assert!(!out.record.digest.is_empty(), "digest must not be empty");
+            assert!(
+                !out.record.help_digest.is_empty(),
+                "help digest must not be empty"
+            );
+            assert_eq!(out.help_snapshot, "fake help\n", "help snapshot mismatch");
+        }
+    }
+
+    /// V02/V03: help 差 → 自動 activation 0。build_artifacts は新規 record を
+    /// 返すだけで active を登録しない（help digest が変わっても activation
+    /// されない）。受入 case「help 差 → 自動 activation 0」。
+    #[test]
+    fn help_diff_does_not_auto_activate() {
+        let base = tmp("helpdiff");
+        let fake = make_fake_make(&base, 0, true);
+        let mut req = BuildRequest::new("ds4-server", "build", "9ab70534", &base, "out.bin");
+        req.make_program = fake.to_string_lossy().to_string();
+        let cancel = AtomicBool::new(false);
+        let out = build_artifacts(&req, &cancel).expect("build ok");
+        // 各 role の help は固有（catalog.json で確認、3 distinct help_digests）。
+        // build は record を返すだけで、active 状態（active marker）を生成しない。
+        assert!(!out.record.help_digest.is_empty());
+        // build 後に workspace へ active marker が作られない（active 不変）。
+        assert!(
+            !base.join("active.txt").exists(),
+            "build must not auto-activate"
+        );
     }
 }

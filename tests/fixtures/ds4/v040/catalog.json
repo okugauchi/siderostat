@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "kind": "upstream-build-catalog",
+  "tracked_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+  "tracked_on_main": true,
+  "current_main": "6289c516273979173abbc062209a81dd3706b804",
+  "commits_since_tracked": 55,
+  "tp_protocol_version": "10 (DS4_TP_PROTOCOL_VERSION 10u, ds4_tp.c:44)",
+  "tp_protocol_changed": false,
+  "capability_delta_from_tracked_to_main": {
+    "ds4_tp.c": "no diff (TP protocol v10 維持)",
+    "ds4_distributed.c": "no diff",
+    "ds4_server.c": "967 insertions, 193 deletions (capability 追跡要。TP argv 契約は A02 のまま)"
+  },
+  "build": {
+    "status": "PASS",
+    "date": "2026-09-14",
+    "workspace": "/Users/o/LLM/ds4-v040",
+    "checkout": "git worktree add --detach 9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "command": "make ds4 ds4-server ds4-agent",
+    "exit_code": 0,
+    "compiler": "cc (clang) + make, macOS Metal (-framework Foundation -framework Metal)",
+    "nvcc_required": false,
+    "targets": {
+      "ds4": {
+        "bin_sha256": "92e83185c119d54e",
+        "bin_size": 2306112,
+        "help_sha256": "a932866934735acd",
+        "help_len": 5072,
+        "help_exit": 0
+      },
+      "ds4-server": {
+        "bin_sha256": "fafff7be48104b86",
+        "bin_size": 2623480,
+        "help_sha256": "6512f50355b93679",
+        "help_len": 4156,
+        "help_exit": 0
+      },
+      "ds4-agent": {
+        "bin_sha256": "ece7916dc5b82e86",
+        "bin_size": 2530680,
+        "help_sha256": "8edec86ff2b31ce5",
+        "help_len": 4029,
+        "help_exit": 0
+      }
+    },
+    "record_matches": {
+      "three_targets_distinct_bin_digests": true,
+      "three_targets_distinct_help_digests": true,
+      "help_exit_all_zero": true
+    }
+  },
+  "ci_environment": {
+    "status": "NOT_RUN",
+    "reason": "実 ds4 build は Metal フレームワーク・GPU 依存・フル C コンパイルを要し、CI (macos runner) では実行困難。実 build は隔離 workspace でローカル実行し PASS。CI での実 build 再実行は H02 前に行う。",
+    "fixed_inputs": [
+      "upstream: https://github.com/antirez/ds4.git (branch main)",
+      "tracked_commit: 9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+      "build command: make ds4 ds4-server ds4-agent (隔離 workspace, checkout 9ab70534)"
+    ],
+    "re_run_command": "git -C /Users/o/LLM/ds4 worktree add --detach <isolated> 9ab705347c1775e7599ede7eb81a6255ec7dccb5 && cd <isolated> && make ds4 ds4-server ds4-agent"
+  },
+  "h01_h02_packet": {
+    "build_gate": "NOT_RUN (CI では実 build 不可。ローカル実 build は PASS、3 target record 一致)",
+    "h01_owner": "H01 に実機操作を集約（実 child 起動 / activation / Bridge 実プロセス / SMAppService 実操作）。実 build は H02 前に隔離 workspace で再実行して build gate を完了させる。",
+    "h02_prereq": "H02 開始前に、隔離 workspace で 3 target を build 再実行し、catalog.json の digest と照合する。実 model の load は行わない。",
+    "compiler_shortage": "none (cc/make + Metal あり、nvcc 不要)"
+  },
+  "pr_not_main": {
+    "status": "reference",
+    "evidence": "source.rs stage_source は非 main commit → SourceError::NotOnMain → reference 扱い (M02)。9ab70534 は main の祖先 (on main)。PR 未 main は reference 維持。"
+  }
+}
