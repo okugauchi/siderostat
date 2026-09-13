@@ -249,11 +249,13 @@ mod tests {
     /// M02。
     fn make_fixture_remote(dir: &Path) {
         // clone --bare の宛先 dir は存在してはいけない（create しない）。M02。
-        // work tree は dir の兄弟に置くが、並列実行で他テストと競合しない
-        // よう dir の file name を含む tag 固有の名前にする。M02。
+        // work tree は base（dir の親）内に置くが、並列実行で他テストと競合
+        // しないよう base の file name を含む tag 固有の名前にする。M02。
+        // dir 自体は常に "remote" なので file_name では区別できない。
         let runner = GitRunner::default();
-        let tag = dir.file_name().and_then(|s| s.to_str()).unwrap_or("work");
-        let work = dir.parent().expect("parent").join(format!("{tag}-work"));
+        let base = dir.parent().expect("parent");
+        let base_tag = base.file_name().and_then(|s| s.to_str()).unwrap_or("work");
+        let work = base.join(format!("{base_tag}-work"));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).expect("create work");
         runner
