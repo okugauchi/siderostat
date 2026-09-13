@@ -24,6 +24,7 @@ pub mod download;
 pub mod jobs;
 pub mod process;
 pub mod registry;
+pub mod rollback;
 pub mod source;
 pub mod stage;
 pub mod verify;
@@ -31,7 +32,7 @@ pub mod verify;
 pub use activation::{
     ActivationError, ActivationJournal, ActivationPhase, ActivationRequest, NodeActivationState,
     NodeArtifactProvider, NodePhase, PrepareOutcome, begin_drain, commit_ack, journal_dir,
-    mark_ready, prepare_activation, rollback_to_previous,
+    mark_ready, prepare_activation,
 };
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
@@ -52,6 +53,7 @@ pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,
     RegistryError, SourceRecord,
 };
+pub use rollback::{PreviousRecovery, RollbackOutcome, RollbackRequest, rollback_to_previous};
 pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
 pub use stage::{
     ActivationPlan, StageError, StageRequest, StagedProfile, StagedProfileStatus,
