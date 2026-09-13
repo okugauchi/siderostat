@@ -1,4 +1,4 @@
-# Troubleshooting Siderostat
+# Troubleshooting siDeroStat
 
 For the Japanese guide, see [docs/troubleshooting.ja.md](troubleshooting.ja.md).
 
@@ -30,16 +30,24 @@ of the service to clear an offline message.
 
 Both Macs must use the same reviewed source revision and compatible model configuration. The Macs must
 first reach `Paired Standalone`; only then can they enter `Distributed (layer-parallel)`. If compatibility
-checks fail, Siderostat deliberately remains in standalone operation.
+checks fail, siDeroStat deliberately remains in standalone operation.
+
+Check the connection mode before troubleshooting a distributed/TP issue:
+
+- If `ForcedStandalone` is selected, siDeroStat intentionally keeps the Mac standalone even while the
+  peer is visible. Select `Automatic` to follow the connection state.
+- Mac-to-Mac tensor parallelism (TP) is gated by the connection mode, peer protocol negotiation, and
+  upstream capability. If the peer is running a different version or the model does not support TP,
+  siDeroStat stays in `Paired Standalone` rather than starting TP against an unsupported peer.
 
 Disconnect and reconnect the Thunderbolt cable once, then wait for both monitors to settle. Do not change
 model files or delete runtime data while the monitors are transitioning.
 
 ## A request returns HTTP 503 or HTTP 504
 
-This can happen while the inference service starts or while Siderostat changes operating state. Wait until
+This can happen while the inference service starts or while siDeroStat changes operating state. Wait until
 the menu bar monitor shows a ready state, then let the client application retry only if repeating the request
-is safe. Siderostat does not automatically replay the failed request.
+is safe. siDeroStat does not automatically replay the failed request.
 
 ## Restart or recovery does not finish
 
@@ -51,7 +59,7 @@ or authentication data.
 ## Login start is not working
 
 Confirm that the user service was installed with `cargo xtask install --start`. If macOS asks for a login-item
-approval, open System Settings > General > Login Items and approve the Siderostat entries. After changing an
+approval, open System Settings > General > Login Items and approve the siDeroStat entries. After changing an
 approval, run the installation command once more so the current state is refreshed.
 
 ## Updating or uninstalling reports an error

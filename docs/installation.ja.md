@@ -1,4 +1,4 @@
-# Siderostat 導入ガイド
+# siDeroStat 導入ガイド
 
 英語版（正本）: [docs/installation.md](installation.md)
 
@@ -8,13 +8,13 @@
 - 両方の Mac の Rust 1.85 以降
 - Thunderbolt ケーブルと、両方の Mac で有効にした Thunderbolt ネットワーク
 - 承認済みの取得元から用意した、対応する推論サービスとモデル
-- 両方の Mac で同じ確認済み Siderostat ソースリビジョン
+- 両方の Mac で同じ確認済み siDeroStat ソースリビジョン
 
 初回ビルドと準備確認が完了するまで、Mac がスリープしないようにしてください。
 
 ## ビルドとインストール
 
-各 Mac で Siderostat のソース checkout をターミナルから開き、次を実行します。
+各 Mac で siDeroStat のソース checkout をターミナルから開き、次を実行します。
 
 ```sh
 cargo xtask fingerprint-models
@@ -24,7 +24,7 @@ cargo xtask install --start
 最初のコマンドは、ローカル設定で使用するモデルの fingerprint を記録します。次のコマンドは runtime と
 メニューバーモニターをビルドし、ユーザーサービスを登録して起動します。
 
-同じ Mac に別の Siderostat インストール方法を併用しないでください。ソース導入が runtime、メニューバーモニター、
+同じ Mac に別の siDeroStat インストール方法を併用しないでください。ソース導入が runtime、メニューバーモニター、
 ユーザーサービスを管理します。
 
 もう一方の Mac でも、同じソースリビジョンと対応するモデル設定でコマンドを実行します。両方が通常の単独稼働状態に
@@ -40,7 +40,7 @@ cargo xtask install --start
 ```
 
 設定、認証情報、モデルファイル、実行状態、キャッシュは保持されます。更新のためにこれらを削除しないでください。
-新しいソースリビジョンと既存の設定またはモデルに互換性がない場合、Siderostat は安全のため状態を進めず、単独稼働を維持します。
+新しいソースリビジョンと既存の設定またはモデルに互換性がない場合、siDeroStat は安全のため状態を進めず、単独稼働を維持します。
 
 ## ロールバック
 
@@ -49,7 +49,7 @@ cargo xtask install --start
 
 ## アンインストール
 
-Siderostat のソース checkout で次を実行します。
+siDeroStat のソース checkout で次を実行します。
 
 ```sh
 cargo xtask uninstall
@@ -68,3 +68,9 @@ cargo xtask uninstall
 
 安全に分散稼働へ移行できない場合は、各 Mac が単独稼働を続けます。これは安全機能による通常の動作であり、
 サービスの別コピーを起動する必要はありません。
+
+分散稼働が開始されるタイミングは接続モードに影響されます。`Automatic`（自動、既定値）では
+準備が整うと分散稼働へ移行します。`ForcedStandalone`（強制単独）では相手が見えていても各 Mac は
+単独稼働を維持し、`Automatic` を再選択するまで `Distributed (layer-parallel)` へ移行しません。
+詳細は[運用ガイド](operations.ja.md)を参照してください。
+

@@ -1,4 +1,4 @@
-# Installing Siderostat
+# Installing siDeroStat
 
 For the Japanese guide, see [docs/installation.ja.md](installation.ja.md).
 
@@ -8,13 +8,13 @@ For the Japanese guide, see [docs/installation.ja.md](installation.ja.md).
 - Rust 1.85 or later on both Macs.
 - A Thunderbolt cable and Thunderbolt networking enabled on both Macs.
 - The compatible inference service and model obtained from an approved source.
-- The same reviewed Siderostat source revision on both Macs.
+- The same reviewed siDeroStat source revision on both Macs.
 
 Keep the Macs awake while the first build and readiness checks complete.
 
 ## Build and install
 
-On each Mac, open a terminal in the Siderostat source checkout and run:
+On each Mac, open a terminal in the siDeroStat source checkout and run:
 
 ```sh
 cargo xtask fingerprint-models
@@ -24,7 +24,7 @@ cargo xtask install --start
 The first command records the model fingerprints used by the local configuration. The second command
 builds the runtime and menu bar monitor, installs the user services, and starts them.
 
-Do not run a second Siderostat installation method on the same Mac. The source installer owns the runtime,
+Do not run a second siDeroStat installation method on the same Mac. The source installer owns the runtime,
 the menu bar monitor, and their user services.
 
 Repeat the commands on the other Mac using the same source revision and compatible model configuration.
@@ -42,7 +42,7 @@ cargo xtask install --start
 
 The update keeps configuration, authentication data, model files, runtime state, and cache data. Do not
 delete those files to make an update work. If the new source revision is not compatible with the existing
-configuration or model, Siderostat fails closed and keeps the Mac in standalone operation.
+configuration or model, siDeroStat fails closed and keeps the Mac in standalone operation.
 
 ## Rolling back
 
@@ -52,7 +52,7 @@ revisions in a distributed pair.
 
 ## Uninstalling
 
-From the Siderostat source checkout, run:
+From the siDeroStat source checkout, run:
 
 ```sh
 cargo xtask uninstall
@@ -71,5 +71,10 @@ sequence is:
 2. `Paired Standalone` after the Macs authenticate each other.
 3. `Distributed (layer-parallel)` after distributed operation is ready.
 
-If distributed operation is not safe, Siderostat keeps each Mac in standalone operation. This is expected
+If distributed operation is not safe, siDeroStat keeps each Mac in standalone operation. This is expected
 safety behavior and does not require another copy of the service.
+
+The connection mode affects when distributed operation starts. With `Automatic` (the default), the Macs
+move to distributed operation after they become ready. With `ForcedStandalone`, each Mac stays in
+standalone operation even while the peer is visible, so `Distributed (layer-parallel)` is not entered
+until you select `Automatic` again. See the [operations guide](operations.md) for details.
