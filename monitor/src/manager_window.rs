@@ -69,7 +69,7 @@ impl ManagerViewModel {
 
     /// `/manager/status` の反映。job を個別更新し、active digest を
     /// 保持する。source fetch が succeeded なら sources へ追加する。
-    /// G03。。
+    /// G03。
     pub fn apply_status(
         &mut self,
         jobs: &[siderostat_core::manager::api::ManagerJobDto],
@@ -88,7 +88,7 @@ impl ManagerViewModel {
                     cancel: job.cancel,
                 },
             );
-            // source fetch succeeded → sources へ追加。G03。。
+            // source fetch succeeded → sources へ追加。G03。
             if job.kind == "fetch"
                 && job.phase == "succeeded"
                 && !self.sources.iter().any(|s| s.remote == job.id)
@@ -287,12 +287,162 @@ pub mod test_util {
     }
 }
 
+/// model catalog のエントリ（C04 / model/activation view）。size / license /
+/// checksum / encoder / support を表示する。checksum が無い model は
+/// activate できない。G04。/
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub name: String,
+    pub size: u64,
+    /// 検証済み SHA が無ければ None（activate disabled）。G04。/
+    pub checksum: Option<String>,
+    pub license: String,
+    /// Vision encoder（例: "openai-whisper"）。runtime と不整合なら理由。G04。/
+    pub encoder: String,
+    /// "supported" / "unsupported"。G04。/
+    pub support: String,
+}
+
+/// model 選択・download・activate・rollback の view（C04）。各 stage ごとに
+/// 同じ承認 dialog を重複させず、実 runtime 変更の承認は一つの activation
+/// 操作へ集約する（レビュー重点）。download / stage / activate は一つの
+/// activation 操作で開始する。rollback は previous 候補から選ぶ。G04。/
+#[derive(Debug, Clone, Default)]
+pub struct ModelView {
+    models: Vec<ModelEntry>,
+    /// 旧 active digest（build/download 中も保持表示）。G04。/
+    current_active: Option<String>,
+    /// rollback 候補（previous）。rollback 後も保持。G04。/
+    previous: Vec<String>,
+    /// model 別 download 進捗（%）。G04。/
+    download_progress: BTreeMap<String, u8>,
+}
+
+impl ModelView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_models(&mut self, models: Vec<ModelEntry>) {
+        self.models = models;
+    }
+
+    pub fn models(&self) -> &[ModelEntry] {
+        &self.models
+    }
+
+    /// checksum 有り + Vision 整合 → activate 可能。checksum が無い model
+    /// は activate disabled（受入 case 1）。Vision 不整合も disabled（受入
+    /// case 2）。G04。/
+    pub fn can_activate(&self, name: &str) -> bool {
+        let Some(model) = self.models.iter().find(|m| m.name == name) else {
+            return false;
+        };
+        model.checksum.is_some() && model.support == "supported" && vision_consistent(model)
+    }
+
+    /// Vision 不整合の理由（受入 case 2）。整合していれば None。G04。/
+    pub fn vision_reason(&self, name: &str) -> Option<String> {
+        let model = self.models.iter().find(|m| m.name == name)?;
+        if model.support != "supported" {
+            return Some(format!("Vision 対応外（{}）", model.support));
+        }
+        if !vision_consistent(model) {
+            return Some(format!("Vision encoder 不整合（{}）", model.encoder));
+        }
+        None
+    }
+
+    /// `/manager/status` の反映。build/download が進行中なら旧 active を
+    /// 表示し続ける（受入 case 3）。download 進捗を model 別に反映。G04。/
+    pub fn apply_status(
+        &mut self,
+        jobs: &[siderostat_core::manager::api::ManagerJobDto],
+        active_digest: Option<&str>,
+    ) {
+        let mut build_or_download_active = false;
+        for job in jobs {
+            if (job.kind == "build" || job.kind == "download")
+                && (job.phase == "running" || job.phase == "cancelling")
+            {
+                build_or_download_active = true;
+            }
+            if job.kind == "download" {
+                self.download_progress.insert(job.id.clone(), job.progress);
+            }
+        }
+        // 進行中は旧 active を保持（active_digest で上書きしない）。G04。/
+        if !build_or_download_active {
+            self.current_active = active_digest.map(str::to_string);
+        }
+    }
+
+    /// 現在の active（旧 active を表示）。G04。/
+    pub fn current_active(&self) -> Option<&str> {
+        self.current_active.as_deref()
+    }
+
+    /// model の download 進捗（%）。G04。/
+    pub fn download_progress(&self, name: &str) -> Option<u8> {
+        self.download_progress.get(name).copied()
+    }
+
+    /// activation を開始する。download / stage / activate は一つの
+    /// activation 操作へ集約（承認 dialog を各 stage で重複させない）。
+    /// 開始前に current_active を previous へ追加する。G04。/
+    pub async fn start_activation(
+        &mut self,
+        name: &str,
+        api: &mut impl ManagerApi,
+    ) -> Result<String, String> {
+        if !self.can_activate(name) {
+            return Err(format!(
+                "{} は activate できません（checksum / Vision 不整合）",
+                name
+            ));
+        }
+        let id = api.submit("activate", name).await?;
+        if let Some(active) = self.current_active.clone()
+            && !self.previous.contains(&active)
+        {
+            self.previous.push(active);
+        }
+        Ok(id)
+    }
+
+    /// rollback 候補（previous）。G04。/
+    pub fn rollback_candidates(&self) -> &[String] {
+        &self.previous
+    }
+
+    /// rollback を開始する（kind=rollback）。previous は保持する（受入
+    /// case 4）。G04。/
+    pub async fn rollback(
+        &mut self,
+        previous_id: &str,
+        api: &mut impl ManagerApi,
+    ) -> Result<String, String> {
+        if !self.previous.contains(&previous_id.to_string()) {
+            return Err("previous candidate not found".to_string());
+        }
+        let id = api.submit("rollback", previous_id).await?;
+        // previous は rollback 後も保持する（自動削除しない）。G04。/
+        Ok(id)
+    }
+}
+
+/// Vision encoder が runtime と整合するか。G04。/
+fn vision_consistent(model: &ModelEntry) -> bool {
+    // 既定の Vision encoder は "openai-whisper"。空は不整合。G04。/
+    model.encoder == "openai-whisper"
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_util::*;
     use super::*;
 
-    /// 入力: source 無し → 取得ボタン。G03。。/
+    /// 入力: source 無し → 取得ボタン。G03。/
     #[test]
     fn empty_sources_enable_fetch_button() {
         let mut api = FakeManagerApi::with_jobs(&["fetch-1"]);
@@ -378,6 +528,118 @@ mod tests {
             cancel: false,
         };
         assert_eq!(ManagerViewModel::redacted_reason(&job), "missing toolchain");
+    }
+
+    fn model(name: &str, checksum: Option<&str>, encoder: &str, support: &str) -> ModelEntry {
+        ModelEntry {
+            name: name.to_string(),
+            size: 1024,
+            checksum: checksum.map(str::to_string),
+            license: "MIT".to_string(),
+            encoder: encoder.to_string(),
+            support: support.to_string(),
+        }
+    }
+
+    /// 入力: checksum 無し → activate disabled。G04。/
+    #[test]
+    fn missing_checksum_disables_activation() {
+        let mut api = FakeManagerApi::with_jobs(&["act-1"]);
+        let mut view = ModelView::new();
+        view.set_models(vec![model("m1", None, "openai-whisper", "supported")]);
+        assert!(!view.can_activate("m1"), "no checksum -> activate disabled");
+        let err = block_on(view.start_activation("m1", &mut api)).expect_err("activate");
+        assert!(err.contains("activate できません"));
+        assert!(api.submit_calls.is_empty(), "no POST when checksum missing");
+    }
+
+    /// 入力: Vision 不整合 → 理由。G04。/
+    #[test]
+    fn vision_mismatch_surfaces_reason() {
+        let mut view = ModelView::new();
+        view.set_models(vec![
+            model("m-ok", Some("sha"), "openai-whisper", "supported"),
+            model("m-enc", Some("sha"), "other-encoder", "supported"),
+            model("m-unsup", Some("sha"), "openai-whisper", "unsupported"),
+        ]);
+        assert!(view.can_activate("m-ok"));
+        assert!(view.vision_reason("m-ok").is_none());
+        let reason = view
+            .vision_reason("m-enc")
+            .expect("encoder mismatch reason");
+        assert!(reason.contains("encoder 不整合"), "{reason}");
+        assert!(!view.can_activate("m-enc"));
+        let reason = view.vision_reason("m-unsup").expect("unsupported reason");
+        assert!(reason.contains("Vision 対応外"), "{reason}");
+        assert!(!view.can_activate("m-unsup"));
+    }
+
+    /// 入力: build/download 中 → 旧 active 表示。G04。/
+    #[test]
+    fn old_active_shown_while_build_or_download_runs() {
+        use siderostat_core::manager::api::ManagerJobDto;
+        let mut view = ModelView::new();
+        let running_build = ManagerJobDto {
+            id: "build-1".to_string(),
+            kind: "build".to_string(),
+            progress: 40,
+            phase: "running".to_string(),
+            error: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            cancel: true,
+        };
+        // 先に旧 active を反映しておく。G04。/
+        view.apply_status(&[], Some("old-active"));
+        assert_eq!(view.current_active(), Some("old-active"));
+        // build 進行中は旧 active を表示し続ける（active_digest で上書き
+        // しない）。G04。/
+        view.apply_status(std::slice::from_ref(&running_build), Some("new-active"));
+        assert_eq!(view.current_active(), Some("old-active"));
+        let _ = running_build;
+    }
+
+    /// 入力: rollback → previous 保持。G04。/
+    #[test]
+    fn rollback_keeps_previous() {
+        let mut api = FakeManagerApi::with_jobs(&["rollback-1"]);
+        let mut view = ModelView::new();
+        view.set_models(vec![model(
+            "m1",
+            Some("sha"),
+            "openai-whisper",
+            "supported",
+        )]);
+        // activation で current_active を previous に追加。G04。/
+        view.apply_status(&[], Some("active-a"));
+        let _ = block_on(view.start_activation("m1", &mut api)).expect("activate");
+        assert_eq!(view.rollback_candidates(), &["active-a".to_string()]);
+        // rollback 後も previous は保持。G04。/
+        let _ = block_on(view.rollback("active-a", &mut api)).expect("rollback");
+        assert_eq!(view.rollback_candidates(), &["active-a".to_string()]);
+        assert_eq!(api.submit_calls.len(), 2);
+        assert_eq!(api.submit_calls[0].0, "activate");
+        assert_eq!(api.submit_calls[1].0, "rollback");
+    }
+
+    /// レビュー重点: activation は一つの操作へ集約（承認 dialog を各 stage
+    /// で重複させない）。G04。/
+    #[test]
+    fn activation_is_single_operation() {
+        let mut api = FakeManagerApi::with_jobs(&["act-1"]);
+        let mut view = ModelView::new();
+        view.set_models(vec![model(
+            "m1",
+            Some("sha"),
+            "openai-whisper",
+            "supported",
+        )]);
+        let id = block_on(view.start_activation("m1", &mut api)).expect("activate");
+        assert_eq!(id, "act-1");
+        // download / stage / activate を分割せず、一つの activate 操作に
+        // 集約（POST 1 回）。G04。/
+        assert_eq!(api.submit_calls.len(), 1);
+        assert_eq!(api.submit_calls[0].0, "activate");
     }
 
     fn block_on<F>(future: F) -> F::Output
