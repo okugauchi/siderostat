@@ -157,8 +157,18 @@ pub fn generate(
         topology: config.ds4.distributed.topology.name().into(),
         speculative_support: "none".into(),
         context_size: config.ds4.distributed.context_size as u64,
-        coordinator_layers: config.ds4.distributed.coordinator_layers.clone(),
-        worker_layers: config.ds4.distributed.worker_layers.clone(),
+        coordinator_layers: config
+            .ds4
+            .distributed
+            .coordinator_layers
+            .clone()
+            .unwrap_or_default(),
+        worker_layers: config
+            .ds4
+            .distributed
+            .worker_layers
+            .clone()
+            .unwrap_or_default(),
         ds4_wire_schema: "ds4d-v1-hello40".into(),
         argv_profile_sha256: distributed_argv_profile,
     };

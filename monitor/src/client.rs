@@ -151,6 +151,35 @@ impl MetricsClient {
         let response = request.send().await.with_context(|| format!("GET {url}"))?;
         Ok(response.status().is_success())
     }
+
+    /// Fetch the DS4 Manager job status from `/manager/status` (M10 / C04).
+    /// Returns `Ok` with the full snapshot on success; a 404 means the runtime
+    /// predates the manager API (旧 version) and the caller should mark new
+    /// operations disabled (G01)。A network failure is a disconnect to retry.
+    pub async fn fetch_manager_jobs(
+        &self,
+    ) -> Result<siderostat_core::manager::api::ManagerStatusResponse> {
+        let url = format!("{}/manager/status", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // 旧 runtime: /manager API が無い。新操作（submit/cancel）disabled。G01
+            return Err(anyhow!("manager API not found (old runtime) at {url}"));
+        }
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "manager/status endpoint returned {}",
+                response.status()
+            ));
+        }
+        response
+            .json()
+            .await
+            .context("parse manager/status response")
+    }
 }
 
 fn metrics_path(routing: &ClusterRoutingState) -> &'static str {

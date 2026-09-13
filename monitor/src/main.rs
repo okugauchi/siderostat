@@ -6,20 +6,18 @@
 //! event loop runs on the main thread (tray-icon macOS requirement) and a
 //! CFRunLoop timer refreshes the tray from the shared state.
 
-mod client;
-mod config;
-mod launchd;
-mod localization;
-mod metrics;
-mod migration;
-mod operation;
-mod service_management;
-mod settings;
-mod state;
-mod tray;
-mod uninstaller;
-
-use crate::{
+use anyhow::{Context, Result};
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_core_foundation::{
+    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
+};
+use siderostat_core::config::ModeAwareConfig;
+use siderostat_core::notify::{
+    DesktopNotificationService, Notification, NotifyPlatform, build_notifier,
+    start_notification_relay,
+};
+use siderostat_monitor::{
     client::MetricsClient,
     config::MonitorConfig,
     localization::{app_metadata_info, text},
@@ -31,17 +29,6 @@ use crate::{
         version_handshake_with_build,
     },
     tray::MonitorTray,
-};
-use anyhow::{Context, Result};
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_core_foundation::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-};
-use siderostat_core::config::ModeAwareConfig;
-use siderostat_core::notify::{
-    DesktopNotificationService, Notification, NotifyPlatform, build_notifier,
-    start_notification_relay,
 };
 use std::{
     cell::Cell,
@@ -75,10 +62,12 @@ struct UpdateContext {
 
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
-        Some("--unregister-services") => return uninstaller::unregister_services_mode(),
-        Some("--uninstaller") => return uninstaller::run_uninstaller_app(),
-        _ if uninstaller::is_uninstaller_process() => {
-            return uninstaller::run_uninstaller_app();
+        Some("--unregister-services") => {
+            return siderostat_monitor::uninstaller::unregister_services_mode();
+        }
+        Some("--uninstaller") => return siderostat_monitor::uninstaller::run_uninstaller_app(),
+        _ if siderostat_monitor::uninstaller::is_uninstaller_process() => {
+            return siderostat_monitor::uninstaller::run_uninstaller_app();
         }
         _ => {}
     }
@@ -98,7 +87,7 @@ fn main() -> Result<()> {
     } else {
         tracing::info!("monitor configuration loaded with defaults");
     }
-    let config_valid = if launchd::is_bundle_mode() {
+    let config_valid = if siderostat_monitor::launchd::is_bundle_mode() {
         match validate_runtime_configuration() {
             Ok(()) => monitor_config_valid,
             Err(error) => {
@@ -114,7 +103,7 @@ fn main() -> Result<()> {
     // desktop notifications to the signed Siderostat.app process over this
     // per-user Unix socket. The native UserNotifications call is made by the
     // relay thread while this process owns the app bundle and AppKit session.
-    let _notification_relay = if launchd::is_bundle_mode() {
+    let _notification_relay = if siderostat_monitor::launchd::is_bundle_mode() {
         match start_notification_relay(true, true) {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -201,12 +190,14 @@ fn main() -> Result<()> {
             let _ = thread::Builder::new()
                 .name("siderostat-monitor-stop".into())
                 .spawn(move || {
-                    if launchd::is_bundle_mode() {
+                    if siderostat_monitor::launchd::is_bundle_mode() {
                         // bundle mode: stop only this monitor process; the runtime
                         // keeps running. launchctl bootout is not used (C-05a).
                         tracing::info!("exiting monitor process (bundle mode)");
                         std::process::exit(0);
-                    } else if let Err(error) = launchd::bootout_runtime_and_monitor() {
+                    } else if let Err(error) =
+                        siderostat_monitor::launchd::bootout_runtime_and_monitor()
+                    {
                         tracing::warn!(error = %error, "LaunchAgent stop failed");
                     }
                 });
@@ -226,7 +217,7 @@ fn main() -> Result<()> {
             let spawn_result = thread::Builder::new()
                 .name("siderostat-runtime-restart".into())
                 .spawn(move || {
-                    let outcome = if launchd::is_bundle_mode() {
+                    let outcome = if siderostat_monitor::launchd::is_bundle_mode() {
                         // bundle mode: graceful restart via the authenticated
                         // /admin/restart endpoint (C-04). launchctl kickstart
                         // is not used (C-05a).
@@ -269,7 +260,7 @@ fn main() -> Result<()> {
                             }
                         })
                     } else {
-                        match launchd::kickstart(launchd::RUNTIME_LABEL) {
+                        match siderostat_monitor::launchd::kickstart(siderostat_monitor::launchd::RUNTIME_LABEL) {
                             Ok(()) => OperationOutcome::Succeeded,
                             Err(error) => {
                                 tracing::warn!(error = %error, "Runtime restart failed");
@@ -316,7 +307,7 @@ fn main() -> Result<()> {
             let spawn_result = thread::Builder::new()
                 .name("siderostat-open-config".into())
                 .spawn(move || {
-                    let outcome = match settings::open_runtime_config() {
+                    let outcome = match siderostat_monitor::settings::open_runtime_config() {
                         Ok(()) => OperationOutcome::Succeeded,
                         Err(error) => {
                             tracing::warn!(error = %error, "Open configuration failed");
@@ -342,7 +333,7 @@ fn main() -> Result<()> {
             let spawn_result = thread::Builder::new()
                 .name("siderostat-open-login-items".into())
                 .spawn(move || {
-                    let outcome = match settings::open_login_items() {
+                    let outcome = match siderostat_monitor::settings::open_login_items() {
                         Ok(()) => OperationOutcome::Succeeded,
                         Err(error) => {
                             tracing::warn!(error = %error, "Open Login Items failed");
@@ -516,7 +507,7 @@ fn initialize_first_launch(
     };
     let state = reduce_first_launch_with_tray(first_launch, tray, event);
     if should_open_login_items(&state, false)
-        && let Err(error) = settings::open_login_items()
+        && let Err(error) = siderostat_monitor::settings::open_login_items()
     {
         tracing::warn!(error = %error, "could not open Login Items after approval request");
     }
@@ -637,10 +628,11 @@ fn collect_legacy_inventory() -> Result<LegacyInventory> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let usr_local_bin = Path::new("/usr/local/bin");
-    let mut inventory = migration::inventory_legacy(&home, usr_local_bin, &BTreeMap::new())?;
+    let mut inventory =
+        siderostat_monitor::migration::inventory_legacy(&home, usr_local_bin, &BTreeMap::new())?;
     #[cfg(target_os = "macos")]
     for plist in &inventory.plists {
-        if let Some(status) = migration::legacy_plist_status(&plist.path) {
+        if let Some(status) = siderostat_monitor::migration::legacy_plist_status(&plist.path) {
             inventory.legacy_status.insert(plist.path.clone(), status);
         }
     }
@@ -666,7 +658,9 @@ fn validate_runtime_configuration() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_statuses() -> (ServiceStatus, ServiceStatus) {
-    use crate::service_management::{ServiceKind, ServiceManagement, ServiceManagementAdapter};
+    use siderostat_monitor::service_management::{
+        ServiceKind, ServiceManagement, ServiceManagementAdapter,
+    };
 
     let adapter = ServiceManagement::new();
     (
@@ -1032,7 +1026,7 @@ fn register_first_launch_services(
     runtime_status: ServiceStatus,
     main_app_login_status: ServiceStatus,
 ) -> OperationOutcome {
-    use crate::service_management::ServiceKind;
+    use siderostat_monitor::service_management::ServiceKind;
 
     let runtime = register_service_if_needed(ServiceKind::RuntimeAgent, runtime_status);
     let main_app = register_service_if_needed(ServiceKind::MainAppLoginItem, main_app_login_status);
@@ -1041,7 +1035,7 @@ fn register_first_launch_services(
 
 #[cfg(target_os = "macos")]
 fn register_service_if_needed(
-    kind: crate::service_management::ServiceKind,
+    kind: siderostat_monitor::service_management::ServiceKind,
     status: ServiceStatus,
 ) -> OperationOutcome {
     match status {
@@ -1077,8 +1071,10 @@ fn combine_registration_outcomes(
 }
 
 #[cfg(target_os = "macos")]
-fn register_service(kind: crate::service_management::ServiceKind) -> OperationOutcome {
-    use crate::service_management::{RegisterOutcome, ServiceManagement, ServiceManagementAdapter};
+fn register_service(kind: siderostat_monitor::service_management::ServiceKind) -> OperationOutcome {
+    use siderostat_monitor::service_management::{
+        RegisterOutcome, ServiceManagement, ServiceManagementAdapter,
+    };
 
     let adapter = ServiceManagement::new();
     match adapter.register(kind) {
@@ -1113,18 +1109,20 @@ fn register_service(kind: crate::service_management::ServiceKind) -> OperationOu
 
 #[cfg(target_os = "macos")]
 fn register_runtime(start: bool) -> OperationOutcome {
-    use crate::service_management::{ServiceKind, ServiceManagement, ServiceManagementAdapter};
+    use siderostat_monitor::service_management::{
+        ServiceKind, ServiceManagement, ServiceManagementAdapter,
+    };
 
     if start {
         register_service(ServiceKind::RuntimeAgent)
     } else {
         match ServiceManagement::new().unregister(ServiceKind::RuntimeAgent) {
-            crate::service_management::UnregisterOutcome::Unregistered
-            | crate::service_management::UnregisterOutcome::AlreadyNotRegistered => {
+            siderostat_monitor::service_management::UnregisterOutcome::Unregistered
+            | siderostat_monitor::service_management::UnregisterOutcome::AlreadyNotRegistered => {
                 tracing::info!("runtime background service unregistered");
                 OperationOutcome::Succeeded
             }
-            crate::service_management::UnregisterOutcome::Error(message) => {
+            siderostat_monitor::service_management::UnregisterOutcome::Error(message) => {
                 tracing::warn!(message = %message, "runtime background unregister failed");
                 OperationOutcome::Failed
             }
