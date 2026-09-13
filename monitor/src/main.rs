@@ -20,6 +20,7 @@ use siderostat_core::notify::{
 use siderostat_monitor::{
     client::MetricsClient,
     config::MonitorConfig,
+    connection_mode::{ConnectionModeUi, ConnectionPolicy},
     localization::{app_metadata_info, text},
     migration::LegacyInventory,
     operation::{OperationKind, OperationOutcome, OperationState},
@@ -52,6 +53,7 @@ const SERVICE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 struct UpdateContext {
     shared: Arc<Mutex<DisplayState>>,
     operation: Arc<Mutex<OperationState>>,
+    connection_mode: Arc<Mutex<ConnectionModeUi>>,
     first_launch: Arc<Mutex<FirstLaunchState>>,
     first_launch_client: MetricsClient,
     first_launch_readiness_started: Arc<AtomicBool>,
@@ -118,6 +120,7 @@ fn main() -> Result<()> {
     let client = MetricsClient::new(&config)?;
     let shared = Arc::new(Mutex::new(DisplayState::default()));
     let operation = Arc::new(Mutex::new(OperationState::default()));
+    let connection_mode = Arc::new(Mutex::new(ConnectionModeUi::new()));
     let first_launch = Arc::new(Mutex::new(FirstLaunchState::VersionShown));
     let first_launch_readiness_started = Arc::new(AtomicBool::new(false));
     let app_metadata = app_metadata_info();
@@ -184,6 +187,8 @@ fn main() -> Result<()> {
     // through Service Management and the graceful-restart admin endpoint, never
     // through launchctl.
     let menu_operation = operation.clone();
+    let menu_connection_mode = connection_mode.clone();
+    let menu_shared = shared.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if MonitorTray::is_quit_event(&event) {
             tracing::info!("quit requested from menu");
@@ -350,6 +355,38 @@ fn main() -> Result<()> {
                     OperationOutcome::Failed,
                 );
             }
+        } else if MonitorTray::is_mode_automatic_event(&event) {
+            // 接続モード（G02 / C03）: 選択を /cluster/operation-policy へ送る
+            //（StableMode 直接書換えなし）。実行は非 GUI スレッドで行い、
+            // GUI thread に network を置かない。G02。
+            let generation = menu_shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation
+                .unwrap_or(0);
+            tracing::info!(generation, "Automatic connection mode requested from menu");
+            apply_connection_mode(
+                ConnectionPolicy::Automatic,
+                &menu_client,
+                &menu_connection_mode,
+                generation,
+            );
+        } else if MonitorTray::is_mode_forced_event(&event) {
+            let generation = menu_shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation
+                .unwrap_or(0);
+            tracing::info!(
+                generation,
+                "ForcedStandalone connection mode requested from menu"
+            );
+            apply_connection_mode(
+                ConnectionPolicy::ForcedStandalone,
+                &menu_client,
+                &menu_connection_mode,
+                generation,
+            );
         }
     }));
 
@@ -357,6 +394,7 @@ fn main() -> Result<()> {
     let update = Box::new(UpdateContext {
         shared: shared.clone(),
         operation,
+        connection_mode,
         first_launch,
         first_launch_client: client,
         first_launch_readiness_started,
@@ -389,6 +427,80 @@ fn main() -> Result<()> {
 
     tracing::info!("monitor exiting");
     Ok(())
+}
+
+/// 接続モード選択を非 GUI スレッドで適用する（G02 / C03）。選択は
+/// `/cluster/operation-policy` へ送る（StableMode 直接書換えなし）。実行は
+/// 専用スレッドで行い、GUI thread に network を置かない。select 実行中は
+/// connection_mode のミューテックスを保持するが、refresh は try_lock で
+/// スキップするので GUI スレッドはブロックされない。G02。
+#[allow(clippy::await_holding_lock)]
+fn apply_connection_mode(
+    policy: ConnectionPolicy,
+    client: &MetricsClient,
+    connection_mode: &Arc<Mutex<ConnectionModeUi>>,
+    generation: u64,
+) {
+    let client = client.clone();
+    let connection_mode = connection_mode.clone();
+    let spawn_result = thread::Builder::new()
+        .name("siderostat-mode-apply".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(error = %error, "mode apply runtime could not be built");
+                    return;
+                }
+            };
+            let result = runtime.block_on(async {
+                let mut ui = connection_mode
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                ui.select(policy, generation, &mut ClientPolicyApi { client: &client })
+                    .await
+            });
+            match result {
+                Ok(job) => {
+                    tracing::info!(
+                        job_id = %job.job_id,
+                        policy = %job.policy.display_name(),
+                        "connection mode apply started"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "connection mode apply failed");
+                }
+            }
+        });
+    if let Err(error) = spawn_result {
+        tracing::warn!(error = %error, "could not spawn connection mode apply");
+    }
+}
+
+/// `MetricsClient` を `PolicyApi` として接続モード選択に渡す wrapper。
+/// `MetricsClient::apply_operation_policy` は `/cluster/operation-policy` へ
+/// POST する（StableMode 直接書換えなし）。G02。
+struct ClientPolicyApi<'a> {
+    client: &'a MetricsClient,
+}
+
+impl siderostat_monitor::connection_mode::PolicyApi for ClientPolicyApi<'_> {
+    async fn apply(
+        &mut self,
+        policy: ConnectionPolicy,
+        expected_generation: u64,
+    ) -> Result<
+        siderostat_monitor::connection_mode::PendingJob,
+        siderostat_monitor::connection_mode::PolicyApiError,
+    > {
+        self.client
+            .apply_operation_policy(policy, expected_generation)
+            .await
+    }
 }
 
 /// CFRunLoop timer callback: refresh the tray from shared state on the main thread.
@@ -424,6 +536,13 @@ unsafe extern "C-unwind" fn refresh_callback(_timer: *mut CFRunLoopTimer, info: 
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     tray.update_operation(&operation);
+    // 接続モード submenu の状態行を反映（G02）。select が別スレッドで
+    // 実行中はミューテックスを try_lock で取得できず、その場合は前回の
+    // 表示を維持する。GUI スレッドは決してブロックされない。G02。
+    if let Ok(mode) = context.connection_mode.try_lock() {
+        let lines = mode.menu_lines();
+        tray.update_connection_mode(&lines);
+    }
 }
 
 /// Feed one event into the shared first-launch reducer.

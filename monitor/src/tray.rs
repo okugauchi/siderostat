@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use std::cell::Cell;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu},
 };
 
 const MENU_QUIT: &str = "quit";
@@ -27,6 +27,9 @@ const MENU_RUNTIME_RESTART: &str = "runtime-restart";
 const MENU_BG_TOGGLE: &str = "bg-toggle";
 const MENU_OPEN_CONFIG: &str = "open-config";
 const MENU_OPEN_LOGIN_ITEMS: &str = "open-login-items";
+const MENU_MODE_SUBMENU: &str = "mode-submenu";
+const MENU_MODE_AUTOMATIC: &str = "mode-automatic";
+const MENU_MODE_FORCED: &str = "mode-forced";
 
 /// Icon drawing colors.
 const GREEN: [u8; 4] = [0x2e, 0xcc, 0x71, 0xff]; // operating state
@@ -57,6 +60,10 @@ pub struct MonitorTray {
     login_status: MenuItem,
     first_launch: MenuItem,
     operation: MenuItem,
+    mode_selected: MenuItem,
+    mode_applied: MenuItem,
+    mode_auto: MenuItem,
+    mode_forced: MenuItem,
     show_decode_tps: bool,
     live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
@@ -103,6 +110,14 @@ impl MonitorTray {
             None,
         );
         let operation = MenuItem::new(text("operation.idle", "操作: 待機中"), false, None);
+        // 接続モード submenu（G02 / C03）。選択項目は Automatic /
+        // ForcedStandalone の 2 つ。選択は /cluster/operation-policy へ送る
+        //（StableMode 直接書換えなし）。状態行（選択・適用状態）を先頭に
+        // 表示し、update_connection_mode で更新する。G02。
+        let mode_selected = MenuItem::new("接続モード（選択）: --", false, None);
+        let mode_applied = MenuItem::new("適用状態: --", false, None);
+        let mode_auto = MenuItem::with_id(MENU_MODE_AUTOMATIC, "Automatic", true, None);
+        let mode_forced = MenuItem::with_id(MENU_MODE_FORCED, "Forced Standalone", true, None);
         let open_config = MenuItem::with_id(
             MENU_OPEN_CONFIG,
             text("menu.settings", "設定ファイルを開く"),
@@ -149,6 +164,13 @@ impl MonitorTray {
         menu.append(&login_status)?;
         menu.append(&first_launch)?;
         menu.append(&operation)?;
+        let mode_submenu = Submenu::with_id(MENU_MODE_SUBMENU, "接続モード", true);
+        mode_submenu.append(&mode_selected)?;
+        mode_submenu.append(&mode_applied)?;
+        mode_submenu.append(&PredefinedMenuItem::separator())?;
+        mode_submenu.append(&mode_auto)?;
+        mode_submenu.append(&mode_forced)?;
+        menu.append(&mode_submenu)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&open_config)?;
         menu.append(&runtime_restart)?;
@@ -177,6 +199,10 @@ impl MonitorTray {
             login_status,
             first_launch,
             operation,
+            mode_selected,
+            mode_applied,
+            mode_auto,
+            mode_forced,
             show_decode_tps,
             live_metric,
             _separator: separator,
@@ -297,6 +323,32 @@ impl MonitorTray {
         let _ = self._tray.set_tooltip(Some(tooltip));
     }
 
+    /// 接続モード submenu の状態行を反映する（G02 / C03）。`lines` は
+    /// `ConnectionModeUi::menu_lines()` の出力（選択・適用状態・適用中・
+    /// 保留）。適用中・保留は適用状態行に追記する。G02。
+    pub fn update_connection_mode(&self, lines: &[String]) {
+        let selected = lines
+            .iter()
+            .find(|l| l.starts_with("接続モード（選択）"))
+            .cloned()
+            .unwrap_or_else(|| "接続モード（選択）: --".to_string());
+        self.mode_selected.set_text(selected);
+        let mut applied = lines
+            .iter()
+            .find(|l| l.starts_with("適用状態"))
+            .cloned()
+            .unwrap_or_else(|| "適用状態: --".to_string());
+        let extras: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("適用中") || l.starts_with("（保留）"))
+            .map(|s| s.as_str())
+            .collect();
+        if !extras.is_empty() {
+            applied = format!("{} / {}", applied, extras.join(" / "));
+        }
+        self.mode_applied.set_text(applied);
+    }
+
     /// Check whether a menu event requests the monitor to quit.
     pub fn is_quit_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_QUIT)
@@ -321,6 +373,16 @@ impl MonitorTray {
     /// (approval affordance, C-05c).
     pub fn is_open_login_items_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_OPEN_LOGIN_ITEMS)
+    }
+
+    /// Check whether a menu event selects Automatic connection mode（G02）。
+    pub fn is_mode_automatic_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_MODE_AUTOMATIC)
+    }
+
+    /// Check whether a menu event selects ForcedStandalone connection mode（G02）。
+    pub fn is_mode_forced_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_MODE_FORCED)
     }
 
     /// Update the background-service registration status display. The runtime

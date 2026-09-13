@@ -19,6 +19,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.24.2"
+uuid = { version = "1.15", features = ["v4"] }
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-core-foundation = "0.3"

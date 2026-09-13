@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod config;
+pub mod connection_mode;
 pub mod jobs;
 pub mod launchd;
 pub mod localization;

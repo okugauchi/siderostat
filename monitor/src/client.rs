@@ -2,6 +2,7 @@
 
 use crate::{
     config::MonitorConfig,
+    connection_mode::{ConnectionPolicy, NodeResult, PendingJob, PolicyApiError},
     metrics::{MetricsSnapshot, parse_metrics},
 };
 use anyhow::{Context, Result, anyhow};
@@ -180,6 +181,111 @@ impl MetricsClient {
             .await
             .context("parse manager/status response")
     }
+
+    /// 接続モードを `/cluster/operation-policy`（P06 / C03）へ適用する。
+    ///
+    /// 選択を直接 `StableMode` へ書換えず、API へ送る（レビュー重点）。
+    /// 202 = 新規 job または冪等な既存 job。409 = 別の lifecycle 操作が
+    /// 進行中（理由表示）。それ以外は Other。G02。
+    pub async fn apply_operation_policy(
+        &self,
+        policy: ConnectionPolicy,
+        expected_generation: u64,
+    ) -> Result<PendingJob, PolicyApiError> {
+        let url = format!("{}/cluster/operation-policy", self.base_url);
+        let body = serde_json::json!({
+            "policy": policy.wire_value(),
+            "expected_generation": expected_generation,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+        });
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(PolicyApiError::Other(format!("POST {url} failed: {error}")));
+            }
+        };
+        match response.status() {
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::OK => {
+                let value: serde_json::Value = match response.json().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(PolicyApiError::Other(format!(
+                            "parse operation-policy response failed: {error}"
+                        )));
+                    }
+                };
+                parse_policy_job(&value)
+                    .ok_or_else(|| PolicyApiError::Other("policy job malformed".to_string()))
+            }
+            reqwest::StatusCode::CONFLICT => {
+                // 409: 別の lifecycle 操作が進行中。理由を表示する。G02。
+                let reason = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "another lifecycle operation is in progress".to_string());
+                Err(PolicyApiError::Busy(reason))
+            }
+            other => Err(PolicyApiError::Other(format!(
+                "operation-policy endpoint returned {other}"
+            ))),
+        }
+    }
+}
+
+/// `/cluster/operation-policy` の応答 PolicyJob JSON を PendingJob に変換。
+/// desired は wire 値（automatic/forced-standalone）、nodes は node 別結果。
+/// 形式が壊れていれば None（Other エラーへ）。G02。
+fn parse_policy_job(value: &serde_json::Value) -> Option<PendingJob> {
+    let job_id = value.get("job_id")?.as_str()?.to_string();
+    let policy = match value.get("desired")?.as_str()? {
+        "automatic" => ConnectionPolicy::Automatic,
+        "forced-standalone" => ConnectionPolicy::ForcedStandalone,
+        _ => return None,
+    };
+    let phase = value
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or("running")
+        .to_string();
+    let node_results = value
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|n| NodeResult {
+                    node: n
+                        .get("node_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    state: n
+                        .get("state")
+                        .and_then(|s| s.as_str())
+                        .map(|s| if s == "Complete" { "ok" } else { "failed" })
+                        .unwrap_or("failed")
+                        .to_string(),
+                    error: n
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PendingJob {
+        job_id,
+        policy,
+        phase,
+        node_results,
+    })
 }
 
 fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
