@@ -19,7 +19,7 @@ mod platform;
 mod policy;
 mod policy_journal;
 mod process;
-mod production;
+pub mod production;
 mod recovery_tp;
 mod restart;
 mod role;

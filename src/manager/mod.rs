@@ -16,6 +16,7 @@
 //! レビュー重点: フォルダ名だけで trusted と扱わない。削除は本 release で
 //! 自動化しない。
 
+pub mod activation;
 pub mod build;
 pub mod catalog;
 pub mod compatibility;
@@ -27,6 +28,11 @@ pub mod source;
 pub mod stage;
 pub mod verify;
 
+pub use activation::{
+    ActivationError, ActivationJournal, ActivationPhase, ActivationRequest, NodeActivationState,
+    NodeArtifactProvider, NodePhase, PrepareOutcome, begin_drain, commit_ack, journal_dir,
+    mark_ready, prepare_activation, rollback_to_previous,
+};
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
     is_approved_role, is_approved_target,

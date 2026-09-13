@@ -44,6 +44,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+pub mod activation;
 mod effects;
 mod pairing;
 pub(crate) mod policy;
