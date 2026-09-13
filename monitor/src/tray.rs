@@ -80,7 +80,7 @@ impl MonitorTray {
     /// Build the tray icon and its static menu structure.
     pub fn new(show_decode_tps: bool, live_metric: LiveMetric) -> Result<Self> {
         let icon = icon_for(None, true)?;
-        let header = MenuItem::new(text("app.name", "Siderostat"), false, None);
+        let header = MenuItem::new(text("app.name", "siDeroStat"), false, None);
         let mode = MenuItem::new("Mode: --", false, None);
         let state = MenuItem::new("State: --", false, None);
         let generation = MenuItem::new("Gen: --", false, None);
@@ -99,7 +99,7 @@ impl MonitorTray {
         let login_status = MenuItem::new(
             text(
                 "status.menu_bar_autostart.pending",
-                "Siderostat メニューバー自動起動: --",
+                "siDeroStat メニューバー自動起動: --",
             ),
             false,
             None,
@@ -145,7 +145,7 @@ impl MonitorTray {
             true,
             None,
         );
-        let quit = MenuItem::with_id(MENU_QUIT, text("menu.quit", "Siderostatを終了"), true, None);
+        let quit = MenuItem::with_id(MENU_QUIT, text("menu.quit", "siDeroStatを終了"), true, None);
 
         let menu = Menu::new();
         menu.append(&header)?;
@@ -179,7 +179,7 @@ impl MonitorTray {
         menu.append(&quit)?;
 
         let tray = TrayIconBuilder::new()
-            .with_tooltip(text("app.name", "Siderostat"))
+            .with_tooltip(text("app.name", "siDeroStat"))
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .build()
@@ -396,7 +396,7 @@ impl MonitorTray {
             runtime,
         ));
         self.login_status.set_text(registration_status_text(
-            &text("status.menu_bar_autostart", "Siderostat自動起動"),
+            &text("status.menu_bar_autostart", "siDeroStat自動起動"),
             login_item,
         ));
         self.runtime_service_status.set(runtime);
@@ -453,7 +453,7 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
             "{} ({})",
             text(
                 "first_launch.version",
-                "初回起動: Siderostatのバージョン情報を確認しました",
+                "初回起動: siDeroStatのバージョン情報を確認しました",
             ),
             app_metadata()
         ),
@@ -482,7 +482,7 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
             runtime_status,
             main_app_login_status,
         } => format!(
-            "{} (siderostat-runtime: {}; Siderostat: {})",
+            "{} (siderostat-runtime: {}; siDeroStat: {})",
             text(
                 "first_launch.service_statuses",
                 "初回起動: 自動起動の状態を確認しました",
@@ -492,23 +492,23 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
         ),
         FirstLaunchState::Registering => text(
             "first_launch.registering",
-            "初回起動: siderostat-runtimeとSiderostatの自動起動を登録中…",
+            "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録中…",
         ),
         FirstLaunchState::Registered => text(
             "first_launch.registered",
-            "初回起動: siderostat-runtimeとSiderostatの自動起動を登録しました",
+            "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録しました",
         ),
         FirstLaunchState::RequiresApproval => text(
             "first_launch.approval",
-            "初回起動: siderostat-runtimeまたはSiderostatのログイン項目の承認が必要です",
+            "初回起動: siderostat-runtimeまたはsiDeroStatのログイン項目の承認が必要です",
         ),
         FirstLaunchState::RegisterFailed => text(
             "first_launch.register_failed",
-            "初回起動: siderostat-runtimeまたはSiderostatの自動起動の登録に失敗しました",
+            "初回起動: siderostat-runtimeまたはsiDeroStatの自動起動の登録に失敗しました",
         ),
         FirstLaunchState::MonitorLoginChecked => text(
             "first_launch.monitor_login",
-            "初回起動: Siderostatの自動起動を確認しました",
+            "初回起動: siDeroStatの自動起動を確認しました",
         ),
         FirstLaunchState::RuntimeAdminReady => text(
             "first_launch.runtime_admin",
@@ -1247,7 +1247,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (runtime, login) in cases {
             let runtime_text = registration_status_text("siderostat-runtime自動起動", runtime);
-            let login_text = registration_status_text("Siderostat自動起動", login);
+            let login_text = registration_status_text("siDeroStat自動起動", login);
             // runtime の文言は login の文言と区別され、逆も同様。
             assert_ne!(runtime_text, login_text);
             // 各組み合わせの (runtime, login) 表示対が一意。

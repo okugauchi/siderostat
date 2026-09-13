@@ -1,9 +1,9 @@
-# Siderostat
+# siDeroStat
 
 日本語版: [README.ja.md](README.ja.md)
 
-Siderostat lets two Apple silicon Macs work together as a two-node inference setup. The Macs are
-connected by Thunderbolt, and Siderostat changes between local and distributed operation as the
+siDeroStat lets two Apple silicon Macs work together as a two-node inference setup. The Macs are
+connected by Thunderbolt, and siDeroStat changes between local and distributed operation as the
 connection becomes ready or unavailable.
 
 > [!NOTE]
@@ -11,7 +11,7 @@ connection becomes ready or unavailable.
 > explicitly says otherwise.
 
 > [!NOTE]
-> Siderostat supports exactly two Macs connected through Thunderbolt networking. Three or more Macs
+> siDeroStat supports exactly two Macs connected through Thunderbolt networking. Three or more Macs
 > are not supported.
 
 ## Features
@@ -56,7 +56,7 @@ Connect the Thunderbolt cable after both Macs reach a normal standalone state.
 
 For the complete procedure, see the [installation guide](docs/installation.md).
 
-## Using Siderostat
+## Using siDeroStat
 
 Use this local OpenAI-compatible endpoint in your client application:
 
@@ -65,7 +65,7 @@ http://127.0.0.1:18080/v1
 ```
 
 The menu bar monitor shows the current state and progress. During startup or a state change, a request
-may temporarily fail with HTTP 503 or HTTP 504. Siderostat does not replay a failed request, so the
+may temporarily fail with HTTP 503 or HTTP 504. siDeroStat does not replay a failed request, so the
 client application must decide whether a retry is safe.
 
 ### Dry-run mode (development only)

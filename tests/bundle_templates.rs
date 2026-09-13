@@ -80,7 +80,6 @@ fn bundle_templates_use_new_identifier_and_version_placeholders() {
     // version / build number は builder が置換する placeholder。
     assert!(contents.contains("<string>@VERSION@</string>"));
     assert!(contents.contains("<string>@BUILD_NUMBER@</string>"));
-
     let runtime = repo_root().join("contrib/macos/dev.siderostat-ds4-proxy.runtime.plist");
     let runtime_contents = std::fs::read_to_string(&runtime).unwrap();
     assert!(runtime_contents.contains("<string>dev.siderostat-ds4-proxy.runtime</string>"));
@@ -126,5 +125,28 @@ fn resources_include_license_notices_and_default_config() {
         assert!(contents.contains("first_launch.model_ready"));
         assert!(contents.contains("uninstaller.confirm.title"));
         assert!(contents.contains("uninstaller.failure.title"));
+        // G06: 表示名は en/ja 双方で siDeroStat に統一される（key 対応）。
+        assert!(
+            contents.contains("\"app.name\" = \"siDeroStat\""),
+            "app.name must be siDeroStat in {}",
+            locale
+        );
     }
+}
+
+/// G06: Info.plist は表示名を siDeroStat に、identifier は互換の旧値のまま維持する。
+#[test]
+fn info_plist_uses_siderostat_display_and_legacy_identifier() {
+    let info = repo_root().join("contrib/macos/Info.plist.in");
+    let contents = std::fs::read_to_string(&info).unwrap();
+    // 表示名（CFBundleDisplayName）は siDeroStat。
+    assert!(contents.contains("<key>CFBundleDisplayName</key>"));
+    assert!(contents.contains("<string>siDeroStat</string>"));
+    // 物理 App 名 / executable 名は互換のため Siderostat のまま。
+    assert!(contents.contains("<key>CFBundleName</key>"));
+    assert!(contents.contains("<key>CFBundleExecutable</key>"));
+    assert!(contents.contains("<string>Siderostat</string>"));
+    // bundle identifier は既存登録・receipt と整合するよう旧値のまま維持。
+    assert!(contents.contains("<key>CFBundleIdentifier</key>"));
+    assert!(contents.contains("<string>dev.siderostat-ds4-proxy</string>"));
 }

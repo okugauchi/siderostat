@@ -18,8 +18,8 @@ pub mod request;
 pub mod response;
 pub mod searxng;
 pub mod server;
-pub mod status;
 pub mod sse;
+pub mod status;
 pub mod wire;
 
 pub use config::BridgeConfig;

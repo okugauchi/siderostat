@@ -1053,10 +1053,10 @@ fn version_notification(
     runtime_version: &str,
     runtime_build: &str,
 ) -> Option<Notification> {
-    let title = text("notification.version.title", "Siderostat Version");
+    let title = text("notification.version.title", "siDeroStat Version");
     let details = text(
         "notification.version.details",
-        " (Siderostat={app_version} build={app_build}, siderostat-runtime={runtime_version} build={runtime_build})",
+        " (siDeroStat={app_version} build={app_build}, siderostat-runtime={runtime_version} build={runtime_build})",
     )
     .replace("{app_version}", app_version)
     .replace("{app_build}", app_build)
@@ -1067,7 +1067,7 @@ fn version_notification(
             "{}{}",
             text(
                 "notification.version.older",
-                "Siderostat is newer than siderostat-runtime. Restart siderostat-runtime from the menu to apply the Siderostat update.",
+                "siDeroStat is newer than siderostat-runtime. Restart siderostat-runtime from the menu to apply the siDeroStat update.",
             ),
             details
         ),
@@ -1075,7 +1075,7 @@ fn version_notification(
             "{}{}",
             text(
                 "notification.version.newer",
-                "siderostat-runtime is newer than Siderostat. Data is not migrated automatically during rollback.",
+                "siderostat-runtime is newer than siDeroStat. Data is not migrated automatically during rollback.",
             ),
             details
         ),

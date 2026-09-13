@@ -1,16 +1,16 @@
-"app.name" = "Siderostat";
+"app.name" = "siDeroStat";
 
 "menu.settings" = "Open Configuration File";
 "menu.login_items" = "Open Login Items";
 "menu.restart_runtime" = "Restart siderostat-runtime";
 "menu.background_enable" = "Start siderostat-runtime and Enable Auto-Start";
 "menu.background_disable" = "Stop siderostat-runtime and Disable Auto-Start";
-"menu.quit" = "Quit Siderostat";
+"menu.quit" = "Quit siDeroStat";
 
 "status.runtime_autostart.pending" = "siderostat-runtime Auto-Start: --";
-"status.menu_bar_autostart.pending" = "Siderostat Auto-Start: --";
+"status.menu_bar_autostart.pending" = "siDeroStat Auto-Start: --";
 "status.runtime_autostart" = "siderostat-runtime Auto-Start";
-"status.menu_bar_autostart" = "Siderostat Auto-Start";
+"status.menu_bar_autostart" = "siDeroStat Auto-Start";
 "status.enabled" = "enabled";
 "status.off" = "off";
 "status.approval_needed" = "approval needed";
@@ -19,10 +19,10 @@
 "status.offline" = "Cannot connect to siderostat-runtime";
 "status.metrics_unavailable" = "Connected to siderostat-runtime, but metrics are unavailable";
 
-"notification.version.title" = "Siderostat Version";
-"notification.version.details" = " (Siderostat={app_version} build={app_build}, siderostat-runtime={runtime_version} build={runtime_build})";
-"notification.version.older" = "Siderostat is newer than siderostat-runtime. Restart siderostat-runtime from the menu to apply the Siderostat update.";
-"notification.version.newer" = "siderostat-runtime is newer than Siderostat. Data is not migrated automatically during rollback.";
+"notification.version.title" = "siDeroStat Version";
+"notification.version.details" = " (siDeroStat={app_version} build={app_build}, siderostat-runtime={runtime_version} build={runtime_build})";
+"notification.version.older" = "siDeroStat is newer than siderostat-runtime. Restart siderostat-runtime from the menu to apply the siDeroStat update.";
+"notification.version.newer" = "siderostat-runtime is newer than siDeroStat. Data is not migrated automatically during rollback.";
 "notification.version.unavailable" = "Cannot read the siderostat-runtime version.";
 "notification.startup.title" = "ds4-server Startup";
 "notification.startup.starting" = "Starting ds4-server";
@@ -36,17 +36,17 @@
 "notification.startup_cleanup.declined" = "An existing ds4-server or siderostat-runtime process was detected. Startup was cancelled.";
 "notification.startup_cleanup.restart" = "siderostat-runtime will restart in 5 seconds";
 
-"first_launch.version" = "First launch: Siderostat version/build metadata checked";
+"first_launch.version" = "First launch: siDeroStat version/build metadata checked";
 "first_launch.inventory_legacy" = "First launch: legacy installation detected";
 "first_launch.inventory_clean" = "First launch: no legacy installation found";
 "first_launch.config_valid" = "First launch: configuration, secrets, and manifests checked";
 "first_launch.config_invalid" = "First launch: configuration validation failed";
 "first_launch.service_statuses" = "First launch: auto-start statuses checked";
-"first_launch.registering" = "First launch: registering siderostat-runtime and Siderostat auto-start…";
-"first_launch.registered" = "First launch: siderostat-runtime and Siderostat auto-start registered";
-"first_launch.approval" = "First launch: approval is required for siderostat-runtime or Siderostat Login Items";
-"first_launch.register_failed" = "First launch: siderostat-runtime or Siderostat auto-start registration failed";
-"first_launch.monitor_login" = "First launch: Siderostat auto-start checked";
+"first_launch.registering" = "First launch: registering siderostat-runtime and siDeroStat auto-start…";
+"first_launch.registered" = "First launch: siderostat-runtime and siDeroStat auto-start registered";
+"first_launch.approval" = "First launch: approval is required for siderostat-runtime or siDeroStat Login Items";
+"first_launch.register_failed" = "First launch: siderostat-runtime or siDeroStat auto-start registration failed";
+"first_launch.monitor_login" = "First launch: siDeroStat auto-start checked";
 "first_launch.runtime_admin" = "First launch: siderostat-runtime API is ready";
 "first_launch.model_ready" = "First launch: ds4-server model is ready";
 
@@ -70,12 +70,12 @@
 "operation.open_login_items.succeeded" = "Operation: Login Items opened";
 "operation.open_login_items.failed" = "Operation: Could not open Login Items";
 
-"uninstaller.confirm.title" = "Uninstall Siderostat?";
+"uninstaller.confirm.title" = "Uninstall siDeroStat?";
 "uninstaller.confirm.message" = "Siderostat.app and its background services will be removed. Configuration, secrets, manifests, cluster state, models, and KV cache will be kept.";
 "uninstaller.confirm.cancel" = "Cancel";
-"uninstaller.confirm.remove" = "Remove Siderostat";
-"uninstaller.result.title" = "Siderostat was removed";
+"uninstaller.confirm.remove" = "Remove siDeroStat";
+"uninstaller.result.title" = "siDeroStat was removed";
 "uninstaller.result.message" = "The application and its background services were removed. User data was kept.";
 "uninstaller.result.ok" = "OK";
-"uninstaller.failure.title" = "Siderostat could not be fully removed";
+"uninstaller.failure.title" = "siDeroStat could not be fully removed";
 "uninstaller.failure.message" = "No user data was intentionally removed. Correct the reported condition and run the Uninstaller again.";

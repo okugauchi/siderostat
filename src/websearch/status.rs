@@ -46,7 +46,8 @@ impl BridgeStatus {
         format!(
             "state={:?} child={} listen={} port_conflict={} last_failure={}",
             self.state,
-            self.child.map_or_else(|| "--".to_string(), |pid| pid.to_string()),
+            self.child
+                .map_or_else(|| "--".to_string(), |pid| pid.to_string()),
             self.listen.as_deref().unwrap_or("--"),
             self.port_conflict,
             self.last_failure.as_deref().unwrap_or("none"),
@@ -180,10 +181,21 @@ mod tests {
         let now = Instant::now();
         let mut lc = BridgeLifecycle::new().with_max_restarts(3);
         assert_eq!(lc.record_crash(now), BridgeState::Running, "1st restart");
-        assert_eq!(lc.record_crash(now + Duration::from_secs(1)), BridgeState::Running, "2nd");
-        assert_eq!(lc.record_crash(now + Duration::from_secs(2)), BridgeState::Running, "3rd");
+        assert_eq!(
+            lc.record_crash(now + Duration::from_secs(1)),
+            BridgeState::Running,
+            "2nd"
+        );
+        assert_eq!(
+            lc.record_crash(now + Duration::from_secs(2)),
+            BridgeState::Running,
+            "3rd"
+        );
         // 上限超過 → Crashed（失敗表示）。G05。/
-        assert_eq!(lc.record_crash(now + Duration::from_secs(3)), BridgeState::Crashed);
+        assert_eq!(
+            lc.record_crash(now + Duration::from_secs(3)),
+            BridgeState::Crashed
+        );
         assert_eq!(lc.crash_count(), 4);
     }
 
