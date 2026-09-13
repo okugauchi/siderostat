@@ -33,6 +33,10 @@ pub const LEGACY_MONITOR_PLIST: &str = "local.siderostat.monitor.plist";
 pub const MIGRATION_BACKUP_DIR: &str = "migration-backup";
 /// Backup manifest file name.
 pub const BACKUP_MANIFEST_NAME: &str = "backup-manifest.json";
+/// siderostat-core の state_store が v1→v2 移行時に保持する v1 state backup
+/// のファイル名 prefix（preserve_v1_backup が `v1-backup-<uuid>` と命名）。
+/// 旧 binary 復元時はこの v1 backup を使用する（C06）。
+pub const V1_STATE_BACKUP_PREFIX: &str = "v1-backup-";
 
 /// One detected legacy binary on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +253,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
     Ok(())
+}
+
+/// 旧 binary 復元時に対応する v1 state backup を選択する（C06: 旧 binary
+/// 復旧時は対応旧 state backup を使用。state が v2 へ移行済みでも v1
+/// backup を使う。v2 state を v1 binary が読むと UnsupportedSchema になるため）。
+///
+/// siderostat-core の state_store が v1→v2 移行時に `v1-backup-<uuid>` の
+/// 命名で state file と同一ディレクトリに保持する（preserve_v1_backup）。
+/// 本関数はその backup を read-only に検出し、複数ある場合は最新の mtime
+/// を選択して返す。無ければ None（v1 state backup 未作成）。原本 state は
+/// 変更しない（原本データを消さない）。
+pub fn select_v1_state_backup(state_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(state_dir).ok()?;
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(V1_STATE_BACKUP_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let modified = entry.metadata().ok()?.modified().ok()?;
+        if best
+            .as_ref()
+            .is_none_or(|(_, existing)| modified > *existing)
+        {
+            best = Some((path, modified));
+        }
+    }
+    best.map(|(path, _)| path)
 }
 
 /// Verify that a legacy job's PID / executable identity is trusted before it is
@@ -637,6 +670,41 @@ mod tests {
         let bytes = std::fs::read(&manifest_path).unwrap();
         let read_back = BackupManifest::from_json(&bytes).unwrap();
         assert_eq!(read_back.entries.len(), 2);
+    }
+
+    #[test]
+    fn selects_latest_v1_state_backup_even_when_v2_state_exists() {
+        // C06: state が v2 へ移行済みでも、旧 binary 復元時は v1 state
+        // backup を使用する（v2 state を v1 binary が読むと UnsupportedSchema）。
+        let (_dir, root) = fixture();
+        let state_dir = root.join("state");
+        touch(
+            &state_dir.join("cluster_state.json"),
+            b"{\"schema_version\":2}",
+        );
+        touch(
+            &state_dir.join("v1-backup-00000000-0000-0000-0000-000000000001"),
+            b"v1-state-old",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        touch(
+            &state_dir.join("v1-backup-00000000-0000-0000-0000-000000000002"),
+            b"v1-state-new",
+        );
+        let selected = select_v1_state_backup(&state_dir).expect("v1 backup exists");
+        // 最新の v1 backup を選択し、v2 state は選択しない。
+        assert!(selected.ends_with("v1-backup-00000000-0000-0000-0000-000000000002"));
+    }
+
+    #[test]
+    fn select_v1_state_backup_is_none_when_no_backup() {
+        let (_dir, root) = fixture();
+        let state_dir = root.join("state");
+        touch(
+            &state_dir.join("cluster_state.json"),
+            b"{\"schema_version\":2}",
+        );
+        assert!(select_v1_state_backup(&state_dir).is_none());
     }
 
     #[test]
