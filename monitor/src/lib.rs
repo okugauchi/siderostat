@@ -19,3 +19,4 @@ pub mod settings;
 pub mod state;
 pub mod tray;
 pub mod uninstaller;
+pub mod websearch_window;

@@ -18,6 +18,7 @@ pub mod request;
 pub mod response;
 pub mod searxng;
 pub mod server;
+pub mod status;
 pub mod sse;
 pub mod wire;
 
