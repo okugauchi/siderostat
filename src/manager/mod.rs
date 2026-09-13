@@ -18,11 +18,13 @@
 
 pub mod build;
 pub mod catalog;
+pub mod compatibility;
 pub mod download;
 pub mod jobs;
 pub mod process;
 pub mod registry;
 pub mod source;
+pub mod stage;
 pub mod verify;
 
 pub use build::{
@@ -33,6 +35,7 @@ pub use catalog::{
     CapabilityStatus, CatalogError, ModelCatalogEntry, compute_status, load_and_validate,
     validate_entry,
 };
+pub use compatibility::{CompatibilityError, SmokeOutcome, SmokeRequest, compatibility_smoke};
 pub use download::{
     Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
     HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
@@ -44,6 +47,10 @@ pub use registry::{
     RegistryError, SourceRecord,
 };
 pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
+pub use stage::{
+    ActivationPlan, StageError, StageRequest, StagedProfile, StagedProfileStatus,
+    build_activation_plan, stage_profile,
+};
 pub use verify::{
     VerifiedArtifact, VerifyError, hex_sha256, publish_verified, recheck_verified, verify_artifact,
 };
