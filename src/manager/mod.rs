@@ -17,6 +17,7 @@
 //! 自動化しない。
 
 pub mod activation;
+pub mod api;
 pub mod build;
 pub mod catalog;
 pub mod compatibility;
@@ -34,6 +35,10 @@ pub use activation::{
     NodeArtifactProvider, NodePhase, PrepareOutcome, begin_drain, commit_ack, journal_dir,
     mark_ready, prepare_activation,
 };
+pub use api::{
+    JobSubmitRequest, ManagerApiError, ManagerJobDto, ManagerStatusResponse, SubmitResponse,
+    cancel, get, parse_kind, status, submit, submit_json,
+};
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
     is_approved_role, is_approved_target,
@@ -47,7 +52,7 @@ pub use download::{
     Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
     HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
 };
-pub use jobs::{JobKind, ManagerJob, ManagerJobError};
+pub use jobs::{JobJournal, JobKind, ManagerJob, ManagerJobError};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
 pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,

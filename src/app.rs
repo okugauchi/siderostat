@@ -36,7 +36,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
     routing::{any, get, post},
 };
@@ -66,6 +66,8 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
+    /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
+    pub jobs: std::sync::Mutex<crate::manager::jobs::JobJournal>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -140,6 +142,7 @@ impl AppState {
             }),
             proxy,
             metrics,
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -1499,6 +1502,12 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
             get(recover_degraded_status),
         )
         .route("/admin/restart", post(graceful_restart))
+        // DS4 Manager API (M10 / C04)。admin port 専用。public proxy の
+        // wildcard には落ちず、DS4 へ転送されない。M10。
+        .route("/manager/status", get(manager_status))
+        .route("/manager/jobs", post(manager_jobs_submit))
+        .route("/manager/jobs/{id}", get(manager_job_get))
+        .route("/manager/jobs/{id}/cancel", post(manager_job_cancel))
         .with_state(state)
 }
 
@@ -2218,6 +2227,93 @@ struct GracefulRestartRequest {
     drain_timeout_ms: Option<u64>,
 }
 
+// ---- DS4 Manager API (M10 / C04) -----------------------------------------
+// `GET /manager/status`, `POST /manager/jobs`,
+// `GET /manager/jobs/{id}`, `POST /manager/jobs/{id}/cancel`。
+// 認証は admin bearer（C03 同等）。secret / raw build log は公開しない。M10。
+
+/// ManagerApiError を HTTP レスポンスへ写像する。M10。
+fn manager_api_error_response(error: &crate::manager::api::ManagerApiError) -> Response<Body> {
+    let (status, message) = match error {
+        crate::manager::api::ManagerApiError::BadRequest(msg) => {
+            (StatusCode::BAD_REQUEST, msg.clone())
+        }
+        crate::manager::api::ManagerApiError::NotFound => {
+            (StatusCode::NOT_FOUND, "job not found".to_string())
+        }
+        crate::manager::api::ManagerApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+    };
+    json_response(status, json!({"error": message}))
+}
+
+/// `GET /manager/status`。M10。job 進捗と旧 active 維持を観測できる。
+async fn manager_status(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let journal = state.jobs.lock().unwrap();
+    let response = crate::manager::api::status(&journal, None);
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+    )
+}
+
+/// `POST /manager/jobs`。M10。kind の厳密 payload を受けて job を登録する。
+async fn manager_jobs_submit(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::submit_json(&mut journal, &body) {
+        Ok(response) => json_response(
+            StatusCode::ACCEPTED,
+            serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => manager_api_error_response(&error),
+    }
+}
+
+/// `GET /manager/jobs/{id}`。M10。M10。
+async fn manager_job_get(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let journal = state.jobs.lock().unwrap();
+    match crate::manager::api::get(&journal, &id) {
+        Ok(job) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(job).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => manager_api_error_response(&error),
+    }
+}
+
+/// `POST /manager/jobs/{id}/cancel`。M10。job を Cancelling にし terminal 保持。
+async fn manager_job_cancel(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::cancel(&mut journal, &id) {
+        Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
+        Err(error) => manager_api_error_response(&error),
+    }
+}
+
 /// `/admin/restart` — authenticated graceful runtime restart (A-01 contract).
 ///
 /// The handler authenticates with the shared admin bearer token, parses the
@@ -2933,6 +3029,7 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),

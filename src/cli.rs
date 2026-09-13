@@ -40,6 +40,40 @@ enum Command {
         #[command(subcommand)]
         command: ClusterCommand,
     },
+    /// DS4 Manager API（M10 / C04）。job の submit / status / get / cancel を
+    /// `/manager/*` エンドポイントへ送る。M10。
+    Manager {
+        #[command(subcommand)]
+        command: ManagerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManagerCommand {
+    /// `POST /manager/jobs`。kind は fetch/build/download/verify/stage/activate/rollback。
+    /// activate/rollback は expected-generation と runtime-lease を要求する。M10。
+    Submit {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        payload_key: String,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long)]
+        runtime_lease: Option<String>,
+    },
+    /// `GET /manager/status`。job 進捗を観測する。M10。
+    Status,
+    /// `GET /manager/jobs/{id}`。M10。
+    Get {
+        #[arg(long)]
+        id: String,
+    },
+    /// `POST /manager/jobs/{id}/cancel`。M10。
+    Cancel {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,7 +183,71 @@ async fn run_with(args: Args) -> anyhow::Result<()> {
             .await
         }
         Some(Command::Cluster { command }) => run_cluster(&config, command).await,
+        Some(Command::Manager { command }) => run_manager(&config, command).await,
     }
+}
+
+/// DS4 Manager API の request（method, path, body, mutation）を純粋に選ぶ。M10。
+/// mutation（POST）のみ admin bearer token を要求する。M10。
+fn manager_request(
+    command: ManagerCommand,
+) -> (reqwest::Method, &'static str, Option<Value>, bool) {
+    match command {
+        ManagerCommand::Submit {
+            kind,
+            payload_key,
+            expected_generation,
+            runtime_lease,
+        } => (
+            reqwest::Method::POST,
+            "/manager/jobs",
+            Some(json!({
+                "kind": kind,
+                "payload_key": payload_key,
+                "expected_generation": expected_generation,
+                "runtime_lease": runtime_lease,
+            })),
+            true,
+        ),
+        ManagerCommand::Status => (reqwest::Method::GET, "/manager/status", None, false),
+        ManagerCommand::Get { id } => {
+            // id は job ID 文字列。パスへ埋め込む（shell 文字列ではなく URL 経由）。M10。
+            let path = Box::leak(format!("/manager/jobs/{id}").into_boxed_str());
+            (reqwest::Method::GET, path, None, false)
+        }
+        ManagerCommand::Cancel { id } => {
+            let path = Box::leak(format!("/manager/jobs/{id}/cancel").into_boxed_str());
+            (reqwest::Method::POST, path, None, true)
+        }
+    }
+}
+
+async fn run_manager(config: &ModeAwareConfig, command: ManagerCommand) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", config.proxy.admin_listen);
+    let (method, path, body, mutation) = manager_request(command);
+    let mut request = client.request(method, format!("{base}{path}"));
+    if mutation {
+        let token = tokio::fs::read(&config.cluster.security.admin_token_file)
+            .await
+            .context("failed to read admin token")?;
+        request = request.bearer_auth(encode_token(&token));
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.context("manager API request failed")?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .context("manager API returned invalid JSON")?;
+    anyhow::ensure!(
+        status.is_success() || status == StatusCode::ACCEPTED,
+        "manager API returned {status}: {value}"
+    );
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 /// Resolve the admin API request (method, path, body, output) for a cluster
