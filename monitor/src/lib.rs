@@ -10,6 +10,7 @@ pub mod connection_mode;
 pub mod jobs;
 pub mod launchd;
 pub mod localization;
+pub mod manager_window;
 pub mod metrics;
 pub mod migration;
 pub mod operation;

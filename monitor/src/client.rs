@@ -236,11 +236,59 @@ impl MetricsClient {
             ))),
         }
     }
+
+    pub async fn submit_manager_job(
+        &self,
+        kind: &str,
+        payload_key: &str,
+    ) -> Result<siderostat_core::manager::api::SubmitResponse> {
+        let url = format!("{}/manager/jobs", self.base_url);
+        let body = serde_json::json!({
+            "kind": kind,
+            "payload_key": payload_key,
+        });
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "manager/jobs endpoint returned {}",
+                response.status()
+            ));
+        }
+        response
+            .json()
+            .await
+            .context("parse manager/jobs submit response")
+    }
+
+    /// `POST /manager/jobs/{id}/cancel`。進行中の job をキャンセルする。
+    /// G03。。/
+    pub async fn cancel_manager_job(&self, id: &str) -> Result<()> {
+        let url = format!("{}/manager/jobs/{id}/cancel", self.base_url);
+        let mut request = self.http.post(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "manager/jobs/{id}/cancel returned {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// `/cluster/operation-policy` の応答 PolicyJob JSON を PendingJob に変換。
-/// desired は wire 値（automatic/forced-standalone）、nodes は node 別結果。
-/// 形式が壊れていれば None（Other エラーへ）。G02。
 fn parse_policy_job(value: &serde_json::Value) -> Option<PendingJob> {
     let job_id = value.get("job_id")?.as_str()?.to_string();
     let policy = match value.get("desired")?.as_str()? {
