@@ -1673,7 +1673,7 @@ v0.1.0の実装順序、migration、verification、rollback記録は [`implement
 
 ## 35. macOS service と導入導線
 
-v0.3.3 の公式導入経路は、`Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法である。
+v0.3.4 の公式導入経路は、`Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法である。
 0.x の hotfix package は Developer ID 署名を行うが、secure timestamp、公証、staple は付けない。
 `cargo xtask install --start` は bundle 外の legacy 開発 workflow としてのみ残す。
 

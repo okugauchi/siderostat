@@ -7,7 +7,7 @@ For the Japanese guide, see [docs/installation.ja.md](installation.ja.md).
 - Two Apple silicon Macs running a supported macOS version.
 - A Thunderbolt cable and Thunderbolt networking enabled on both Macs.
 - The compatible inference service and model obtained from an approved source.
-- The same `Siderostat-0.3.3-no-timestamp.pkg` artifact on both Macs.
+- The same `Siderostat-0.3.4.pkg` artifact on both Macs.
 
 Keep the Macs awake while the first build and readiness checks complete.
 
@@ -16,25 +16,25 @@ Keep the Macs awake while the first build and readiness checks complete.
 Build the package once from the reviewed source revision:
 
 ```sh
-cargo xtask app-dev --version 0.3.3 --build-number <monotonic-build> --verify
+cargo xtask app-dev --version 0.3.4 --build-number <monotonic-build> --verify
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.3 \
+  --version 0.3.4 \
   --build-number <monotonic-build> \
   --application-identity "Developer ID Application: <name> (<team>)" \
   --installer-identity "Developer ID Installer: <name> (<team>)" \
-  --timestamp-mode none \
-  --output-dir dist/hotfix-0.3.3
+  --notary-profile siderostat-notary \
+  --with-dmg \
+  --output-dir dist/release-0.3.4
 ```
 
-Copy `dist/hotfix-0.3.3/Siderostat-0.3.3-no-timestamp.pkg` unchanged to both Macs. On each Mac,
+Copy `dist/release-0.3.4/Siderostat-0.3.4.pkg` unchanged to both Macs. On each Mac,
 double-click the package so macOS Installer performs the installation, then complete the administrator
 prompt. The installer launches the application after installation; the application registers its own
 bundle-contained runtime helper and menu-bar login item through Service Management.
 
-The `--timestamp-mode none` artifact is Developer ID signed but has no Apple secure timestamp,
-notarization, or stapled ticket. It is a controlled 0.x hotfix artifact, not a public Gatekeeper-ready
-distribution. If a Mac still has the legacy source installation, run `cargo xtask uninstall` once from
+The release artifact has a Developer ID signature, Apple secure timestamp, notarization, and a stapled
+ticket. If a Mac still has the legacy source installation, run `cargo xtask uninstall` once from
 that checkout before opening the package; preserved configuration, secrets, models, runtime state, and
 cache are not removed.
 

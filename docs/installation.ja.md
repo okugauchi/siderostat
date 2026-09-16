@@ -7,7 +7,7 @@
 - 対応する macOS を搭載した Apple シリコン Mac 2台
 - Thunderbolt ケーブルと、両方の Mac で有効にした Thunderbolt ネットワーク
 - 承認済みの取得元から用意した、対応する推論サービスとモデル
-- 両方の Mac で同じ `Siderostat-0.3.3-no-timestamp.pkg`
+- 両方の Mac で同じ `Siderostat-0.3.4.pkg`
 
 初回ビルドと準備確認が完了するまで、Mac がスリープしないようにしてください。
 
@@ -16,24 +16,24 @@
 確認済み source リビジョンから package を一度作成します。
 
 ```sh
-cargo xtask app-dev --version 0.3.3 --build-number <単調増加するbuild番号> --verify
+cargo xtask app-dev --version 0.3.4 --build-number <単調増加するbuild番号> --verify
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.3 \
+  --version 0.3.4 \
   --build-number <単調増加するbuild番号> \
   --application-identity "Developer ID Application: <name> (<team>)" \
   --installer-identity "Developer ID Installer: <name> (<team>)" \
-  --timestamp-mode none \
-  --output-dir dist/hotfix-0.3.3
+  --notary-profile siderostat-notary \
+  --with-dmg \
+  --output-dir dist/release-0.3.4
 ```
 
-`dist/hotfix-0.3.3/Siderostat-0.3.3-no-timestamp.pkg` を変更せず両方の Mac へコピーします。
+`dist/release-0.3.4/Siderostat-0.3.4.pkg` を変更せず両方の Mac へコピーします。
 各 Mac で package をダブルクリックして macOS Installer を起動し、管理者認証を完了します。
 インストール後は Installer がアプリケーションを起動します。アプリケーション自身が bundle 内の
 runtime helper とメニューバーの Login Item を Service Management へ登録します。
 
-`--timestamp-mode none` は Developer ID 署名済みですが、Apple secure timestamp、公証、staple はありません。
-0.x の管理された hotfix artifact であり、公開 Gatekeeper 対応配布物ではありません。旧来の source 導入が残っている場合は、
+release artifact は Developer ID 署名、Apple secure timestamp、公証、staple 済みの Gatekeeper 対応配布物です。旧来の source 導入が残っている場合は、
 package を開く前にその checkout から `cargo xtask uninstall` を一度実行します。保持される設定、secret、モデル、実行状態、cache は削除されません。
 
 両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。

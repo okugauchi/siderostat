@@ -3,12 +3,12 @@
 この文書は、siderostatの変更、ビルド、テスト、macOS 配布 artifact を扱う開発者向けの手順です。通常の利用者は
 [README](../README.md)と[利用者向け導入ガイド](installation.md)を参照してください。
 
-v0.3.3 の公式導入経路は `Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法です。
+v0.3.4 の公式導入経路は `Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法です。
 `cargo xtask install --start` は bundle 外の legacy 開発 workflow としてのみ残します。
 
 `app-dev`、`pkg-dev`、`dmg-dev`、`sign` は macOS のローカル artifact 検証と将来の任意の
 バイナリ配布を対象とする workflow です。0.x の hotfix artifact は Developer ID 署名を行いますが、
-secure timestamp、公証、staple は付けません。
+secure timestamp、公証、staple まで実施します。
 
 ## 必要な環境
 
@@ -47,20 +47,20 @@ cargo xtask install --ci
 配布 artifact の作成と検証は次の順序で行う。
 
 ```sh
-cargo xtask app-dev --version 0.3.3 --build-number <build> --verify
+cargo xtask app-dev --version 0.3.4 --build-number <build> --verify
 cargo xtask sign \
   --app-dir build/app-dev \
-  --version 0.3.3 \
+  --version 0.3.4 \
   --build-number <build> \
   --application-identity "Developer ID Application: <name> (<team>)" \
   --installer-identity "Developer ID Installer: <name> (<team>)" \
-  --timestamp-mode none \
-  --output-dir dist/hotfix-0.3.3
+  --notary-profile siderostat-notary \
+  --with-dmg \
+  --output-dir dist/release-0.3.4
 ```
 
-生成される `Siderostat-0.3.3-no-timestamp.pkg` を macOS Installer で両ノードへ導入する。
-`--timestamp-mode none` は 0.x の controlled hotfix 用であり、`timestamp_mode=none`、
-`notarization=skipped`、`distribution_ready=false` を維持する。
+生成される `Siderostat-0.3.4.pkg` を macOS Installer で両ノードへ導入する。release artifact は
+Apple secure timestamp、公証、staple 済みで、`distribution_ready=true` となる。
 
 ## テストの考え方
 

@@ -43,15 +43,15 @@ They are model details, not operating-state or topology names.
 
 ## Installation
 
-Install the same `Siderostat-0.3.3-no-timestamp.pkg` artifact on both Macs by opening it in the macOS
+Install the same `Siderostat-0.3.4.pkg` artifact on both Macs by opening it in the macOS
 Installer application and completing the administrator prompt. The package installs the official
 `Siderostat.app` bundle; do not run `cargo xtask install` on these Macs.
 
 If a Mac still has the legacy source installation, run `cargo xtask uninstall` once from that source
 checkout before opening the package. This preserves configuration, secrets, models, runtime state, and cache.
 
-The package is Developer ID signed but intentionally has no Apple secure timestamp or notarization because
-this is a 0.x controlled hotfix artifact. It is suitable for the two-node rollout described by this release.
+The package is signed with Developer ID, has an Apple secure timestamp, and is notarized for Gatekeeper-ready
+distribution. It is suitable for the two-node rollout described by this release.
 
 The package can be built from the reviewed source revision with the developer workflow documented in
 the [development guide](docs/development.md). It is then copied unchanged to the other Mac.

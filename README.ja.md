@@ -40,13 +40,13 @@ Siderostat は、2台の Apple シリコン搭載 Mac を Thunderbolt で接続�
 
 ## インストール
 
-両方の Mac に同じ `Siderostat-0.3.3-no-timestamp.pkg` を macOS の Installer で開いて導入し、管理者認証を完了します。
+両方の Mac に同じ `Siderostat-0.3.4.pkg` を macOS の Installer で開いて導入し、管理者認証を完了します。
 この package は正式な `Siderostat.app` bundle を導入します。対象 Mac では `cargo xtask install` を実行しないでください。
 
 旧来の source 導入が残っている場合は、package を開く前にその source checkout から `cargo xtask uninstall` を一度実行します。
 設定、secret、モデル、実行状態、cache は保持されます。
 
-この package は Developer ID 署名済みですが、0.x の管理された hotfix artifact であるため Apple の secure timestamp と公証は付けていません。
+この package は Developer ID 署名済みで、Apple の secure timestamp と公証を付けた Gatekeeper 対応の配布物です。
 今回の2ノード導入用 artifact として使用します。
 
 package は確認済み source リビジョンから、[開発者向け手順](docs/development.md)に従って作成し、同じ file をもう一方の Mac へコピーします。
