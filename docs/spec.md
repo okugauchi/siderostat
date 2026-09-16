@@ -1673,17 +1673,17 @@ v0.1.0の実装順序、migration、verification、rollback記録は [`implement
 
 ## 35. macOS service と導入導線
 
-v0.3.0 の公式提供物はソースコードであり、公式の事前ビルド済み `.app`、`.pkg`、DMG、
-`Siderostat Uninstaller.app` は配布しない。利用者はソース checkout から `cargo xtask install --start`
-を実行して、各 Mac 上で runtime と Monitor をビルド・配置する。`cargo xtask app-dev`、`pkg-dev`、
-`dmg-dev`、`sign` は、macOS のローカル検証または将来のバイナリ配布を検討するための任意経路であり、
-v0.3.0 の公式リリース条件ではない。
+v0.3.3 の公式導入経路は、`Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法である。
+0.x の hotfix package は Developer ID 署名を行うが、secure timestamp、公証、staple は付けない。
+`cargo xtask install --start` は bundle 外の legacy 開発 workflow としてのみ残す。
 
-ソースからの `cargo xtask install --start` は、各 Mac 上で runtime と Monitor をビルドし、ユーザーの
-LaunchAgent として登録・起動する。app bundle 内の `dev.siderostat-ds4-proxy.runtime.plist` を
-Service Management へ登録する方式は、`app-dev`／package workflow をローカルで検証する場合、または
-将来の任意バイナリ配布を採用する場合に限る。ユーザー承認が必要な場合は System Settings > General >
-Login Items に案内する。管理者認証と Login Items／Background Items のユーザー承認は別の操作である。
+`.pkg` は各 Mac の `/Applications/Siderostat.app` を更新し、Installer の postinstall から app を起動する。
+app bundle 内の `dev.siderostat-ds4-proxy.runtime.plist` と main app の Login Item は、app が
+Service Management へ登録・更新する。ユーザー承認が必要な場合は System Settings > General > Login Items
+に案内する。管理者認証と Login Items／Background Items のユーザー承認は別の操作である。
+
+source からの `cargo xtask install --start` は、bundle 外の legacy LaunchAgent を登録する検証用 workflow である。
+source mode では Service Management による Login Item 登録を行わず、launchd lifecycle だけを使用する。
 
 1つの user service job だけが runtime process を管理する。
 

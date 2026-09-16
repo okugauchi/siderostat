@@ -38,20 +38,24 @@ They are model details, not operating-state or topology names.
 ## Requirements
 
 - Two Apple silicon Macs with a supported macOS version.
-- Rust 1.85 or later on each Mac.
 - A Thunderbolt cable and Thunderbolt networking enabled on both Macs.
 - A compatible inference service and model obtained from an approved source.
 
 ## Installation
 
-Install the same reviewed source revision on both Macs. From the repository checkout on each Mac:
+Install the same `Siderostat-0.3.3-no-timestamp.pkg` artifact on both Macs by opening it in the macOS
+Installer application and completing the administrator prompt. The package installs the official
+`Siderostat.app` bundle; do not run `cargo xtask install` on these Macs.
 
-```sh
-cargo xtask fingerprint-models
-cargo xtask install --start
-```
+If a Mac still has the legacy source installation, run `cargo xtask uninstall` once from that source
+checkout before opening the package. This preserves configuration, secrets, models, runtime state, and cache.
 
-The command builds the local runtime and menu bar monitor, installs the user services, and starts them.
+The package is Developer ID signed but intentionally has no Apple secure timestamp or notarization because
+this is a 0.x controlled hotfix artifact. It is suitable for the two-node rollout described by this release.
+
+The package can be built from the reviewed source revision with the developer workflow documented in
+the [development guide](docs/development.md). It is then copied unchanged to the other Mac.
+
 Connect the Thunderbolt cable after both Macs reach a normal standalone state.
 
 For the complete procedure, see the [installation guide](docs/installation.md).

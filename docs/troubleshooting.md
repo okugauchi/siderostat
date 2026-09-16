@@ -4,20 +4,17 @@ For the Japanese guide, see [docs/troubleshooting.ja.md](troubleshooting.ja.md).
 
 ## The menu bar monitor does not appear
 
-From the same checkout, run the installation command once:
+Open the reviewed `.pkg` with macOS Installer once. Do not launch the monitor executable from a terminal
+or run a second Siderostat copy.
 
-```sh
-cargo xtask install --start
-```
-
-Wait for the runtime and monitor to start. Do not launch a second copy or register another user service.
-If the command reports a configuration or model error, resolve that error and run it again.
+Wait for the runtime and monitor to start. If Installer reports an error, resolve that error and retry the
+same package after confirming that no unrelated process is being stopped.
 
 ## The monitor says offline
 
 Check the following in order:
 
-1. Confirm that `cargo xtask install --start` completed on the Mac showing offline.
+1. Confirm that the `.pkg` installation completed on the Mac showing offline.
 2. Confirm that the inference service has had time to start; the first start can take several minutes.
 3. Confirm that the other Mac is awake and that the Thunderbolt cable is connected at both ends.
 4. Confirm that Thunderbolt networking is enabled in System Settings.
@@ -50,17 +47,14 @@ or authentication data.
 
 ## Login start is not working
 
-Confirm that the user service was installed with `cargo xtask install --start`. If macOS asks for a login-item
-approval, open System Settings > General > Login Items and approve the Siderostat entries. After changing an
-approval, run the installation command once more so the current state is refreshed.
+Confirm that the `.pkg` installation completed and that Siderostat.app was opened. If macOS asks for a
+login-item or background-item approval, open System Settings > General > Login Items and approve the
+Siderostat entries. After changing an approval, reopen the same package-installed application.
 
 ## Updating or uninstalling reports an error
 
-Run the command from the same source checkout and resolve the displayed error before retrying. Updating uses:
-
-```sh
-cargo xtask install --start
-```
+For package updates, open the reviewed `.pkg` with macOS Installer and resolve the displayed error before retrying.
+Do not use `cargo xtask install` for the package-installed application.
 
 Uninstalling uses:
 
@@ -68,7 +62,8 @@ Uninstalling uses:
 cargo xtask uninstall
 ```
 
-Both workflows preserve configuration, authentication data, model files, runtime state, and cache data. Do
+The package workflow and the legacy source uninstall preserve configuration, authentication data, model files,
+runtime state, and cache data. Do
 not use a generic cleanup command or manually delete those files.
 
 ## Information to provide when asking for help

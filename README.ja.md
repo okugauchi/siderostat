@@ -35,20 +35,22 @@ Siderostat は、2台の Apple シリコン搭載 Mac を Thunderbolt で接続�
 ## 必要なもの
 
 - 対応する macOS を搭載した Apple シリコン Mac 2台
-- 各 Mac の Rust 1.85 以降
 - Thunderbolt ケーブルと、両方の Mac で有効にした Thunderbolt ネットワーク
 - 承認済みの取得元から用意した、対応する推論サービスとモデル
 
 ## インストール
 
-両方の Mac に同じ確認済みソースリビジョンを導入します。各 Mac のリポジトリ checkout で次を実行します。
+両方の Mac に同じ `Siderostat-0.3.3-no-timestamp.pkg` を macOS の Installer で開いて導入し、管理者認証を完了します。
+この package は正式な `Siderostat.app` bundle を導入します。対象 Mac では `cargo xtask install` を実行しないでください。
 
-```sh
-cargo xtask fingerprint-models
-cargo xtask install --start
-```
+旧来の source 導入が残っている場合は、package を開く前にその source checkout から `cargo xtask uninstall` を一度実行します。
+設定、secret、モデル、実行状態、cache は保持されます。
 
-このコマンドはローカルの runtime とメニューバーモニターをビルドし、ユーザーサービスを登録して起動します。
+この package は Developer ID 署名済みですが、0.x の管理された hotfix artifact であるため Apple の secure timestamp と公証は付けていません。
+今回の2ノード導入用 artifact として使用します。
+
+package は確認済み source リビジョンから、[開発者向け手順](docs/development.md)に従って作成し、同じ file をもう一方の Mac へコピーします。
+
 両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。
 
 詳細な手順は[導入ガイド](docs/installation.ja.md)を参照してください。
