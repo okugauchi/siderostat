@@ -1,13 +1,13 @@
 # Third-party notices
 
-Siderostat uses third-party Rust packages. The v0.3.1 dependency graph is unchanged from v0.3.0;
+Siderostat uses third-party Rust packages. The v0.3.2 dependency graph is unchanged from v0.3.1;
 the complete inventory is recorded in
 `docs/releases/v0.3.0-dependencies.md` and is derived from the repository's locked dependency graph.
 
 The inventory records each package name, exact version, SPDX license expression or license-file
 declaration, package source, and crates.io checksum. It covers normal, build, development,
 target-specific, and transitive dependencies for all workspace members. All 318 third-party packages
-in the v0.3.1 lockfile provide license metadata.
+in the v0.3.2 lockfile provide license metadata.
 
 The applicable license text and copyright notices for each package are provided by that package's
 source distribution. `Cargo.lock` fixes the package versions and checksums used to retrieve those
