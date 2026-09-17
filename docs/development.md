@@ -3,13 +3,12 @@
 この文書は、siderostatの変更、ビルド、テスト、macOS 配布 artifact を扱う開発者向けの手順です。通常の利用者は
 [README](../README.md)と[利用者向け導入ガイド](installation.md)を参照してください。
 
-v0.3.2 の公式提供物はソースコードです。公式の事前ビルド済み `.app`、`.pkg`、DMG、
-`Siderostat Uninstaller.app` は配布しません。利用者向けの導入経路も、ソース checkout で
-`cargo xtask install --start` を実行する方法を正本とします。
+v0.3.4 の公式導入経路は `Siderostat.app` を payload とする `.pkg` を macOS Installer で導入する方法です。
+`cargo xtask install --start` は bundle 外の legacy 開発 workflow としてのみ残します。
 
 `app-dev`、`pkg-dev`、`dmg-dev`、`sign` は macOS のローカル artifact 検証と将来の任意の
-バイナリ配布を対象とする開発者向け workflow です。これらの署名・公証・timestamp は、
-v0.3.2 のソースリリース受入条件ではありません。
+バイナリ配布を対象とする workflow です。0.x の hotfix artifact は Developer ID 署名を行いますが、
+secure timestamp、公証、staple まで実施します。
 
 ## 必要な環境
 
@@ -35,7 +34,7 @@ cargo test --all-targets
 git diff --check
 ```
 
-インストールを含む検証は、次のコマンドでまとめて実行できます。
+legacy source workflow のインストールを含む検証は、次のコマンドで実行できます。
 
 ```sh
 cargo xtask install --ci
@@ -45,17 +44,23 @@ cargo xtask install --ci
 起動項目を扱います。実機へインストールする場合は、[利用者向け導入ガイド](installation.md)の
 手順と確認項目を先に確認してください。
 
-配布 artifact の開発検証は次の順序で行う。
+配布 artifact の作成と検証は次の順序で行う。
 
 ```sh
-cargo xtask app-dev --version 0.3.2 --build-number <build> --verify
-cargo xtask pkg-dev --app-dir build/app-dev --version 0.3.2 --output-dir dist
-cargo xtask dmg-dev --app-dir build/app-dev --package dist/Siderostat-0.3.2.pkg \
-  --version 0.3.2 --build-number <build> --output-dir dist --verify
+cargo xtask app-dev --version 0.3.4 --build-number <build> --verify
+cargo xtask sign \
+  --app-dir build/app-dev \
+  --version 0.3.4 \
+  --build-number <build> \
+  --application-identity "Developer ID Application: <name> (<team>)" \
+  --installer-identity "Developer ID Installer: <name> (<team>)" \
+  --notary-profile siderostat-notary \
+  --with-dmg \
+  --output-dir dist/release-0.3.4
 ```
 
-Developer ID 署名、公証、staple は `cargo xtask sign` の承認済み手順だけを使う。
-`--timestamp-mode none` の成果物は internal diagnostic artifact であり、配布物にしない。
+生成される `Siderostat-0.3.4.pkg` を macOS Installer で両ノードへ導入する。release artifact は
+Apple secure timestamp、公証、staple 済みで、`distribution_ready=true` となる。
 
 ## テストの考え方
 
