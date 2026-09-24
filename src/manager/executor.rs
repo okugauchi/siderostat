@@ -1,5 +1,6 @@
 //! Bounded manager job executor and cancellation bridge.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,7 +101,6 @@ impl ManagerExecutorHandle {
             return Ok(());
         }
         if !journal.matches_request(&request.id, request.kind, &request.payload_key) {
-            let _ = journal.fail_if_running(&request.id, "manager job request mismatch");
             return Err(ManagerExecutorError::RequestMismatch);
         }
 
@@ -179,15 +179,42 @@ pub struct ManagerExecutor;
 
 static BACKEND_PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static BACKEND_PANIC_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
 
-struct RestorePanicHook(Option<PanicHook>);
+struct RestorePanicHook(Option<Arc<Mutex<Option<PanicHook>>>>);
 
 impl Drop for RestorePanicHook {
     fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            std::panic::set_hook(previous);
+        if let Some(saved) = self.0.take() {
+            // Remove the temporary wrapper before moving the original hook.
+            // The default hook remains active during this brief handoff.
+            drop(std::panic::take_hook());
+            let previous = saved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(previous) = previous {
+                std::panic::set_hook(previous);
+            }
         }
+    }
+}
+
+struct BackendPanicMarker(bool);
+
+impl BackendPanicMarker {
+    fn enter() -> Self {
+        Self(BACKEND_PANIC_ACTIVE.with(|active| active.replace(true)))
+    }
+}
+
+impl Drop for BackendPanicMarker {
+    fn drop(&mut self) {
+        BACKEND_PANIC_ACTIVE.with(|active| active.set(self.0));
     }
 }
 
@@ -196,15 +223,29 @@ fn execute_backend<B: ManagerExecutionBackend>(
     request: ManagerExecutionRequest,
     cancel: Arc<AtomicBool>,
 ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
-    // Panic hooks are process-global. Serialize the temporary replacement and
-    // never pass backend panic payloads to stderr or tracing.
+    // Panic hooks are process-global. Serialize replacement, but delegate
+    // panics from unrelated threads to the previous hook.
     let _hook_lock = BACKEND_PANIC_HOOK_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let restore = RestorePanicHook(Some(std::panic::take_hook()));
-    std::panic::set_hook(Box::new(|_| {}));
+    let saved = Arc::new(Mutex::new(Some(std::panic::take_hook())));
+    let delegate = saved.clone();
+    let restore = RestorePanicHook(Some(saved));
+    std::panic::set_hook(Box::new(move |info| {
+        if !BACKEND_PANIC_ACTIVE.with(Cell::get) {
+            if let Some(previous) = delegate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                previous(info);
+            }
+        }
+    }));
+    let marker = BackendPanicMarker::enter();
     let result = catch_unwind(AssertUnwindSafe(|| backend.execute(request, cancel)))
         .unwrap_or(Err(ManagerExecutionError::Unavailable));
+    drop(marker);
     drop(restore);
     result
 }
@@ -575,6 +616,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_thread_panic_keeps_original_hook_during_backend_call() {
+        if std::env::var_os("SIDEROSTAT_EXECUTOR_UNRELATED_PANIC_CHILD").is_some() {
+            let started = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let (handle, worker, journal) = test_executor(FixtureOutcome::Block {
+                started: started.clone(),
+                release: release.clone(),
+            });
+            handle
+                .submit(fixture_request(
+                    &journal,
+                    JobKind::Build,
+                    "hook-concurrency",
+                ))
+                .expect("queue");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("backend started");
+            std::thread::spawn(|| {
+                let _ = std::panic::catch_unwind(|| panic!("unrelated-thread-marker"));
+            })
+            .join()
+            .expect("unrelated thread");
+            release.store(true, Ordering::SeqCst);
+            handle.shutdown_for_test();
+            worker.await.expect("worker");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "manager::executor::tests::unrelated_thread_panic_keeps_original_hook_during_backend_call",
+                "--nocapture",
+            ])
+            .env("SIDEROSTAT_EXECUTOR_UNRELATED_PANIC_CHILD", "1")
+            .output()
+            .expect("child test");
+        assert!(output.status.success());
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            visible.contains("unrelated-thread-marker"),
+            "unrelated panic hook was suppressed"
+        );
+    }
+
+    #[tokio::test]
     async fn mismatched_kind_or_payload_never_reaches_backend() {
         let calls = Arc::new(AtomicUsize::new(0));
         let journal = Arc::new(Mutex::new(JobJournal::new()));
@@ -590,12 +685,50 @@ mod tests {
             );
             assert_eq!(
                 journal.lock().unwrap().get(&request.id).unwrap().phase,
-                JobPhase::Failed
+                JobPhase::Running
             );
+            journal
+                .lock()
+                .unwrap()
+                .fail_if_running(&request.id, "request rejected by caller")
+                .expect("caller closes rejected job");
         }
         handle.shutdown_for_test();
         worker.await.expect("worker");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_duplicate_cannot_fail_accepted_job() {
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let (handle, worker, journal) = test_executor(FixtureOutcome::Block {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let request = fixture_request(&journal, JobKind::Build, "accepted-key");
+        let id = request.id.clone();
+        handle.submit(request.clone()).expect("correct submission");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend started");
+        let mut malformed = request;
+        malformed.payload_key = "wrong-key".to_string();
+        let result = handle.submit(malformed);
+        let phase_after_mismatch = journal.lock().unwrap().get(&id).unwrap().phase;
+        release.store(true, Ordering::SeqCst);
+        handle.shutdown_for_test();
+        worker.await.expect("worker");
+        assert_eq!(result, Err(ManagerExecutorError::RequestMismatch));
+        assert_eq!(phase_after_mismatch, JobPhase::Running);
+        assert_eq!(
+            journal.lock().unwrap().get(&id).unwrap().phase,
+            JobPhase::Succeeded
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
