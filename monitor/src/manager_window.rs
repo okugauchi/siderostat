@@ -11,7 +11,28 @@
 //! レビュー重点: model 巨大 list や poll で main loop を block しない
 //! （poll は非 GUI、view model は純粋ロジック）。sudo install を GUI
 //! 既定導線にしない（本 view model に install 導線を含めない）。G03。/
+use crate::client::MetricsClient;
+use siderostat_core::manager::api::ManagerStatusResponse;
 use std::collections::BTreeMap;
+use std::sync::mpsc::{self, Receiver, Sender};
+
+#[cfg(target_os = "macos")]
+use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSTextField,
+    NSWindow, NSWindowStyleMask,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
 
 /// source エントリ（commit 候補・active 判定）。G03。/
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +229,351 @@ impl ManagerViewModel {
     /// URL query/credentials/token をログ/表示へ出さない）。G03。/
     pub fn redacted_reason(job: &ManagerJobView) -> String {
         redact_secrets(&job.error)
+    }
+}
+
+/// GUIからworkerへ送るmanager操作。HTTP処理はこのenumを受けたworkerが
+/// 実行し、AppKitのmain loopでは実行しない。H06。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerCommand {
+    FetchSource,
+    Build {
+        target: String,
+    },
+    Download {
+        profile: String,
+    },
+    Verify {
+        profile: String,
+    },
+    Stage {
+        profile: String,
+    },
+    Activate {
+        profile: String,
+        expected_generation: u64,
+        runtime_lease: String,
+    },
+    Rollback {
+        previous: String,
+        expected_generation: u64,
+        runtime_lease: String,
+    },
+    Cancel {
+        job_id: String,
+    },
+    Refresh,
+}
+
+/// workerからmain threadへ返すmanager状態更新。非terminal jobを成功へ
+/// 変換せず、表示側で観測した状態をそのまま保持する。H06。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerEvent {
+    Status(ManagerStatusResponse),
+    Submitted { kind: String, id: String },
+    Failed { message: String },
+}
+
+#[cfg(target_os = "macos")]
+static MANAGER_COMMAND_SENDER: OnceLock<Mutex<Option<Sender<ManagerCommand>>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn register_manager_command_sender(sender: Sender<ManagerCommand>) {
+    let slot = MANAGER_COMMAND_SENDER.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+}
+
+#[cfg(target_os = "macos")]
+fn send_manager_command(command: ManagerCommand) {
+    let Some(slot) = MANAGER_COMMAND_SENDER.get() else {
+        return;
+    };
+    let sender = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(sender) = sender {
+        let _ = sender.send(command);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct ManagerActionIvars;
+
+#[cfg(target_os = "macos")]
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ManagerActionIvars]
+    struct ManagerActionTarget;
+
+    impl ManagerActionTarget {
+        #[unsafe(method(managerFetch:))]
+        fn manager_fetch(&self, _sender: Option<&AnyObject>) {
+            send_manager_command(ManagerCommand::FetchSource);
+        }
+
+        #[unsafe(method(managerBuild:))]
+        fn manager_build(&self, _sender: Option<&AnyObject>) {
+            send_manager_command(ManagerCommand::Build {
+                target: "ds4-server".to_string(),
+            });
+        }
+
+        #[unsafe(method(managerDownload:))]
+        fn manager_download(&self, _sender: Option<&AnyObject>) {
+            send_manager_command(ManagerCommand::Download {
+                profile: "mxfp4-0731".to_string(),
+            });
+        }
+
+        #[unsafe(method(managerVerify:))]
+        fn manager_verify(&self, _sender: Option<&AnyObject>) {
+            send_manager_command(ManagerCommand::Verify {
+                profile: "mxfp4-0731".to_string(),
+            });
+        }
+
+        #[unsafe(method(managerStage:))]
+        fn manager_stage(&self, _sender: Option<&AnyObject>) {
+            send_manager_command(ManagerCommand::Stage {
+                profile: "mxfp4-0731".to_string(),
+            });
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl ManagerActionTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ManagerActionIvars);
+        // SAFETY: ManagerActionTarget directly subclasses NSObject and uses
+        // NSObject's standard init implementation.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// AppKit manager window host. The view model and command channel outlive the
+/// visible window, so close/reopen does not cancel jobs. H06。
+#[cfg(target_os = "macos")]
+pub struct ManagerWindowHost {
+    mtm: Option<MainThreadMarker>,
+    _client: MetricsClient,
+    window: Option<Retained<NSWindow>>,
+    status_label: Option<Retained<NSTextField>>,
+    _action_target: Option<Retained<ManagerActionTarget>>,
+    command_tx: Sender<ManagerCommand>,
+    command_rx: Receiver<ManagerCommand>,
+    view_model: ManagerViewModel,
+    test_window_identity: usize,
+    test_visible: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ManagerWindowHost {
+    pub fn new(
+        mtm: MainThreadMarker,
+        client: MetricsClient,
+        view_model: ManagerViewModel,
+    ) -> Result<Self> {
+        let (command_tx, command_rx) = mpsc::channel();
+        register_manager_command_sender(command_tx.clone());
+        let action_target = ManagerActionTarget::new(mtm);
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(780.0, 560.0)),
+                NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::Resizable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        // SAFETY: the host retains the window for the process lifetime, so it
+        // must not be released when the user closes it.
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("siDeroStat Manager"));
+        window.center();
+        let content = window
+            .contentView()
+            .context("manager window content view unavailable")?;
+
+        let title = NSTextField::labelWithString(&NSString::from_str("DS4 Manager — GUI受入"), mtm);
+        title.setFrame(NSRect::new(
+            NSPoint::new(24.0, 510.0),
+            NSSize::new(720.0, 28.0),
+        ));
+        content.addSubview(&title);
+
+        let status_label = NSTextField::wrappingLabelWithString(
+            &NSString::from_str(
+                "待機中。runtime/modelは変更されていません。job状態を確認してください。",
+            ),
+            mtm,
+        );
+        status_label.setFrame(NSRect::new(
+            NSPoint::new(24.0, 420.0),
+            NSSize::new(720.0, 70.0),
+        ));
+        content.addSubview(&status_label);
+
+        let sections = [
+            ("Runtime / source", 380.0),
+            ("Artifact pipeline", 280.0),
+            (
+                "Profiles: MXFP4/0731 · Q2 · Vision · GLM · prefix-file",
+                180.0,
+            ),
+            ("Activation / rollback", 110.0),
+            ("Jobs", 55.0),
+        ];
+        for (text, y) in sections {
+            let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+            label.setFrame(NSRect::new(NSPoint::new(24.0, y), NSSize::new(720.0, 22.0)));
+            content.addSubview(&label);
+        }
+
+        let button_specs = [
+            ("公式source取得", sel!(managerFetch:), 520.0, 350.0),
+            ("ds4-server build", sel!(managerBuild:), 680.0, 350.0),
+            ("model download", sel!(managerDownload:), 520.0, 250.0),
+            ("verify", sel!(managerVerify:), 680.0, 250.0),
+            ("stage", sel!(managerStage:), 520.0, 150.0),
+        ];
+        for (text, action, x, y) in button_specs {
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(text),
+                    Some(&*action_target),
+                    Some(action),
+                    mtm,
+                )
+            };
+            button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(140.0, 28.0)));
+            content.addSubview(&button);
+        }
+
+        Ok(Self {
+            mtm: Some(mtm),
+            _client: client,
+            window: Some(window),
+            status_label: Some(status_label),
+            _action_target: Some(action_target),
+            command_tx,
+            command_rx,
+            view_model,
+            test_window_identity: 0,
+            test_visible: false,
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn for_test(client: MetricsClient, view_model: ManagerViewModel) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let identity = (&command_tx as *const Sender<ManagerCommand>) as usize;
+        Self {
+            mtm: None,
+            _client: client,
+            window: None,
+            status_label: None,
+            _action_target: None,
+            command_tx,
+            command_rx,
+            view_model,
+            test_window_identity: identity,
+            test_visible: false,
+        }
+    }
+
+    pub fn show_or_focus(&mut self) -> Result<()> {
+        if let (Some(window), Some(mtm)) = (&self.window, self.mtm) {
+            window.makeKeyAndOrderFront(None);
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
+        } else {
+            self.test_visible = true;
+        }
+        Ok(())
+    }
+
+    pub fn hide(&mut self) {
+        if let Some(window) = &self.window {
+            window.orderOut(None);
+        }
+        self.test_visible = false;
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.isVisible())
+            || self.test_visible
+    }
+
+    pub fn window_identity(&self) -> usize {
+        self.window
+            .as_ref()
+            .map_or(self.test_window_identity, |window| {
+                (&**window as *const NSWindow).cast::<()>() as usize
+            })
+    }
+
+    pub fn send_command(&self, command: ManagerCommand) -> Result<()> {
+        self.command_tx
+            .send(command)
+            .context("manager command channel closed")
+    }
+
+    pub fn drain_commands(&self) -> Vec<ManagerCommand> {
+        self.command_rx.try_iter().collect()
+    }
+
+    pub fn apply_event(&mut self, event: ManagerEvent) {
+        match event {
+            ManagerEvent::Status(status) => {
+                self.view_model
+                    .apply_status(&status.jobs, status.active_digest.as_deref());
+                if let Some(status_label) = &self.status_label {
+                    status_label.setStringValue(&NSString::from_str(&format!(
+                        "active={} / queue={} / jobs={}",
+                        self.view_model.active_digest().unwrap_or("未設定"),
+                        status.queue_depth,
+                        status.jobs.len()
+                    )));
+                }
+            }
+            ManagerEvent::Submitted { kind, id } => {
+                if let Some(status_label) = &self.status_label {
+                    status_label.setStringValue(&NSString::from_str(&format!(
+                        "{kind} jobを開始しました: {id}"
+                    )));
+                }
+            }
+            ManagerEvent::Failed { message } => {
+                if let Some(status_label) = &self.status_label {
+                    status_label.setStringValue(&NSString::from_str(&redact_secrets(&message)));
+                }
+            }
+        }
+    }
+
+    pub fn view_model(&self) -> &ManagerViewModel {
+        &self.view_model
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct ManagerWindowHost;
+
+#[cfg(not(target_os = "macos"))]
+impl ManagerWindowHost {
+    pub fn send_command(&self, _command: ManagerCommand) -> anyhow::Result<()> {
+        anyhow::bail!("manager window requires macOS")
     }
 }
 
