@@ -11,6 +11,7 @@
 //! - 入力: cancel 後 poll → terminal 保持
 //! - 入力: 不正 job / unknown field → 400
 //! - 入力: activate busy → 409
+use crate::manager::executor::ManagerExecutionRequest;
 use crate::manager::jobs::{JobJournal, JobKind, JobPhase, ManagerJobError};
 
 /// 公開 job DTO。secret / raw build log を含まない。M10。
@@ -77,6 +78,25 @@ pub struct JobSubmitRequest {
     /// activation/rollback に要求（C04）。M10。
     #[serde(default)]
     pub runtime_lease: Option<String>,
+}
+
+impl JobSubmitRequest {
+    /// Preserve the submitted generation and lease when handing a journaled
+    /// request to the executor. The payload key remains an opaque lookup key.
+    pub fn execution_request(
+        &self,
+        id: String,
+    ) -> Result<ManagerExecutionRequest, ManagerApiError> {
+        let kind = parse_kind(&self.kind)
+            .ok_or_else(|| ManagerApiError::BadRequest("unknown job kind".into()))?;
+        Ok(ManagerExecutionRequest {
+            id,
+            kind,
+            payload_key: self.payload_key.clone(),
+            expected_generation: self.expected_generation,
+            runtime_lease: self.runtime_lease.clone(),
+        })
+    }
 }
 
 /// `POST /manager/jobs` の応答。M10。

@@ -3,12 +3,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
+use crate::manager::catalog;
 use crate::manager::jobs::{JobJournal, JobKind, JobPhase};
+use crate::manager::{activation, build, download, registry, rollback, source, stage, verify};
 
 /// The immutable context passed from a submitted job to its backend.
 #[derive(Debug, Clone)]
@@ -48,6 +51,543 @@ impl<T: ManagerExecutionBackend + ?Sized> ManagerExecutionBackend for Arc<T> {
         cancel: Arc<AtomicBool>,
     ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
         (**self).execute(request, cancel)
+    }
+}
+
+/// A payload key resolves to one concrete, typed domain operation. Keys never
+/// become paths, URLs, commands, or model names by themselves.
+#[derive(Clone)]
+pub enum ManagerJobInput {
+    Fetch {
+        cache: PathBuf,
+        official: source::OfficialRemote,
+        remote: String,
+        revision: String,
+        main_ref: String,
+    },
+    Build(build::BuildRequest),
+    Download {
+        spec: download::DownloadSpec,
+        part_path: PathBuf,
+    },
+    Verify {
+        registry: Arc<Mutex<registry::ArtifactRegistry>>,
+        artifact_id: String,
+        expected_sha256: String,
+    },
+    Stage {
+        request: Box<stage::StageRequest>,
+        registry: Arc<Mutex<registry::ArtifactRegistry>>,
+        artifact_ids: Vec<String>,
+    },
+    Activate(activation::ActivationRequest),
+    Rollback(rollback::RollbackRequest),
+}
+
+impl ManagerJobInput {
+    fn kind(&self) -> JobKind {
+        match self {
+            Self::Fetch { .. } => JobKind::Fetch,
+            Self::Build(_) => JobKind::Build,
+            Self::Download { .. } => JobKind::Download,
+            Self::Verify { .. } => JobKind::Verify,
+            Self::Stage { .. } => JobKind::Stage,
+            Self::Activate(_) => JobKind::Activate,
+            Self::Rollback(_) => JobKind::Rollback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerInputError {
+    Rejected,
+    Unavailable,
+}
+
+/// Explicitly configured payload keys. An empty resolver is safe for a runtime
+/// that has not yet connected its source, catalog, registry, and cluster state.
+#[derive(Default)]
+pub struct ManagerJobInputResolver {
+    plans: HashMap<(JobKind, String), ManagerJobInput>,
+    model_catalog_available: bool,
+}
+
+impl ManagerJobInputResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        kind: JobKind,
+        key: impl Into<String>,
+        plan: ManagerJobInput,
+    ) -> Result<(), ManagerInputError> {
+        let key = key.into();
+        if key.is_empty() || plan.kind() != kind {
+            return Err(ManagerInputError::Rejected);
+        }
+        if kind == JobKind::Download || kind == JobKind::Stage {
+            self.model_catalog_available = true;
+        }
+        self.plans.insert((kind, key), plan);
+        Ok(())
+    }
+
+    pub fn resolve(
+        &self,
+        request: &ManagerExecutionRequest,
+    ) -> Result<ManagerJobInput, ManagerInputError> {
+        self.resolve_inner(request, true)
+    }
+
+    fn resolve_inner(
+        &self,
+        request: &ManagerExecutionRequest,
+        check_real_inputs: bool,
+    ) -> Result<ManagerJobInput, ManagerInputError> {
+        if request.id.is_empty() || request.payload_key.is_empty() {
+            return Err(ManagerInputError::Rejected);
+        }
+        if matches!(request.kind, JobKind::Activate | JobKind::Rollback)
+            && (request.expected_generation == 0
+                || request
+                    .runtime_lease
+                    .as_deref()
+                    .is_none_or(|lease| lease.trim().is_empty()))
+        {
+            return Err(ManagerInputError::Rejected);
+        }
+        let Some(plan) = self.plans.get(&(request.kind, request.payload_key.clone())) else {
+            return if matches!(request.kind, JobKind::Download | JobKind::Stage)
+                && !self.model_catalog_available
+            {
+                Err(ManagerInputError::Unavailable)
+            } else {
+                Err(ManagerInputError::Rejected)
+            };
+        };
+        match plan {
+            ManagerJobInput::Fetch {
+                cache,
+                remote,
+                revision,
+                main_ref,
+                ..
+            } => {
+                if cache.as_os_str().is_empty()
+                    || remote.is_empty()
+                    || revision.is_empty()
+                    || main_ref.is_empty()
+                {
+                    return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::Build(req) => {
+                if (check_real_inputs && !req.workspace.is_dir()) || req.source.is_empty() {
+                    return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::Download { spec, part_path } => {
+                if !full_sha256(&spec.sha256)
+                    || spec.expected_size == 0
+                    || (check_real_inputs
+                        && part_path.parent().is_none_or(|parent| !parent.is_dir()))
+                {
+                    return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::Verify {
+                registry,
+                artifact_id,
+                expected_sha256,
+            } => {
+                if !full_sha256(expected_sha256)
+                    || (check_real_inputs
+                        && registry
+                            .lock()
+                            .map_err(|_| ManagerInputError::Unavailable)?
+                            .get(artifact_id)
+                            .is_none())
+                {
+                    return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::Stage {
+                request: req,
+                registry,
+                artifact_ids,
+            } => {
+                if !full_sha256(&req.model.sha256) || req.role_artifacts.is_empty() {
+                    return Err(ManagerInputError::Unavailable);
+                }
+                if check_real_inputs {
+                    let registry = registry
+                        .lock()
+                        .map_err(|_| ManagerInputError::Unavailable)?;
+                    if artifact_ids.len() != req.role_artifacts.len() {
+                        return Err(ManagerInputError::Unavailable);
+                    }
+                    for (id, path) in artifact_ids.iter().zip(&req.role_artifacts) {
+                        let record = registry.get(id).ok_or(ManagerInputError::Unavailable)?;
+                        if record.state != registry::ArtifactState::Verified
+                            || !full_sha256(&record.sha256)
+                            || registry.root().root().join(&record.rel_path) != *path
+                            || registry
+                                .file_sha256(&record.rel_path)
+                                .map_err(|_| ManagerInputError::Unavailable)?
+                                != record.sha256
+                        {
+                            return Err(ManagerInputError::Unavailable);
+                        }
+                    }
+                }
+            }
+            ManagerJobInput::Activate(_) | ManagerJobInput::Rollback(_) => {}
+        }
+        let mut plan = plan.clone();
+        match &mut plan {
+            ManagerJobInput::Activate(input) => {
+                input.expected_generation = request.expected_generation;
+                input.runtime_lease = request.runtime_lease.clone().expect("checked lease");
+            }
+            ManagerJobInput::Rollback(input) => {
+                if input.previous_digest.is_empty() {
+                    return Err(ManagerInputError::Unavailable);
+                }
+                input.expected_generation = request.expected_generation;
+                input.runtime_lease = request.runtime_lease.clone().expect("checked lease");
+            }
+            _ => {}
+        }
+        Ok(plan)
+    }
+}
+
+fn full_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Production adapter. Activation and rollback require a connected cluster
+/// runtime; until that bridge is supplied, they fail before changing state.
+pub struct RuntimeManagerBackend {
+    resolver: ManagerJobInputResolver,
+    transport: Option<Arc<dyn download::HttpTransport + Send + Sync>>,
+}
+
+impl RuntimeManagerBackend {
+    pub fn new(resolver: ManagerJobInputResolver) -> Self {
+        Self {
+            resolver,
+            transport: None,
+        }
+    }
+
+    pub fn without_model_catalog() -> Self {
+        Self::new(ManagerJobInputResolver::new())
+    }
+
+    pub fn with_transport(
+        mut self,
+        transport: Arc<dyn download::HttpTransport + Send + Sync>,
+    ) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+}
+
+impl ManagerExecutionBackend for RuntimeManagerBackend {
+    fn execute(
+        &self,
+        request: ManagerExecutionRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let plan = self
+            .resolver
+            .resolve(&request)
+            .map_err(|error| match error {
+                ManagerInputError::Rejected => {
+                    ManagerExecutionError::InputRejected("invalid manager job input".into())
+                }
+                ManagerInputError::Unavailable => ManagerExecutionError::Unavailable,
+            })?;
+        match plan {
+            ManagerJobInput::Fetch {
+                cache,
+                official,
+                remote,
+                revision,
+                main_ref,
+            } => {
+                source::stage_source(&cache, &official, &remote, &revision, &main_ref)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Build(input) => {
+                build::build_artifacts(&input, &cancel)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Download { spec, part_path } => {
+                let transport = self
+                    .transport
+                    .as_ref()
+                    .ok_or(ManagerExecutionError::Unavailable)?;
+                download::download_bounded(&spec, transport.as_ref(), &part_path, None, &cancel)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Verify {
+                registry,
+                artifact_id,
+                expected_sha256,
+            } => {
+                let mut registry = registry
+                    .lock()
+                    .map_err(|_| ManagerExecutionError::Unavailable)?;
+                verify::verify_artifact(&mut registry, &artifact_id, &expected_sha256)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Stage { mut request, .. } => {
+                request.model = catalog::validate_entry(request.model.clone())
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                let result = stage::stage_profile(*request)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                if result.status != stage::StagedProfileStatus::Validated {
+                    return Err(ManagerExecutionError::Unavailable);
+                }
+            }
+            ManagerJobInput::Activate(_) | ManagerJobInput::Rollback(_) => {
+                return Err(ManagerExecutionError::Unavailable);
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        Ok(ManagerExecutionOutcome { progress: 100 })
+    }
+}
+
+/// Deterministic adapter for integration tests. Its seven explicit plans use
+/// the same request/result boundary while avoiding network and child processes.
+#[cfg(feature = "test-support")]
+pub struct FixtureManagerBackend {
+    resolver: ManagerJobInputResolver,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for FixtureManagerBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl FixtureManagerBackend {
+    pub fn new() -> Self {
+        let mut resolver = ManagerJobInputResolver::new();
+        let digest = verify::hex_sha256(b"fixture");
+        let model = catalog::ModelCatalogEntry {
+            catalog_id: "fixture-model".into(),
+            url: "fixture://model".into(),
+            redirect_allowlist: vec![],
+            size: 7,
+            sha256: digest.clone(),
+            license: "fixture".into(),
+            family: "ds4".into(),
+            quantization: "Q4".into(),
+            encoder: None,
+            support: None,
+            prefix_file: None,
+            reference: None,
+            main_integrated: true,
+            ram_reference: None,
+            compatibility: vec![],
+            status: catalog::CapabilityStatus::Candidate,
+        };
+        let inputs = [
+            (
+                JobKind::Fetch,
+                ManagerJobInput::Fetch {
+                    cache: PathBuf::from("fixture-cache"),
+                    official: source::OfficialRemote::new("fixture://source"),
+                    remote: "fixture://source".into(),
+                    revision: "main".into(),
+                    main_ref: "refs/heads/main".into(),
+                },
+            ),
+            (
+                JobKind::Build,
+                ManagerJobInput::Build(build::BuildRequest::new(
+                    "ds4",
+                    "build",
+                    "fixture-commit",
+                    "fixture-workspace",
+                    "out.bin",
+                )),
+            ),
+            (
+                JobKind::Download,
+                ManagerJobInput::Download {
+                    spec: download::DownloadSpec::new("fixture://model", 7, digest.clone()),
+                    part_path: PathBuf::from("fixture-model.part"),
+                },
+            ),
+            (
+                JobKind::Verify,
+                ManagerJobInput::Verify {
+                    registry: Arc::new(Mutex::new(registry::ArtifactRegistry::new(
+                        registry::ManagerRoot::explicit(PathBuf::from("fixture-root")),
+                    ))),
+                    artifact_id: "fixture-artifact".into(),
+                    expected_sha256: digest.clone(),
+                },
+            ),
+            (
+                JobKind::Stage,
+                ManagerJobInput::Stage {
+                    request: Box::new(stage::StageRequest {
+                        profile_id: "fixture-stage".into(),
+                        role_artifacts: vec![PathBuf::from("fixture-artifact")],
+                        model,
+                        expected_family: "ds4".into(),
+                        context_size: 4096,
+                        expected_prefix_digest: None,
+                        ram_confirmed: true,
+                    }),
+                    registry: Arc::new(Mutex::new(registry::ArtifactRegistry::new(
+                        registry::ManagerRoot::explicit(PathBuf::from("fixture-root")),
+                    ))),
+                    artifact_ids: vec!["fixture-artifact".into()],
+                },
+            ),
+            (
+                JobKind::Activate,
+                ManagerJobInput::Activate(activation::ActivationRequest {
+                    operation_id: "fixture-activate".into(),
+                    expected_generation: 1,
+                    runtime_lease: "fixture-lease".into(),
+                    policy_epoch: 1,
+                    nodes: vec!["local".into(), "peer".into()],
+                }),
+            ),
+            (
+                JobKind::Rollback,
+                ManagerJobInput::Rollback(rollback::RollbackRequest {
+                    operation_id: "fixture-rollback".into(),
+                    expected_generation: 1,
+                    runtime_lease: "fixture-lease".into(),
+                    policy_epoch: 1,
+                    previous_digest: digest,
+                    nodes: vec!["local".into(), "peer".into()],
+                }),
+            ),
+        ];
+        for (kind, input) in inputs {
+            resolver
+                .register(kind, format!("fixture-{kind}"), input)
+                .expect("valid fixture plan");
+        }
+        Self {
+            resolver,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    pub fn domain_call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ManagerExecutionBackend for FixtureManagerBackend {
+    fn execute(
+        &self,
+        request: ManagerExecutionRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let input = self
+            .resolver
+            .resolve_inner(&request, false)
+            .map_err(|error| match error {
+                ManagerInputError::Rejected => {
+                    ManagerExecutionError::InputRejected("invalid fixture input".into())
+                }
+                ManagerInputError::Unavailable => ManagerExecutionError::Unavailable,
+            })?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // Use each domain's pure validation or state transition. Fetch/build/
+        // download/verify avoid their external IO boundaries in this fixture.
+        match input {
+            ManagerJobInput::Fetch {
+                official, remote, ..
+            } if official.matches(&remote) => {}
+            ManagerJobInput::Build(input)
+                if build::is_approved_role(&input.role)
+                    && build::is_approved_target(&input.target) => {}
+            ManagerJobInput::Download { spec, .. } => {
+                download::check_capacity(u64::MAX, spec.expected_size, 1, 0)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Verify {
+                expected_sha256, ..
+            } if expected_sha256 == verify::hex_sha256(b"fixture") => {}
+            ManagerJobInput::Stage { mut request, .. } => {
+                request.model = catalog::validate_entry(request.model.clone())
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                stage::stage_profile(*request)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::Activate(input) => {
+                if !matches!(
+                    activation::prepare_activation(input, &FixtureNodeProvider),
+                    Ok(activation::PrepareOutcome::Prepared(_))
+                ) {
+                    return Err(ManagerExecutionError::Unavailable);
+                }
+            }
+            ManagerJobInput::Rollback(input) => {
+                rollback::rollback_to_previous(
+                    input,
+                    &FixtureNodeProvider,
+                    &mut FixtureRecovery,
+                    false,
+                )
+                .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            _ => {
+                return Err(ManagerExecutionError::InputRejected(
+                    "invalid fixture plan".into(),
+                ));
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        Ok(ManagerExecutionOutcome { progress: 100 })
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct FixtureNodeProvider;
+
+#[cfg(feature = "test-support")]
+impl activation::NodeArtifactProvider for FixtureNodeProvider {
+    fn verified_artifact(&self, _node: &activation::NodeId) -> Option<String> {
+        Some(verify::hex_sha256(b"fixture"))
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct FixtureRecovery;
+
+#[cfg(feature = "test-support")]
+impl rollback::PreviousRecovery for FixtureRecovery {
+    fn start_previous_and_wait_ready(&mut self) -> Result<(), activation::ActivationError> {
+        Ok(())
     }
 }
 
