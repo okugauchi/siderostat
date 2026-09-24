@@ -486,6 +486,29 @@ impl WorkerControl {
             .message(request_id.into(), ControlCommand::Drained))
     }
 
+    /// 分散worker childの異常終了をcoordinatorへ通知する。authenticatedな故障通知として
+    /// coordinator側のrecovery ownerへ渡し、route monitorより早く安全遷移を開始できる。
+    pub fn child_exited_message(
+        &mut self,
+        request_id: impl Into<String>,
+    ) -> Result<ControlMessage, ControlError> {
+        if !matches!(
+            self.phase,
+            DistributedControlPhase::WorkerReady
+                | DistributedControlPhase::Draining
+                | DistributedControlPhase::Drained
+        ) {
+            return Err(ControlError::InvalidPhase { phase: self.phase });
+        }
+        self.phase = DistributedControlPhase::Paired;
+        Ok(self.processor.message(
+            request_id.into(),
+            ControlCommand::WorkerEvent {
+                event: WorkerEventKind::Exited,
+            },
+        ))
+    }
+
     pub fn phase(&self) -> DistributedControlPhase {
         self.phase
     }

@@ -3,7 +3,7 @@ use crate::{
     cluster::{
         AuthenticatedPeer, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
         ControlRequest, ControlResponse, EventOwner, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE,
-        HEADER_TIMESTAMP, SignedControlHeaders,
+        HEADER_TIMESTAMP, SignedControlHeaders, WorkerEventKind,
     },
     target::LocalRole,
 };
@@ -217,6 +217,11 @@ impl super::ProductionClusterRuntime {
             ControlCommand::PrepareWorker => self.prepare_worker().await?,
             ControlCommand::BeginDrain => self.worker_drained().await?,
             ControlCommand::CancelGeneration | ControlCommand::Demote => self.stop_worker().await?,
+            ControlCommand::WorkerEvent {
+                event: WorkerEventKind::Exited,
+            } if self.inner.role == LocalRole::Coordinator => {
+                self.recover_from_peer_loss(EventOwner::Control).await?;
+            }
             ControlCommand::DistributedReady => {
                 self.inner.proxy.admission().start_serving();
             }

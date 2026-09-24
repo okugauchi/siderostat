@@ -422,7 +422,8 @@ mod force_tests {
 /// 短時間 mutex を保持して network await しない。。
 pub struct PolicyControlState {
     epoch: std::sync::Mutex<u64>,
-    idempotency: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>,
+    /// prepare/commit/abortは同じoperation_idを共有するためphaseごとに冪等性を分ける。
+    idempotency: std::sync::Mutex<std::collections::HashMap<(uuid::Uuid, PolicyControlPhase), u64>>,
 }
 
 impl Default for PolicyControlState {
@@ -472,11 +473,12 @@ impl PolicyControlState {
         }
         let body_hash = canonical_request_hash(request);
         let mut idem = self.idempotency.lock().unwrap_or_else(|p| p.into_inner());
-        match idem.get(&request.operation_id) {
+        let key = (request.operation_id, request.phase);
+        match idem.get(&key) {
             Some(existing) if *existing == body_hash => Ok(PolicyControlVerdict::Duplicate),
             Some(_) => Err(PolicyControlError::IdempotencyConflict),
             None => {
-                idem.insert(request.operation_id, body_hash);
+                idem.insert(key, body_hash);
                 Ok(PolicyControlVerdict::New)
             }
         }
@@ -487,7 +489,7 @@ impl PolicyControlState {
         self.idempotency
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&operation_id);
+            .retain(|(id, _), _| *id != operation_id);
     }
 }
 
@@ -576,6 +578,24 @@ mod tests {
         state.release(req.operation_id);
         assert_eq!(
             state.validate(&req, true).unwrap(),
+            PolicyControlVerdict::New
+        );
+    }
+
+    #[test]
+    fn prepare_and_commit_share_operation_id_but_have_distinct_idempotency_slots() {
+        let state = PolicyControlState::new();
+        let prepare = request(1, PolicyControlPhase::Prepare);
+        assert_eq!(
+            state.validate(&prepare, true).unwrap(),
+            PolicyControlVerdict::New
+        );
+        let commit = PolicyControlRequest {
+            phase: PolicyControlPhase::Commit,
+            ..prepare
+        };
+        assert_eq!(
+            state.validate(&commit, true).unwrap(),
             PolicyControlVerdict::New
         );
     }

@@ -94,6 +94,23 @@ impl<'a> PolicyJournal<'a> {
         Ok(state)
     }
 
+    /// Automatic 適用結果を完了後に永続化する。片側commitが不明な間は呼ばない。
+    pub fn record_automatic_applied(
+        &self,
+        epoch: u64,
+    ) -> Result<PersistentClusterState, StateStoreError> {
+        let mut state = self.store.load()?.unwrap_or_default_for_save();
+        state.applied_policy = OperationPolicy::Automatic;
+        state.policy_epoch = epoch;
+        if let Some(mut pending) = state.pending_operation.take() {
+            pending.phase = PersistentOperationPhase::Applied;
+            pending.peer_ack = true;
+            state.pending_operation = Some(pending);
+        }
+        self.store.save(&state)?;
+        Ok(state)
+    }
+
     /// Automatic 復帰 intent を永続化する。pending は Automatic で記録し、TP 再接続の
     /// 抑止を解除するのは適用完了後。P05 で cluster-wide 適用に接続する。
     pub fn persist_automatic_intent(

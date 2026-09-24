@@ -8,15 +8,17 @@ use super::{
     HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
     LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
     NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
-    PeerObservation, PromotionRetryPolicy, StandaloneSupervisor, WorkerControl,
-    WorkerDistributedRuntime, spawn_network_event_monitor,
+    PeerObservation, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
+    PolicyControlResponse, PolicyControlState, PolicyControlStatus, PromotionRetryPolicy,
+    StandaloneSupervisor, StateStore, WorkerControl, WorkerDistributedRuntime, WorkerEventKind,
+    spawn_network_event_monitor,
 };
 #[cfg(feature = "test-support")]
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
 use crate::{
     cluster::{
-        AutomaticPromotionVerdict, ClusterEvent, ClusterEventKind, OperationPolicy, TpStartVerdict,
-        automatic_promotion_verdict,
+        AutomaticPromotionVerdict, ClusterEvent, ClusterEventKind, ControlRequest, OperationPolicy,
+        SignedControlHeaders, TpStartVerdict, automatic_promotion_verdict,
     },
     config::{ModeAwareConfig, SpeculativeSupport},
     metrics::{MetricSnapshot, Metrics},
@@ -130,6 +132,47 @@ impl ProductionControlClient {
         let timeout = effect_requires_ack(&message.command).then_some(self.inner.lifecycle_timeout);
         self.request(reqwest::Method::POST, path, body, timeout)
             .await
+    }
+
+    /// Signed v2 policy prepare/commit/abort request to the peer.
+    pub async fn apply_policy(
+        &self,
+        request: &PolicyControlRequest,
+    ) -> anyhow::Result<PolicyControlResponse> {
+        let body = serde_json::to_vec(request)?;
+        let timestamp = now_millis();
+        let path = "/v2/operation-policy";
+        let signed = self.inner.authenticator.sign(
+            self.inner.local_node_id.clone(),
+            reqwest::Method::POST.as_str(),
+            path,
+            timestamp,
+            uuid::Uuid::new_v4().simple().to_string(),
+            &body,
+        )?;
+        let response = self
+            .inner
+            .client
+            .post(self.inner.base.join(path.trim_start_matches('/'))?)
+            .header(HEADER_NODE, signed.node_id())
+            .header(HEADER_TIMESTAMP, signed.timestamp_millis())
+            .header(HEADER_NONCE, signed.nonce())
+            .header(HEADER_SIGNATURE, signed.signature())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(self.inner.lifecycle_timeout)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "peer policy control returned {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub async fn node(&self) -> anyhow::Result<ControlResponse> {
@@ -283,8 +326,18 @@ struct ProductionInner {
     /// 復元され、適用調整（P04/P05）で更新される。Automatic を選んでも保護ラッチは
     /// 解除しない。全自動経路（pair/promote）の gate が参照する。。
     operator_policy: std::sync::Mutex<OperationPolicy>,
+    /// 最後に両nodeでcommitされた方針。intentとは分離して公開する。。
+    applied_policy: std::sync::Mutex<OperationPolicy>,
     /// 現在の policy epoch（C03）。両端 pair/promote は peer epoch 一致を検証する。。
     policy_epoch: AtomicU64,
+    /// prepare後、両nodeのcommitが揃うまで自動昇格を抑止する。。
+    policy_pending: AtomicBool,
+    policy_control: Arc<PolicyControlState>,
+    policy_store: std::sync::Mutex<Option<Arc<StateStore>>>,
+    /// Serializes policy-journal writes with the app-level runtime-state snapshot. Without this
+    /// lock a background snapshot could read IntentSaved, then overwrite a concurrently
+    /// committed Applied journal entry (P0 false-success/persistence race).
+    policy_persistence: std::sync::Mutex<()>,
     planned_restart: PlannedRestartGate,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
@@ -724,7 +777,12 @@ impl ProductionClusterRuntime {
             recovery_owner_active: AtomicBool::new(false),
             automatic_pairing_blocked: AtomicBool::new(false),
             operator_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
+            applied_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
             policy_epoch: AtomicU64::new(0),
+            policy_pending: AtomicBool::new(false),
+            policy_control: Arc::new(PolicyControlState::new()),
+            policy_store: std::sync::Mutex::new(None),
+            policy_persistence: std::sync::Mutex::new(()),
             planned_restart: PlannedRestartGate::default(),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
@@ -1095,6 +1153,20 @@ impl ProductionClusterRuntime {
         self.inner.automatic_pairing_blocked.load(Ordering::Acquire)
     }
 
+    pub(super) fn unblock_automatic_pairing(&self) {
+        self.inner
+            .automatic_pairing_blocked
+            .store(false, Ordering::Release);
+    }
+
+    pub(super) async fn peer_present(&self) -> bool {
+        let now = now_millis();
+        match &self.inner.control {
+            RoleControl::Coordinator(control) => control.lock().await.peer_present(now),
+            RoleControl::Worker(control) => control.lock().await.peer_present(now),
+        }
+    }
+
     /// 現在の操作方針（C03）。P01 journal から復元され、適用調整（P04/P05）で更新される。
     pub fn operator_policy(&self) -> OperationPolicy {
         *self
@@ -1102,6 +1174,209 @@ impl ProductionClusterRuntime {
             .operator_policy
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 起動時にpersistent policy journalをruntimeへ復元する（P0）。副作用は行わず、
+    /// pending中は自動昇格だけを抑止する。ForcedStandalone自体はgateで常に優先される。
+    pub fn restore_policy(
+        &self,
+        operator_policy: OperationPolicy,
+        applied_policy: OperationPolicy,
+        policy_epoch: u64,
+        pending: bool,
+    ) {
+        *self
+            .inner
+            .operator_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = operator_policy;
+        *self
+            .inner
+            .applied_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = applied_policy;
+        self.inner
+            .policy_epoch
+            .store(policy_epoch, Ordering::Release);
+        self.inner.policy_pending.store(pending, Ordering::Release);
+        self.inner.policy_control.advance_epoch(policy_epoch);
+    }
+
+    /// StateStoreをpolicy control endpointへ接続する。起動時のStateStore取得後、control
+    /// listener開始前に一度だけ呼び出す。
+    pub fn attach_policy_store(&self, store: Arc<StateStore>) {
+        *self
+            .inner
+            .policy_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+    }
+
+    /// Lock the policy journal/runtime-state persistence critical section. The guard is held only
+    /// across synchronous journal load/save and in-memory policy updates; callers must not await
+    /// while holding it.
+    pub(crate) fn policy_persistence_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner
+            .policy_persistence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Two-node policy transaction. Prepare is persisted on both nodes before either commit;
+    /// commit is acknowledged on both nodes before the caller can report cluster completion.
+    pub async fn apply_policy_transaction(
+        &self,
+        desired: OperationPolicy,
+        expected_generation: u64,
+        operation_id: uuid::Uuid,
+    ) -> anyhow::Result<serde_json::Value> {
+        let current_generation = self.inner.mode.snapshot().generation;
+        anyhow::ensure!(
+            expected_generation == 0 || expected_generation == current_generation,
+            "policy generation is stale: expected {current_generation}, received {expected_generation}"
+        );
+        let epoch = self.policy_epoch().saturating_add(1);
+        let prepare = PolicyControlRequest {
+            protocol_version: policy::POLICY_CONTROL_PROTOCOL_VERSION,
+            policy_epoch: epoch,
+            operation_id,
+            phase: PolicyControlPhase::Prepare,
+            desired,
+        };
+        self.apply_policy_phase(&prepare).await?;
+        let peer_id = self.peer_node_id().await.unwrap_or_else(|| "peer".into());
+        self.inner.client.apply_policy(&prepare).await?;
+
+        // Peer commit first. If the local commit fails, the local intent remains pending and the
+        // admin job is failed rather than presenting a false cluster-wide success.
+        let commit = PolicyControlRequest {
+            phase: PolicyControlPhase::Commit,
+            ..prepare.clone()
+        };
+        self.inner.client.apply_policy(&commit).await?;
+        self.apply_policy_phase(&commit).await?;
+
+        let local_id = self.inner.descriptor.node_id.clone();
+        Ok(serde_json::json!({
+            "desired": desired,
+            "applied": desired,
+            "cluster_complete": true,
+            "nodes": [
+                {"node_id": local_id, "state": "complete", "applied": desired},
+                {"node_id": peer_id, "state": "complete", "applied": desired}
+            ]
+        }))
+    }
+
+    async fn peer_node_id(&self) -> Option<String> {
+        match &self.inner.control {
+            RoleControl::Coordinator(control) => control
+                .lock()
+                .await
+                .peer_lease()
+                .descriptor()
+                .map(|descriptor| descriptor.node_id.clone()),
+            RoleControl::Worker(control) => control
+                .lock()
+                .await
+                .peer_lease()
+                .descriptor()
+                .map(|descriptor| descriptor.node_id.clone()),
+        }
+    }
+
+    fn policy_store(&self) -> Option<Arc<StateStore>> {
+        self.inner
+            .policy_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 認証済みpeerから受けたprepare/commit/abortをlocalへ適用する。副作用の前に
+    /// intentをjournalへ保存し、commit完了後だけappliedを更新する。
+    async fn apply_policy_phase(
+        &self,
+        request: &PolicyControlRequest,
+    ) -> anyhow::Result<PolicyControlResponse> {
+        match request.phase {
+            PolicyControlPhase::Prepare => {
+                let _persistence_guard = self.policy_persistence_guard();
+                if let Some(store) = self.policy_store() {
+                    let journal = super::PolicyJournal::new(store.as_ref());
+                    match request.desired {
+                        OperationPolicy::ForcedStandalone => {
+                            journal
+                                .persist_force_intent(request.policy_epoch, request.operation_id)?;
+                        }
+                        OperationPolicy::Automatic => {
+                            journal.persist_automatic_intent(request.policy_epoch)?;
+                        }
+                    }
+                }
+                self.set_operator_policy(request.desired);
+                self.set_policy_epoch(request.policy_epoch);
+                self.set_policy_pending(true);
+            }
+            PolicyControlPhase::Commit => {
+                if request.desired == OperationPolicy::ForcedStandalone {
+                    self.recover_from_forced_policy().await?;
+                }
+                let _persistence_guard = self.policy_persistence_guard();
+                if let Some(store) = self.policy_store() {
+                    let journal = super::PolicyJournal::new(store.as_ref());
+                    match request.desired {
+                        OperationPolicy::ForcedStandalone => {
+                            journal.record_force_applied(request.policy_epoch)?;
+                        }
+                        OperationPolicy::Automatic => {
+                            journal.record_automatic_applied(request.policy_epoch)?;
+                        }
+                    }
+                }
+                self.set_operator_policy(request.desired);
+                self.set_applied_policy(request.desired);
+                self.set_policy_epoch(request.policy_epoch);
+                self.set_policy_pending(false);
+                self.inner
+                    .policy_control
+                    .advance_epoch(request.policy_epoch);
+            }
+            PolicyControlPhase::Abort => {
+                self.set_policy_pending(false);
+            }
+        }
+        Ok(PolicyControlResponse {
+            status: PolicyControlStatus::Applied,
+            policy_epoch: self.policy_epoch(),
+            applied: self.applied_policy(),
+        })
+    }
+
+    /// 最後にcluster-wide commitされたpolicy。
+    pub fn applied_policy(&self) -> OperationPolicy {
+        *self
+            .inner
+            .applied_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// intentが保存され、両node commitが未完了か。
+    pub fn policy_pending(&self) -> bool {
+        self.inner.policy_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_policy_pending(&self, pending: bool) {
+        self.inner.policy_pending.store(pending, Ordering::Release);
+    }
+
+    pub(crate) fn set_applied_policy(&self, policy: OperationPolicy) {
+        *self
+            .inner
+            .applied_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
     }
 
     /// operator_policy を更新する。Automatic を選んでも ForcedStandalone 保護ラッチの
@@ -1136,6 +1411,9 @@ impl ProductionClusterRuntime {
         peer_present: bool,
         peer_policy_epoch: u64,
     ) -> AutomaticPromotionVerdict {
+        if self.policy_pending() && self.operator_policy() == OperationPolicy::Automatic {
+            return AutomaticPromotionVerdict::EpochMismatch;
+        }
         automatic_promotion_verdict(
             self.operator_policy(),
             self.inner.config.cluster.policy.auto_promote,
@@ -1200,6 +1478,7 @@ impl ProductionClusterRuntime {
             .route("/v1/demote", post(control_demote))
             .route("/v1/prepare-restart", post(control_prepare_restart))
             .route("/v1/cancel-restart", post(control_cancel_restart))
+            .route("/v2/operation-policy", post(control_operation_policy))
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self.clone())
     }
@@ -1473,6 +1752,7 @@ impl PeerLifecycle {
 enum ControlHttpError {
     Auth(AuthError),
     Control(super::ControlError),
+    Policy(PolicyControlError),
     Effect(String),
     MissingHeader(&'static str),
     BadJson(String),
@@ -1498,12 +1778,64 @@ impl IntoResponse for ControlHttpError {
                 StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
                 error.to_string(),
             ),
+            Self::Policy(error) => (
+                StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+                format!("{error:?}"),
+            ),
             Self::Effect(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
             Self::MissingHeader(name) => (StatusCode::UNAUTHORIZED, format!("missing {name}")),
             Self::BadJson(error) => (StatusCode::BAD_REQUEST, error),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
     }
+}
+
+async fn control_operation_policy(
+    State(runtime): State<ProductionClusterRuntime>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<PolicyControlResponse>, ControlHttpError> {
+    let signed = SignedControlHeaders::from_header_values(
+        header(&headers, HEADER_NODE)?,
+        header(&headers, HEADER_TIMESTAMP)?,
+        header(&headers, HEADER_NONCE)?,
+        header(&headers, HEADER_SIGNATURE)?,
+    )?;
+    let authenticated = ControlRequest {
+        method: "POST",
+        path_and_query: "/v2/operation-policy",
+        body: &body,
+        source_ip: source.ip(),
+        headers: &signed,
+    }
+    .authenticate(&runtime.inner.authenticator, now_millis())?;
+    if let Some(expected) = runtime.peer_node_id().await
+        && expected != authenticated.node_id()
+    {
+        return Err(ControlHttpError::Policy(
+            PolicyControlError::Unauthenticated,
+        ));
+    }
+    let request: PolicyControlRequest = serde_json::from_slice(&body)
+        .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
+    let verdict = runtime
+        .inner
+        .policy_control
+        .validate(&request, true)
+        .map_err(ControlHttpError::Policy)?;
+    if matches!(verdict, super::PolicyControlVerdict::Duplicate) {
+        return Ok(Json(PolicyControlResponse {
+            status: PolicyControlStatus::Duplicate,
+            policy_epoch: runtime.policy_epoch(),
+            applied: runtime.applied_policy(),
+        }));
+    }
+    runtime
+        .apply_policy_phase(&request)
+        .await
+        .map(Json)
+        .map_err(|error| ControlHttpError::Effect(error.to_string()))
 }
 
 fn effect_requires_ack(command: &ControlCommand) -> bool {
@@ -1516,6 +1848,9 @@ fn effect_requires_ack(command: &ControlCommand) -> bool {
             | ControlCommand::Demote
             | ControlCommand::PrepareRestart
             | ControlCommand::CancelRestart
+            | ControlCommand::WorkerEvent {
+                event: WorkerEventKind::Exited,
+            }
     )
 }
 

@@ -33,6 +33,19 @@ impl PeerLossRecovery {
     }
 }
 impl super::ProductionClusterRuntime {
+    /// Operator Force policy uses the same ordered cleanup as peer-loss recovery, while keeping
+    /// the policy latch active so periodic reconciliation cannot promote again.
+    pub async fn recover_from_forced_policy(
+        &self,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        self.recover_to_solo(
+            EventOwner::Control,
+            ClusterEventKind::PeerLost,
+            "forced-standalone",
+        )
+        .await
+    }
+
     /// The single PeerLost recovery entry point. Both the control-reconcile path and the
     /// route-loss demotion monitor call this. Order is fixed by the design:
     /// admission block -> distributed stop -> standalone start -> publish SoloReady.

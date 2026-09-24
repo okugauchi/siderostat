@@ -9,11 +9,11 @@ use crate::{
         DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
         ModeRuntime, OperationPolicy, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION,
         PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
-        PersistentProxyTarget, PolicyStart, PolicyStartError, ProcessControlError,
-        ProductionClusterRuntime, RestartDecision, StandaloneManifest, StandaloneSupervisor,
-        StateStore, StateStoreError, build_standalone_command, detect_cluster_role,
-        fingerprint_file, platform_process_controller, reconcile_restart, required_port_available,
-        spawn_network_event_monitor,
+        PersistentOperationPhase, PersistentProxyTarget, PolicyStart, PolicyStartError,
+        ProcessControlError, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
+        StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
+        detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
+        required_port_available, spawn_network_event_monitor,
     },
     config::{ModeAwareConfig, Quantization, RecoveryConfig, Residency, SpeculativeSupport},
     diagnostics::{DiagnosticSnapshot, DiagnosticSnapshotStore},
@@ -417,8 +417,8 @@ impl AdminExecutor for RuntimeAdminExecutor {
                 )),
                 AdminAction::SetPolicy {
                     desired,
-                    expected_generation: _,
-                    request_id: _,
+                    expected_generation,
+                    request_id,
                 } => {
                     let Some(production) = production else {
                         return Ok(serde_json::json!({
@@ -428,20 +428,9 @@ impl AdminExecutor for RuntimeAdminExecutor {
                             "error": "cluster runtime is disabled",
                         }));
                     };
-                    // P06 / C03: 方針を適用する。set_operator_policy は epoch を進める。
-                    // 適用結果は node 別 nodes 配列で返す（単一 node 構成では local 1 件）。。
-                    production.set_operator_policy(desired);
-                    production.set_policy_epoch(production.policy_epoch() + 1);
-                    let applied = production.operator_policy();
-                    Ok(serde_json::json!({
-                        "desired": desired,
-                        "applied": applied,
-                        "nodes": [{
-                            "node_id": "local",
-                            "state": "complete",
-                            "applied": applied,
-                        }],
-                    }))
+                    production
+                        .apply_policy_transaction(desired, expected_generation, request_id)
+                        .await
                 }
             }
         })
@@ -651,6 +640,21 @@ pub async fn serve_with_options(
         control_session_generation,
         dry_run,
     )?;
+    if let (Some(production), Some(persisted)) = (production.as_ref(), persisted.as_ref()) {
+        let pending = persisted
+            .pending_operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase != PersistentOperationPhase::Applied);
+        production.restore_policy(
+            persisted.operator_policy,
+            persisted.applied_policy,
+            persisted.policy_epoch,
+            pending,
+        );
+    }
+    if let (Some(production), Some(store)) = (production.as_ref(), state_store.as_ref()) {
+        production.attach_policy_store(store.clone());
+    }
     let notifier = build_notifier(
         config.notifications.enabled,
         config.notifications.sound,
@@ -1385,6 +1389,11 @@ async fn persist_runtime_state(
     };
     // P01 / C03: policy journal（operator_policy / applied_policy / policy_epoch /
     // pending_operation）は runtime の再保存で自動に戻さない。既存 state から引き継ぐ。
+    // Policy transitions hold the same critical section while updating the journal. This prevents
+    // a background mode snapshot from reading IntentSaved and overwriting a concurrently
+    // committed Applied record.
+    let _policy_persistence_guard =
+        production.map(|production| production.policy_persistence_guard());
     let prior = store.load()?;
     let operator_policy = prior
         .as_ref()
@@ -2158,7 +2167,13 @@ async fn operation_policy(
     };
     let body_hash = crate::cluster::policy_body_hash(desired, body.expected_generation);
     let local_node_id = "local".to_string();
-    match admin.start_policy(body.request_id, body_hash, desired, local_node_id) {
+    match admin.start_policy(
+        body.request_id,
+        body_hash,
+        desired,
+        body.expected_generation,
+        local_node_id,
+    ) {
         Ok(PolicyStart::Created(job)) => match serde_json::to_value(job) {
             Ok(value) => json_response(StatusCode::ACCEPTED, value),
             Err(error) => {
@@ -2698,21 +2713,28 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
     let diagnostics = state.production_diagnostics().await;
     // v0.4.0 操作方針（P06 / C03）: desired / applied / epoch を GET /cluster に公開する。。
-    let (desired_policy, applied_policy, policy_epoch) = match state.production_runtime() {
-        Some(production) => {
-            let policy = production.operator_policy();
-            let name = serde_json::to_value(policy)
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| serde_json::Error::io(std::io::Error::other("not a string")))
-                })
-                .unwrap_or_else(|_| "automatic".to_string());
-            (name.clone(), name, production.policy_epoch())
-        }
-        None => ("automatic".to_string(), "automatic".to_string(), 0),
-    };
+    let (desired_policy, applied_policy, policy_epoch) =
+        match state.production_runtime() {
+            Some(production) => {
+                let policy = production.operator_policy();
+                let name = serde_json::to_value(policy)
+                    .and_then(|value| {
+                        value.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::other("not a string"))
+                        })
+                    })
+                    .unwrap_or_else(|_| "automatic".to_string());
+                let applied = serde_json::to_value(production.applied_policy())
+                    .and_then(|value| {
+                        value.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::other("not a string"))
+                        })
+                    })
+                    .unwrap_or_else(|_| "automatic".to_string());
+                (name, applied, production.policy_epoch())
+            }
+            None => ("automatic".to_string(), "automatic".to_string(), 0),
+        };
     let (control_session, children) = match &diagnostics {
         Some(diagnostics) => (
             control_session_json(&diagnostics.control_session),

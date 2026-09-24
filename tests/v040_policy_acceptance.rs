@@ -56,6 +56,36 @@ impl AdminExecutor for FailingExecutor {
     }
 }
 
+/// cluster-wide の完了を返さない executor。現在の実装が local node の complete だけで
+/// job 全体を成功扱いしてしまう回帰を捕捉する。
+#[derive(Clone)]
+struct IncompleteExecutor;
+
+impl AdminExecutor for IncompleteExecutor {
+    fn execute(&self, action: AdminAction) -> AdminFuture {
+        Box::pin(async move {
+            let _ = action;
+            Ok(serde_json::json!({
+                "desired": "forced-standalone",
+                "applied": "forced-standalone",
+                "cluster_complete": false,
+                "nodes": [
+                    {
+                        "node_id": "local",
+                        "state": "complete",
+                        "applied": "forced-standalone"
+                    },
+                    {
+                        "node_id": "remote",
+                        "state": "running",
+                        "applied": "automatic"
+                    }
+                ]
+            }))
+        })
+    }
+}
+
 /// request payload の拒否を検証するための最小構造体。
 /// 本番 handler（app.rs）と同一の deny_unknown_fields を再現する。
 #[derive(Debug, serde::Deserialize)]
@@ -121,6 +151,7 @@ async fn p06_case3_stale_generation_returns_409() {
         request_id,
         body_hash_a,
         OperationPolicy::ForcedStandalone,
+        3,
         "local".into(),
     ) {
         Ok(PolicyStart::Created(_)) => {}
@@ -133,6 +164,7 @@ async fn p06_case3_stale_generation_returns_409() {
         request_id,
         body_hash_b,
         OperationPolicy::ForcedStandalone,
+        9,
         "local".into(),
     ) {
         Err(PolicyStartError::IdempotencyConflict) => {}
@@ -152,6 +184,7 @@ async fn p06_case4_simultaneous_gui_one_job() {
         request_id,
         body_hash,
         OperationPolicy::ForcedStandalone,
+        3,
         "local".into(),
     ) {
         Ok(PolicyStart::Created(job)) => job,
@@ -163,6 +196,7 @@ async fn p06_case4_simultaneous_gui_one_job() {
         request_id,
         body_hash,
         OperationPolicy::ForcedStandalone,
+        3,
         "local".into(),
     ) {
         Ok(PolicyStart::Existing(job)) => job,
@@ -196,6 +230,7 @@ async fn p06_case5_partial_failure_exit_and_node_state() {
         request_id,
         body_hash,
         OperationPolicy::ForcedStandalone,
+        3,
         "local".into(),
     );
 
@@ -238,4 +273,36 @@ async fn p06_case5_partial_failure_exit_and_node_state() {
         admin.policy_job(&unknown).is_none(),
         "未知 request_id は 404（None）であるべき"
     );
+}
+
+#[tokio::test]
+async fn p06_incomplete_cluster_apply_is_not_reported_as_complete() {
+    let admin = controller(Arc::new(IncompleteExecutor));
+    let request_id = uuid::Uuid::new_v4();
+    let body_hash = policy_body_hash(OperationPolicy::ForcedStandalone, 3);
+    let _ = admin.start_policy(
+        request_id,
+        body_hash,
+        OperationPolicy::ForcedStandalone,
+        3,
+        "local".into(),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let job = loop {
+        let job = admin.policy_job(&request_id).expect("job は照会できるべき");
+        if job.state != siderostat::cluster::PolicyJobState::Running
+            || std::time::Instant::now() >= deadline
+        {
+            break job;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    assert_ne!(
+        job.state,
+        siderostat::cluster::PolicyJobState::Complete,
+        "両nodeのcommit未完了をcompleteとして公開してはならない"
+    );
+    assert_eq!(job.nodes.len(), 2);
 }

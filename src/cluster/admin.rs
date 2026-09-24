@@ -274,6 +274,7 @@ impl AdminController {
         request_id: uuid::Uuid,
         body_hash: u64,
         desired: OperationPolicy,
+        expected_generation: u64,
         local_node_id: String,
     ) -> Result<PolicyStart, PolicyStartError> {
         let mut idem = self
@@ -330,7 +331,7 @@ impl AdminController {
                     let result = executor
                         .execute(AdminAction::SetPolicy {
                             desired,
-                            expected_generation: 0,
+                            expected_generation,
                             request_id,
                         })
                         .await;
@@ -343,16 +344,48 @@ impl AdminController {
                     };
                     match result {
                         Ok(value) => {
-                            entry.state = PolicyJobState::Complete;
-                            entry.applied = desired;
-                            if let Some(node) = entry.nodes.first_mut() {
-                                node.state = PolicyJobState::Complete;
-                                node.applied = desired;
+                            // executor は必ず node 別結果と cluster-wide 完了判定を返す。
+                            // 旧単一node executorとの互換性のため、明示値が無い場合だけ
+                            // 1 node 全て complete を成功とみなす。複数nodeで明示的な
+                            // `cluster_complete=false` を返した場合は、local nodeが
+                            // completeでも job 全体を成功扱いしない（C03）。。
+                            let nodes =
+                                value
+                                    .get("nodes")
+                                    .and_then(Value::as_array)
+                                    .and_then(|nodes| {
+                                        serde_json::from_value::<Vec<PolicyNodeResult>>(
+                                            serde_json::Value::Array(nodes.clone()),
+                                        )
+                                        .ok()
+                                    });
+                            if let Some(nodes) = nodes {
+                                entry.nodes = nodes;
                             }
-                            // node 別結果（peer 分）は executor の戻りに含める。。
-                            if let Some(nodes) = value.get("nodes").and_then(Value::as_array) {
-                                entry.nodes = serde_json::from_value(serde_json::json!(nodes))
-                                    .unwrap_or_else(|_| entry.nodes.clone());
+                            let cluster_complete = value
+                                .get("cluster_complete")
+                                .and_then(Value::as_bool)
+                                .unwrap_or_else(|| {
+                                    entry.nodes.len() == 1
+                                        && entry
+                                            .nodes
+                                            .iter()
+                                            .all(|node| node.state == PolicyJobState::Complete)
+                                });
+                            if cluster_complete
+                                && entry
+                                    .nodes
+                                    .iter()
+                                    .all(|node| node.state == PolicyJobState::Complete)
+                            {
+                                entry.state = PolicyJobState::Complete;
+                                entry.applied = desired;
+                            } else {
+                                entry.state = PolicyJobState::Failed;
+                                entry.error = Some(
+                                    "cluster-wide policy apply did not complete on every node"
+                                        .into(),
+                                );
                             }
                         }
                         Err(error) => {

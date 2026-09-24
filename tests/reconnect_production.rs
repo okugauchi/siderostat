@@ -7,12 +7,98 @@ mod support;
 
 use siderostat::{
     admission::AdmissionState,
-    cluster::{DistributedControlPhase, EventOwner, NetworkSnapshot, ThunderboltIpState},
+    cluster::{
+        DistributedControlPhase, EventOwner, NetworkSnapshot, OperationPolicy, ThunderboltIpState,
+    },
     target::{ClusterState, LocalRole, ProxyTarget, StableMode},
 };
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use support::{Node, TwoNode, wait_until};
+
+#[tokio::test]
+async fn h04_policy_restore_keeps_forced_latch_and_epoch() {
+    let nodes = TwoNode::boot().await.expect("boot two nodes");
+    nodes.coordinator.production.restore_policy(
+        OperationPolicy::ForcedStandalone,
+        OperationPolicy::ForcedStandalone,
+        7,
+        true,
+    );
+
+    assert_eq!(
+        nodes.coordinator.production.operator_policy(),
+        OperationPolicy::ForcedStandalone
+    );
+    assert_eq!(nodes.coordinator.production.policy_epoch(), 7);
+    assert!(nodes.coordinator.production.policy_pending());
+    assert!(matches!(
+        nodes
+            .coordinator
+            .production
+            .automatic_promotion_gate(true, 7),
+        siderostat::cluster::AutomaticPromotionVerdict::ForcedStandaloneLatch
+    ));
+    nodes.shutdown().await;
+}
+
+#[tokio::test]
+async fn h04_force_transaction_stops_both_distributed_children() {
+    let nodes = TwoNode::boot().await.expect("boot two nodes");
+    nodes.pair().await.expect("pair nodes");
+    nodes.promote_to_distributed().await.expect("promote nodes");
+
+    let result = nodes
+        .coordinator
+        .production
+        .apply_policy_transaction(OperationPolicy::ForcedStandalone, 0, uuid::Uuid::new_v4())
+        .await
+        .expect("force transaction");
+
+    assert_eq!(result["cluster_complete"], true);
+    assert_eq!(
+        nodes.coordinator.production.operator_policy(),
+        OperationPolicy::ForcedStandalone
+    );
+    assert_eq!(
+        nodes.worker.production.operator_policy(),
+        OperationPolicy::ForcedStandalone
+    );
+    assert!(
+        nodes
+            .wait_until_both(ClusterState::SoloStandaloneReady, Duration::from_secs(5))
+            .await
+    );
+    nodes.shutdown().await;
+}
+
+#[tokio::test]
+async fn h04_worker_child_crash_recovers_without_manual_demote() {
+    let nodes = TwoNode::boot().await.expect("boot two nodes");
+    nodes.pair().await.expect("pair nodes");
+    nodes.promote_to_distributed().await.expect("promote nodes");
+    let monitor = nodes.worker.production.start_reconcile_task();
+
+    nodes
+        .worker
+        .worker_child
+        .as_ref()
+        .expect("worker child")
+        .child()
+        .stop();
+
+    let recovered = wait_until(Duration::from_secs(5), || async {
+        nodes.coordinator.mode.snapshot().state == ClusterState::SoloStandaloneReady
+            && nodes.worker.mode.snapshot().state == ClusterState::SoloStandaloneReady
+    })
+    .await;
+    monitor.abort();
+    assert!(
+        recovered,
+        "child crash must trigger automatic safe recovery"
+    );
+    nodes.shutdown().await;
+}
 
 /// One-node observation captured from the reconnect diagnostics contract plus the proxy
 /// target / admission surface, so every E-01 checkpoint can assert state, stable mode,

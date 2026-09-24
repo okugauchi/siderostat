@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -345,6 +346,9 @@ async fn run_admin_command(
     config: &ModeAwareConfig,
     command: ClusterCommand,
 ) -> anyhow::Result<()> {
+    if let ClusterCommand::Mode { policy } = command {
+        return run_operation_policy_command(config, policy).await;
+    }
     let client = reqwest::Client::new();
     let base = format!("http://{}", config.proxy.admin_listen);
     let (method, path, body, output) = cluster_request(command);
@@ -393,6 +397,99 @@ async fn run_admin_command(
         }
     }
     Ok(())
+}
+
+/// Policy変更は202の受付だけを成功とせず、両node commit済みのjobと`/cluster`実値を
+/// 再取得してから完了として表示する。GUIも同じjob polling契約を利用する。
+async fn run_operation_policy_command(
+    config: &ModeAwareConfig,
+    policy: PolicyMode,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let token = tokio::fs::read(&config.cluster.security.admin_token_file)
+        .await
+        .context("failed to read admin token")?;
+    let bearer = encode_token(&token);
+    let base = format!("http://{}", config.proxy.admin_listen);
+    let cluster: Value = client
+        .get(format!("{base}/cluster"))
+        .send()
+        .await
+        .context("cluster status request failed")?
+        .json()
+        .await
+        .context("cluster status returned invalid JSON")?;
+    let expected_generation = cluster["generation"].as_u64().unwrap_or(0);
+    let request_id = uuid::Uuid::new_v4();
+    let desired = match policy {
+        PolicyMode::Automatic => "automatic",
+        PolicyMode::Standalone => "forced-standalone",
+    };
+    let request = client
+        .post(format!("{base}/cluster/operation-policy"))
+        .bearer_auth(&bearer)
+        .json(&json!({
+            "policy": desired,
+            "expected_generation": expected_generation,
+            "request_id": request_id,
+        }))
+        .send()
+        .await
+        .context("operation-policy request failed")?;
+    let status = request.status();
+    let accepted: Value = request
+        .json()
+        .await
+        .context("operation-policy returned invalid JSON")?;
+    anyhow::ensure!(
+        status == StatusCode::ACCEPTED,
+        "operation-policy returned {status}: {accepted}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let job = loop {
+        let response = client
+            .get(format!("{base}/cluster/jobs/{request_id}"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .context("operation-policy job request failed")?;
+        let status = response.status();
+        let job: Value = response
+            .json()
+            .await
+            .context("operation-policy job returned invalid JSON")?;
+        anyhow::ensure!(
+            status.is_success(),
+            "operation-policy job returned {status}: {job}"
+        );
+        if policy_job_is_terminal(&job) {
+            break job;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "operation-policy job timed out");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    anyhow::ensure!(
+        job["state"].as_str() == Some("complete"),
+        "operation-policy failed: {job}"
+    );
+    let cluster: Value = client
+        .get(format!("{base}/cluster"))
+        .send()
+        .await
+        .context("final cluster status request failed")?
+        .json()
+        .await
+        .context("final cluster status returned invalid JSON")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"job": job, "cluster": cluster}))?
+    );
+    Ok(())
+}
+
+fn policy_job_is_terminal(job: &Value) -> bool {
+    matches!(job["state"].as_str(), Some("complete" | "failed"))
 }
 
 async fn run_recovery_command(
@@ -715,5 +812,12 @@ mod tests {
         });
         let body = body.unwrap();
         assert_eq!(body["policy"], "forced-standalone");
+    }
+
+    #[test]
+    fn policy_job_polling_only_stops_on_terminal_state() {
+        assert!(!policy_job_is_terminal(&json!({"state": "running"})));
+        assert!(policy_job_is_terminal(&json!({"state": "complete"})));
+        assert!(policy_job_is_terminal(&json!({"state": "failed"})));
     }
 }
