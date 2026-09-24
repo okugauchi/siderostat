@@ -40,7 +40,7 @@
 - Consumes: existing `JobJournal`, `ManagerJob`, `JobPhase`.
 - Produces: `Arc<Mutex<JobJournal>>` ownership in `AppState`; guarded methods `is_cancelling`, `succeed_if_running`, and `fail_if_running`.
 
-- [ ] **Step 1: Write failing tests for terminal guards**
+- [x] **Step 1: Write failing tests for terminal guards**
 
 ```rust
 #[test]
@@ -53,13 +53,13 @@ fn terminal_guard_rejects_late_success_after_cancel() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run: `cargo test --lib manager::jobs terminal_guard_rejects_late_success_after_cancel --features test-support`
 
 Expected: FAIL because the guarded journal methods do not exist.
 
-- [ ] **Step 3: Implement guarded journal transitions**
+- [x] **Step 3: Implement guarded journal transitions**
 
 Add methods that inspect the current phase before mutating:
 
@@ -71,13 +71,13 @@ pub fn fail_if_running(&mut self, id: &str, error: impl Into<String>) -> Result<
 
 `succeed_if_running` returns `false` for `Cancelling`, `Succeeded`, or `Failed`; `fail_if_running` may close `Running` or `Cancelling` but never overwrites a terminal phase. Move `AppState.jobs` to `Arc<Mutex<JobJournal>>` so the HTTP handlers and executor share one journal.
 
-- [ ] **Step 4: Run focused tests and the API regression suite**
+- [x] **Step 4: Run focused tests and the API regression suite**
 
 Run: `cargo test --test v040_manager_api --features test-support`
 
 Expected: existing six API tests pass; the terminal guard is covered by the focused library test.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/manager/jobs.rs src/app.rs
