@@ -296,7 +296,7 @@ git commit -m "Wire manager executor into runtime API"
 - Modify: `docs/superpowers/plans/2026-09-24-h06-manager-executor-bridge.md`
 - Modify: `Vault: /Users/o/LLM/obsidian-vault/Projects/siderostat/v0.4.0-implementation/evidence/H06.md`
 
-- [ ] **Step 1: Run all repository gates**
+- [x] **Step 1: Run all repository gates**
 
 Run:
 
@@ -310,17 +310,17 @@ git diff --check
 
 Expected: all executable tests, monitor tests, format, clippy, and diff checks pass. The skipped root test remains documented as an external missing `codex-replay` binary and is not reclassified as a product failure.
 
-- [ ] **Step 2: Build and inspect app-dev without touching official runtime**
+- [x] **Step 2: Build and inspect app-dev without touching official runtime**
 
 Run: `cargo xtask app-dev --version 0.4.0 --build-number 3 --verify`
 
 Expected: bundle version/build and ad-hoc signature verification pass; no installed runtime/model/state is stopped or modified.
 
-- [ ] **Step 3: Update the plan and Vault evidence**
+- [x] **Step 3: Update the plan and Vault evidence**
 
 Record the executor commits, route lifecycle results, fixture matrix, skipped external test, and the remaining physical H06 cases. Keep H06 `PENDING` until GUI clean-root, failed-build recovery, startup rollback, upgrade restore, and profile minimal-request cases are actually observed.
 
-- [ ] **Step 4: Commit the verification record**
+- [x] **Step 4: Commit the verification record**
 
 ```bash
 git add docs/superpowers/plans/2026-09-24-h06-manager-executor-bridge.md
