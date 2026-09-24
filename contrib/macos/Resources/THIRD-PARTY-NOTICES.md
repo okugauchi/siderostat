@@ -1,6 +1,6 @@
 # Third-party notices
 
-Siderostat uses third-party Rust packages. The v0.3.1 dependency graph is unchanged from v0.3.0;
+Siderostat uses third-party Rust packages. The v0.3.4 dependency graph is unchanged from v0.3.1;
 the complete inventory is recorded in the Siderostat project knowledge base at
 `Projects/siderostat/docs/releases/v0.3.0-dependencies.md` in the Obsidian Vault and is derived from
 the repository's locked dependency graph.

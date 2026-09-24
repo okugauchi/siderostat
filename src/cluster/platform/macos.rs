@@ -15,6 +15,17 @@ struct CallbackContext {
     events: NetworkEventHandle,
 }
 
+fn notification_registration(interface: &str) -> (Vec<String>, Vec<String>) {
+    (
+        Vec::new(),
+        vec![
+            "State:/Network/Interface$".into(),
+            format!("State:/Network/Interface/{interface}/.*"),
+            "Setup:/Network/Service/.*/.*".into(),
+        ],
+    )
+}
+
 pub struct MacOsDynamicStoreWatcher {
     run_loop: CFRunLoop,
     thread: Option<thread::JoinHandle<()>>,
@@ -67,12 +78,21 @@ fn run_dynamic_store(
         let _ = ready.send(Err("create SCDynamicStore session failed".into()));
         return;
     };
-    let keys = CFArray::from_CFTypes(&[CFString::from("State:/Network/Interface")]);
-    let interface_pattern = format!("State:/Network/Interface/{interface}/(Link|IPv4)");
-    let patterns = CFArray::from_CFTypes(&[
-        CFString::from(interface_pattern.as_str()),
-        CFString::from("Setup:/Network/Service/.*/(Interface|IPv4)"),
-    ]);
+    // SCDynamicStore's patterns are full POSIX regexes. Keep the keys list empty and express
+    // every absolute path in the patterns list; this is also the shape used by the platform
+    // crate's watch example. Passing a root key together with absolute patterns is ambiguous on
+    // macOS versions that interpret patterns relative to the key list.
+    let (key_values, pattern_values) = notification_registration(&interface);
+    let key_strings: Vec<CFString> = key_values
+        .iter()
+        .map(|value| CFString::from(value.as_str()))
+        .collect();
+    let pattern_strings: Vec<CFString> = pattern_values
+        .iter()
+        .map(|value| CFString::from(value.as_str()))
+        .collect();
+    let keys = CFArray::from_CFTypes(&key_strings);
+    let patterns = CFArray::from_CFTypes(&pattern_strings);
     if !store.set_notification_keys(&keys, &patterns) {
         let _ = ready.send(Err(
             "register SCDynamicStore notification keys failed".into()
@@ -147,6 +167,20 @@ mod tests {
         assert_eq!(
             classify_key("State:/Network/Interface/en0/IPv4", "bridge0"),
             None
+        );
+    }
+
+    #[test]
+    fn registers_absolute_dynamic_store_patterns_without_root_key_list() {
+        let (keys, patterns) = notification_registration("bridge0");
+        assert!(keys.is_empty());
+        assert_eq!(
+            patterns,
+            vec![
+                "State:/Network/Interface$",
+                "State:/Network/Interface/bridge0/.*",
+                "Setup:/Network/Service/.*/.*",
+            ]
         );
     }
 }

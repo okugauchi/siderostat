@@ -1,6 +1,6 @@
 [package]
 name = "siderostat-monitor"
-version = "0.3.1"
+version = "0.3.4"
 edition = "2024"
 description = "macOS menu bar monitor for siderostat"
 
