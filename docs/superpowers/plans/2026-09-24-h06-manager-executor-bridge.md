@@ -71,16 +71,16 @@ pub fn fail_if_running(&mut self, id: &str, error: impl Into<String>) -> Result<
 
 `succeed_if_running` returns `false` for `Cancelling`, `Succeeded`, or `Failed`; `fail_if_running` may close `Running` or `Cancelling` but never overwrites a terminal phase. Move `AppState.jobs` to `Arc<Mutex<JobJournal>>` so the HTTP handlers and executor share one journal.
 
-- [ ] **Step 4: Run focused tests and the API suite**
+- [ ] **Step 4: Run focused tests and the API regression suite**
 
 Run: `cargo test --test v040_manager_api --features test-support`
 
-Expected: existing six API tests and the new terminal guard test pass.
+Expected: existing six API tests pass; the terminal guard is covered by the focused library test.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/manager/jobs.rs src/app.rs tests/v040_manager_api.rs
+git add src/manager/jobs.rs src/app.rs
 git commit -m "Add guarded manager job terminal transitions"
 ```
 
@@ -190,7 +190,10 @@ Create fixture inputs for all seven kinds. Assert that valid fixture plans call 
 #[test]
 fn unknown_payload_key_is_rejected_without_domain_call() {
     let backend = fixture_backend_with_call_counter();
-    let error = backend.resolve_and_execute(fixture_request("fetch-0", JobKind::Fetch, "unknown"));
+    let error = backend.execute(
+        fixture_request("fetch-0", JobKind::Fetch, "unknown"),
+        Arc::new(AtomicBool::new(false)),
+    );
     assert!(matches!(error, Err(ManagerExecutionError::InputRejected(_))));
     assert_eq!(backend.domain_call_count(), 0);
 }
@@ -201,7 +204,7 @@ fn activation_without_generation_or_lease_is_rejected() {
     let mut request = fixture_request("activate-0", JobKind::Activate, "fixture-activate");
     request.expected_generation = 0;
     request.runtime_lease = None;
-    let error = backend.resolve_and_execute(request);
+    let error = backend.execute(request, Arc::new(AtomicBool::new(false)));
     assert!(matches!(error, Err(ManagerExecutionError::InputRejected(_))));
     assert_eq!(backend.domain_call_count(), 0);
 }
