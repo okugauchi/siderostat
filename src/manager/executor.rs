@@ -65,9 +65,13 @@ pub enum ManagerJobInput {
         revision: String,
         main_ref: String,
     },
-    Build(build::BuildRequest),
+    Build {
+        request: Box<build::BuildRequest>,
+        source: registry::SourceRecord,
+    },
     Download {
         spec: download::DownloadSpec,
+        catalog_id: String,
         part_path: PathBuf,
     },
     Verify {
@@ -79,6 +83,8 @@ pub enum ManagerJobInput {
         request: Box<stage::StageRequest>,
         registry: Arc<Mutex<registry::ArtifactRegistry>>,
         artifact_ids: Vec<String>,
+        model_artifact_id: String,
+        model_artifact_path: PathBuf,
     },
     Activate(activation::ActivationRequest),
     Rollback(rollback::RollbackRequest),
@@ -88,7 +94,7 @@ impl ManagerJobInput {
     fn kind(&self) -> JobKind {
         match self {
             Self::Fetch { .. } => JobKind::Fetch,
-            Self::Build(_) => JobKind::Build,
+            Self::Build { .. } => JobKind::Build,
             Self::Download { .. } => JobKind::Download,
             Self::Verify { .. } => JobKind::Verify,
             Self::Stage { .. } => JobKind::Stage,
@@ -109,7 +115,7 @@ pub enum ManagerInputError {
 #[derive(Default)]
 pub struct ManagerJobInputResolver {
     plans: HashMap<(JobKind, String), ManagerJobInput>,
-    model_catalog_available: bool,
+    model_catalog: HashMap<String, catalog::ModelCatalogEntry>,
 }
 
 impl ManagerJobInputResolver {
@@ -127,10 +133,25 @@ impl ManagerJobInputResolver {
         if key.is_empty() || plan.kind() != kind {
             return Err(ManagerInputError::Rejected);
         }
-        if kind == JobKind::Download || kind == JobKind::Stage {
-            self.model_catalog_available = true;
-        }
         self.plans.insert((kind, key), plan);
+        Ok(())
+    }
+
+    /// Register an entry only after its catalog rules, full checksum, URL and
+    /// size have been checked. Plans can reference this catalog by ID only.
+    pub fn register_catalog_entry(
+        &mut self,
+        entry: catalog::ModelCatalogEntry,
+    ) -> Result<(), ManagerInputError> {
+        if entry.catalog_id.is_empty()
+            || entry.url.is_empty()
+            || !full_sha256(&entry.sha256)
+            || entry.size == 0
+        {
+            return Err(ManagerInputError::Unavailable);
+        }
+        let entry = catalog::validate_entry(entry).map_err(|_| ManagerInputError::Rejected)?;
+        self.model_catalog.insert(entry.catalog_id.clone(), entry);
         Ok(())
     }
 
@@ -160,7 +181,7 @@ impl ManagerJobInputResolver {
         }
         let Some(plan) = self.plans.get(&(request.kind, request.payload_key.clone())) else {
             return if matches!(request.kind, JobKind::Download | JobKind::Stage)
-                && !self.model_catalog_available
+                && self.model_catalog.is_empty()
             {
                 Err(ManagerInputError::Unavailable)
             } else {
@@ -183,17 +204,38 @@ impl ManagerJobInputResolver {
                     return Err(ManagerInputError::Unavailable);
                 }
             }
-            ManagerJobInput::Build(req) => {
-                if (check_real_inputs && !req.workspace.is_dir()) || req.source.is_empty() {
+            ManagerJobInput::Build {
+                request: req,
+                source,
+            } => {
+                if req.source != source.full_commit
+                    || source.remote.is_empty()
+                    || source.main_proof.is_empty()
+                    || !full_git_commit(&source.full_commit)
+                {
+                    return Err(ManagerInputError::Unavailable);
+                }
+                if check_real_inputs && !pinned_checkout_matches(req) {
                     return Err(ManagerInputError::Unavailable);
                 }
             }
-            ManagerJobInput::Download { spec, part_path } => {
-                if !full_sha256(&spec.sha256)
-                    || spec.expected_size == 0
-                    || (check_real_inputs
-                        && part_path.parent().is_none_or(|parent| !parent.is_dir()))
+            ManagerJobInput::Download {
+                spec,
+                catalog_id,
+                part_path,
+            } => {
+                let entry = self
+                    .model_catalog
+                    .get(catalog_id)
+                    .ok_or(ManagerInputError::Unavailable)?;
+                if spec.url != entry.url
+                    || spec.expected_size != entry.size
+                    || spec.sha256 != entry.sha256
+                    || spec.redirect_allowlist != entry.redirect_allowlist
                 {
+                    return Err(ManagerInputError::Rejected);
+                }
+                if check_real_inputs && part_path.parent().is_none_or(|parent| !parent.is_dir()) {
                     return Err(ManagerInputError::Unavailable);
                 }
             }
@@ -202,24 +244,46 @@ impl ManagerJobInputResolver {
                 artifact_id,
                 expected_sha256,
             } => {
-                if !full_sha256(expected_sha256)
-                    || (check_real_inputs
-                        && registry
-                            .lock()
-                            .map_err(|_| ManagerInputError::Unavailable)?
-                            .get(artifact_id)
-                            .is_none())
-                {
+                if !full_sha256(expected_sha256) {
                     return Err(ManagerInputError::Unavailable);
+                }
+                if check_real_inputs {
+                    let registry = registry
+                        .lock()
+                        .map_err(|_| ManagerInputError::Unavailable)?;
+                    let record = registry
+                        .get(artifact_id)
+                        .ok_or(ManagerInputError::Unavailable)?;
+                    let path = registry.root().root().join(&record.rel_path);
+                    if !path.is_file() || registry.resolve_within_root(&record.rel_path).is_err() {
+                        return Err(ManagerInputError::Unavailable);
+                    }
                 }
             }
             ManagerJobInput::Stage {
                 request: req,
                 registry,
                 artifact_ids,
+                model_artifact_id,
+                model_artifact_path,
             } => {
-                if !full_sha256(&req.model.sha256) || req.role_artifacts.is_empty() {
+                if req.role_artifacts.is_empty()
+                    || model_artifact_id.is_empty()
+                    || model_artifact_path.as_os_str().is_empty()
+                {
                     return Err(ManagerInputError::Unavailable);
+                }
+                let entry = self
+                    .model_catalog
+                    .get(&req.model.catalog_id)
+                    .ok_or(ManagerInputError::Unavailable)?;
+                let planned_model = catalog::validate_entry(req.model.clone())
+                    .map_err(|_| ManagerInputError::Rejected)?;
+                if &planned_model != entry {
+                    return Err(ManagerInputError::Rejected);
+                }
+                if req.model.catalog_id != *model_artifact_id {
+                    return Err(ManagerInputError::Rejected);
                 }
                 if check_real_inputs {
                     let registry = registry
@@ -229,17 +293,19 @@ impl ManagerJobInputResolver {
                         return Err(ManagerInputError::Unavailable);
                     }
                     for (id, path) in artifact_ids.iter().zip(&req.role_artifacts) {
-                        let record = registry.get(id).ok_or(ManagerInputError::Unavailable)?;
-                        if record.state != registry::ArtifactState::Verified
-                            || !full_sha256(&record.sha256)
-                            || registry.root().root().join(&record.rel_path) != *path
-                            || registry
-                                .file_sha256(&record.rel_path)
-                                .map_err(|_| ManagerInputError::Unavailable)?
-                                != record.sha256
-                        {
-                            return Err(ManagerInputError::Unavailable);
-                        }
+                        verified_record_matches(&registry, id, path, None)?;
+                    }
+                    verified_record_matches(
+                        &registry,
+                        model_artifact_id,
+                        model_artifact_path,
+                        Some(&entry.sha256),
+                    )?;
+                    if registry
+                        .get(model_artifact_id)
+                        .is_none_or(|record| record.kind != "model")
+                    {
+                        return Err(ManagerInputError::Rejected);
                     }
                 }
             }
@@ -247,6 +313,24 @@ impl ManagerJobInputResolver {
         }
         let mut plan = plan.clone();
         match &mut plan {
+            ManagerJobInput::Download {
+                spec, catalog_id, ..
+            } => {
+                let entry = self
+                    .model_catalog
+                    .get(catalog_id)
+                    .expect("resolved catalog");
+                // The catalog is authoritative; only credentials come from the
+                // configured transport plan after identity checks above.
+                let credentials = spec.credentials.take();
+                *spec = download::DownloadSpec {
+                    url: entry.url.clone(),
+                    expected_size: entry.size,
+                    sha256: entry.sha256.clone(),
+                    redirect_allowlist: entry.redirect_allowlist.clone(),
+                    credentials,
+                };
+            }
             ManagerJobInput::Activate(input) => {
                 input.expected_generation = request.expected_generation;
                 input.runtime_lease = request.runtime_lease.clone().expect("checked lease");
@@ -266,6 +350,74 @@ impl ManagerJobInputResolver {
 
 fn full_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn full_git_commit(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn pinned_checkout_matches(req: &build::BuildRequest) -> bool {
+    if !req.workspace.is_dir() || !req.workspace.join(".git").exists() {
+        return false;
+    }
+    let Some(path) = req.workspace.to_str() else {
+        return false;
+    };
+    let git = source::GitRunner::default();
+    let Ok(head) = git.run(["-C", path, "rev-parse", "--verify", "HEAD^{commit}"]) else {
+        return false;
+    };
+    if head != req.source {
+        return false;
+    }
+    matches!(git.run(["-C", path, "status", "--porcelain", "--untracked-files=all"]), Ok(status) if status.is_empty())
+}
+
+fn verified_record_matches(
+    registry: &registry::ArtifactRegistry,
+    id: &str,
+    path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<(), ManagerInputError> {
+    let record = registry.get(id).ok_or(ManagerInputError::Unavailable)?;
+    if record.state != registry::ArtifactState::Verified || !full_sha256(&record.sha256) {
+        return Err(ManagerInputError::Unavailable);
+    }
+    if registry.root().root().join(&record.rel_path) != path {
+        return Err(ManagerInputError::Rejected);
+    }
+    if !path.is_file() {
+        return Err(ManagerInputError::Unavailable);
+    }
+    let resolved = registry
+        .resolve_within_root(&record.rel_path)
+        .map_err(|_| ManagerInputError::Unavailable)?;
+    let actual = file_sha256_streaming(&resolved)?;
+    if actual != record.sha256 || expected_sha256.is_some_and(|expected| actual != expected) {
+        return Err(ManagerInputError::Unavailable);
+    }
+    Ok(())
+}
+
+fn file_sha256_streaming(path: &std::path::Path) -> Result<String, ManagerInputError> {
+    use sha2::Digest;
+
+    let mut file = std::fs::File::open(path).map_err(|_| ManagerInputError::Unavailable)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let count = std::io::Read::read(&mut file, &mut chunk)
+            .map_err(|_| ManagerInputError::Unavailable)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&chunk[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Production adapter. Activation and rollback require a connected cluster
@@ -325,11 +477,13 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                 source::stage_source(&cache, &official, &remote, &revision, &main_ref)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
-            ManagerJobInput::Build(input) => {
-                build::build_artifacts(&input, &cancel)
+            ManagerJobInput::Build { request, .. } => {
+                build::build_artifacts(&request, &cancel)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
-            ManagerJobInput::Download { spec, part_path } => {
+            ManagerJobInput::Download {
+                spec, part_path, ..
+            } => {
                 let transport = self
                     .transport
                     .as_ref()
@@ -406,6 +560,9 @@ impl FixtureManagerBackend {
             compatibility: vec![],
             status: catalog::CapabilityStatus::Candidate,
         };
+        resolver
+            .register_catalog_entry(model.clone())
+            .expect("valid fixture catalog");
         let inputs = [
             (
                 JobKind::Fetch,
@@ -419,18 +576,27 @@ impl FixtureManagerBackend {
             ),
             (
                 JobKind::Build,
-                ManagerJobInput::Build(build::BuildRequest::new(
-                    "ds4",
-                    "build",
-                    "fixture-commit",
-                    "fixture-workspace",
-                    "out.bin",
-                )),
+                ManagerJobInput::Build {
+                    request: Box::new(build::BuildRequest::new(
+                        "ds4",
+                        "build",
+                        "a".repeat(40),
+                        "fixture-workspace",
+                        "out.bin",
+                    )),
+                    source: registry::SourceRecord {
+                        remote: "fixture://source".into(),
+                        full_commit: "a".repeat(40),
+                        main_proof: "refs/heads/main".into(),
+                        fetched_at: 1,
+                    },
+                },
             ),
             (
                 JobKind::Download,
                 ManagerJobInput::Download {
                     spec: download::DownloadSpec::new("fixture://model", 7, digest.clone()),
+                    catalog_id: "fixture-model".into(),
                     part_path: PathBuf::from("fixture-model.part"),
                 },
             ),
@@ -460,6 +626,8 @@ impl FixtureManagerBackend {
                         registry::ManagerRoot::explicit(PathBuf::from("fixture-root")),
                     ))),
                     artifact_ids: vec!["fixture-artifact".into()],
+                    model_artifact_id: "fixture-model".into(),
+                    model_artifact_path: PathBuf::from("fixture-root/model.bin"),
                 },
             ),
             (
@@ -525,9 +693,9 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
             ManagerJobInput::Fetch {
                 official, remote, ..
             } if official.matches(&remote) => {}
-            ManagerJobInput::Build(input)
-                if build::is_approved_role(&input.role)
-                    && build::is_approved_target(&input.target) => {}
+            ManagerJobInput::Build { request, .. }
+                if build::is_approved_role(&request.role)
+                    && build::is_approved_target(&request.target) => {}
             ManagerJobInput::Download { spec, .. } => {
                 download::check_capacity(u64::MAX, spec.expected_size, 1, 0)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
