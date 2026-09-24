@@ -67,7 +67,7 @@ pub struct AppState {
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
     /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
-    pub jobs: std::sync::Mutex<crate::manager::jobs::JobJournal>,
+    pub jobs: Arc<std::sync::Mutex<crate::manager::jobs::JobJournal>>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -142,7 +142,9 @@ impl AppState {
             }),
             proxy,
             metrics,
-            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
+            jobs: Arc::new(std::sync::Mutex::new(
+                crate::manager::jobs::JobJournal::new(),
+            )),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -3051,7 +3053,9 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
-            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
+            jobs: Arc::new(std::sync::Mutex::new(
+                crate::manager::jobs::JobJournal::new(),
+            )),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),

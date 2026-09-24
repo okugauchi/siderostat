@@ -243,6 +243,36 @@ impl JobJournal {
         Ok(())
     }
 
+    /// 指定 job がキャンセル中かを返す。
+    pub fn is_cancelling(&self, id: &str) -> Result<bool, ManagerJobError> {
+        let job = self.jobs.get(id).ok_or(ManagerJobError::NotFound)?;
+        Ok(job.phase == JobPhase::Cancelling)
+    }
+
+    /// 実行中の job だけを成功で閉じる。遅れて届いた成功は状態を変えない。
+    pub fn succeed_if_running(&mut self, id: &str) -> Result<bool, ManagerJobError> {
+        let job = self.jobs.get(id).ok_or(ManagerJobError::NotFound)?;
+        if job.phase != JobPhase::Running {
+            return Ok(false);
+        }
+        self.succeed(id)?;
+        Ok(true)
+    }
+
+    /// 実行中またはキャンセル中の job だけを失敗で閉じる。
+    pub fn fail_if_running(
+        &mut self,
+        id: &str,
+        error: impl Into<String>,
+    ) -> Result<bool, ManagerJobError> {
+        let job = self.jobs.get(id).ok_or(ManagerJobError::NotFound)?;
+        if !matches!(job.phase, JobPhase::Running | JobPhase::Cancelling) {
+            return Ok(false);
+        }
+        self.fail(id, error)?;
+        Ok(true)
+    }
+
     /// キャンセル要求する。重複キーは保持（キャンセル中も進行扱い）。M01。
     pub fn request_cancel(&mut self, id: &str) -> Result<(), ManagerJobError> {
         let job = self.jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
@@ -320,6 +350,52 @@ mod tests {
         journal.get_mut(&id).expect("job").set_progress(50);
         assert_eq!(journal.get(&id).expect("job").progress, 50);
         journal.succeed(&id).expect("succeed");
+        let job = journal.get(&id).expect("job");
+        assert_eq!(job.phase, JobPhase::Succeeded);
+        assert_eq!(job.progress, 100);
+    }
+
+    #[test]
+    fn terminal_guard_rejects_late_success_after_cancel() {
+        let mut journal = JobJournal::new();
+        let id = journal
+            .enqueue(JobKind::Build, "build-key")
+            .expect("enqueue");
+        journal.request_cancel(&id).expect("cancel");
+        assert!(journal.is_cancelling(&id).expect("lookup"));
+        assert!(!journal.succeed_if_running(&id).expect("lookup"));
+        assert_eq!(journal.get(&id).expect("job").phase, JobPhase::Cancelling);
+    }
+
+    #[test]
+    fn terminal_guard_closes_cancelling_job_as_failure_once() {
+        let mut journal = JobJournal::new();
+        let id = journal
+            .enqueue(JobKind::Build, "build-key")
+            .expect("enqueue");
+        journal.request_cancel(&id).expect("cancel");
+        assert!(journal.fail_if_running(&id, "canceled").expect("lookup"));
+        assert!(!journal.fail_if_running(&id, "late error").expect("lookup"));
+        let job = journal.get(&id).expect("job");
+        assert_eq!(job.phase, JobPhase::Failed);
+        assert_eq!(job.error, "canceled");
+        assert_ne!(
+            journal
+                .enqueue(JobKind::Build, "build-key")
+                .expect("enqueue"),
+            id
+        );
+    }
+
+    #[test]
+    fn terminal_guard_closes_running_job_as_success_once() {
+        let mut journal = JobJournal::new();
+        let id = journal
+            .enqueue(JobKind::Build, "build-key")
+            .expect("enqueue");
+        assert!(!journal.is_cancelling(&id).expect("lookup"));
+        assert!(journal.succeed_if_running(&id).expect("lookup"));
+        assert!(!journal.fail_if_running(&id, "late error").expect("lookup"));
         let job = journal.get(&id).expect("job");
         assert_eq!(job.phase, JobPhase::Succeeded);
         assert_eq!(job.progress, 100);
