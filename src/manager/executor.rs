@@ -471,8 +471,13 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                 revision,
                 main_ref,
             } => {
-                source::stage_source(&cache, &official, &remote, &revision, &main_ref)
-                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                source::stage_source_cancellable(
+                    &cache, &official, &remote, &revision, &main_ref, &cancel,
+                )
+                .map_err(|error| match error {
+                    source::SourceError::Canceled => ManagerExecutionError::Canceled,
+                    other => ManagerExecutionError::Domain(other.to_string()),
+                })?;
             }
             ManagerJobInput::Build { request, .. } => {
                 build::build_artifacts(&request, &cancel)
@@ -1049,6 +1054,26 @@ mod tests {
         release: Arc<AtomicBool>,
     }
 
+    struct GitCancelBackend(PathBuf);
+
+    impl ManagerExecutionBackend for GitCancelBackend {
+        fn execute(
+            &self,
+            request: ManagerExecutionRequest,
+            cancel: Arc<AtomicBool>,
+        ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+            if request.kind == JobKind::Fetch {
+                source::GitRunner::new(&self.0)
+                    .run_cancellable(["ignored"], &cancel)
+                    .map_err(|error| match error {
+                        source::SourceError::Canceled => ManagerExecutionError::Canceled,
+                        other => ManagerExecutionError::Domain(other.to_string()),
+                    })?;
+            }
+            Ok(ManagerExecutionOutcome { progress: 100 })
+        }
+    }
+
     impl ManagerExecutionBackend for CountingBackend {
         fn execute(
             &self,
@@ -1190,6 +1215,59 @@ mod tests {
         let job = journal.lock().unwrap().get(&id).unwrap().clone();
         assert_eq!(job.phase, JobPhase::Failed);
         assert!(job.cancel);
+    }
+
+    #[tokio::test]
+    async fn canceled_git_fetch_releases_executor_for_next_job() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "siderostat-executor-fetch-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let marker = base.join("started");
+        let script = base.join("slow-git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 5 &\nprintf '%s' \"$$\" > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = Arc::new(Mutex::new(JobJournal::new()));
+        let (handle, worker) = ManagerExecutor::start(journal.clone(), GitCancelBackend(script));
+        let first = fixture_request(&journal, JobKind::Fetch, "source");
+        let first_id = first.id.clone();
+        handle.submit(first).unwrap();
+        let second = fixture_request(&journal, JobKind::Build, "next");
+        let second_id = second.id.clone();
+        handle.submit(second).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("git started");
+        handle.cancel(&first_id).unwrap();
+        handle.shutdown_for_test();
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("cancel releases worker")
+            .expect("worker");
+        let journal = journal.lock().unwrap();
+        let canceled = journal.get(&first_id).unwrap();
+        assert_eq!(canceled.phase, JobPhase::Failed);
+        assert!(canceled.cancel);
+        assert_eq!(journal.get(&second_id).unwrap().phase, JobPhase::Succeeded);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

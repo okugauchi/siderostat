@@ -19,11 +19,16 @@
 //! 契約: CONTRACTS.md C04 / SourceRecord・stage_source。M02。
 use super::registry::SourceRecord;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::{io::Read, os::unix::process::CommandExt};
 
 /// source fetch のエラー。M02。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
+    /// A requested cancellation stopped the owned git process group.
+    Canceled,
     /// remote が公式 pin 済み remote と一致しない。M02。
     UnapprovedRemote,
     /// revision が安全でない（shell 展開・`--upload-pack` 等）。M02。
@@ -39,6 +44,7 @@ pub enum SourceError {
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SourceError::Canceled => write!(f, "source fetch canceled"),
             SourceError::UnapprovedRemote => write!(f, "remote is not an approved official source"),
             SourceError::UnsafeRevision => write!(f, "unsafe revision"),
             SourceError::GitFailed(msg) => write!(f, "git failed: {msg}"),
@@ -106,15 +112,8 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let mut cmd = Command::new(&self.git);
-        // 外部実行経路の制限と環境最小化。M02。
-        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args(["-c", "core.hooksPath=/dev/null"])
-            .args(["-c", "protocol.file.allow=always"])
-            .args(args);
-        let output = cmd
+        let output = self
+            .command(args)
             .output()
             .map_err(|e| SourceError::GitFailed(format!("spawn: {e}")))?;
         if !output.status.success() {
@@ -123,6 +122,117 @@ impl GitRunner {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+
+    fn command<I, S>(&self, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut cmd = Command::new(&self.git);
+        // 外部実行経路の制限と環境最小化。M02。
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args);
+        cmd
+    }
+
+    /// Run git in an owned process group so cancellation also stops helpers
+    /// started by git (for example a network transport), then reap git.
+    pub fn run_cancellable<I, S>(&self, args: I, cancel: &AtomicBool) -> Result<String, SourceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SourceError::Canceled);
+        }
+        let mut cmd = self.command(args);
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SourceError::GitFailed(format!("spawn: {e}")))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
+        let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
+        let status = loop {
+            if cancel.load(Ordering::SeqCst) {
+                terminate_process_group(&mut child);
+                let _ = child.wait();
+                // A helper may have been forked while SIGKILL was in flight.
+                // Keep killing the owned group until inherited pipes close.
+                while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+                    terminate_process_group(&mut child);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(SourceError::Canceled);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    terminate_process_group(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(SourceError::GitFailed(format!("wait: {error}")));
+                }
+            }
+        };
+        // Git can exit before a helper inheriting its pipes does. Keep the
+        // cancellation boundary active until both output readers have exited.
+        while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            if cancel.load(Ordering::SeqCst) {
+                terminate_process_group(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(SourceError::Canceled);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| SourceError::GitFailed("stdout reader panicked".into()))?
+            .map_err(|e| SourceError::GitFailed(format!("stdout: {e}")))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| SourceError::GitFailed("stderr reader panicked".into()))?
+            .map_err(|e| SourceError::GitFailed(format!("stderr: {e}")))?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SourceError::Canceled);
+        }
+        if !status.success() {
+            return Err(SourceError::GitFailed(
+                String::from_utf8_lossy(&stderr).trim().to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+}
+
+fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    let pid = child.id();
+    if pid <= i32::MAX as u32 {
+        // SAFETY: `process_group(0)` made the child PID the process-group ID.
+        // A negative PID sends SIGKILL to that owned group, including helpers.
+        if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
 }
 
 /// revision を安全か検証する。M02。
@@ -160,6 +270,26 @@ pub fn stage_source(
     revision: &str,
     main_ref: &str,
 ) -> Result<SourceRecord, SourceError> {
+    stage_source_cancellable(
+        cache,
+        official,
+        remote,
+        revision,
+        main_ref,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Cancellable source fetch for the manager executor. Every git command is
+/// owned and stopped before this function reports cancellation.
+pub fn stage_source_cancellable(
+    cache: &Path,
+    official: &OfficialRemote,
+    remote: &str,
+    revision: &str,
+    main_ref: &str,
+    cancel: &AtomicBool,
+) -> Result<SourceRecord, SourceError> {
     // 公式 remote 固定。M02。
     if !official.matches(remote) {
         return Err(SourceError::UnapprovedRemote);
@@ -170,48 +300,69 @@ pub fn stage_source(
     // cache を bare で初期化（既にあれば fetch のみ）。M02。
     let runner = GitRunner::default();
     if !cache.join("HEAD").exists() {
-        runner.run(["init", "--bare", cache.to_str().unwrap_or_default()])?;
+        runner.run_cancellable(
+            ["init", "--bare", cache.to_str().unwrap_or_default()],
+            cancel,
+        )?;
     }
 
     // main_ref を cache のローカル ref に取り込む（main ancestry 検証用）。
     // fetch だけで activation されない（SourceRecord を返すだけ）。M02。
-    let _ = runner.run([
-        "--git-dir",
-        cache.to_str().unwrap_or_default(),
-        "fetch",
-        remote,
-        &format!("{main_ref}:{main_ref}"),
-    ]);
+    let main_fetch = runner.run_cancellable(
+        [
+            "--git-dir",
+            cache.to_str().unwrap_or_default(),
+            "fetch",
+            remote,
+            &format!("{main_ref}:{main_ref}"),
+        ],
+        cancel,
+    );
+    if main_fetch == Err(SourceError::Canceled) {
+        return Err(SourceError::Canceled);
+    }
 
     // fetch。network 失敗時は Err を返し、旧 candidate は保持される。M02。
-    runner.run([
-        "--git-dir",
-        cache.to_str().unwrap_or_default(),
-        "fetch",
-        remote,
-        revision,
-    ])?;
+    runner.run_cancellable(
+        [
+            "--git-dir",
+            cache.to_str().unwrap_or_default(),
+            "fetch",
+            remote,
+            revision,
+        ],
+        cancel,
+    )?;
 
     // full commit を解決する。M02。
-    let full_commit = runner.run([
-        "--git-dir",
-        cache.to_str().unwrap_or_default(),
-        "rev-parse",
-        "FETCH_HEAD",
-    ])?;
+    let full_commit = runner.run_cancellable(
+        [
+            "--git-dir",
+            cache.to_str().unwrap_or_default(),
+            "rev-parse",
+            "FETCH_HEAD",
+        ],
+        cancel,
+    )?;
     if full_commit.is_empty() {
         return Err(SourceError::GitFailed("empty full commit".into()));
     }
 
     // main ancestry を検証する。非 main は reference 扱い（NotOnMain）。M02。
-    let is_ancestor = runner.run([
-        "--git-dir",
-        cache.to_str().unwrap_or_default(),
-        "merge-base",
-        "--is-ancestor",
-        &full_commit,
-        main_ref,
-    ]);
+    let is_ancestor = runner.run_cancellable(
+        [
+            "--git-dir",
+            cache.to_str().unwrap_or_default(),
+            "merge-base",
+            "--is-ancestor",
+            &full_commit,
+            main_ref,
+        ],
+        cancel,
+    );
+    if is_ancestor == Err(SourceError::Canceled) {
+        return Err(SourceError::Canceled);
+    }
     if is_ancestor.is_err() {
         // merge-base --is-ancestor は非祖先のとき exit 1 を返す。M02。
         return Err(SourceError::NotOnMain);
@@ -236,6 +387,53 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_git_command_reaps_its_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let base = tmp("canceled-runner");
+        std::fs::create_dir_all(&base).unwrap();
+        let marker = base.join("started");
+        let script = base.join("slow-git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 5 &\nprintf '%s' \"$$\" > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            GitRunner::new(script).run_cancellable(["ignored"], &thread_cancel)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "fixture process started");
+            std::thread::yield_now();
+        };
+        let started = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(thread.join().unwrap(), Err(SourceError::Canceled));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancel returns before sleep completes"
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "direct child was reaped");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!("siderostat-m02-{tag}"));
