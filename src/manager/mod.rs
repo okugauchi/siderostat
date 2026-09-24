@@ -22,6 +22,7 @@ pub mod build;
 pub mod catalog;
 pub mod compatibility;
 pub mod download;
+pub mod executor;
 pub mod jobs;
 pub mod process;
 pub mod registry;
@@ -51,6 +52,10 @@ pub use compatibility::{CompatibilityError, SmokeOutcome, SmokeRequest, compatib
 pub use download::{
     Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
     HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
+};
+pub use executor::{
+    ManagerExecutionBackend, ManagerExecutionError, ManagerExecutionOutcome,
+    ManagerExecutionRequest, ManagerExecutor, ManagerExecutorError, ManagerExecutorHandle,
 };
 pub use jobs::{JobJournal, JobKind, ManagerJob, ManagerJobError};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
