@@ -774,6 +774,16 @@ pub struct ModelEntry {
     pub support: String,
 }
 
+/// Compatibility/prepare state shown in a profile row. `Pending` is used for
+/// an artifact that has not passed the required preparation check; it is never
+/// reported as a terminal success. G04/H06。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileReadiness {
+    Pending(String),
+    Ready,
+    Rejected(String),
+}
+
 /// model 選択・download・activate・rollback の view（C04）。各 stage ごとに
 /// 同じ承認 dialog を重複させず、実 runtime 変更の承認は一つの activation
 /// 操作へ集約する（レビュー重点）。download / stage / activate は一つの
@@ -787,6 +797,10 @@ pub struct ModelView {
     previous: Vec<String>,
     /// model 別 download 進捗（%）。G04。/
     download_progress: BTreeMap<String, u8>,
+    /// Optional prefix-file compatibility results supplied by the manifest
+    /// adapter. Missing entries remain compatible with the existing catalog
+    /// behavior; an explicit false disables activation. H06。
+    prefix_file_compatibility: BTreeMap<String, bool>,
 }
 
 impl ModelView {
@@ -798,6 +812,14 @@ impl ModelView {
         self.models = models;
     }
 
+    /// Set the verified prefix-file compatibility result for one profile.
+    /// A mismatch is a hard rejection and is kept separate from checksum and
+    /// encoder validation. H06。
+    pub fn set_prefix_file_compatible(&mut self, name: &str, compatible: bool) {
+        self.prefix_file_compatibility
+            .insert(name.to_string(), compatible);
+    }
+
     pub fn models(&self) -> &[ModelEntry] {
         &self.models
     }
@@ -806,10 +828,32 @@ impl ModelView {
     /// は activate disabled（受入 case 1）。Vision 不整合も disabled（受入
     /// case 2）。G04。/
     pub fn can_activate(&self, name: &str) -> bool {
+        matches!(self.profile_readiness(name), ProfileReadiness::Ready)
+    }
+
+    /// Project one model row into the user-visible compatibility state. This
+    /// is the single source of truth used by both activation gating and the
+    /// AppKit profile display. H06。
+    pub fn profile_readiness(&self, name: &str) -> ProfileReadiness {
         let Some(model) = self.models.iter().find(|m| m.name == name) else {
-            return false;
+            return ProfileReadiness::Pending("profile未準備".to_string());
         };
-        model.checksum.is_some() && model.support == "supported" && vision_consistent(model)
+        if self.prefix_file_compatibility.get(name) == Some(&false) {
+            return ProfileReadiness::Rejected("prefix-file不一致".to_string());
+        }
+        if model.checksum.is_none() {
+            return ProfileReadiness::Pending("checksum未検証".to_string());
+        }
+        if model.support != "supported" {
+            return ProfileReadiness::Rejected(format!("Vision 対応外（{}）", model.support));
+        }
+        if !vision_consistent(model) {
+            return ProfileReadiness::Rejected(format!(
+                "Vision encoder 不整合（{}）",
+                model.encoder
+            ));
+        }
+        ProfileReadiness::Ready
     }
 
     /// Vision 不整合の理由（受入 case 2）。整合していれば None。G04。/
