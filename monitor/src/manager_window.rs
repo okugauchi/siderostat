@@ -26,11 +26,12 @@ use objc2::runtime::AnyObject;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSTextField,
-    NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
+    NSButton, NSLayoutAttribute, NSStackView, NSStackViewDistribution, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSEdgeInsets, NSObject, NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
 
@@ -463,7 +464,7 @@ impl ManagerWindowHost {
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(780.0, 560.0)),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(780.0, 600.0)),
                 NSWindowStyleMask::Titled
                     | NSWindowStyleMask::Closable
                     | NSWindowStyleMask::Miniaturizable
@@ -481,60 +482,104 @@ impl ManagerWindowHost {
             .contentView()
             .context("manager window content view unavailable")?;
 
-        let title = NSTextField::labelWithString(&NSString::from_str("DS4 Manager — GUI受入"), mtm);
-        title.setFrame(NSRect::new(
-            NSPoint::new(24.0, 510.0),
-            NSSize::new(720.0, 28.0),
+        // Use AppKit's standard stack layout so the window reads like a native
+        // settings/tool window: a clear header, grouped sections, and compact
+        // horizontal action rows. H06。
+        let root = NSStackView::new(mtm);
+        root.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        root.setAlignment(NSLayoutAttribute::Leading);
+        root.setDistribution(NSStackViewDistribution::GravityAreas);
+        root.setSpacing(12.0);
+        root.setEdgeInsets(NSEdgeInsets {
+            top: 24.0,
+            left: 28.0,
+            bottom: 24.0,
+            right: 28.0,
+        });
+        root.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(780.0, 600.0),
         ));
-        content.addSubview(&title);
+        root.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        content.addSubview(&root);
 
+        let title = NSTextField::labelWithString(&NSString::from_str("DS4 Manager"), mtm);
+        root.addArrangedSubview(&title);
+        let subtitle = NSTextField::labelWithString(
+            &NSString::from_str("source、artifact、profile、jobを確認・操作します"),
+            mtm,
+        );
+        root.addArrangedSubview(&subtitle);
         let status_label = NSTextField::wrappingLabelWithString(
             &NSString::from_str(
                 "待機中。runtime/modelは変更されていません。job状態を確認してください。",
             ),
             mtm,
         );
-        status_label.setFrame(NSRect::new(
-            NSPoint::new(24.0, 420.0),
-            NSSize::new(720.0, 70.0),
-        ));
-        content.addSubview(&status_label);
+        status_label.setPreferredMaxLayoutWidth(700.0);
+        status_label.setMaximumNumberOfLines(2);
+        root.addArrangedSubview(&status_label);
 
-        let sections = [
-            ("Runtime / source", 380.0),
-            ("Artifact pipeline", 280.0),
-            (
-                "Profiles: MXFP4/0731 · Q2 · Vision · GLM · prefix-file",
-                180.0,
-            ),
-            ("Activation / rollback", 110.0),
-            ("Jobs", 55.0),
-        ];
-        for (text, y) in sections {
-            let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-            label.setFrame(NSRect::new(NSPoint::new(24.0, y), NSSize::new(720.0, 22.0)));
-            content.addSubview(&label);
-        }
+        let section = |title: &str| {
+            let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+            root.addArrangedSubview(&label);
+        };
+        let action_row = |buttons: Vec<Retained<NSButton>>| {
+            let row = NSStackView::new(mtm);
+            row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            row.setSpacing(8.0);
+            row.setAlignment(NSLayoutAttribute::CenterY);
+            for button in buttons {
+                row.addArrangedSubview(&button);
+            }
+            root.addArrangedSubview(&row);
+        };
+        let active_button = |text: &str, action| unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(text),
+                Some(&*action_target),
+                Some(action),
+                mtm,
+            )
+        };
+        let disabled_button = |text: &str| unsafe {
+            let button =
+                NSButton::buttonWithTitle_target_action(&NSString::from_str(text), None, None, mtm);
+            button.setEnabled(false);
+            button
+        };
 
-        let button_specs = [
-            ("公式source取得", sel!(managerFetch:), 520.0, 350.0),
-            ("ds4-server build", sel!(managerBuild:), 680.0, 350.0),
-            ("model download", sel!(managerDownload:), 520.0, 250.0),
-            ("verify", sel!(managerVerify:), 680.0, 250.0),
-            ("stage", sel!(managerStage:), 520.0, 150.0),
-        ];
-        for (text, action, x, y) in button_specs {
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(text),
-                    Some(&*action_target),
-                    Some(action),
-                    mtm,
-                )
-            };
-            button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(140.0, 28.0)));
-            content.addSubview(&button);
-        }
+        section("Runtime / source");
+        action_row(vec![
+            active_button("公式sourceを取得", sel!(managerFetch:)),
+            active_button("ds4-serverをbuild", sel!(managerBuild:)),
+        ]);
+        section("Artifact pipeline");
+        action_row(vec![
+            active_button("modelをdownload", sel!(managerDownload:)),
+            active_button("verify", sel!(managerVerify:)),
+            active_button("stage", sel!(managerStage:)),
+        ]);
+        section("Profiles");
+        let profiles = NSTextField::labelWithString(
+            &NSString::from_str("MXFP4/0731 · Q2 · Vision · GLM · prefix-file"),
+            mtm,
+        );
+        root.addArrangedSubview(&profiles);
+        section("Activation / rollback");
+        action_row(vec![
+            disabled_button("activate（準備中）"),
+            disabled_button("rollback（準備中）"),
+        ]);
+        section("Jobs");
+        let jobs = NSTextField::labelWithString(
+            &NSString::from_str("実行中jobはwindowを閉じても継続します。状態は自動更新されます。"),
+            mtm,
+        );
+        root.addArrangedSubview(&jobs);
 
         Ok(Self {
             mtm: Some(mtm),
