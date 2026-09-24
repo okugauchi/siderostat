@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use tokio::sync::mpsc;
 
@@ -177,31 +177,10 @@ impl ManagerExecutorHandle {
 
 pub struct ManagerExecutor;
 
-static BACKEND_PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+static BACKEND_PANIC_HOOK_ONCE: Once = Once::new();
 
 thread_local! {
     static BACKEND_PANIC_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
-
-type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
-
-struct RestorePanicHook(Option<Arc<Mutex<Option<PanicHook>>>>);
-
-impl Drop for RestorePanicHook {
-    fn drop(&mut self) {
-        if let Some(saved) = self.0.take() {
-            // Remove the temporary wrapper before moving the original hook.
-            // The default hook remains active during this brief handoff.
-            drop(std::panic::take_hook());
-            let previous = saved
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(previous) = previous {
-                std::panic::set_hook(previous);
-            }
-        }
-    }
 }
 
 struct BackendPanicMarker(bool);
@@ -218,35 +197,29 @@ impl Drop for BackendPanicMarker {
     }
 }
 
+fn install_backend_panic_dispatcher() {
+    BACKEND_PANIC_HOOK_ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !BACKEND_PANIC_ACTIVE.with(Cell::get) {
+                previous(info);
+            }
+        }));
+    });
+}
+
 fn execute_backend<B: ManagerExecutionBackend>(
     backend: Arc<B>,
     request: ManagerExecutionRequest,
     cancel: Arc<AtomicBool>,
 ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
-    // Panic hooks are process-global. Serialize replacement, but delegate
-    // panics from unrelated threads to the previous hook.
-    let _hook_lock = BACKEND_PANIC_HOOK_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let saved = Arc::new(Mutex::new(Some(std::panic::take_hook())));
-    let delegate = saved.clone();
-    let restore = RestorePanicHook(Some(saved));
-    std::panic::set_hook(Box::new(move |info| {
-        if !BACKEND_PANIC_ACTIVE.with(Cell::get) {
-            if let Some(previous) = delegate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-            {
-                previous(info);
-            }
-        }
-    }));
+    // The process-lifetime hook delegates every non-backend panic. Only this
+    // blocking thread's marker changes for each execution.
+    install_backend_panic_dispatcher();
     let marker = BackendPanicMarker::enter();
     let result = catch_unwind(AssertUnwindSafe(|| backend.execute(request, cancel)))
         .unwrap_or(Err(ManagerExecutionError::Unavailable));
     drop(marker);
-    drop(restore);
     result
 }
 
@@ -587,7 +560,7 @@ mod tests {
                 journal.lock().unwrap().get(&id).unwrap().phase,
                 JobPhase::Failed
             );
-            let _ = std::panic::catch_unwind(|| panic!("hook-restored-marker"));
+            let _ = std::panic::catch_unwind(|| panic!("hook-delegated-marker"));
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -610,8 +583,77 @@ mod tests {
             "panic payload leaked: {visible}"
         );
         assert!(
-            visible.contains("hook-restored-marker"),
-            "panic hook was not restored"
+            visible.contains("hook-delegated-marker"),
+            "prior panic hook was not called after backend execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_prior_hook_handles_unrelated_panics_during_and_after_backend() {
+        if std::env::var_os("SIDEROSTAT_EXECUTOR_CUSTOM_HOOK_CHILD").is_some() {
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let capture = seen.clone();
+            let prior = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                capture.lock().unwrap().push(info.to_string());
+            }));
+            let started = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let (handle, worker, journal) = test_executor(FixtureOutcome::Block {
+                started: started.clone(),
+                release: release.clone(),
+            });
+            handle
+                .submit(fixture_request(&journal, JobKind::Build, "custom-hook"))
+                .expect("queue");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("backend started");
+            std::thread::spawn(|| {
+                let _ = std::panic::catch_unwind(|| panic!("during-backend-marker"));
+            })
+            .join()
+            .expect("during thread");
+            release.store(true, Ordering::SeqCst);
+            handle.shutdown_for_test();
+            worker.await.expect("worker");
+            std::thread::spawn(|| {
+                let _ = std::panic::catch_unwind(|| panic!("after-backend-marker"));
+            })
+            .join()
+            .expect("after thread");
+            {
+                let _marker = BackendPanicMarker::enter();
+                let _ = std::panic::catch_unwind(|| panic!("backend-probe-marker"));
+            }
+            let captured = seen.lock().unwrap().join("\n");
+            std::panic::set_hook(prior);
+            assert!(captured.contains("during-backend-marker"));
+            assert!(captured.contains("after-backend-marker"));
+            assert!(
+                !captured.contains("backend-probe-marker"),
+                "backend-marked panic reached prior hook: {captured}"
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "manager::executor::tests::custom_prior_hook_handles_unrelated_panics_during_and_after_backend",
+                "--nocapture",
+            ])
+            .env("SIDEROSTAT_EXECUTOR_CUSTOM_HOOK_CHILD", "1")
+            .output()
+            .expect("child test");
+        assert!(
+            output.status.success(),
+            "child test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
