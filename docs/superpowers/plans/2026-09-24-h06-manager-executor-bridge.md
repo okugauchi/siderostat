@@ -156,7 +156,7 @@ Expected: FAIL because the executor module and backend traits are absent.
 
 Use `tokio::sync::mpsc::channel(16)` and a `HashMap<String, Arc<AtomicBool>>` protected by `Mutex` for cancellation. The worker must call the synchronous backend inside `tokio::task::spawn_blocking`, then apply exactly one guarded journal transition. On `Canceled`, `QueueClosed`, backend error, or panic conversion, call `fail_if_running`; never call `succeed_if_running` when the cancel flag is set.
 
-Redact backend errors before writing them to the journal by removing URL userinfo, bearer/token query values, and `raw build log` labels. Catch backend panics behind a serialized temporary panic hook that emits no payload before converting the join failure to `Unavailable`; keep the original panic private and never send it to tracing. Validate that the queued request's `kind` and `payload_key` match the journal entry before executing it. Update `JobJournal::enqueue`'s running index to use the `(kind, payload_key)` pair so same keys for different kinds cannot share an ID.
+Redact backend errors before writing them to the journal by removing URL userinfo, bearer/token query values, and `raw build log` labels. Install one process-lifetime thread-aware panic dispatcher that captures the existing hook once, emits no payload for the backend thread marker, and delegates unrelated thread panics to the captured hook; convert backend panics to `Unavailable` without exposing the payload. Validate that the queued request's `kind` and `payload_key` match the journal entry before executing it. Update `JobJournal::enqueue`'s running index to use the `(kind, payload_key)` pair so same keys for different kinds cannot share an ID.
 
 - [ ] **Step 4: Run executor tests and verify GREEN**
 
