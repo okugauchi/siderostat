@@ -163,7 +163,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tray.update(&display);
     }
-    let bundle_mode = launchd::is_bundle_mode();
+    let bundle_mode = siderostat_monitor::launchd::is_bundle_mode();
     let (runtime_status, login_item_status) = service_statuses();
     tray.update_registration(runtime_status, login_item_status);
     tray.update_operation(&OperationState::default());
@@ -793,7 +793,7 @@ fn service_statuses() -> (ServiceStatus, ServiceStatus) {
         ServiceKind, ServiceManagement, ServiceManagementAdapter,
     };
 
-    if !uses_service_management(launchd::is_bundle_mode()) {
+    if !uses_service_management(siderostat_monitor::launchd::is_bundle_mode()) {
         return (ServiceStatus::NotFound, ServiceStatus::NotFound);
     }
 
