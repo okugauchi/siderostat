@@ -23,7 +23,7 @@ use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
@@ -33,7 +33,7 @@ use objc2_app_kit::{
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSEdgeInsets, NSObject, NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// source エントリ（commit 候補・active 判定）。G03。/
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +93,7 @@ pub trait ManagerApi {
 #[derive(Debug, Clone, Default)]
 pub struct ManagerViewModel {
     jobs: BTreeMap<String, ManagerJobView>,
+    latest_cancellable_id: Option<String>,
     sources: Vec<SourceEntry>,
     active_digest: Option<String>,
     build_targets: Vec<String>,
@@ -112,6 +113,11 @@ impl ManagerViewModel {
         active_digest: Option<&str>,
     ) {
         self.active_digest = active_digest.map(str::to_string);
+        self.latest_cancellable_id = jobs
+            .iter()
+            .filter(|job| job.phase == "running")
+            .max_by_key(|job| (job.updated_at, job.created_at, &job.id))
+            .map(|job| job.id.clone());
         for job in jobs {
             self.jobs.insert(
                 job.id.clone(),
@@ -157,6 +163,7 @@ impl ManagerViewModel {
                 cancel: true,
             },
         );
+        self.latest_cancellable_id = Some(id.clone());
         Ok(id)
     }
 
@@ -186,6 +193,7 @@ impl ManagerViewModel {
                 cancel: true,
             },
         );
+        self.latest_cancellable_id = Some(id.clone());
         Ok(id)
     }
 
@@ -213,6 +221,11 @@ impl ManagerViewModel {
     /// job 一覧。G03。/
     pub fn jobs(&self) -> impl Iterator<Item = &ManagerJobView> {
         self.jobs.values()
+    }
+
+    /// 最新のrunning job ID。`cancel` wire fieldはキャンセル要求済みフラグ。H06。
+    pub fn latest_cancellable_job_id(&self) -> Option<&str> {
+        self.latest_cancellable_id.as_deref()
     }
 
     /// source 一覧。G03。/
@@ -356,31 +369,29 @@ pub async fn execute_manager_command(
 }
 
 #[cfg(target_os = "macos")]
-static MANAGER_COMMAND_SENDER: OnceLock<Mutex<Option<Sender<ManagerCommand>>>> = OnceLock::new();
-
-#[cfg(target_os = "macos")]
-fn register_manager_command_sender(sender: Sender<ManagerCommand>) {
-    let slot = MANAGER_COMMAND_SENDER.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+#[derive(Debug)]
+struct ManagerActionIvars {
+    command_tx: Sender<ManagerCommand>,
+    cancel_job_id: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(target_os = "macos")]
-fn send_manager_command(command: ManagerCommand) {
-    let Some(slot) = MANAGER_COMMAND_SENDER.get() else {
-        return;
-    };
-    let sender = slot
+fn send_cancel_command(
+    sender: &Sender<ManagerCommand>,
+    selected: &Mutex<Option<String>>,
+) -> anyhow::Result<bool> {
+    let id = selected
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    if let Some(sender) = sender {
-        let _ = sender.send(command);
-    }
+    let Some(job_id) = id else {
+        return Ok(false);
+    };
+    sender
+        .send(ManagerCommand::Cancel { job_id })
+        .context("manager command channel closed")?;
+    Ok(true)
 }
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-struct ManagerActionIvars;
 
 #[cfg(target_os = "macos")]
 define_class!(
@@ -392,47 +403,115 @@ define_class!(
     impl ManagerActionTarget {
         #[unsafe(method(managerFetch:))]
         fn manager_fetch(&self, _sender: Option<&AnyObject>) {
-            send_manager_command(ManagerCommand::FetchSource);
+            let _ = self.ivars().command_tx.send(ManagerCommand::FetchSource);
         }
 
         #[unsafe(method(managerBuild:))]
         fn manager_build(&self, _sender: Option<&AnyObject>) {
-            send_manager_command(ManagerCommand::Build {
+            let _ = self.ivars().command_tx.send(ManagerCommand::Build {
                 target: "ds4-server".to_string(),
             });
         }
 
         #[unsafe(method(managerDownload:))]
         fn manager_download(&self, _sender: Option<&AnyObject>) {
-            send_manager_command(ManagerCommand::Download {
+            let _ = self.ivars().command_tx.send(ManagerCommand::Download {
                 profile: "mxfp4-0731".to_string(),
             });
         }
 
         #[unsafe(method(managerVerify:))]
         fn manager_verify(&self, _sender: Option<&AnyObject>) {
-            send_manager_command(ManagerCommand::Verify {
+            let _ = self.ivars().command_tx.send(ManagerCommand::Verify {
                 profile: "mxfp4-0731".to_string(),
             });
         }
 
         #[unsafe(method(managerStage:))]
         fn manager_stage(&self, _sender: Option<&AnyObject>) {
-            send_manager_command(ManagerCommand::Stage {
+            let _ = self.ivars().command_tx.send(ManagerCommand::Stage {
                 profile: "mxfp4-0731".to_string(),
             });
+        }
+
+        #[unsafe(method(managerCancel:))]
+        fn manager_cancel(&self, _sender: Option<&AnyObject>) {
+            let _ = send_cancel_command(&self.ivars().command_tx, &self.ivars().cancel_job_id);
+        }
+
+        #[unsafe(method(managerRefresh:))]
+        fn manager_refresh(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().command_tx.send(ManagerCommand::Refresh);
         }
     }
 );
 
 #[cfg(target_os = "macos")]
 impl ManagerActionTarget {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ManagerActionIvars);
+    fn new(
+        mtm: MainThreadMarker,
+        command_tx: Sender<ManagerCommand>,
+        cancel_job_id: Arc<Mutex<Option<String>>>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ManagerActionIvars {
+            command_tx,
+            cancel_job_id,
+        });
         // SAFETY: ManagerActionTarget directly subclasses NSObject and uses
         // NSObject's standard init implementation.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn project_jobs(view_model: &ManagerViewModel) -> String {
+    let rows: Vec<String> = view_model
+        .jobs()
+        .map(|job| {
+            let error = if job.error.is_empty() {
+                "なし".to_string()
+            } else {
+                ManagerViewModel::redacted_reason(job)
+            };
+            format!(
+                "{} · {} · {} · {}% · error: {}",
+                redact_secrets(&job.id),
+                redact_secrets(&job.kind),
+                redact_secrets(&job.phase),
+                job.progress,
+                error
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        "jobはありません。再読込で状態を取得できます。".to_string()
+    } else {
+        rows.join("\n")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn project_profiles(model_view: &ModelView) -> String {
+    if model_view.models().is_empty() {
+        return "Pending · profile未準備（model catalog入力なし）· 操作不可".to_string();
+    }
+    model_view
+        .models()
+        .iter()
+        .map(|model| {
+            let state = match model_view.profile_readiness(&model.name) {
+                ProfileReadiness::Pending(reason) => format!("Pending（{reason}）· 操作不可"),
+                ProfileReadiness::Ready => "Ready（検証入力上）".to_string(),
+                ProfileReadiness::Rejected(reason) => format!("Rejected（{reason}）· 操作不可"),
+            };
+            format!(
+                "{} · {}",
+                redact_secrets(&model.name),
+                redact_secrets(&state)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// AppKit manager window host. The view model and command channel outlive the
@@ -443,10 +522,17 @@ pub struct ManagerWindowHost {
     _client: MetricsClient,
     window: Option<Retained<NSWindow>>,
     status_label: Option<Retained<NSTextField>>,
+    jobs_label: Option<Retained<NSTextField>>,
+    profiles_label: Option<Retained<NSTextField>>,
+    cancel_button: Option<Retained<NSButton>>,
     _action_target: Option<Retained<ManagerActionTarget>>,
     command_tx: Sender<ManagerCommand>,
     command_rx: Option<Receiver<ManagerCommand>>,
     view_model: ManagerViewModel,
+    model_view: ModelView,
+    jobs_summary: String,
+    profiles_summary: String,
+    cancel_job_id: Arc<Mutex<Option<String>>>,
     test_window_identity: usize,
     test_visible: bool,
 }
@@ -459,8 +545,14 @@ impl ManagerWindowHost {
         view_model: ManagerViewModel,
     ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
-        register_manager_command_sender(command_tx.clone());
-        let action_target = ManagerActionTarget::new(mtm);
+        let cancel_job_id = Arc::new(Mutex::new(
+            view_model.latest_cancellable_job_id().map(str::to_string),
+        ));
+        let action_target =
+            ManagerActionTarget::new(mtm, command_tx.clone(), Arc::clone(&cancel_job_id));
+        let model_view = ModelView::new();
+        let jobs_summary = project_jobs(&view_model);
+        let profiles_summary = project_profiles(&model_view);
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -564,10 +656,9 @@ impl ManagerWindowHost {
             active_button("stage", sel!(managerStage:)),
         ]);
         section("Profiles");
-        let profiles = NSTextField::labelWithString(
-            &NSString::from_str("MXFP4/0731 · Q2 · Vision · GLM · prefix-file"),
-            mtm,
-        );
+        let profiles =
+            NSTextField::wrappingLabelWithString(&NSString::from_str(&profiles_summary), mtm);
+        profiles.setPreferredMaxLayoutWidth(700.0);
         root.addArrangedSubview(&profiles);
         section("Activation / rollback");
         action_row(vec![
@@ -575,21 +666,39 @@ impl ManagerWindowHost {
             disabled_button("rollback（準備中）"),
         ]);
         section("Jobs");
-        let jobs = NSTextField::labelWithString(
-            &NSString::from_str("実行中jobはwindowを閉じても継続します。状態は自動更新されます。"),
-            mtm,
-        );
+        let jobs = NSTextField::wrappingLabelWithString(&NSString::from_str(&jobs_summary), mtm);
+        jobs.setPreferredMaxLayoutWidth(700.0);
         root.addArrangedSubview(&jobs);
+        let cancel_button = active_button("Cancel（実行中jobなし）", sel!(managerCancel:));
+        if let Some(id) = view_model.latest_cancellable_job_id() {
+            cancel_button.setTitle(&NSString::from_str(&format!(
+                "Cancel {}",
+                redact_secrets(id)
+            )));
+        } else {
+            cancel_button.setEnabled(false);
+        }
+        action_row(vec![
+            cancel_button.clone(),
+            active_button("再読込", sel!(managerRefresh:)),
+        ]);
 
         Ok(Self {
             mtm: Some(mtm),
             _client: client,
             window: Some(window),
             status_label: Some(status_label),
+            jobs_label: Some(jobs),
+            profiles_label: Some(profiles),
+            cancel_button: Some(cancel_button),
             _action_target: Some(action_target),
             command_tx,
             command_rx: Some(command_rx),
             view_model,
+            model_view,
+            jobs_summary,
+            profiles_summary,
+            cancel_job_id,
             test_window_identity: 0,
             test_visible: false,
         })
@@ -599,15 +708,28 @@ impl ManagerWindowHost {
     pub fn for_test(client: MetricsClient, view_model: ManagerViewModel) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let identity = (&command_tx as *const Sender<ManagerCommand>) as usize;
+        let jobs_summary = project_jobs(&view_model);
+        let model_view = ModelView::new();
+        let profiles_summary = project_profiles(&model_view);
+        let cancel_job_id = Arc::new(Mutex::new(
+            view_model.latest_cancellable_job_id().map(str::to_string),
+        ));
         Self {
             mtm: None,
             _client: client,
             window: None,
             status_label: None,
+            jobs_label: None,
+            profiles_label: None,
+            cancel_button: None,
             _action_target: None,
             command_tx,
             command_rx: Some(command_rx),
             view_model,
+            model_view,
+            jobs_summary,
+            profiles_summary,
+            cancel_job_id,
             test_window_identity: identity,
             test_visible: false,
         }
@@ -674,6 +796,35 @@ impl ManagerWindowHost {
             ManagerEvent::Status(status) => {
                 self.view_model
                     .apply_status(&status.jobs, status.active_digest.as_deref());
+                self.model_view
+                    .apply_status(&status.jobs, status.active_digest.as_deref());
+                self.jobs_summary = project_jobs(&self.view_model);
+                self.profiles_summary = project_profiles(&self.model_view);
+                *self
+                    .cancel_job_id
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = self
+                    .view_model
+                    .latest_cancellable_job_id()
+                    .map(str::to_string);
+                if let Some(jobs_label) = &self.jobs_label {
+                    jobs_label.setStringValue(&NSString::from_str(&self.jobs_summary));
+                }
+                if let Some(profiles_label) = &self.profiles_label {
+                    profiles_label.setStringValue(&NSString::from_str(&self.profiles_summary));
+                }
+                if let Some(cancel_button) = &self.cancel_button {
+                    if let Some(id) = self.view_model.latest_cancellable_job_id() {
+                        cancel_button.setTitle(&NSString::from_str(&format!(
+                            "Cancel {}",
+                            redact_secrets(id)
+                        )));
+                        cancel_button.setEnabled(true);
+                    } else {
+                        cancel_button.setTitle(&NSString::from_str("Cancel（実行中jobなし）"));
+                        cancel_button.setEnabled(false);
+                    }
+                }
                 if let Some(status_label) = &self.status_label {
                     status_label.setStringValue(&NSString::from_str(&format!(
                         "active={} / queue={} / jobs={}",
@@ -701,6 +852,37 @@ impl ManagerWindowHost {
     pub fn view_model(&self) -> &ManagerViewModel {
         &self.view_model
     }
+
+    pub fn model_view(&self) -> &ModelView {
+        &self.model_view
+    }
+
+    /// 外部のcatalog/manifest検証結果を純粋なModelViewとして受け取る。H06。
+    pub fn set_model_view(&mut self, model_view: ModelView) {
+        self.model_view = model_view;
+        self.profiles_summary = project_profiles(&self.model_view);
+        if let Some(label) = &self.profiles_label {
+            label.setStringValue(&NSString::from_str(&self.profiles_summary));
+        }
+    }
+
+    pub fn jobs_summary(&self) -> &str {
+        &self.jobs_summary
+    }
+
+    pub fn profiles_summary(&self) -> &str {
+        &self.profiles_summary
+    }
+
+    /// AppKitのCancel actionと同じdispatchをfixtureから確認する。H06。
+    pub fn request_cancel_selected(&self) -> Result<bool> {
+        send_cancel_command(&self.command_tx, &self.cancel_job_id)
+    }
+
+    /// AppKitの再読込actionと同じworker channelに送る。H06。
+    pub fn request_refresh(&self) -> Result<()> {
+        self.send_command(ManagerCommand::Refresh)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -713,8 +895,8 @@ impl ManagerWindowHost {
     }
 }
 
-/// エラー文字列から資格情報・URL を隠す。`scheme://user:pass@host` や
-/// `?token=...` 等を `[REDACTED]` に置換する。G03。/
+/// エラー文字列から資格情報を隠す。URL userinfo、queryの全項目、
+/// Authorization header、Bearer tokenを表示前に置換する。G03/H06。/
 pub fn redact_secrets(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -735,26 +917,58 @@ pub fn redact_secrets(input: &str) -> String {
         rest = &after[end..];
     }
     out.push_str(rest);
-    // 残る query の token/secret も隠す。G03。/
-    let mut out2 = String::with_capacity(out.len());
+    let mut query_redacted = String::with_capacity(out.len());
     let mut rest = out.as_str();
     while let Some(start) = rest.find('?') {
-        out2.push_str(&rest[..=start]);
+        query_redacted.push_str(&rest[..=start]);
         let after = &rest[start + 1..];
-        let end = after.find(['&', ' ']).unwrap_or(after.len());
-        let pair = &after[..end];
-        if pair.to_ascii_lowercase().contains("token")
-            || pair.to_ascii_lowercase().contains("secret")
-            || pair.to_ascii_lowercase().contains("key=")
-        {
-            out2.push_str("[REDACTED]");
-        } else {
-            out2.push_str(pair);
+        let end = after
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '#' | '"' | '\'' | '<' | '>' | ')'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            query_redacted.push_str("[REDACTED]");
         }
         rest = &after[end..];
     }
-    out2.push_str(rest);
-    out2
+    query_redacted.push_str(rest);
+
+    // Header values may contain spaces, so hide the whole header line.
+    let mut headers_redacted = String::with_capacity(query_redacted.len());
+    for line in query_redacted.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let auth = lower
+            .find("authorization:")
+            .or_else(|| lower.find("authorization="));
+        if let Some(start) = auth {
+            headers_redacted.push_str(&line[..start]);
+            headers_redacted.push_str("Authorization: [REDACTED]");
+            if line.ends_with('\n') {
+                headers_redacted.push('\n');
+            }
+        } else {
+            headers_redacted.push_str(line);
+        }
+    }
+
+    let mut bearer_redacted = String::with_capacity(headers_redacted.len());
+    let mut rest = headers_redacted.as_str();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(start) = lower.find("bearer ") else {
+            bearer_redacted.push_str(rest);
+            break;
+        };
+        bearer_redacted.push_str(&rest[..start + "bearer ".len()]);
+        let after = &rest[start + "bearer ".len()..];
+        let end = after
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '"' | '\''))
+            .unwrap_or(after.len());
+        if end > 0 {
+            bearer_redacted.push_str("[REDACTED]");
+        }
+        rest = &after[end..];
+    }
+    bearer_redacted
 }
 
 // ---------------------------------------------------------------------------

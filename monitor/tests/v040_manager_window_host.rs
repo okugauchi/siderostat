@@ -85,7 +85,7 @@ fn manager_fixture_matrix_keeps_running_cancelled_terminal_and_old_active() {
     let mut host = ManagerWindowHost::for_test(client, ManagerViewModel::new());
     host.apply_event(ManagerEvent::Status(ManagerStatusResponse {
         jobs: vec![
-            fixture_job("build-1", "build", "running", "", true),
+            fixture_job("build-1", "build", "running", "", false),
             fixture_job("download-1", "download", "cancelling", "", true),
             fixture_job("verify-1", "verify", "succeeded", "", false),
             fixture_job(
@@ -131,6 +131,44 @@ fn manager_fixture_matrix_keeps_running_cancelled_terminal_and_old_active() {
         .unwrap();
     assert!(!ManagerViewModel::redacted_reason(failed).contains("secret"));
     assert!(!ManagerViewModel::redacted_reason(failed).contains("pw"));
+    let rendered = host.jobs_summary();
+    for expected in [
+        "build-1", "build", "running", "40%", "stage-1", "failed", "error:",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+    assert!(!rendered.contains("secret"));
+    assert!(!rendered.contains("pw"));
+    assert!(rendered.contains("[REDACTED]"));
+    assert_eq!(
+        host.view_model().latest_cancellable_job_id(),
+        Some("build-1")
+    );
+    assert!(host.request_cancel_selected().expect("cancel action"));
+    host.request_refresh().expect("refresh action");
+    assert_eq!(
+        host.drain_commands(),
+        vec![
+            ManagerCommand::Cancel {
+                job_id: "build-1".to_string()
+            },
+            ManagerCommand::Refresh,
+        ]
+    );
+    host.apply_event(ManagerEvent::Status(ManagerStatusResponse {
+        jobs: vec![fixture_job("build-1", "build", "succeeded", "", false)],
+        active_digest: Some("old-active".to_string()),
+        queue_depth: 0,
+    }));
+    assert!(
+        !host
+            .request_cancel_selected()
+            .expect("terminal cancel disabled")
+    );
+    assert!(host.drain_commands().is_empty());
 }
 
 #[cfg(all(target_os = "macos", feature = "test-support"))]
@@ -169,6 +207,23 @@ fn profile_fixture_matrix_marks_pending_and_rejects_incompatible_profiles() {
     ));
     assert_eq!(view.profile_readiness("q2-ready"), ProfileReadiness::Ready);
     assert!(!view.can_activate("prefix-bad"));
+
+    let client = MetricsClient::new(&MonitorConfig::default()).expect("client");
+    let mut host = ManagerWindowHost::for_test(client, ManagerViewModel::new());
+    assert!(host.profiles_summary().contains("profile未準備"));
+    host.set_model_view(view);
+    let rendered = host.profiles_summary();
+    for reason in [
+        "checksum未検証",
+        "encoder 不整合",
+        "対応外",
+        "prefix-file不一致",
+    ] {
+        assert!(rendered.contains(reason), "missing {reason}: {rendered}");
+    }
+    assert!(rendered.contains("操作不可"));
+    assert!(rendered.contains("q2-ready · Ready"));
+    assert!(!host.model_view().can_activate("prefix-bad"));
 }
 
 fn fixture_job(id: &str, kind: &str, phase: &str, error: &str, cancel: bool) -> ManagerJobDto {
