@@ -255,23 +255,23 @@ git commit -m "Connect manager executor to typed runtime inputs"
 - Consumes: `ManagerExecutorHandle`, `RuntimeManagerBackend`, guarded `Arc<Mutex<JobJournal>>`.
 - Produces: submit/cancel routes that enqueue and cancel the same job id; status polling observes terminal states.
 
-- [ ] **Step 1: Write failing route lifecycle tests**
+- [x] **Step 1: Write failing route lifecycle tests**
 
 Extend the existing Axum test helpers to submit a fixture-backed job, poll `/manager/jobs/{id}` until `succeeded` or `failed`, then submit a cancelled job and assert it never becomes `succeeded`.
 
-- [ ] **Step 2: Run the route tests and confirm RED**
+- [x] **Step 2: Run the route tests and confirm RED**
 
 Run: `cargo test --test v040_manager_api --features test-support`
 
 Expected: a submitted manager job remains `running` because the routes are not yet wired to the executor.
 
-- [ ] **Step 3: Wire executor ownership into AppState**
+- [x] **Step 3: Wire executor ownership into AppState**
 
 Construct `Arc<Mutex<JobJournal>>` and `ManagerExecutorHandle` together in `AppState::from_config`. Add `AppState::from_config_with_manager_backend` for test state construction so integration tests can inject `FixtureManagerBackend`; production construction uses `RuntimeManagerBackend`. `manager_jobs_submit` must retain the existing `202` response, enqueue the returned job id, and fail the journal entry if queue submission fails. `manager_job_cancel` must call both `api::cancel` and `executor.cancel` before returning `200`.
 
 Use the fixture backend only in test state construction; production state uses `RuntimeManagerBackend`. Do not start a second HTTP server or AppKit event loop.
 
-- [ ] **Step 4: Run API, monitor, and root manager suites**
+- [x] **Step 4: Run API, monitor, and root manager suites**
 
 Run:
 
@@ -283,7 +283,7 @@ cargo test --all-targets -- --skip w09_all_fixtures_accepted_by_real_codex_parse
 
 Expected: submitted jobs reach honest terminal states; existing monitor and root suites remain green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/app.rs src/manager/api.rs monitor/src/manager_window.rs tests/v040_manager_api.rs monitor/tests/v040_monitor_contract.rs
