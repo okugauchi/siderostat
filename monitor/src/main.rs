@@ -22,6 +22,10 @@ use siderostat_monitor::{
     config::MonitorConfig,
     connection_mode::{ConnectionModeUi, ConnectionPolicy},
     localization::{app_metadata_info, text},
+    manager_window::{
+        ManagerCommand, ManagerEvent, ManagerViewModel, ManagerWindowHost, execute_manager_command,
+        manager_failed_event,
+    },
     migration::LegacyInventory,
     operation::{OperationKind, OperationOutcome, OperationState},
     service_management::ServiceStatus,
@@ -58,6 +62,10 @@ struct UpdateContext {
     first_launch_client: MetricsClient,
     first_launch_readiness_started: Arc<AtomicBool>,
     tray: *const MonitorTray,
+    manager_host: *mut ManagerWindowHost,
+    manager_events: Arc<Mutex<Vec<ManagerEvent>>>,
+    manager_open_requested: Arc<AtomicBool>,
+    manager_refresh_checked_at: Cell<Instant>,
     service_statuses: Cell<(ServiceStatus, ServiceStatus)>,
     service_status_checked_at: Cell<Instant>,
 }
@@ -157,6 +165,43 @@ fn main() -> Result<()> {
     tracing::info!("NSApplication ready (accessory policy)");
 
     let tray = MonitorTray::new(config.show_decode_tps, config.live_metric)?;
+    let mut manager_host = ManagerWindowHost::new(mtm, client.clone(), ManagerViewModel::new())?;
+    let manager_command_rx = manager_host.take_command_receiver()?;
+    let manager_host = Box::into_raw(Box::new(manager_host));
+    let manager_events = Arc::new(Mutex::new(Vec::<ManagerEvent>::new()));
+    let manager_open_requested = Arc::new(AtomicBool::new(false));
+    let manager_worker_events = manager_events.clone();
+    let manager_worker_client = client.clone();
+    thread::Builder::new()
+        .name("siderostat-manager-worker".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    manager_worker_events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(manager_failed_event(error.to_string()));
+                    return;
+                }
+            };
+            while let Ok(command) = manager_command_rx.recv() {
+                let event =
+                    runtime.block_on(execute_manager_command(&manager_worker_client, command));
+                manager_worker_events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }
+        })?;
+    // Prime the manager snapshot asynchronously. The command is consumed by
+    // the worker above; no HTTP call is made on the AppKit thread.
+    unsafe {
+        (*manager_host).send_command(ManagerCommand::Refresh)?;
+    }
     {
         let display = shared
             .lock()
@@ -196,6 +241,7 @@ fn main() -> Result<()> {
     let menu_operation = operation.clone();
     let menu_connection_mode = connection_mode.clone();
     let menu_shared = shared.clone();
+    let menu_manager_open_requested = manager_open_requested.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if MonitorTray::is_quit_event(&event) {
             tracing::info!("quit requested from menu");
@@ -336,6 +382,11 @@ fn main() -> Result<()> {
                     OperationOutcome::Failed,
                 );
             }
+        } else if MonitorTray::is_open_manager_event(&event) {
+            // Menu callbacks may be delivered outside the AppKit callback
+            // stack. Request the main-loop timer to show/focus the existing
+            // host there, preserving single-window ownership.
+            menu_manager_open_requested.store(true, Ordering::Release);
         } else if MonitorTray::is_open_login_items_event(&event) {
             if !begin_operation(&menu_operation, OperationKind::OpenLoginItems) {
                 return;
@@ -406,6 +457,10 @@ fn main() -> Result<()> {
         first_launch_client: client,
         first_launch_readiness_started,
         tray: &tray as *const MonitorTray,
+        manager_host,
+        manager_events,
+        manager_open_requested,
+        manager_refresh_checked_at: Cell::new(Instant::now() - Duration::from_secs(2)),
         service_statuses: Cell::new((runtime_status, login_item_status)),
         service_status_checked_at: Cell::new(Instant::now()),
     });
@@ -523,6 +578,36 @@ unsafe extern "C-unwind" fn refresh_callback(_timer: *mut CFRunLoopTimer, info: 
     // alive until the process exits.
     let tray = unsafe { &*context.tray };
     tray.update(&display);
+
+    // Window show/focus and view-model updates are kept on the AppKit main
+    // thread. The manager worker only places events in this queue.
+    if context.manager_open_requested.swap(false, Ordering::AcqRel) {
+        let host = unsafe { &mut *context.manager_host };
+        if let Err(error) = host.show_or_focus() {
+            tracing::warn!(error = %error, "manager window could not be shown");
+        }
+    }
+    if context.manager_refresh_checked_at.get().elapsed() >= Duration::from_secs(2) {
+        context.manager_refresh_checked_at.set(Instant::now());
+        let host = unsafe { &*context.manager_host };
+        if let Err(error) = host.send_command(ManagerCommand::Refresh) {
+            tracing::debug!(error = %error, "manager refresh request was dropped");
+        }
+    }
+    let events = {
+        let mut queue = context
+            .manager_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.drain(..).collect::<Vec<_>>()
+    };
+    if !events.is_empty() {
+        let host = unsafe { &mut *context.manager_host };
+        for event in events {
+            host.apply_event(event);
+        }
+    }
+
     let (runtime_status, login_item_status) = refresh_service_statuses(context);
     tray.update_registration(runtime_status, login_item_status);
     if resume_first_launch_after_approval(&context.first_launch, runtime_status, login_item_status)

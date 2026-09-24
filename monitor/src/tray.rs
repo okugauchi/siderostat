@@ -26,6 +26,7 @@ const MENU_QUIT: &str = "quit";
 const MENU_RUNTIME_RESTART: &str = "runtime-restart";
 const MENU_BG_TOGGLE: &str = "bg-toggle";
 const MENU_OPEN_CONFIG: &str = "open-config";
+const MENU_OPEN_MANAGER: &str = "open-manager";
 const MENU_OPEN_LOGIN_ITEMS: &str = "open-login-items";
 const MENU_MODE_SUBMENU: &str = "mode-submenu";
 const MENU_MODE_AUTOMATIC: &str = "mode-automatic";
@@ -68,6 +69,7 @@ pub struct MonitorTray {
     live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
     _open_config: MenuItem,
+    _open_manager: MenuItem,
     _open_login_items: MenuItem,
     _runtime_restart: MenuItem,
     _bg_toggle: MenuItem,
@@ -124,6 +126,7 @@ impl MonitorTray {
             true,
             None,
         );
+        let open_manager = MenuItem::with_id(MENU_OPEN_MANAGER, "管理画面を開く", true, None);
         let open_login_items = MenuItem::with_id(
             MENU_OPEN_LOGIN_ITEMS,
             text("menu.login_items", "ログイン項目を開く"),
@@ -173,6 +176,7 @@ impl MonitorTray {
         menu.append(&mode_submenu)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&open_config)?;
+        menu.append(&open_manager)?;
         menu.append(&runtime_restart)?;
         menu.append(&bg_toggle)?;
         menu.append(&open_login_items)?;
@@ -207,6 +211,7 @@ impl MonitorTray {
             live_metric,
             _separator: separator,
             _open_config: open_config,
+            _open_manager: open_manager,
             _open_login_items: open_login_items,
             _runtime_restart: runtime_restart,
             _bg_toggle: bg_toggle,
@@ -367,6 +372,11 @@ impl MonitorTray {
     /// Check whether a menu event requests opening the runtime configuration.
     pub fn is_open_config_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_OPEN_CONFIG)
+    }
+
+    /// Check whether a menu event requests opening the DS4 manager window.
+    pub fn is_open_manager_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_OPEN_MANAGER)
     }
 
     /// Check whether a menu event requests opening System Settings Login Items
@@ -1316,13 +1326,14 @@ mod tests {
             MENU_RUNTIME_RESTART,
             MENU_BG_TOGGLE,
             MENU_OPEN_CONFIG,
+            MENU_OPEN_MANAGER,
             MENU_OPEN_LOGIN_ITEMS,
         ];
         let mut seen = std::collections::HashSet::new();
         for id in ids {
             assert!(seen.insert(id), "duplicate menu id: {id}");
         }
-        assert_eq!(seen.len(), 5);
+        assert_eq!(seen.len(), 6);
     }
 
     #[test]
@@ -1345,6 +1356,10 @@ mod tests {
                 MonitorTray::is_open_config_event as fn(&MenuEvent) -> bool,
             ),
             (
+                MENU_OPEN_MANAGER,
+                MonitorTray::is_open_manager_event as fn(&MenuEvent) -> bool,
+            ),
+            (
                 MENU_OPEN_LOGIN_ITEMS,
                 MonitorTray::is_open_login_items_event as fn(&MenuEvent) -> bool,
             ),
@@ -1354,6 +1369,7 @@ mod tests {
             MENU_RUNTIME_RESTART,
             MENU_BG_TOGGLE,
             MENU_OPEN_CONFIG,
+            MENU_OPEN_MANAGER,
             MENU_OPEN_LOGIN_ITEMS,
         ];
         for (target_id, helper) in cases {

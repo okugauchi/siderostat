@@ -274,6 +274,86 @@ pub enum ManagerEvent {
     Failed { message: String },
 }
 
+/// Convert a worker error into an event safe for the GUI boundary. Secrets and
+/// URL credentials are redacted before the event can reach AppKit. H06。
+pub fn manager_failed_event(message: impl AsRef<str>) -> ManagerEvent {
+    ManagerEvent::Failed {
+        message: redact_secrets(message.as_ref()),
+    }
+}
+
+/// A successful submit only acknowledges that a non-terminal job was queued.
+/// The terminal result is observed later through `ManagerEvent::Status`. H06。
+pub fn manager_submitted_event(kind: impl Into<String>, id: impl Into<String>) -> ManagerEvent {
+    ManagerEvent::Submitted {
+        kind: kind.into(),
+        id: id.into(),
+    }
+}
+
+/// Execute one manager command on the worker side. No command is reported as
+/// terminal success here; status snapshots remain the source of truth for job
+/// phases. H06。
+pub async fn execute_manager_command(
+    client: &MetricsClient,
+    command: ManagerCommand,
+) -> ManagerEvent {
+    let result = match command {
+        ManagerCommand::FetchSource => client
+            .submit_manager_job("fetch", "official")
+            .await
+            .map(|response| manager_submitted_event("fetch", response.id)),
+        ManagerCommand::Build { target } => client
+            .submit_manager_job("build", &target)
+            .await
+            .map(|response| manager_submitted_event("build", response.id)),
+        ManagerCommand::Download { profile } => client
+            .submit_manager_job("download", &profile)
+            .await
+            .map(|response| manager_submitted_event("download", response.id)),
+        ManagerCommand::Verify { profile } => client
+            .submit_manager_job("verify", &profile)
+            .await
+            .map(|response| manager_submitted_event("verify", response.id)),
+        ManagerCommand::Stage { profile } => client
+            .submit_manager_job("stage", &profile)
+            .await
+            .map(|response| manager_submitted_event("stage", response.id)),
+        ManagerCommand::Activate {
+            profile,
+            expected_generation,
+            runtime_lease,
+        } => client
+            .submit_manager_job_with_context(
+                "activate",
+                &profile,
+                expected_generation,
+                &runtime_lease,
+            )
+            .await
+            .map(|response| manager_submitted_event("activate", response.id)),
+        ManagerCommand::Rollback {
+            previous,
+            expected_generation,
+            runtime_lease,
+        } => client
+            .submit_manager_job_with_context(
+                "rollback",
+                &previous,
+                expected_generation,
+                &runtime_lease,
+            )
+            .await
+            .map(|response| manager_submitted_event("rollback", response.id)),
+        ManagerCommand::Cancel { job_id } => client
+            .cancel_manager_job(&job_id)
+            .await
+            .map(|()| manager_submitted_event("cancel", job_id)),
+        ManagerCommand::Refresh => client.fetch_manager_jobs().await.map(ManagerEvent::Status),
+    };
+    result.unwrap_or_else(|error| manager_failed_event(error.to_string()))
+}
+
 #[cfg(target_os = "macos")]
 static MANAGER_COMMAND_SENDER: OnceLock<Mutex<Option<Sender<ManagerCommand>>>> = OnceLock::new();
 
@@ -364,7 +444,7 @@ pub struct ManagerWindowHost {
     status_label: Option<Retained<NSTextField>>,
     _action_target: Option<Retained<ManagerActionTarget>>,
     command_tx: Sender<ManagerCommand>,
-    command_rx: Receiver<ManagerCommand>,
+    command_rx: Option<Receiver<ManagerCommand>>,
     view_model: ManagerViewModel,
     test_window_identity: usize,
     test_visible: bool,
@@ -463,7 +543,7 @@ impl ManagerWindowHost {
             status_label: Some(status_label),
             _action_target: Some(action_target),
             command_tx,
-            command_rx,
+            command_rx: Some(command_rx),
             view_model,
             test_window_identity: 0,
             test_visible: false,
@@ -481,7 +561,7 @@ impl ManagerWindowHost {
             status_label: None,
             _action_target: None,
             command_tx,
-            command_rx,
+            command_rx: Some(command_rx),
             view_model,
             test_window_identity: identity,
             test_visible: false,
@@ -529,8 +609,19 @@ impl ManagerWindowHost {
             .context("manager command channel closed")
     }
 
+    /// Move the command receiver to the single worker thread. The host keeps
+    /// only the sender, so AppKit never performs HTTP itself. H06。
+    pub fn take_command_receiver(&mut self) -> Result<Receiver<ManagerCommand>> {
+        self.command_rx
+            .take()
+            .context("manager command receiver already taken")
+    }
+
     pub fn drain_commands(&self) -> Vec<ManagerCommand> {
-        self.command_rx.try_iter().collect()
+        self.command_rx
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn apply_event(&mut self, event: ManagerEvent) {
