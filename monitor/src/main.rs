@@ -163,6 +163,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tray.update(&display);
     }
+    let bundle_mode = launchd::is_bundle_mode();
     let (runtime_status, login_item_status) = service_statuses();
     tray.update_registration(runtime_status, login_item_status);
     tray.update_operation(&OperationState::default());
@@ -172,15 +173,21 @@ fn main() -> Result<()> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tray.update_first_launch(&state);
     }
-    initialize_first_launch(
-        &first_launch,
-        &tray,
-        &client,
-        config_valid,
-        runtime_status,
-        login_item_status,
-        &first_launch_readiness_started,
-    );
+    if uses_service_management(bundle_mode) {
+        initialize_first_launch(
+            &first_launch,
+            &tray,
+            &client,
+            config_valid,
+            runtime_status,
+            login_item_status,
+            &first_launch_readiness_started,
+        );
+    } else {
+        tracing::info!(
+            "non-bundle monitor uses LaunchAgent lifecycle; skipping Service Management registration"
+        );
+    }
 
     // LaunchAgent operations run on dedicated threads so the AppKit main loop is
     // never blocked. In bundle mode (C-05a) the runtime and monitor are managed
@@ -776,10 +783,19 @@ fn validate_runtime_configuration() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn uses_service_management(bundle_mode: bool) -> bool {
+    bundle_mode
+}
+
+#[cfg(target_os = "macos")]
 fn service_statuses() -> (ServiceStatus, ServiceStatus) {
     use siderostat_monitor::service_management::{
         ServiceKind, ServiceManagement, ServiceManagementAdapter,
     };
+
+    if !uses_service_management(launchd::is_bundle_mode()) {
+        return (ServiceStatus::NotFound, ServiceStatus::NotFound);
+    }
 
     let adapter = ServiceManagement::new();
     (
@@ -1389,6 +1405,13 @@ mod version_notification_tests {
         assert!(notification.body.contains("0.2.1"));
         assert!(notification.body.contains("12"));
         assert!(notification.body.contains("7"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_management_is_only_enabled_for_app_bundle() {
+        assert!(!uses_service_management(false));
+        assert!(uses_service_management(true));
     }
 
     #[cfg(target_os = "macos")]

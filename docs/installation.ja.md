@@ -1,66 +1,68 @@
-# siDeroStat 導入ガイド
+# Siderostat 導入ガイド
 
 英語版（正本）: [docs/installation.md](installation.md)
 
 ## 必要なもの
 
 - 対応する macOS を搭載した Apple シリコン Mac 2台
-- 両方の Mac の Rust 1.85 以降
 - Thunderbolt ケーブルと、両方の Mac で有効にした Thunderbolt ネットワーク
 - 承認済みの取得元から用意した、対応する推論サービスとモデル
-- 両方の Mac で同じ確認済み siDeroStat ソースリビジョン
+- 両方の Mac で同じ `Siderostat-0.3.4.pkg`
 
 初回ビルドと準備確認が完了するまで、Mac がスリープしないようにしてください。
 
 ## ビルドとインストール
 
-各 Mac で siDeroStat のソース checkout をターミナルから開き、次を実行します。
+確認済み source リビジョンから package を一度作成します。
 
 ```sh
-cargo xtask fingerprint-models
-cargo xtask install --start
+cargo xtask app-dev --version 0.3.4 --build-number <単調増加するbuild番号> --verify
+cargo xtask sign \
+  --app-dir build/app-dev \
+  --version 0.3.4 \
+  --build-number <単調増加するbuild番号> \
+  --application-identity "Developer ID Application: <name> (<team>)" \
+  --installer-identity "Developer ID Installer: <name> (<team>)" \
+  --notary-profile siderostat-notary \
+  --with-dmg \
+  --output-dir dist/release-0.3.4
 ```
 
-最初のコマンドは、ローカル設定で使用するモデルの fingerprint を記録します。次のコマンドは runtime と
-メニューバーモニターをビルドし、ユーザーサービスを登録して起動します。
+`dist/release-0.3.4/Siderostat-0.3.4.pkg` を変更せず両方の Mac へコピーします。
+各 Mac で package をダブルクリックして macOS Installer を起動し、管理者認証を完了します。
+インストール後は Installer がアプリケーションを起動します。アプリケーション自身が bundle 内の
+runtime helper とメニューバーの Login Item を Service Management へ登録します。
 
-同じ Mac に別の siDeroStat インストール方法を併用しないでください。ソース導入が runtime、メニューバーモニター、
-ユーザーサービスを管理します。
+release artifact は Developer ID 署名、Apple secure timestamp、公証、staple 済みの Gatekeeper 対応配布物です。旧来の source 導入が残っている場合は、
+package を開く前にその checkout から `cargo xtask uninstall` を一度実行します。保持される設定、secret、モデル、実行状態、cache は削除されません。
 
-もう一方の Mac でも、同じソースリビジョンと対応するモデル設定でコマンドを実行します。両方が通常の単独稼働状態に
-なったら Thunderbolt ケーブルを接続し、接続済み単独稼働から分散稼働へ進むまで待ちます。
+両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。
 
 ## 更新
 
-ソース checkout を確認済みのリビジョンへ更新し、同じコマンドを再実行します。
-
-```sh
-cargo xtask fingerprint-models
-cargo xtask install --start
-```
-
-設定、認証情報、モデルファイル、実行状態、キャッシュは保持されます。更新のためにこれらを削除しないでください。
-新しいソースリビジョンと既存の設定またはモデルに互換性がない場合、siDeroStat は安全のため状態を進めず、単独稼働を維持します。
+確認済みリビジョンから新しい package を作成し、両方の Mac で macOS Installer を使って開きます。
+package の導入に `cargo xtask install` は使用しません。設定、認証情報、モデルファイル、実行状態、cache は保持されます。
+更新のためにこれらを削除しないでください。新しい package と既存の設定またはモデルに互換性がない場合、Siderostat は安全のため状態を進めず、単独稼働を維持します。
 
 ## ロールバック
 
-以前に確認したソースリビジョンを選択し、通常のソース導入コマンドを再実行します。Mac 2台を再接続する前に、単独稼働の
-準備完了を確認してください。異なるソースリビジョンからビルドしたバイナリを、分散ペアで混在させないでください。
+以前に確認した package を両方の Mac で macOS Installer から開きます。Mac 2台を再接続する前に、単独稼働の
+準備完了を確認してください。異なる source リビジョンから作成した package を分散ペアで混在させないでください。
 
 ## アンインストール
 
-siDeroStat のソース checkout で次を実行します。
+旧来の source 導入を削除する場合は、Siderostat の source checkout で次を一度実行します。
 
 ```sh
 cargo xtask uninstall
 ```
 
-ソース導入で登録したユーザーサービスを停止・無効化します。設定、認証情報、モデルファイル、実行状態、キャッシュは保持します。
+source 導入で登録した旧ユーザーサービスを停止・無効化します。設定、認証情報、モデルファイル、実行状態、cache は保持します。
 エラーが表示された場合は、表示された状態を解消して再実行してください。保持されたデータを削除したり、無関係なプロセスを停止したりしないでください。
 
 ## インストール結果の確認
 
-`cargo xtask install --start` 完了後もメニューバーのモニターが表示されます。通常は次の順に進みます。
+Installer 完了後もメニューバーのモニターが表示されます。通常は次の順に進みます。
 
 1. 相手の Mac が利用できない間は `Solo Standalone`
 2. 2台の認証が完了すると `Paired Standalone`
@@ -68,9 +70,3 @@ cargo xtask uninstall
 
 安全に分散稼働へ移行できない場合は、各 Mac が単独稼働を続けます。これは安全機能による通常の動作であり、
 サービスの別コピーを起動する必要はありません。
-
-分散稼働が開始されるタイミングは接続モードに影響されます。`Automatic`（自動、既定値）では
-準備が整うと分散稼働へ移行します。`ForcedStandalone`（強制単独）では相手が見えていても各 Mac は
-単独稼働を維持し、`Automatic` を再選択するまで `Distributed (layer-parallel)` へ移行しません。
-詳細は[運用ガイド](operations.ja.md)を参照してください。
-
