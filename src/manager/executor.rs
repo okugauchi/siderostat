@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -177,7 +177,7 @@ impl ManagerExecutorHandle {
 
 pub struct ManagerExecutor;
 
-static BACKEND_PANIC_HOOK_ONCE: Once = Once::new();
+const MANAGER_PANIC_MESSAGE: &str = "manager process panic (details redacted)";
 
 thread_local! {
     static BACKEND_PANIC_ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -198,14 +198,11 @@ impl Drop for BackendPanicMarker {
 }
 
 fn install_backend_panic_dispatcher() {
-    BACKEND_PANIC_HOOK_ONCE.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !BACKEND_PANIC_ACTIVE.with(Cell::get) {
-                previous(info);
-            }
-        }));
-    });
+    std::panic::set_hook(Box::new(|_| {
+        if !BACKEND_PANIC_ACTIVE.with(Cell::get) {
+            eprintln!("{MANAGER_PANIC_MESSAGE}");
+        }
+    }));
 }
 
 fn execute_backend<B: ManagerExecutionBackend>(
@@ -213,8 +210,8 @@ fn execute_backend<B: ManagerExecutionBackend>(
     request: ManagerExecutionRequest,
     cancel: Arc<AtomicBool>,
 ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
-    // The process-lifetime hook delegates every non-backend panic. Only this
-    // blocking thread's marker changes for each execution.
+    // Reinstall just before execution in case another component replaced it.
+    // No previous hook or panic payload is copied into this dispatcher.
     install_backend_panic_dispatcher();
     let marker = BackendPanicMarker::enter();
     let result = catch_unwind(AssertUnwindSafe(|| backend.execute(request, cancel)))
@@ -228,6 +225,7 @@ impl ManagerExecutor {
         journal: Arc<Mutex<JobJournal>>,
         backend: B,
     ) -> (ManagerExecutorHandle, tokio::task::JoinHandle<()>) {
+        install_backend_panic_dispatcher();
         let (sender, mut receiver) = mpsc::channel(16);
         let state = Arc::new(ExecutorState {
             sender: Mutex::new(Some(sender)),
@@ -583,67 +581,86 @@ mod tests {
             "panic payload leaked: {visible}"
         );
         assert!(
-            visible.contains("hook-delegated-marker"),
-            "prior panic hook was not called after backend execution"
+            !visible.contains("hook-delegated-marker"),
+            "unrelated panic payload leaked"
         );
+        assert!(visible.contains("manager process panic (details redacted)"));
     }
 
     #[tokio::test]
-    async fn custom_prior_hook_handles_unrelated_panics_during_and_after_backend() {
-        if std::env::var_os("SIDEROSTAT_EXECUTOR_CUSTOM_HOOK_CHILD").is_some() {
-            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-            let capture = seen.clone();
-            let prior = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                capture.lock().unwrap().push(info.to_string());
-            }));
-            let started = Arc::new(AtomicBool::new(false));
-            let release = Arc::new(AtomicBool::new(false));
-            let (handle, worker, journal) = test_executor(FixtureOutcome::Block {
-                started: started.clone(),
-                release: release.clone(),
-            });
-            handle
-                .submit(fixture_request(&journal, JobKind::Build, "custom-hook"))
-                .expect("queue");
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !started.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("backend started");
-            std::thread::spawn(|| {
-                let _ = std::panic::catch_unwind(|| panic!("during-backend-marker"));
-            })
-            .join()
-            .expect("during thread");
-            release.store(true, Ordering::SeqCst);
-            handle.shutdown_for_test();
-            worker.await.expect("worker");
-            std::thread::spawn(|| {
-                let _ = std::panic::catch_unwind(|| panic!("after-backend-marker"));
-            })
-            .join()
-            .expect("after thread");
-            {
-                let _marker = BackendPanicMarker::enter();
-                let _ = std::panic::catch_unwind(|| panic!("backend-probe-marker"));
-            }
-            let captured = seen.lock().unwrap().join("\n");
-            std::panic::set_hook(prior);
-            assert!(captured.contains("during-backend-marker"));
-            assert!(captured.contains("after-backend-marker"));
-            assert!(
-                !captured.contains("backend-probe-marker"),
-                "backend-marked panic reached prior hook: {captured}"
+    async fn external_hook_replacement_cannot_leak_later_backend_panic() {
+        if std::env::var_os("SIDEROSTAT_EXECUTOR_REPLACED_HOOK_CHILD").is_some() {
+            let (first, first_worker, first_journal) =
+                test_executor(FixtureOutcome::Success { progress: 100 });
+            first
+                .submit(fixture_request(
+                    &first_journal,
+                    JobKind::Build,
+                    "first-backend",
+                ))
+                .expect("first queue");
+            first.shutdown_for_test();
+            first_worker.await.expect("first worker");
+
+            let (second, second_worker, second_journal) = test_executor(FixtureOutcome::Panic);
+            std::panic::set_hook(Box::new(|info| eprintln!("LEAKING HOOK: {info}")));
+            let request = fixture_request(&second_journal, JobKind::Build, "second-backend");
+            let id = request.id.clone();
+            second.submit(request).expect("second queue");
+            second.shutdown_for_test();
+            second_worker.await.expect("second worker");
+            assert_eq!(
+                second_journal.lock().unwrap().get(&id).unwrap().phase,
+                JobPhase::Failed
             );
+            let _ = std::panic::catch_unwind(|| panic!("unrelated-after-marker"));
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "manager::executor::tests::custom_prior_hook_handles_unrelated_panics_during_and_after_backend",
+                "manager::executor::tests::external_hook_replacement_cannot_leak_later_backend_panic",
+                "--nocapture",
+            ])
+            .env("SIDEROSTAT_EXECUTOR_REPLACED_HOOK_CHILD", "1")
+            .output()
+            .expect("child test");
+        assert!(output.status.success());
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !visible.contains("LEAKING HOOK"),
+            "external hook was not replaced"
+        );
+        assert!(
+            !visible.contains("backend panic secret"),
+            "backend panic payload leaked"
+        );
+        assert!(
+            !visible.contains("unrelated-after-marker"),
+            "unrelated panic payload leaked"
+        );
+        assert!(visible.contains("manager process panic (details redacted)"));
+    }
+
+    #[tokio::test]
+    async fn manager_hook_replaces_leaking_hook_before_worker_execution() {
+        if std::env::var_os("SIDEROSTAT_EXECUTOR_CUSTOM_HOOK_CHILD").is_some() {
+            std::panic::set_hook(Box::new(|info| eprintln!("LEAKING PRIOR HOOK: {info}")));
+            let (handle, worker, _journal) =
+                test_executor(FixtureOutcome::Success { progress: 100 });
+            let _ = std::panic::catch_unwind(|| panic!("before-worker-marker"));
+            handle.shutdown_for_test();
+            worker.await.expect("worker");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "manager::executor::tests::manager_hook_replaces_leaking_hook_before_worker_execution",
                 "--nocapture",
             ])
             .env("SIDEROSTAT_EXECUTOR_CUSTOM_HOOK_CHILD", "1")
@@ -655,10 +672,18 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!visible.contains("LEAKING PRIOR HOOK"));
+        assert!(!visible.contains("before-worker-marker"));
+        assert!(visible.contains("manager process panic (details redacted)"));
     }
 
     #[tokio::test]
-    async fn unrelated_thread_panic_keeps_original_hook_during_backend_call() {
+    async fn unrelated_thread_panic_is_redacted_during_backend_call() {
         if std::env::var_os("SIDEROSTAT_EXECUTOR_UNRELATED_PANIC_CHILD").is_some() {
             let started = Arc::new(AtomicBool::new(false));
             let release = Arc::new(AtomicBool::new(false));
@@ -693,7 +718,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "manager::executor::tests::unrelated_thread_panic_keeps_original_hook_during_backend_call",
+                "manager::executor::tests::unrelated_thread_panic_is_redacted_during_backend_call",
                 "--nocapture",
             ])
             .env("SIDEROSTAT_EXECUTOR_UNRELATED_PANIC_CHILD", "1")
@@ -706,9 +731,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            visible.contains("unrelated-thread-marker"),
-            "unrelated panic hook was suppressed"
+            !visible.contains("unrelated-thread-marker"),
+            "unrelated panic payload leaked"
         );
+        assert!(visible.contains("manager process panic (details redacted)"));
     }
 
     #[tokio::test]
