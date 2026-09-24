@@ -182,7 +182,7 @@ git commit -m "Add manager executor lifecycle bridge"
 - Consumes: `ManagerExecutionBackend`, existing manager domain functions, `JobSubmitRequest` context.
 - Produces: `RuntimeManagerBackend` and `ManagerJobInputResolver` with explicit typed rejection for unavailable real inputs.
 
-- [ ] **Step 1: Write failing resolver and backend tests**
+- [x] **Step 1: Write failing resolver and backend tests**
 
 Create fixture inputs for all seven kinds. Assert that valid fixture plans call the corresponding domain adapter and finish, while these cases fail before domain execution:
 
@@ -218,25 +218,25 @@ fn unavailable_real_model_is_terminal_failure_not_pending_forever() {
 }
 ```
 
-- [ ] **Step 2: Run the new integration test and confirm RED**
+- [x] **Step 2: Run the new integration test and confirm RED**
 
 Run: `cargo test --test v040_manager_executor --features test-support`
 
 Expected: FAIL because the resolver/backend adapter is absent.
 
-- [ ] **Step 3: Implement typed input resolution**
+- [x] **Step 3: Implement typed input resolution**
 
 Define `ManagerJobInputResolver` with one method per `JobKind` or a typed enum return. The runtime resolver accepts only configured payload keys and returns `InputUnavailable` when a required source checkout, catalog checksum, verified artifact, production runtime, or previous digest is absent. It must pass generation/lease through unchanged for activate/rollback and reject zero/empty context before invoking any domain function.
 
 Add `FixtureManagerBackend` for tests. Add `RuntimeManagerBackend` for production; it invokes existing pure/domain functions when a complete resolver plan exists and returns `Unavailable` or `InputRejected` for missing real inputs. It must never report success merely because a journal entry was created.
 
-- [ ] **Step 4: Run the resolver integration tests**
+- [x] **Step 4: Run the resolver integration tests**
 
 Run: `cargo test --test v040_manager_executor --features test-support`
 
 Expected: seven fixture kinds reach terminal success, negative cases reach redacted failed, and no real network/process is used.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/manager/executor.rs src/manager/api.rs tests/v040_manager_executor.rs
