@@ -218,7 +218,10 @@ pub fn get(journal: &JobJournal, id: &str) -> Result<ManagerJobDto, ManagerApiEr
 /// `POST /manager/jobs/{id}/cancel`。M10。job phase を Cancelling にし、
 /// terminal 状態を保持する（cancel 後 poll でも terminal）。M10。
 pub fn cancel(journal: &mut JobJournal, id: &str) -> Result<(), ManagerApiError> {
-    journal.request_cancel(id)?;
+    let phase = journal.get(id).ok_or(ManagerApiError::NotFound)?.phase;
+    if matches!(phase, JobPhase::Running | JobPhase::Cancelling) {
+        journal.request_cancel(id)?;
+    }
     Ok(())
 }
 

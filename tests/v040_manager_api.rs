@@ -11,6 +11,235 @@ use siderostat::manager::{
     },
 };
 
+#[cfg(feature = "test-support")]
+mod routes {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use siderostat::{
+        app::{AppState, admin_router},
+        cluster::{AdminAction, AdminController, AdminExecutor, AdminFuture, encode_token},
+        config::ModeAwareConfig,
+        manager::executor::{
+            FixtureManagerBackend, ManagerExecutionBackend, ManagerExecutionError,
+            ManagerExecutionOutcome, ManagerExecutionRequest, RuntimeManagerBackend,
+        },
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use tower::ServiceExt;
+
+    struct UnusedAdminExecutor;
+
+    impl AdminExecutor for UnusedAdminExecutor {
+        fn execute(&self, _action: AdminAction) -> AdminFuture {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+    }
+
+    fn state_with_backend<B: ManagerExecutionBackend>(backend: B) -> Arc<AppState> {
+        let mut config = ModeAwareConfig::parse(include_str!("../siderostat.example.toml"))
+            .expect("parse test config");
+        config.cluster.enabled = false;
+        let admin =
+            AdminController::new(vec![3; 32], Arc::new(UnusedAdminExecutor)).expect("admin");
+        AppState::from_config_with_manager_backend(config, backend, admin).expect("manager state")
+    }
+
+    fn state() -> Arc<AppState> {
+        state_with_backend(FixtureManagerBackend::new())
+    }
+
+    struct WaitForCancelBackend {
+        started: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ManagerExecutionBackend for WaitForCancelBackend {
+        fn execute(
+            &self,
+            _request: ManagerExecutionRequest,
+            cancel: Arc<AtomicBool>,
+        ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.store(true, Ordering::SeqCst);
+            while !cancel.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            // Even a late success after cancellation must remain failed.
+            Ok(ManagerExecutionOutcome { progress: 100 })
+        }
+    }
+
+    async fn request(
+        state: Arc<AppState>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let bearer = format!("Bearer {}", encode_token(&[3; 32]));
+        let response = admin_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("route");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&body).expect("json"))
+    }
+
+    #[tokio::test]
+    async fn routes_preserve_admin_auth_and_strict_payload() {
+        let state = state();
+        let unauthenticated = admin_router(state.clone())
+            .oneshot(
+                Request::post("/manager/jobs")
+                    .body(Body::from(
+                        r#"{"kind":"fetch","payload_key":"fixture-fetch"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("route");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let (invalid_status, _) = request(
+            state,
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"fetch","payload_key":"fixture-fetch","unknown":true}"#,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+    }
+
+    async fn terminal(state: Arc<AppState>, id: &str) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (status, job) =
+                request(state.clone(), "GET", &format!("/manager/jobs/{id}"), "").await;
+            assert_eq!(status, StatusCode::OK);
+            if matches!(job["phase"].as_str(), Some("succeeded" | "failed")) {
+                return job;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job stayed nonterminal: {job}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_submit_reaches_terminal_through_routes() {
+        let state = state();
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"fetch","payload_key":"fixture-fetch"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["id"].as_str().expect("job id");
+        let job = terminal(state.clone(), id).await;
+        assert_eq!(job["phase"], "succeeded");
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/manager/jobs/{id}/cancel"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, after_cancel) = request(state, "GET", &format!("/manager/jobs/{id}"), "").await;
+        assert_eq!(after_cancel["phase"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_runs_once_and_route_cancel_wins() {
+        let started = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = state_with_backend(WaitForCancelBackend {
+            started: started.clone(),
+            calls: calls.clone(),
+        });
+        let body = r#"{"kind":"fetch","payload_key":"fixture-fetch"}"#;
+        let (first_status, first) = request(state.clone(), "POST", "/manager/jobs", body).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED);
+        let id = first["id"].as_str().expect("id").to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend started");
+        let (duplicate_status, duplicate) =
+            request(state.clone(), "POST", "/manager/jobs", body).await;
+        assert_eq!(duplicate_status, StatusCode::ACCEPTED);
+        assert_eq!(duplicate["id"], id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (cancel_status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/manager/jobs/{id}/cancel"),
+            "",
+        )
+        .await;
+        assert_eq!(cancel_status, StatusCode::OK);
+        let job = terminal(state, &id).await;
+        assert_eq!(job["phase"], "failed");
+        assert_eq!(job["cancel"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_queue_fails_only_new_job() {
+        let state = state();
+        state.shutdown_manager_executor_for_test();
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"fetch","payload_key":"fixture-fetch"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "manager executor queue is closed");
+        let (_, status_body) = request(state, "GET", "/manager/status", "").await;
+        assert_eq!(status_body["queue_depth"], 0);
+        assert_eq!(status_body["jobs"][0]["phase"], "failed");
+    }
+
+    #[tokio::test]
+    async fn production_backend_with_no_registered_plan_never_succeeds() {
+        let state = state_with_backend(RuntimeManagerBackend::without_model_catalog());
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"activate","payload_key":"unknown","expected_generation":1,"runtime_lease":"lease"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["id"].as_str().expect("id");
+        let job = terminal(state, id).await;
+        assert_eq!(job["phase"], "failed");
+    }
+}
+
 fn req(kind: &str, key: &str) -> JobSubmitRequest {
     JobSubmitRequest {
         kind: kind.to_string(),
@@ -78,6 +307,19 @@ fn cancel_keeps_terminal_phase() {
     assert!(dto.cancel);
     // 存在しない job の cancel → NotFound。M10。
     assert_eq!(cancel(&mut journal, "nope"), Err(ManagerApiError::NotFound));
+}
+
+#[test]
+fn cancel_does_not_reopen_a_completed_job() {
+    let mut journal = JobJournal::new();
+    let id = submit(&mut journal, req("fetch", "completed"))
+        .expect("submit")
+        .id;
+    journal.succeed(&id).expect("complete");
+    cancel(&mut journal, &id).expect("idempotent cancel");
+    let dto = get(&journal, &id).expect("get");
+    assert_eq!(dto.phase, "succeeded");
+    assert!(!dto.cancel);
 }
 
 /// 受入: 不正 job / unknown field → 400。M10。

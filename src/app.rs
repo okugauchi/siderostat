@@ -68,6 +68,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
     pub jobs: Arc<std::sync::Mutex<crate::manager::jobs::JobJournal>>,
+    manager_executor: crate::manager::executor::ManagerExecutorHandle,
+    manager_worker: tokio::task::JoinHandle<()>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -87,6 +89,37 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
+        Self::from_config_with_backend(
+            config,
+            crate::manager::executor::RuntimeManagerBackend::without_model_catalog(),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn from_config_with_manager_backend<B>(
+        config: ModeAwareConfig,
+        backend: B,
+        admin: AdminController,
+    ) -> anyhow::Result<Arc<Self>>
+    where
+        B: crate::manager::executor::ManagerExecutionBackend,
+    {
+        let state = Self::from_config_with_backend(config, backend)?;
+        state.attach_admin(admin);
+        Ok(state)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn shutdown_manager_executor_for_test(&self) {
+        self.manager_executor.shutdown_for_test();
+    }
+
+    fn from_config_with_backend<B>(config: ModeAwareConfig, backend: B) -> anyhow::Result<Arc<Self>>
+    where
+        B: crate::manager::executor::ManagerExecutionBackend,
+    {
+        tokio::runtime::Handle::try_current()
+            .context("manager executor requires a Tokio runtime")?;
         let recovery_config = config.recovery.clone();
         let metrics = Arc::new(Metrics::default());
         let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
@@ -124,6 +157,12 @@ impl AppState {
             proxy.admission().start_serving();
         }
 
+        let jobs = Arc::new(std::sync::Mutex::new(
+            crate::manager::jobs::JobJournal::new(),
+        ));
+        let (manager_executor, manager_worker) =
+            crate::manager::executor::ManagerExecutor::start(jobs.clone(), backend);
+
         Ok(Arc::new(Self {
             config: Arc::new(AppConfig {
                 public_listen: config.proxy.public_listen,
@@ -142,9 +181,9 @@ impl AppState {
             }),
             proxy,
             metrics,
-            jobs: Arc::new(std::sync::Mutex::new(
-                crate::manager::jobs::JobJournal::new(),
-            )),
+            jobs,
+            manager_executor,
+            manager_worker,
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -307,6 +346,12 @@ impl AppState {
 
     fn request_graceful_restart(&self) {
         self.restart_requested.notify_one();
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.manager_worker.abort();
     }
 }
 
@@ -2285,15 +2330,58 @@ async fn manager_jobs_submit(
     if let Err(response) = authorized_admin(&headers, &state) {
         return *response;
     }
-    let body = String::from_utf8_lossy(&body).into_owned();
-    let mut journal = state.jobs.lock().unwrap();
-    match crate::manager::api::submit_json(&mut journal, &body) {
-        Ok(response) => json_response(
-            StatusCode::ACCEPTED,
-            serde_json::to_value(response).unwrap_or_else(|_| json!({})),
-        ),
-        Err(error) => manager_api_error_response(&error),
+    let request: crate::manager::api::JobSubmitRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return manager_api_error_response(&crate::manager::api::ManagerApiError::BadRequest(
+                error.to_string(),
+            ));
+        }
+    };
+    let (response, newly_created) = {
+        let mut journal = state.jobs.lock().unwrap();
+        let count_before = journal.all().len();
+        let response = match crate::manager::api::submit(&mut journal, request.clone()) {
+            Ok(response) => response,
+            Err(error) => return manager_api_error_response(&error),
+        };
+        let newly_created = journal.all().len() != count_before;
+        (response, newly_created)
+    };
+    if newly_created {
+        let execution = match request.execution_request(response.id.clone()) {
+            Ok(execution) => execution,
+            Err(error) => {
+                let _ = state
+                    .jobs
+                    .lock()
+                    .unwrap()
+                    .fail_if_running(&response.id, "manager job input rejected");
+                return manager_api_error_response(&error);
+            }
+        };
+        if let Err(error) = state.manager_executor.submit(execution) {
+            // The executor also closes failed queue admissions. This guard only
+            // targets the job created by this request; a duplicate must never
+            // overwrite an already accepted job.
+            let _ = state
+                .jobs
+                .lock()
+                .unwrap()
+                .fail_if_running(&response.id, error.to_string());
+            let status = match error {
+                crate::manager::executor::ManagerExecutorError::RequestMismatch => {
+                    StatusCode::CONFLICT
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return json_response(status, json!({"error": error.to_string()}));
+        }
     }
+    json_response(
+        StatusCode::ACCEPTED,
+        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+    )
 }
 
 /// `GET /manager/jobs/{id}`。M10。M10。
@@ -2324,10 +2412,19 @@ async fn manager_job_cancel(
     if let Err(response) = authorized_admin(&headers, &state) {
         return *response;
     }
-    let mut journal = state.jobs.lock().unwrap();
-    match crate::manager::api::cancel(&mut journal, &id) {
+    let result = {
+        let mut journal = state.jobs.lock().unwrap();
+        crate::manager::api::cancel(&mut journal, &id)
+    };
+    if let Err(error) = result {
+        return manager_api_error_response(&error);
+    }
+    match state.manager_executor.cancel(&id) {
         Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
-        Err(error) => manager_api_error_response(&error),
+        Err(_) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "manager executor unavailable"}),
+        ),
     }
 }
 
@@ -3039,6 +3136,13 @@ mod tests {
             proxy.set_target(ProxyTarget::LocalStandalone, true);
             proxy.admission().start_serving();
         }
+        let jobs = Arc::new(std::sync::Mutex::new(
+            crate::manager::jobs::JobJournal::new(),
+        ));
+        let (manager_executor, manager_worker) = crate::manager::executor::ManagerExecutor::start(
+            jobs.clone(),
+            crate::manager::executor::RuntimeManagerBackend::without_model_catalog(),
+        );
         let state = Arc::new(AppState {
             config: Arc::new(AppConfig {
                 public_listen: "127.0.0.1:18080".parse().unwrap(),
@@ -3053,9 +3157,9 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
-            jobs: Arc::new(std::sync::Mutex::new(
-                crate::manager::jobs::JobJournal::new(),
-            )),
+            jobs,
+            manager_executor,
+            manager_worker,
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -3088,8 +3192,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recovery_notification_helpers_use_the_attached_service() {
+    #[tokio::test]
+    async fn recovery_notification_helpers_use_the_attached_service() {
         let state = test_state(true);
         state.attach_notification_service(Arc::new(std::sync::Mutex::new(
             DesktopNotificationService::new(Arc::new(crate::notify::NoopNotifier)),
