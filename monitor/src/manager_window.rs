@@ -47,6 +47,20 @@ impl ManagerJobView {
 pub trait ManagerApi {
     /// 新規 job を開始する。Ok(id)。G03。/
     async fn submit(&mut self, kind: &str, payload_key: &str) -> Result<String, String>;
+
+    /// generation/lease を伴う job を開始する。既存の fake/API 境界を
+    /// 壊さないため、context が無い場合は通常 submit へ委譲する。C04。/
+    async fn submit_with_context(
+        &mut self,
+        kind: &str,
+        payload_key: &str,
+        expected_generation: Option<u64>,
+        runtime_lease: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (expected_generation, runtime_lease);
+        self.submit(kind, payload_key).await
+    }
+
     /// 進行中 job をキャンセルする。G03。/
     async fn cancel(&mut self, job_id: &str) -> Result<(), String>;
 }
@@ -640,6 +654,15 @@ mod tests {
         // 集約（POST 1 回）。G04。/
         assert_eq!(api.submit_calls.len(), 1);
         assert_eq!(api.submit_calls[0].0, "activate");
+    }
+
+    #[test]
+    fn manager_api_context_submit_preserves_plain_fake_boundary() {
+        let mut api = FakeManagerApi::with_jobs(&["fetch-1"]);
+        let id = block_on(api.submit_with_context("fetch", "official", None, None))
+            .expect("plain submit");
+        assert_eq!(id, "fetch-1");
+        assert_eq!(api.submit_calls, vec![("fetch".into(), "official".into())]);
     }
 
     fn block_on<F>(future: F) -> F::Output

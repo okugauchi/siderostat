@@ -242,11 +242,34 @@ impl MetricsClient {
         kind: &str,
         payload_key: &str,
     ) -> Result<siderostat_core::manager::api::SubmitResponse> {
+        let body = manager_job_body(kind, payload_key, None, None)?;
+        self.submit_manager_job_body(body).await
+    }
+
+    /// Submit an activation/rollback job with the generation and runtime
+    /// lease required by C04. Validation happens before the request is sent so
+    /// an incomplete context cannot mutate the runtime.
+    pub async fn submit_manager_job_with_context(
+        &self,
+        kind: &str,
+        payload_key: &str,
+        expected_generation: u64,
+        runtime_lease: &str,
+    ) -> Result<siderostat_core::manager::api::SubmitResponse> {
+        let body = manager_job_body(
+            kind,
+            payload_key,
+            Some(expected_generation),
+            Some(runtime_lease),
+        )?;
+        self.submit_manager_job_body(body).await
+    }
+
+    async fn submit_manager_job_body(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<siderostat_core::manager::api::SubmitResponse> {
         let url = format!("{}/manager/jobs", self.base_url);
-        let body = serde_json::json!({
-            "kind": kind,
-            "payload_key": payload_key,
-        });
         let mut request = self.http.post(&url).json(&body);
         if let Some(token) = &self.admin_token {
             request = request.bearer_auth(token);
@@ -336,6 +359,37 @@ fn parse_policy_job(value: &serde_json::Value) -> Option<PendingJob> {
     })
 }
 
+fn manager_job_body(
+    kind: &str,
+    payload_key: &str,
+    expected_generation: Option<u64>,
+    runtime_lease: Option<&str>,
+) -> Result<serde_json::Value> {
+    let needs_context = matches!(kind, "activate" | "rollback");
+    if needs_context {
+        anyhow::ensure!(
+            expected_generation.is_some_and(|generation| generation > 0),
+            "expected_generation must be greater than zero for {kind}"
+        );
+        anyhow::ensure!(
+            runtime_lease.is_some_and(|lease| !lease.trim().is_empty()),
+            "runtime_lease must not be empty for {kind}"
+        );
+    }
+
+    let mut body = serde_json::json!({
+        "kind": kind,
+        "payload_key": payload_key,
+    });
+    if let Some(generation) = expected_generation {
+        body["expected_generation"] = serde_json::json!(generation);
+    }
+    if let Some(lease) = runtime_lease {
+        body["runtime_lease"] = serde_json::json!(lease);
+    }
+    Ok(body)
+}
+
 fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
     if routing.role == "worker" && routing.target == "coordinator" {
         "/metrics/coordinator"
@@ -387,5 +441,31 @@ mod tests {
     fn ready_endpoint_distinguishes_ready_from_not_ready() {
         assert!(reqwest::StatusCode::OK.is_success());
         assert!(!reqwest::StatusCode::SERVICE_UNAVAILABLE.is_success());
+    }
+
+    #[test]
+    fn manager_job_body_includes_context_only_when_provided() {
+        let activation = manager_job_body("activate", "profile-a", Some(3), Some("lease-3"))
+            .expect("activation body");
+        assert_eq!(activation["kind"], "activate");
+        assert_eq!(activation["payload_key"], "profile-a");
+        assert_eq!(activation["expected_generation"], 3);
+        assert_eq!(activation["runtime_lease"], "lease-3");
+
+        let fetch = manager_job_body("fetch", "official", None, None).expect("fetch body");
+        assert_eq!(fetch["kind"], "fetch");
+        assert!(fetch.get("expected_generation").is_none());
+        assert!(fetch.get("runtime_lease").is_none());
+    }
+
+    #[test]
+    fn manager_job_body_rejects_incomplete_activation_context() {
+        let error = manager_job_body("activate", "profile-a", Some(0), Some("lease-3"))
+            .expect_err("zero generation must be rejected");
+        assert!(error.to_string().contains("expected_generation"));
+
+        let error = manager_job_body("rollback", "profile-a", Some(3), Some(""))
+            .expect_err("empty lease must be rejected");
+        assert!(error.to_string().contains("runtime_lease"));
     }
 }
