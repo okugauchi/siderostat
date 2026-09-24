@@ -14,7 +14,10 @@
 //! - 入力: 11件 → 5件
 //! - 入力: javascript/file URL → 除外
 
+use super::backend::{SearchBackend, SearchFuture};
 use super::backend::{SearchError, SearchResult};
+use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 /// SearXNG JSON endpoint の固定 path。W04。
@@ -62,6 +65,7 @@ impl Default for ReqwestTransport {
         // redirect 無効。C05: 検索結果 URL の fetch は実装しない。W04。
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client");
         Self { client }
@@ -126,7 +130,7 @@ pub struct SearxngBackend {
     pub endpoint: Url,
     /// SearXNG 固有 api_key（任意）。W04。
     pub api_key: Option<String>,
-    transport: Box<dyn SearxngTransport>,
+    transport: Arc<dyn SearxngTransport>,
     /// 結果上限（既定5）。W04。
     max_results: usize,
 }
@@ -141,7 +145,7 @@ impl SearxngBackend {
         Self {
             endpoint,
             api_key,
-            transport,
+            transport: Arc::from(transport),
             max_results: super::backend::DEFAULT_MAX_RESULTS,
         }
     }
@@ -161,6 +165,31 @@ impl SearxngBackend {
             .transport
             .post_search(&self.endpoint, query, self.api_key.as_deref())?;
         classify_response(resp, self.max_results)
+    }
+}
+
+/// SearXNG backendの本番非同期境界。blocking transportは専用blocking threadへ隔離し、
+/// Bridgeのasync runtimeを塞がない。設定・query・credentialはログへ出さない。
+impl SearchBackend for SearxngBackend {
+    fn search<'a>(&'a self, query: &'a str) -> SearchFuture<'a> {
+        let endpoint = self.endpoint.clone();
+        let api_key = self.api_key.clone();
+        let max_results = self.max_results;
+        let transport = Arc::clone(&self.transport);
+        let query = query.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let backend = SearxngBackend {
+                    endpoint,
+                    api_key,
+                    transport,
+                    max_results,
+                };
+                backend.search_blocking(&query)
+            })
+            .await
+            .map_err(|_| SearchError::Unavailable)?
+        })
     }
 }
 

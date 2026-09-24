@@ -16,7 +16,12 @@
 //!
 //! （実 HTTP 通信は dry-run 対象外。テストは fake 境界で検証する。）W08。
 
+use std::sync::Arc;
+
+use siderostat::websearch::backend::SearchBackend;
+use siderostat::websearch::chat_client::ReqwestChatClient;
 use siderostat::websearch::config::BridgeConfig;
+use siderostat::websearch::searxng::{ReqwestTransport, SearxngBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,15 +55,33 @@ async fn main() -> anyhow::Result<()> {
     })?;
     tracing::info!("websearch bridge listening on {}", listener.local_addr()?);
 
-    // 実 HTTP 実装（reqwest ChatClient / SearchBackend）は本番構成で注入する。
-    // 本 binary では抽象境界を構築して起動する。実装は W09 の対象。W08。
-    let server = siderostat::websearch::server::BridgeServer::new(
-        config,
-        // 本番 ChatClient は W09 で reqwest 実装を注入する。W08。
-        siderostat::websearch::server::noop_chat(),
-        // 本番 SearchBackend は W09 で reqwest 実装を注入する。W08。
-        siderostat::websearch::server::noop_search(),
-    );
+    // 実 DS4 Chat clientをbackend URLへ接続する。modelは環境変数で明示的に
+    // 上書きできるが、既定はH02で配置したDeepSeek V4 Flash aliasとする。
+    let model =
+        std::env::var("SIDEROSTAT_BRIDGE_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
+    let max_output_tokens = std::env::var("SIDEROSTAT_BRIDGE_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024);
+    let chat = ReqwestChatClient::new(config.backend_url.clone())?
+        .with_model(model)
+        .with_max_output_tokens(max_output_tokens);
+
+    // SearXNG endpointが設定されていない場合は検索を実行しない。設定済みの場合は
+    // adapterを本番HTTP backendとして接続する。Bridge tokenは転送しない。
+    let search: Arc<dyn SearchBackend> = match config.searxng.clone() {
+        Some(searxng) => Arc::new(
+            SearxngBackend::new(
+                searxng.endpoint,
+                searxng.api_key,
+                Box::new(ReqwestTransport::default()),
+            )
+            .with_max_results(config.max_results),
+        ),
+        None => siderostat::websearch::server::noop_search(),
+    };
+    let server = siderostat::websearch::server::BridgeServer::new(config, Arc::new(chat), search);
     let app = server.router();
 
     axum::serve(listener, app).await?;

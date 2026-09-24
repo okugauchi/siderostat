@@ -164,6 +164,36 @@ async fn w08_missing_token_provider_comm_zero() {
     assert_eq!(search.calls.load(Ordering::SeqCst), 0);
 }
 
+/// external_access=false のとき live search を拒否し、providerへ迂回しない。H05。
+#[tokio::test]
+async fn h05_external_search_requires_opt_in() {
+    let chat = Arc::new(FakeChat::ok(vec![final_turn("answer")]));
+    let search = Arc::new(FakeSearch {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let server = BridgeServer::new(config(), chat.clone(), search.clone());
+    let app = server.router();
+    let body = serde_json::json!({
+        "model": "ds4",
+        "input": "search this",
+        "tools": [{"type": "web_search", "external_web_access": true}],
+        "tool_choice": "required"
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer secret-token")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(chat.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(search.calls.load(Ordering::SeqCst), 0);
+}
+
 /// 受入 case: 正常 request → SSE 200 + completed 1 回。W08。
 #[tokio::test]
 async fn w08_valid_request_returns_sse_completed_once() {

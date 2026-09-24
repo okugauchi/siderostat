@@ -56,6 +56,8 @@ pub enum EngineError {
     TooManyTurns,
     /// その他。W05。
     Other,
+    /// 検索結果に検証可能な引用が含まれない。W06/H05。
+    CitationInvalid,
 }
 
 impl std::fmt::Display for EngineError {
@@ -67,6 +69,7 @@ impl std::fmt::Display for EngineError {
             EngineError::BackendUnavailable => "backend_unavailable",
             EngineError::DeadlineExceeded => "deadline_exceeded",
             EngineError::TooManyTurns => "too_many_turns",
+            EngineError::CitationInvalid => "citation_invalid",
             EngineError::Other => "other",
         };
         write!(f, "{name}")
@@ -168,10 +171,21 @@ impl<'a> WebSearchEngine<'a> {
         &mut self,
         initial_messages: &[ChatMessage],
     ) -> Result<EngineOutcome, EngineError> {
+        self.run_with_search_requirement(initial_messages, false)
+            .await
+    }
+
+    /// 初回turnだけ検索必須をChat clientへ伝える。H05。
+    pub async fn run_with_search_requirement(
+        &mut self,
+        initial_messages: &[ChatMessage],
+        require_search: bool,
+    ) -> Result<EngineOutcome, EngineError> {
         let mut messages: Vec<ChatMessage> = initial_messages.to_vec();
         let mut search_results: Vec<SearchResult> = Vec::new();
         let mut search_queries: Vec<String> = Vec::new();
         let mut client_calls: Vec<super::request::ChatToolCall> = Vec::new();
+        let mut first_turn = true;
 
         loop {
             // model turn 上限。W05。
@@ -180,11 +194,15 @@ impl<'a> WebSearchEngine<'a> {
             }
             self.turns_left -= 1;
 
-            let turn = self
-                .chat
-                .send_turn(&messages)
-                .await
-                .map_err(chat_error_to_engine)?;
+            let turn = if first_turn {
+                first_turn = false;
+                self.chat
+                    .send_turn_with_search_requirement(&messages, require_search)
+                    .await
+            } else {
+                self.chat.send_turn(&messages).await
+            }
+            .map_err(chat_error_to_engine)?;
             // 総 deadline（600s）を共有する。W05。
             if self.deadline.elapsed() > super::chat_client::TOTAL_DEADLINE {
                 return Err(EngineError::DeadlineExceeded);
@@ -271,7 +289,8 @@ fn format_search_results(results: &[SearchResult]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&format!("[{}] {} {} {}", i, r.title, r.url, r.snippet,));
+        // citation moduleのsource IDは1-based。tool dataも同じ番号で表示する。
+        out.push_str(&format!("[{}] {} {} {}", i + 1, r.title, r.url, r.snippet,));
     }
     out
 }

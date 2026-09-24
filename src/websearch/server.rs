@@ -22,6 +22,7 @@
 //! - 入力: DS4 配信中失敗 → failed terminal
 
 use super::chat_client::ChatClient;
+use super::citation::{build_sources, render_citations};
 use super::engine::{EngineError, WebSearchEngine};
 use super::request::{ChatMessage, MAX_BODY_BYTES, RequestError, ValidatedResponseRequest};
 use super::response::{AssembledResponse, assemble};
@@ -174,6 +175,16 @@ async fn handle_responses(
         }
     };
 
+    // 外部検索は設定で明示的にopt-inされた場合だけ許可する。無効時は
+    // Chat/SearXNGへ一切接続せず、検索要求を誤って通常回答へ迂回しない。
+    if validated.search.is_some() && !state.config.external_access {
+        return (
+            StatusCode::FORBIDDEN,
+            "external web search is disabled; enable external_access explicitly",
+        )
+            .into_response();
+    }
+
     // 3. 同時 request 制限（bounded）。queue で待ち、超過は待たずに 429。W08。
     let _permit = match state.concurrent.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -187,11 +198,33 @@ async fn handle_responses(
     // disconnect oneshot を明示的に fire して cancel 経路を検証する。W08。
     let (_keepalive, disconnect) = tokio::sync::oneshot::channel::<()>();
     let initial_messages = validated.messages.clone();
-    let outcome = run_engine_cancellable(&state, &initial_messages, disconnect).await;
+    let require_search = validated
+        .search
+        .as_ref()
+        .is_some_and(|search| search.required);
+    let outcome =
+        run_engine_cancellable(&state, &initial_messages, require_search, disconnect).await;
 
     // 5. SSE を返す。W08。
     match outcome {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // 検索結果を含む回答は、modelが返した[N] markerを実URLへ変換してから
+            // Responses item/SSEを組み立てる。引用なし・偽ID・未完markerは成功扱いしない。
+            if !outcome.search_results.is_empty() {
+                let sources = build_sources(&outcome.search_results);
+                let cited = match render_citations(&outcome.text, &sources) {
+                    Ok(cited) if !cited.citations.is_empty() => cited,
+                    _ => {
+                        let events = render_failed(
+                            &response_id(),
+                            "citation_invalid",
+                            "search result citation was missing or invalid",
+                        );
+                        return stream_events(events);
+                    }
+                };
+                outcome.text = cited.text;
+            }
             let assembled = assemble(&outcome, &response_id());
             stream_sse(assembled)
         }
@@ -259,10 +292,11 @@ async fn read_bounded_body(body: axum::body::Body, limit: usize) -> Result<axum:
 async fn run_engine_cancellable(
     state: &BridgeServer,
     initial_messages: &[ChatMessage],
+    require_search: bool,
     mut disconnect: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<super::engine::EngineOutcome, EngineError> {
     let mut engine = WebSearchEngine::new(state.chat.as_ref(), state.search.as_ref());
-    let engine_fut = engine.run(initial_messages);
+    let engine_fut = engine.run_with_search_requirement(initial_messages, require_search);
     tokio::pin!(engine_fut);
 
     tokio::select! {
@@ -292,6 +326,7 @@ fn error_code(err: &EngineError) -> &'static str {
         EngineError::BackendUnavailable => "backend_unavailable",
         EngineError::DeadlineExceeded => "deadline_exceeded",
         EngineError::TooManyTurns => "too_many_turns",
+        EngineError::CitationInvalid => "citation_invalid",
         EngineError::Other => "other",
     }
 }
@@ -501,7 +536,7 @@ mod tests {
         tx.send(()).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_engine_cancellable(&s, &msg, rx),
+            run_engine_cancellable(&s, &msg, false, rx),
         )
         .await
         .expect("cancel は即座に完了する");
