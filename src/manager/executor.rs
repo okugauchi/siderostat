@@ -1,6 +1,7 @@
 //! Bounded manager job executor and cancellation bridge.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +55,7 @@ pub enum ManagerExecutorError {
     QueueFull,
     QueueClosed,
     JobNotFound,
+    RequestMismatch,
 }
 
 impl std::fmt::Display for ManagerExecutorError {
@@ -62,6 +64,7 @@ impl std::fmt::Display for ManagerExecutorError {
             Self::QueueFull => "manager executor queue is full",
             Self::QueueClosed => "manager executor queue is closed",
             Self::JobNotFound => "manager job not found",
+            Self::RequestMismatch => "manager job request does not match journal",
         };
         f.write_str(message)
     }
@@ -95,6 +98,10 @@ impl ManagerExecutorHandle {
             .ok_or(ManagerExecutorError::JobNotFound)?;
         if !matches!(phase, JobPhase::Running | JobPhase::Cancelling) {
             return Ok(());
+        }
+        if !journal.matches_request(&request.id, request.kind, &request.payload_key) {
+            let _ = journal.fail_if_running(&request.id, "manager job request mismatch");
+            return Err(ManagerExecutorError::RequestMismatch);
         }
 
         let mut cancellation = self
@@ -170,6 +177,38 @@ impl ManagerExecutorHandle {
 
 pub struct ManagerExecutor;
 
+static BACKEND_PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+struct RestorePanicHook(Option<PanicHook>);
+
+impl Drop for RestorePanicHook {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            std::panic::set_hook(previous);
+        }
+    }
+}
+
+fn execute_backend<B: ManagerExecutionBackend>(
+    backend: Arc<B>,
+    request: ManagerExecutionRequest,
+    cancel: Arc<AtomicBool>,
+) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+    // Panic hooks are process-global. Serialize the temporary replacement and
+    // never pass backend panic payloads to stderr or tracing.
+    let _hook_lock = BACKEND_PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = RestorePanicHook(Some(std::panic::take_hook()));
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(|| backend.execute(request, cancel)))
+        .unwrap_or(Err(ManagerExecutionError::Unavailable));
+    drop(restore);
+    result
+}
+
 impl ManagerExecutor {
     pub fn start<B: ManagerExecutionBackend>(
         journal: Arc<Mutex<JobJournal>>,
@@ -195,9 +234,11 @@ impl ManagerExecutor {
                 } else {
                     let backend = backend.clone();
                     let cancel = queued.cancel.clone();
-                    tokio::task::spawn_blocking(move || backend.execute(queued.request, cancel))
-                        .await
-                        .unwrap_or(Err(ManagerExecutionError::Unavailable))
+                    tokio::task::spawn_blocking(move || {
+                        execute_backend(backend, queued.request, cancel)
+                    })
+                    .await
+                    .unwrap_or(Err(ManagerExecutionError::Unavailable))
                 };
                 let mut journal = state.journal.lock().expect("manager journal poisoned");
                 if queued.cancel.load(Ordering::SeqCst)
@@ -261,6 +302,7 @@ fn public_error(error: &ManagerExecutionError) -> &'static str {
 mod tests {
     use super::*;
     use crate::manager::jobs::{JobKind, JobPhase};
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Clone)]
     enum FixtureOutcome {
@@ -281,6 +323,40 @@ mod tests {
     }
 
     struct FixtureBackend(FixtureOutcome);
+
+    struct CountingBackend(Arc<AtomicUsize>);
+
+    struct BlockingCountingBackend {
+        calls: Arc<AtomicUsize>,
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ManagerExecutionBackend for CountingBackend {
+        fn execute(
+            &self,
+            _request: ManagerExecutionRequest,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ManagerExecutionOutcome { progress: 100 })
+        }
+    }
+
+    impl ManagerExecutionBackend for BlockingCountingBackend {
+        fn execute(
+            &self,
+            _request: ManagerExecutionRequest,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            Ok(ManagerExecutionOutcome { progress: 100 })
+        }
+    }
 
     impl ManagerExecutionBackend for FixtureBackend {
         fn execute(
@@ -455,6 +531,109 @@ mod tests {
         let job = journal.lock().unwrap().get(&id).unwrap().clone();
         assert_eq!(job.phase, JobPhase::Failed);
         assert!(!job.error.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn backend_panic_hook_hides_payload() {
+        if std::env::var_os("SIDEROSTAT_EXECUTOR_PANIC_CHILD").is_some() {
+            let (handle, worker, journal) = test_executor(FixtureOutcome::Panic);
+            let request = fixture_request(&journal, JobKind::Build, "panic-hook");
+            let id = request.id.clone();
+            handle.submit(request).expect("queue");
+            handle.shutdown_for_test();
+            worker.await.expect("worker");
+            assert_eq!(
+                journal.lock().unwrap().get(&id).unwrap().phase,
+                JobPhase::Failed
+            );
+            let _ = std::panic::catch_unwind(|| panic!("hook-restored-marker"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "manager::executor::tests::backend_panic_hook_hides_payload",
+                "--nocapture",
+            ])
+            .env("SIDEROSTAT_EXECUTOR_PANIC_CHILD", "1")
+            .output()
+            .expect("child test");
+        assert!(output.status.success());
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !visible.contains("backend panic secret"),
+            "panic payload leaked: {visible}"
+        );
+        assert!(
+            visible.contains("hook-restored-marker"),
+            "panic hook was not restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_kind_or_payload_never_reaches_backend() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let journal = Arc::new(Mutex::new(JobJournal::new()));
+        let (handle, worker) =
+            ManagerExecutor::start(journal.clone(), CountingBackend(calls.clone()));
+        for (kind, key) in [(JobKind::Verify, "real-key"), (JobKind::Build, "wrong-key")] {
+            let mut request = fixture_request(&journal, JobKind::Build, "real-key");
+            request.kind = kind;
+            request.payload_key = key.to_string();
+            assert_eq!(
+                handle.submit(request.clone()),
+                Err(ManagerExecutorError::RequestMismatch)
+            );
+            assert_eq!(
+                journal.lock().unwrap().get(&request.id).unwrap().phase,
+                JobPhase::Failed
+            );
+        }
+        handle.shutdown_for_test();
+        worker.await.expect("worker");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_duplicate_submits_execute_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let journal = Arc::new(Mutex::new(JobJournal::new()));
+        let (handle, worker) = ManagerExecutor::start(
+            journal.clone(),
+            BlockingCountingBackend {
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+            },
+        );
+        let request = fixture_request(&journal, JobKind::Fetch, "same-key");
+        handle.submit(request.clone()).expect("first submit");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend started");
+        let mut submits = Vec::new();
+        for _ in 0..16 {
+            let handle = handle.clone();
+            let request = request.clone();
+            submits.push(tokio::spawn(async move { handle.submit(request) }));
+        }
+        for submit in submits {
+            assert_eq!(submit.await.expect("submit task"), Ok(()));
+        }
+        release.store(true, Ordering::SeqCst);
+        handle.shutdown_for_test();
+        worker.await.expect("worker");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

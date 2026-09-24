@@ -174,7 +174,7 @@ impl std::error::Error for ManagerJobError {}
 pub struct JobJournal {
     jobs: HashMap<String, ManagerJob>,
     /// 進行中（Running/Cancelling）の重複キー → job ID。M01。
-    running_by_key: HashMap<String, String>,
+    running_by_key: HashMap<(JobKind, String), String>,
     /// 次 ID カウンタ（決定論的 ID のための連番）。M01。
     next_id: u64,
 }
@@ -190,15 +190,15 @@ impl JobJournal {
     /// `payload_key` は同一作業を表す正規化キー。同一キーの進行中 job が
     /// 既にあれば同 ID を返す（重複 job → 同 ID）。M01。
     pub fn enqueue(&mut self, kind: JobKind, payload_key: &str) -> Result<String, ManagerJobError> {
-        if let Some(id) = self.running_by_key.get(payload_key) {
+        let key = (kind, payload_key.to_string());
+        if let Some(id) = self.running_by_key.get(&key) {
             // 進行中 job が既にある → 同 ID を返す。M01。
             return Ok(id.clone());
         }
         let id = format!("{}-{}", kind.as_str(), self.next_id);
         self.next_id += 1;
         let job = ManagerJob::new(id.clone(), kind);
-        self.running_by_key
-            .insert(payload_key.to_string(), job.id.clone());
+        self.running_by_key.insert(key, job.id.clone());
         self.jobs.insert(id.clone(), job);
         Ok(id)
     }
@@ -211,6 +211,15 @@ impl JobJournal {
     /// 指定 ID の job を取得する。M01。
     pub fn get(&self, id: &str) -> Option<&ManagerJob> {
         self.jobs.get(id)
+    }
+
+    /// ID が journal に登録された kind と payload key の組に一致するか。
+    pub fn matches_request(&self, id: &str, kind: JobKind, payload_key: &str) -> bool {
+        self.jobs.get(id).is_some_and(|job| job.kind == kind)
+            && self
+                .running_by_key
+                .get(&(kind, payload_key.to_string()))
+                .is_some_and(|registered_id| registered_id == id)
     }
 
     /// 全 job を ID 順で返す。M01。
@@ -291,7 +300,7 @@ impl JobJournal {
     fn release_key(&mut self, kind: JobKind, id: &str) {
         // kind が一致し、ID が一致する進行中エントリだけを除去する。
         // （終了した job が別 payload の新規 job の重複判定を誤らないように）
-        let stale: Vec<String> = self
+        let stale: Vec<(JobKind, String)> = self
             .running_by_key
             .iter()
             .filter(|(_, v)| **v == id)
@@ -341,6 +350,36 @@ mod tests {
         let a = journal.enqueue(JobKind::Download, "model-a").expect("a");
         let b = journal.enqueue(JobKind::Download, "model-b").expect("b");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn same_payload_different_kind_has_distinct_jobs() {
+        let mut journal = JobJournal::new();
+        let build = journal
+            .enqueue(JobKind::Build, "shared-key")
+            .expect("build");
+        let verify = journal
+            .enqueue(JobKind::Verify, "shared-key")
+            .expect("verify");
+        assert_ne!(build, verify);
+        assert_eq!(journal.get(&build).unwrap().kind, JobKind::Build);
+        assert_eq!(journal.get(&verify).unwrap().kind, JobKind::Verify);
+        assert!(journal.matches_request(&build, JobKind::Build, "shared-key"));
+        assert!(!journal.matches_request(&build, JobKind::Verify, "shared-key"));
+        assert!(!journal.matches_request(&build, JobKind::Build, "other-key"));
+        journal.succeed(&build).expect("complete build");
+        assert_eq!(
+            journal
+                .enqueue(JobKind::Verify, "shared-key")
+                .expect("duplicate verify"),
+            verify
+        );
+        assert_ne!(
+            journal
+                .enqueue(JobKind::Build, "shared-key")
+                .expect("new build"),
+            build
+        );
     }
 
     #[test]
