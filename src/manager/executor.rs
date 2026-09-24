@@ -282,9 +282,6 @@ impl ManagerJobInputResolver {
                 if &planned_model != entry {
                     return Err(ManagerInputError::Rejected);
                 }
-                if req.model.catalog_id != *model_artifact_id {
-                    return Err(ManagerInputError::Rejected);
-                }
                 if check_real_inputs {
                     let registry = registry
                         .lock()

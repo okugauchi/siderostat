@@ -335,7 +335,7 @@ fn empty_or_mismatched_checkout_is_unavailable() {
 }
 
 #[test]
-fn staged_role_without_verified_model_is_unavailable() {
+fn staged_model_binds_catalog_to_distinct_verified_registry_id() {
     let root = scratch("stage-model");
     std::fs::create_dir_all(&root).unwrap();
     let role_path = root.join("role.bin");
@@ -348,7 +348,7 @@ fn staged_role_without_verified_model_is_unavailable() {
         sha256: siderostat::manager::hex_sha256(b"role"),
         state: ArtifactState::Verified,
     });
-    let model = model_entry("model", b"real model");
+    let model = model_entry("catalog-entry", b"real model");
     let mut resolver = ManagerJobInputResolver::new();
     resolver.register_catalog_entry(model.clone()).unwrap();
     let registry = Arc::new(Mutex::new(registry));
@@ -370,7 +370,7 @@ fn staged_role_without_verified_model_is_unavailable() {
                 }),
                 registry: registry.clone(),
                 artifact_ids: vec!["role".into()],
-                model_artifact_id: "model".into(),
+                model_artifact_id: "registry-model-1".into(),
                 model_artifact_path: root.join("model.bin"),
             },
         )
@@ -395,7 +395,7 @@ fn staged_role_without_verified_model_is_unavailable() {
                 }),
                 registry: registry.clone(),
                 artifact_ids: vec!["role".into()],
-                model_artifact_id: "model".into(),
+                model_artifact_id: "registry-model-1".into(),
                 model_artifact_path: root.join("model.bin"),
             },
         )
@@ -406,10 +406,10 @@ fn staged_role_without_verified_model_is_unavailable() {
     ));
     std::fs::write(root.join("model.bin"), b"tampered model").unwrap();
     registry.lock().unwrap().put(ArtifactRecord {
-        id: "model".into(),
+        id: "registry-model-1".into(),
         kind: "model".into(),
         rel_path: "model.bin".into(),
-        sha256: model_entry("model", b"real model").sha256,
+        sha256: model_entry("catalog-entry", b"real model").sha256,
         state: ArtifactState::Verified,
     });
     assert!(matches!(
@@ -417,10 +417,15 @@ fn staged_role_without_verified_model_is_unavailable() {
         Err(siderostat::manager::executor::ManagerInputError::Unavailable)
     ));
     std::fs::write(root.join("model.bin"), b"real model").unwrap();
-    assert!(matches!(
-        resolver.resolve(&request(JobKind::Stage, "profile")),
-        Ok(ManagerJobInput::Stage { .. })
-    ));
+    let backend = RuntimeManagerBackend::new(resolver);
+    assert!(
+        backend
+            .execute(
+                request(JobKind::Stage, "profile"),
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_ok()
+    );
     std::fs::remove_dir_all(&root).unwrap();
 }
 
