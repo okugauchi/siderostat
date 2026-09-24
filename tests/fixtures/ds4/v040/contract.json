@@ -3,28 +3,28 @@
   "upstream": {
     "repo": "https://github.com/antirez/ds4.git",
     "branch": "main",
-    "tracked_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
-    "tracked_commit_date": "2026-09-05",
-    "tracked_commit_subject": "Record long GLM quality controls and Spark decode gains",
+    "tracked_commit": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+    "tracked_commit_date": "2026-09-20",
+    "tracked_commit_subject": "Document physical Metal TP QA preflight and native batch coverage",
     "ancestry_proof": {
       "method": "git rev-parse main origin/main (local clone at /Users/o/LLM/ds4)",
-      "main": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
-      "origin_main": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+      "main": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+      "origin_main": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
       "equal": true,
       "note": "追跡対象は単一 commit に固定せず、upstream main 更新時に再検証・更新する。TP protocol 更新時は coordinator/worker を同一追跡対象で揃える。"
     },
-    "protocol_version": 10,
+    "protocol_version": 14,
     "tp_magic": "0x44533454",
     "tp_magic_label": "\"DS4T\"",
     "source_digests": {
-      "README.md": "bfeaba2c53ed4ad681f6308c7fecb636becf0859ab7411e51142051a6a73beb4",
-      "ds4.c": "218a81f9bde26b2dceff2370a0c2343c07e38fdc068264d151d450f1b8a6a8d3",
-      "ds4_tp.c": "5ef79dfc260222c09388c388555c5ecd0b2fe791f7f62ae751909734fa9677d2",
-      "ds4_server.c": "2886bb615d340a6a1ccf7525bdceda7d68dcd4ad80bd9057f4f8febde4367375",
-      "ds4_agent.c": "95fd4230e1093e1727e468d646c24d3236813ececba10c1e8297827562f174f3",
-      "ds4_cli.c": "13876351b52d84c16a4d98155242131ec7bb6408cace66179040c0a836a557f4",
+      "README.md": "d61ff9a3153916ab88917cbfab0ca1a8c2e42b138b71a1ca0d74d05f391ff113",
+      "ds4.c": "8f546837c0032a24b381052253244a34e10b7eea2647e97862cb4967b8604b89",
+      "ds4_tp.c": "3f9277262ac26ae11ed55c60e369aea84ac335b174ef5ba3fb92e431495eda0c",
+      "ds4_server.c": "9324cd8bd87b52abd8fe2848ba029a207e4e3371f43f07c8d04a26fcc8977071",
+      "ds4_agent.c": "8b8911d242142641afabe4e0673d260dc1f99762aa8f6988f7b6b4aa206f6e65",
+      "ds4_cli.c": "15fc13922d75891ca8301214ee121e9c8026c9a9095afacd7d19265d0014da9f",
       "ds4_distributed.c": "08ff11e22f2c5791de72cc910d94a6817c7a8310bde4b9cee57379f3be75e0f2",
-      "Makefile": "70703cd50026220b71acd8ddfd5cd2f707194fcf528dce7bab8425b363af5658"
+      "Makefile": "5596981ea737dbf00a4caa1847984d05098cdc1fcfbbe4f2a9a703375e9fddc8"
     }
   },
   "role_argv": {
@@ -170,6 +170,6 @@
     "generic TCP connect や旧 DS4D HELLO を TP ready と誤認しないこと。",
     "source の準備完了観測（ds4-server: listening on http:// 行）を HTTP readiness として固定。handshake 成功のみを ready としない。",
     "worker Connected を coordinator 起動前に待たない。",
-    "追跡対象 commit (9ab70534) は upstream main 更新時に再検証・更新する。protocol v10 固定ではない。"
+    "追跡対象 commit (0aaea5a) は upstream main 更新時に再検証・更新する。現行 protocol は v14。"
   ]
 }

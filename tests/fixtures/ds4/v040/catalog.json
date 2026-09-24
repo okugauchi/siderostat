@@ -1,46 +1,46 @@
 {
   "schema_version": 1,
   "kind": "upstream-build-catalog",
-  "tracked_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+  "tracked_commit": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
   "tracked_on_main": true,
-  "current_main": "6289c516273979173abbc062209a81dd3706b804",
-  "commits_since_tracked": 55,
-  "tp_protocol_version": "10 (DS4_TP_PROTOCOL_VERSION 10u, ds4_tp.c:44)",
-  "tp_protocol_changed": false,
+  "current_main": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+  "commits_since_tracked": 0,
+  "tp_protocol_version": "14 (DS4_TP_PROTOCOL_VERSION 14u, ds4_tp.c:43)",
+  "tp_protocol_changed": true,
   "capability_delta_from_tracked_to_main": {
-    "ds4_tp.c": "no diff (TP protocol v10 維持)",
-    "ds4_distributed.c": "no diff",
-    "ds4_server.c": "967 insertions, 193 deletions (capability 追跡要。TP argv 契約は A02 のまま)"
+    "ds4_tp.c": "protocol v10 → v14。現行source/help/handshakeをH02で再固定",
+    "ds4_distributed.c": "現行main source digestを再固定",
+    "ds4_server.c": "現行main source/help/readinessを再固定"
   },
   "build": {
     "status": "PASS",
-    "date": "2026-09-14",
-    "workspace": "/Users/o/LLM/ds4-v040",
-    "checkout": "git worktree add --detach 9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "date": "2026-09-24",
+    "workspace": "/private/tmp/siderostat-h02-ds4-0aaea5a",
+    "checkout": "git worktree add --detach 0aaea5a238fb41a35106a551e73c8409dfb751ac",
     "command": "make ds4 ds4-server ds4-agent",
     "exit_code": 0,
     "compiler": "cc (clang) + make, macOS Metal (-framework Foundation -framework Metal)",
     "nvcc_required": false,
     "targets": {
       "ds4": {
-        "bin_sha256": "92e83185c119d54e",
-        "bin_size": 2306112,
-        "help_sha256": "a932866934735acd",
-        "help_len": 5072,
+        "bin_sha256": "c655533c78dca40e7bf6852dadc70ba8263b2ae1557fabb4566f331c74d45dc8",
+        "bin_size": 2729232,
+        "help_sha256": "f92fa9eeaa3a6345d08f5fb21e29be831dfbb80f5afdeafddafa26a29924054f",
+        "help_len": 5192,
         "help_exit": 0
       },
       "ds4-server": {
-        "bin_sha256": "fafff7be48104b86",
-        "bin_size": 2623480,
-        "help_sha256": "6512f50355b93679",
+        "bin_sha256": "7cb00e05f7414b4a75ef4a6c2cf29e70e766aae6ef0dd4ffff1ed50ac47304df",
+        "bin_size": 3088264,
+        "help_sha256": "6512f50355b9367909e41d266fcb3b81eaaf7f2318a615542e08466867fc1abf",
         "help_len": 4156,
         "help_exit": 0
       },
       "ds4-agent": {
-        "bin_sha256": "ece7916dc5b82e86",
-        "bin_size": 2530680,
-        "help_sha256": "8edec86ff2b31ce5",
-        "help_len": 4029,
+        "bin_sha256": "9498790a9b705d841598dd7bb6cc281322cfc0e184e56c415cb630f69e444948",
+        "bin_size": 2969400,
+        "help_sha256": "4d0fe89bd0c1540bbc5b8edde4e488a1692dc71f8193ae04ce9cca90df7785a9",
+        "help_len": 4249,
         "help_exit": 0
       }
     },
@@ -55,19 +55,19 @@
     "reason": "実 ds4 build は Metal フレームワーク・GPU 依存・フル C コンパイルを要し、CI (macos runner) では実行困難。実 build は隔離 workspace でローカル実行し PASS。CI での実 build 再実行は H02 前に行う。",
     "fixed_inputs": [
       "upstream: https://github.com/antirez/ds4.git (branch main)",
-      "tracked_commit: 9ab705347c1775e7599ede7eb81a6255ec7dccb5",
-      "build command: make ds4 ds4-server ds4-agent (隔離 workspace, checkout 9ab70534)"
+      "tracked_commit: 0aaea5a238fb41a35106a551e73c8409dfb751ac",
+      "build command: make ds4 ds4-server ds4-agent (隔離 workspace, checkout 0aaea5a)"
     ],
-    "re_run_command": "git -C /Users/o/LLM/ds4 worktree add --detach <isolated> 9ab705347c1775e7599ede7eb81a6255ec7dccb5 && cd <isolated> && make ds4 ds4-server ds4-agent"
+    "re_run_command": "git -C /Users/o/LLM/ds4 worktree add --detach <isolated> 0aaea5a238fb41a35106a551e73c8409dfb751ac && cd <isolated> && make ds4 ds4-server ds4-agent"
   },
   "h01_h02_packet": {
-    "build_gate": "NOT_RUN (CI では実 build 不可。ローカル実 build は PASS、3 target record 一致)",
+    "build_gate": "LOCAL_PASS (CI では実 build 未実行。現行main 0aaea5aを隔離workspaceで3 target build、record一致)",
     "h01_owner": "H01 に実機操作を集約（実 child 起動 / activation / Bridge 実プロセス / SMAppService 実操作）。実 build は H02 前に隔離 workspace で再実行して build gate を完了させる。",
-    "h02_prereq": "H02 開始前に、隔離 workspace で 3 target を build 再実行し、catalog.json の digest と照合する。実 model の load は行わない。",
+    "h02_prereq": "現行main 0aaea5aの隔離3 target buildとdigest照合は完了。RC配置前にsiderostat現行基点のartifact digestを固定する。実 model の load は行わない。",
     "compiler_shortage": "none (cc/make + Metal あり、nvcc 不要)"
   },
   "pr_not_main": {
     "status": "reference",
-    "evidence": "source.rs stage_source は非 main commit → SourceError::NotOnMain → reference 扱い (M02)。9ab70534 は main の祖先 (on main)。PR 未 main は reference 維持。"
+    "evidence": "source.rs stage_source は非 main commit → SourceError::NotOnMain → reference 扱い (M02)。0aaea5a は現行 main tip。PR 未 main は reference 維持。"
   }
 }
