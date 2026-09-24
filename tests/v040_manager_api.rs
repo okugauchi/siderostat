@@ -216,8 +216,14 @@ mod routes {
             r#"{"kind":"fetch","payload_key":"fixture-fetch"}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"], "manager executor queue is closed");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["id"].as_str().expect("job id");
+        assert_eq!(body.as_object().expect("response object").len(), 1);
+        let (get_status, job) =
+            request(state.clone(), "GET", &format!("/manager/jobs/{id}"), "").await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(job["phase"], "failed");
+        assert_eq!(job["error"], "manager executor queue is closed");
         let (_, status_body) = request(state, "GET", "/manager/status", "").await;
         assert_eq!(status_body["queue_depth"], 0);
         assert_eq!(status_body["jobs"][0]["phase"], "failed");

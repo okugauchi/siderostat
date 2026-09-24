@@ -2349,33 +2349,22 @@ async fn manager_jobs_submit(
         (response, newly_created)
     };
     if newly_created {
-        let execution = match request.execution_request(response.id.clone()) {
-            Ok(execution) => execution,
-            Err(error) => {
-                let _ = state
-                    .jobs
-                    .lock()
-                    .unwrap()
-                    .fail_if_running(&response.id, "manager job input rejected");
-                return manager_api_error_response(&error);
-            }
+        let admission_error = match request.execution_request(response.id.clone()) {
+            Ok(execution) => state
+                .manager_executor
+                .submit(execution)
+                .err()
+                .map(|error| error.to_string()),
+            Err(_) => Some("manager job input rejected".to_string()),
         };
-        if let Err(error) = state.manager_executor.submit(execution) {
-            // The executor also closes failed queue admissions. This guard only
-            // targets the job created by this request; a duplicate must never
-            // overwrite an already accepted job.
+        if let Some(error) = admission_error {
+            // Preserve the accepted {id} response. Polling the same job reveals
+            // the failure; duplicate submissions never overwrite its state.
             let _ = state
                 .jobs
                 .lock()
                 .unwrap()
-                .fail_if_running(&response.id, error.to_string());
-            let status = match error {
-                crate::manager::executor::ManagerExecutorError::RequestMismatch => {
-                    StatusCode::CONFLICT
-                }
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            return json_response(status, json!({"error": error.to_string()}));
+                .fail_if_running(&response.id, error);
         }
     }
     json_response(
