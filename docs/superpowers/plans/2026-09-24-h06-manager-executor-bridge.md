@@ -100,7 +100,7 @@ git commit -m "Add guarded manager job terminal transitions"
   - `trait ManagerExecutionBackend: Send + Sync + 'static { fn execute(&self, request: ManagerExecutionRequest, cancel: Arc<AtomicBool>) -> Result<ManagerExecutionOutcome, ManagerExecutionError>; }`
   - `ManagerExecutorHandle::submit`, `ManagerExecutorHandle::cancel`, `ManagerExecutorHandle::shutdown_for_test`, and `ManagerExecutor::start`.
 
-- [ ] **Step 1: Write failing executor tests**
+- [x] **Step 1: Write failing executor tests**
 
 Add tests for a fixture backend that returns each outcome:
 
@@ -146,25 +146,25 @@ async fn closed_queue_marks_submitter_error() {
 }
 ```
 
-- [ ] **Step 2: Run executor tests and confirm RED**
+- [x] **Step 2: Run executor tests and confirm RED**
 
 Run: `cargo test --lib manager::executor`
 
 Expected: FAIL because the executor module and backend traits are absent.
 
-- [ ] **Step 3: Implement the bounded executor**
+- [x] **Step 3: Implement the bounded executor**
 
 Use `tokio::sync::mpsc::channel(16)` and a `HashMap<String, Arc<AtomicBool>>` protected by `Mutex` for cancellation. The worker must call the synchronous backend inside `tokio::task::spawn_blocking`, then apply exactly one guarded journal transition. On `Canceled`, `QueueClosed`, backend error, or panic conversion, call `fail_if_running`; never call `succeed_if_running` when the cancel flag is set.
 
 Redact backend errors before writing them to the journal by removing URL userinfo, bearer/token query values, and `raw build log` labels. Install a manager-owned thread-aware panic dispatcher with direct `set_hook` before worker execution and before each backend call; it emits a fixed non-secret message for unrelated panics, suppresses payload for the backend thread marker, never calls `take_hook`, and converts backend panics to `Unavailable`. Validate that the queued request's `kind` and `payload_key` match the journal entry before executing it. Update `JobJournal::enqueue`'s running index to use the `(kind, payload_key)` pair so same keys for different kinds cannot share an ID.
 
-- [ ] **Step 4: Run executor tests and verify GREEN**
+- [x] **Step 4: Run executor tests and verify GREEN**
 
 Run: `cargo test --lib manager::executor`
 
 Expected: all executor lifecycle, cancellation, queue, and redaction tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/manager/executor.rs src/manager/mod.rs
