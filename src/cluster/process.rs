@@ -1227,6 +1227,11 @@ mod tests {
     };
     use std::sync::Mutex;
 
+    // The macOS process identity APIs can transiently return EIO while several test children are
+    // being exec'd at once. Keep OS-backed child tests isolated while leaving the rest of the
+    // Rust test harness parallel.
+    static OS_PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct TestRoot(PathBuf);
 
     impl TestRoot {
@@ -1620,6 +1625,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_spawn_owns_process_group_and_reaps_verified_child() {
+        let _process_test = OS_PROCESS_TEST_LOCK.lock().await;
         use crate::{
             cluster::Ds4Profile,
             config::{Quantization, Residency},
@@ -1645,6 +1651,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_stop_uses_a_bounded_kill_window_after_term_timeout() {
+        let _process_test = OS_PROCESS_TEST_LOCK.lock().await;
         use crate::{
             cluster::Ds4Profile,
             config::{Quantization, Residency},
@@ -1679,6 +1686,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn distributed_worker_supervisor_starts_and_reaps_one_owned_child() {
+        let _process_test = OS_PROCESS_TEST_LOCK.lock().await;
         use crate::{
             cluster::Ds4Profile,
             config::{Quantization, Residency},
@@ -1713,6 +1721,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn distributed_worker_command_slot_rejects_live_swap_and_starts_verified_candidate() {
+        let _process_test = OS_PROCESS_TEST_LOCK.lock().await;
         let initial = crate::cluster::Ds4Command {
             executable: PathBuf::from("/bin/sleep"),
             working_directory: PathBuf::from("/tmp"),
