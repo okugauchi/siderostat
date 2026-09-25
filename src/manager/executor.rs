@@ -21,7 +21,6 @@ pub struct ManagerExecutionRequest {
     pub kind: JobKind,
     pub payload_key: String,
     pub expected_generation: u64,
-    pub runtime_lease: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +33,15 @@ pub enum ManagerExecutionError {
     Canceled,
     InputRejected(String),
     Domain(String),
+    NotConfigured,
     Unavailable,
+    StaleGeneration,
+    LifecycleBusy,
+    LeaseUnavailable,
+    StalePolicyEpoch,
+    UnpairedPeer,
+    NotReady,
+    ManualIntervention,
 }
 
 pub trait ManagerExecutionBackend: Send + Sync + 'static {
@@ -43,6 +50,13 @@ pub trait ManagerExecutionBackend: Send + Sync + 'static {
         request: ManagerExecutionRequest,
         cancel: Arc<AtomicBool>,
     ) -> Result<ManagerExecutionOutcome, ManagerExecutionError>;
+
+    /// Attach the runtime-owned activation bridge before the admin listener is exposed.
+    fn attach_runtime_handle(
+        &self,
+        _handle: crate::cluster::production::manager::ManagerRuntimeHandle,
+    ) {
+    }
 }
 
 impl<T: ManagerExecutionBackend + ?Sized> ManagerExecutionBackend for Arc<T> {
@@ -52,6 +66,13 @@ impl<T: ManagerExecutionBackend + ?Sized> ManagerExecutionBackend for Arc<T> {
         cancel: Arc<AtomicBool>,
     ) -> Result<ManagerExecutionOutcome, ManagerExecutionError> {
         (**self).execute(request, cancel)
+    }
+
+    fn attach_runtime_handle(
+        &self,
+        handle: crate::cluster::production::manager::ManagerRuntimeHandle,
+    ) {
+        (**self).attach_runtime_handle(handle)
     }
 }
 
@@ -126,6 +147,7 @@ impl ManagerJobInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerInputError {
     Rejected,
+    NotConfigured,
     Unavailable,
 }
 
@@ -159,11 +181,21 @@ fn valid_source_receipt_id(value: &str) -> bool {
 pub struct ManagerJobInputResolver {
     plans: HashMap<(JobKind, String), ManagerJobInput>,
     model_catalog: HashMap<String, catalog::ModelCatalogEntry>,
+    missing_plan_is_unavailable: bool,
 }
 
 impl ManagerJobInputResolver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a runtime resolver whose unconfigured job kinds fail as unavailable.
+    /// This distinguishes missing production wiring from malformed configured input.
+    pub fn unconfigured_runtime() -> Self {
+        Self {
+            missing_plan_is_unavailable: true,
+            ..Self::default()
+        }
     }
 
     pub fn register(
@@ -242,13 +274,33 @@ impl ManagerJobInputResolver {
             return Err(ManagerInputError::Rejected);
         }
         if matches!(request.kind, JobKind::Activate | JobKind::Rollback)
-            && (request.expected_generation == 0
-                || request
-                    .runtime_lease
-                    .as_deref()
-                    .is_none_or(|lease| lease.trim().is_empty()))
+            && request.expected_generation == 0
         {
             return Err(ManagerInputError::Rejected);
+        }
+        if request.kind == JobKind::Activate {
+            if !valid_manager_profile_id(&request.payload_key) {
+                return Err(ManagerInputError::Rejected);
+            }
+            return Ok(ManagerJobInput::Activate(activation::ActivationRequest {
+                operation_id: request.id.clone(),
+                expected_generation: request.expected_generation,
+                profile_id: request.payload_key.clone(),
+                policy_epoch: 0,
+                nodes: Vec::new(),
+            }));
+        }
+        if request.kind == JobKind::Rollback {
+            if request.payload_key != "previous" {
+                return Err(ManagerInputError::Rejected);
+            }
+            return Ok(ManagerJobInput::Rollback(rollback::RollbackRequest {
+                operation_id: request.id.clone(),
+                expected_generation: request.expected_generation,
+                policy_epoch: 0,
+                previous_digest: String::new(),
+                nodes: Vec::new(),
+            }));
         }
         let Some(plan) = self.plans.get(&(request.kind, request.payload_key.clone())) else {
             if request.kind == JobKind::Build {
@@ -283,7 +335,14 @@ impl ManagerJobInputResolver {
                     });
                 }
             }
-            return if matches!(request.kind, JobKind::Download | JobKind::Stage)
+            return if self.missing_plan_is_unavailable {
+                let kind_has_plans = self.plans.keys().any(|(kind, _)| *kind == request.kind);
+                if kind_has_plans {
+                    Err(ManagerInputError::Rejected)
+                } else {
+                    Err(ManagerInputError::NotConfigured)
+                }
+            } else if matches!(request.kind, JobKind::Download | JobKind::Stage)
                 && self.model_catalog.is_empty()
             {
                 Err(ManagerInputError::Unavailable)
@@ -461,14 +520,12 @@ impl ManagerJobInputResolver {
             }
             ManagerJobInput::Activate(input) => {
                 input.expected_generation = request.expected_generation;
-                input.runtime_lease = request.runtime_lease.clone().expect("checked lease");
+                input.operation_id = request.id.clone();
+                input.profile_id = request.payload_key.clone();
             }
             ManagerJobInput::Rollback(input) => {
-                if input.previous_digest.is_empty() {
-                    return Err(ManagerInputError::Unavailable);
-                }
                 input.expected_generation = request.expected_generation;
-                input.runtime_lease = request.runtime_lease.clone().expect("checked lease");
+                input.operation_id = request.id.clone();
             }
             _ => {}
         }
@@ -478,6 +535,12 @@ impl ManagerJobInputResolver {
 
 fn valid_model_artifact_id(value: &str) -> bool {
     value.strip_prefix("model-").is_some_and(full_sha256)
+}
+
+fn valid_manager_profile_id(value: &str) -> bool {
+    value.strip_prefix("profile-").is_some_and(|suffix| {
+        suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn valid_build_artifact_id(value: &str) -> bool {
@@ -583,6 +646,7 @@ pub struct RuntimeManagerBackend {
     transport: Option<Arc<dyn download::HttpTransport + Send + Sync>>,
     manager_store: Option<Arc<Mutex<crate::manager::store::ManagerReleaseStore>>>,
     stage_runtime_config: Option<stage::StageRuntimeConfig>,
+    runtime_handle: Mutex<Option<crate::cluster::production::manager::ManagerRuntimeHandle>>,
 }
 
 impl RuntimeManagerBackend {
@@ -597,6 +661,7 @@ impl RuntimeManagerBackend {
             transport: None,
             manager_store: None,
             stage_runtime_config: None,
+            runtime_handle: Mutex::new(None),
         }
     }
 
@@ -658,7 +723,7 @@ impl RuntimeManagerBackend {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn without_model_catalog() -> Self {
-        Self::new_runtime(ManagerJobInputResolver::new())
+        Self::new_runtime(ManagerJobInputResolver::unconfigured_runtime())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1007,6 +1072,7 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                 ManagerInputError::Rejected => {
                     ManagerExecutionError::InputRejected("invalid manager job input".into())
                 }
+                ManagerInputError::NotConfigured => ManagerExecutionError::NotConfigured,
                 ManagerInputError::Unavailable => ManagerExecutionError::Unavailable,
             })?;
         match plan {
@@ -1093,14 +1159,53 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
             } => {
                 self.stage_managed_artifacts(&build_artifact_id, &model_artifact_id, &cancel)?;
             }
-            ManagerJobInput::Activate(_) | ManagerJobInput::Rollback(_) => {
-                return Err(ManagerExecutionError::Unavailable);
+            ManagerJobInput::Activate(input) => {
+                let handle = self
+                    .runtime_handle
+                    .lock()
+                    .map_err(|_| ManagerExecutionError::Unavailable)?
+                    .clone()
+                    .ok_or(ManagerExecutionError::Unavailable)?;
+                handle
+                    .activate_blocking(
+                        crate::cluster::production::manager::ManagerActivationRequest {
+                            operation_id: input.operation_id,
+                            profile_id: input.profile_id,
+                            expected_generation: input.expected_generation,
+                        },
+                    )
+                    .map_err(map_runtime_manager_error)?;
+            }
+            ManagerJobInput::Rollback(input) => {
+                let handle = self
+                    .runtime_handle
+                    .lock()
+                    .map_err(|_| ManagerExecutionError::Unavailable)?
+                    .clone()
+                    .ok_or(ManagerExecutionError::Unavailable)?;
+                handle
+                    .rollback_blocking(
+                        crate::cluster::production::manager::ManagerRollbackRequest {
+                            operation_id: input.operation_id,
+                            expected_generation: input.expected_generation,
+                        },
+                    )
+                    .map_err(map_runtime_manager_error)?;
             }
         }
         if cancel.load(Ordering::SeqCst) {
             return Err(ManagerExecutionError::Canceled);
         }
         Ok(ManagerExecutionOutcome { progress: 100 })
+    }
+
+    fn attach_runtime_handle(
+        &self,
+        handle: crate::cluster::production::manager::ManagerRuntimeHandle,
+    ) {
+        if let Ok(mut current) = self.runtime_handle.lock() {
+            *current = Some(handle);
+        }
     }
 }
 
@@ -1497,27 +1602,6 @@ impl FixtureManagerBackend {
                     model_artifact_path: PathBuf::from("fixture-root/model.bin"),
                 },
             ),
-            (
-                JobKind::Activate,
-                ManagerJobInput::Activate(activation::ActivationRequest {
-                    operation_id: "fixture-activate".into(),
-                    expected_generation: 1,
-                    runtime_lease: "fixture-lease".into(),
-                    policy_epoch: 1,
-                    nodes: vec!["local".into(), "peer".into()],
-                }),
-            ),
-            (
-                JobKind::Rollback,
-                ManagerJobInput::Rollback(rollback::RollbackRequest {
-                    operation_id: "fixture-rollback".into(),
-                    expected_generation: 1,
-                    runtime_lease: "fixture-lease".into(),
-                    policy_epoch: 1,
-                    previous_digest: digest,
-                    nodes: vec!["local".into(), "peer".into()],
-                }),
-            ),
         ];
         for (kind, input) in inputs {
             resolver
@@ -1544,6 +1628,15 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
         if cancel.load(Ordering::SeqCst) {
             return Err(ManagerExecutionError::Canceled);
         }
+        if matches!(request.kind, JobKind::Activate | JobKind::Rollback) {
+            // Fixture execution has no runtime owner and cannot claim to activate a child.
+            if request.expected_generation == 0 {
+                return Err(ManagerExecutionError::InputRejected(
+                    "activation generation is required".into(),
+                ));
+            }
+            return Err(ManagerExecutionError::Unavailable);
+        }
         let input = self
             .resolver
             .resolve_inner(&request, false)
@@ -1551,6 +1644,7 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
                 ManagerInputError::Rejected => {
                     ManagerExecutionError::InputRejected("invalid fixture input".into())
                 }
+                ManagerInputError::NotConfigured => ManagerExecutionError::NotConfigured,
                 ManagerInputError::Unavailable => ManagerExecutionError::Unavailable,
             })?;
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1583,23 +1677,6 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
                 stage::stage_profile(*request)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
-            ManagerJobInput::Activate(input) => {
-                if !matches!(
-                    activation::prepare_activation(input, &FixtureNodeProvider),
-                    Ok(activation::PrepareOutcome::Prepared(_))
-                ) {
-                    return Err(ManagerExecutionError::Unavailable);
-                }
-            }
-            ManagerJobInput::Rollback(input) => {
-                rollback::rollback_to_previous(
-                    input,
-                    &FixtureNodeProvider,
-                    &mut FixtureRecovery,
-                    false,
-                )
-                .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
-            }
             _ => {
                 return Err(ManagerExecutionError::InputRejected(
                     "invalid fixture plan".into(),
@@ -1610,26 +1687,6 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
             return Err(ManagerExecutionError::Canceled);
         }
         Ok(ManagerExecutionOutcome { progress: 100 })
-    }
-}
-
-#[cfg(feature = "test-support")]
-struct FixtureNodeProvider;
-
-#[cfg(feature = "test-support")]
-impl activation::NodeArtifactProvider for FixtureNodeProvider {
-    fn verified_artifact(&self, _node: &activation::NodeId) -> Option<String> {
-        Some(verify::hex_sha256(b"fixture"))
-    }
-}
-
-#[cfg(feature = "test-support")]
-struct FixtureRecovery;
-
-#[cfg(feature = "test-support")]
-impl rollback::PreviousRecovery for FixtureRecovery {
-    fn start_previous_and_wait_ready(&mut self) -> Result<(), activation::ActivationError> {
-        Ok(())
     }
 }
 
@@ -1897,7 +1954,33 @@ fn public_error(error: &ManagerExecutionError) -> &'static str {
         ManagerExecutionError::Canceled => "manager job canceled",
         ManagerExecutionError::InputRejected(_) => "manager job input rejected",
         ManagerExecutionError::Domain(_) => "manager backend failed",
+        ManagerExecutionError::NotConfigured => "manager job input is not configured",
         ManagerExecutionError::Unavailable => "manager backend unavailable",
+        ManagerExecutionError::StaleGeneration => "manager request generation is stale",
+        ManagerExecutionError::LifecycleBusy => "lifecycle operation in progress",
+        ManagerExecutionError::LeaseUnavailable => "manager peer lease is unavailable",
+        ManagerExecutionError::StalePolicyEpoch => "manager policy is not committed",
+        ManagerExecutionError::UnpairedPeer => "manager activation requires a paired peer",
+        ManagerExecutionError::NotReady => "manager profile is not activation-ready",
+        ManagerExecutionError::ManualIntervention => {
+            "manager activation requires manual intervention"
+        }
+    }
+}
+
+fn map_runtime_manager_error(
+    error: crate::cluster::production::manager::ManagerRuntimeError,
+) -> ManagerExecutionError {
+    use crate::cluster::production::manager::ManagerRuntimeError as RuntimeError;
+    match error {
+        RuntimeError::Unavailable => ManagerExecutionError::Unavailable,
+        RuntimeError::Busy => ManagerExecutionError::LifecycleBusy,
+        RuntimeError::StaleGeneration => ManagerExecutionError::StaleGeneration,
+        RuntimeError::LeaseUnavailable => ManagerExecutionError::LeaseUnavailable,
+        RuntimeError::StalePolicyEpoch => ManagerExecutionError::StalePolicyEpoch,
+        RuntimeError::UnpairedPeer => ManagerExecutionError::UnpairedPeer,
+        RuntimeError::NotReady => ManagerExecutionError::NotReady,
+        RuntimeError::ManualIntervention => ManagerExecutionError::ManualIntervention,
     }
 }
 
@@ -2040,7 +2123,6 @@ mod tests {
             kind,
             payload_key: key.to_string(),
             expected_generation: 0,
-            runtime_lease: None,
         }
     }
 

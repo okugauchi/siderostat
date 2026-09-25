@@ -332,7 +332,6 @@ fn fetch_request(id: &str) -> ManagerExecutionRequest {
         kind: JobKind::Fetch,
         payload_key: "official".into(),
         expected_generation: 0,
-        runtime_lease: None,
     }
 }
 
@@ -354,7 +353,6 @@ async fn run_job(
             kind,
             payload_key: payload_key.into(),
             expected_generation: 0,
-            runtime_lease: None,
         })
         .expect("submit manager job");
     executor.shutdown_for_test();
@@ -678,7 +676,6 @@ async fn build_failures_never_publish_artifact_records() {
             kind: JobKind::Build,
             payload_key: build_key(&source_id, "ds4-server"),
             expected_generation: 0,
-            runtime_lease: None,
         },
         Arc::new(AtomicBool::new(true)),
     );

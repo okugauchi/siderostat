@@ -19,6 +19,7 @@ mod routes {
     };
     use siderostat::{
         app::{AppState, admin_router},
+        cluster::production::manager::{ManagerRuntimeError, ManagerRuntimeOperation},
         cluster::{AdminAction, AdminController, AdminExecutor, AdminFuture, encode_token},
         config::ModeAwareConfig,
         manager::executor::{
@@ -283,13 +284,53 @@ mod routes {
             state.clone(),
             "POST",
             "/manager/jobs",
-            r#"{"kind":"activate","payload_key":"unknown","expected_generation":1,"runtime_lease":"lease"}"#,
+            r#"{"kind":"activate","payload_key":"profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_generation":1}"#,
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         let id = body["id"].as_str().expect("id");
         let job = terminal(state, id).await;
         assert_eq!(job["phase"], "failed");
+        assert_eq!(job["error"], "manager backend unavailable");
+    }
+
+    #[tokio::test]
+    async fn activation_job_reaches_runtime_actor_with_generation_only() {
+        let state = state_with_backend(RuntimeManagerBackend::without_model_catalog());
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let actor_observed = observed.clone();
+        state
+            .attach_manager_runtime_for_test(move |operation| {
+                let actor_observed = actor_observed.clone();
+                async move {
+                    let ManagerRuntimeOperation::Activate(request) = operation else {
+                        return Err(ManagerRuntimeError::Unavailable);
+                    };
+                    *actor_observed.lock().unwrap() =
+                        Some((request.profile_id, request.expected_generation));
+                    Ok(serde_json::json!({"accepted": true}))
+                }
+            })
+            .expect("attach test runtime actor");
+
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"activate","payload_key":"profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expected_generation":37}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["id"].as_str().expect("job id");
+        let job = terminal(state, id).await;
+        assert_eq!(job["phase"], "succeeded");
+        assert_eq!(
+            observed.lock().unwrap().as_ref(),
+            Some(&(
+                "profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                37
+            ))
+        );
     }
 }
 
@@ -298,7 +339,6 @@ fn req(kind: &str, key: &str) -> JobSubmitRequest {
         kind: kind.to_string(),
         payload_key: key.to_string(),
         expected_generation: 0,
-        runtime_lease: None,
     }
 }
 
@@ -307,7 +347,6 @@ fn activate_req(key: &str) -> JobSubmitRequest {
         kind: "activate".to_string(),
         payload_key: key.to_string(),
         expected_generation: 3,
-        runtime_lease: Some("lease-3".to_string()),
     }
 }
 
@@ -429,9 +468,9 @@ fn activate_busy_conflicts() {
     ));
 }
 
-/// activate/rollback は generation + lease を要求（C04）。M10。
+/// activate/rollback は generation を要求し、caller lease は unknown field として拒否。M10。
 #[test]
-fn activate_requires_generation_and_lease() {
+fn activate_requires_generation_and_rejects_caller_lease() {
     let mut journal = JobJournal::new();
     let mut a = activate_req("profile-d");
     a.expected_generation = 0;
@@ -439,13 +478,19 @@ fn activate_requires_generation_and_lease() {
         submit(&mut journal, a),
         Err(ManagerApiError::BadRequest(_))
     ));
-    let mut a = activate_req("profile-e");
-    a.runtime_lease = None;
+    let a = activate_req("profile-e");
+    assert!(submit(&mut journal, a).is_ok());
+    let with_lease = serde_json::json!({
+        "kind": "activate",
+        "payload_key": "profile-f",
+        "expected_generation": 3,
+        "runtime_lease": "caller-controlled"
+    });
     assert!(matches!(
-        submit(&mut journal, a),
+        submit_json(&mut journal, &with_lease.to_string()),
         Err(ManagerApiError::BadRequest(_))
     ));
-    // rollback も generation+lease 必須。M10。
+    // rollback も generation 必須。M10。
     let mut rb = activate_req("profile-f");
     rb.kind = "rollback".to_string();
     rb.expected_generation = 0;

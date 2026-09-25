@@ -83,15 +83,13 @@ pub struct StagedProfile {
     pub status: StagedProfileStatus,
 }
 
-/// activation plan（C04: expected_generation + runtime lease）。M07。
+/// activation plan。runtime lease はruntime owner が実行時に取得する。M07。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActivationPlan {
     /// 対象 staged profile。M07。
     pub profile_id: String,
     /// expected generation（activation/rollback に要求）。M07。
     pub expected_generation: u64,
-    /// runtime lease。M07。
-    pub runtime_lease: String,
     /// 空き RAM 確認済み（Validated のみ activation plan を生成）。M07。
     pub ready: bool,
 }
@@ -201,15 +199,10 @@ pub fn stage_profile(req: StageRequest) -> Result<StagedProfile, StageError> {
 ///
 /// 空き RAM 未確認（HardwarePending）は ready=false（起動未実行を ready
 /// 済みとしない）。M07。
-pub fn build_activation_plan(
-    staged: &StagedProfile,
-    expected_generation: u64,
-    runtime_lease: String,
-) -> ActivationPlan {
+pub fn build_activation_plan(staged: &StagedProfile, expected_generation: u64) -> ActivationPlan {
     ActivationPlan {
         profile_id: staged.profile_id.clone(),
         expected_generation,
-        runtime_lease,
         ready: staged.status == StagedProfileStatus::Validated,
     }
 }

@@ -1,7 +1,7 @@
 //! v0.4.0 M09 — rollback・再起動復旧・fault matrix。M09。
 //!
 //! 公開 API（manager::rollback）経由で受入 case を検証する。旧 artifact へ
-//! 同じ runtime lease で復旧し、復旧失敗は ManualIntervention として route を
+//! runtime owner の lifecycle gate を通して復旧し、復旧失敗は ManualIntervention として route を
 //! 閉じる。rollback でも最新 Force intent（policy_epoch）を保持する。旧
 //! artifact の自動削除なし。実 child 起動なし（fake 境界で駆動）。M09。
 //!
@@ -38,7 +38,6 @@ fn req() -> RollbackRequest {
     RollbackRequest {
         operation_id: "op-r".to_string(),
         expected_generation: 1,
-        runtime_lease: "lease-1".to_string(),
         policy_epoch: 7,
         previous_digest: "old-digest".to_string(),
         nodes: vec!["local".to_string(), "peer".to_string()],
@@ -114,7 +113,7 @@ fn m09_ambiguous_journal_not_completed() {
     let prepare_req = siderostat::manager::activation::ActivationRequest {
         operation_id: r.operation_id.clone(),
         expected_generation: r.expected_generation,
-        runtime_lease: r.runtime_lease.clone(),
+        profile_id: String::new(),
         policy_epoch: r.policy_epoch,
         nodes: r.nodes.clone(),
     };

@@ -131,9 +131,11 @@ pub enum PersistedActivationPhase {
     Preparing,
     Draining,
     Starting,
+    Ready,
     Committing,
     RollingBack,
     Complete,
+    RolledBack,
     ManualIntervention,
 }
 
@@ -533,6 +535,115 @@ impl ManagerReleaseStore {
             .ok_or_else(|| StoreError::InvalidReference("artifact".into()))
     }
 
+    /// Revalidate a managed artifact and return its canonical file path for the runtime owner.
+    /// This path is an internal process-construction input and is never projected into the API.
+    pub(crate) fn verified_artifact_path(
+        &mut self,
+        artifact_id: &str,
+        expected_kind: ArtifactKind,
+    ) -> Result<(PersistedArtifactRecord, PathBuf), StoreError> {
+        let artifact = self.verify_managed_artifact(artifact_id, expected_kind)?;
+        let path = self.resolve_artifact_path(&artifact.rel_path)?;
+        Ok((artifact, path))
+    }
+
+    /// Persist one immutable activation intent/phase before the runtime performs its next step.
+    pub fn record_activation(
+        &mut self,
+        record: PersistedActivationRecord,
+    ) -> Result<(), StoreError> {
+        let operation_id = record.operation_id.clone();
+        if let Some(existing) = self.snapshot.activation_journals.get(&operation_id) {
+            if existing != &record {
+                return Err(StoreError::InvalidReference(
+                    "activation operation id collision".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let mut candidate = self.snapshot.clone();
+        candidate.activation_journals.insert(operation_id, record);
+        self.commit_candidate(candidate)
+    }
+
+    /// Advance an activation journal without allowing operation identity or verified artifact
+    /// identity to change. Each phase is durable before the lifecycle owner performs its next
+    /// external action.
+    pub fn advance_activation(
+        &mut self,
+        record: PersistedActivationRecord,
+    ) -> Result<(), StoreError> {
+        let existing = self
+            .snapshot
+            .activation_journals
+            .get(&record.operation_id)
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidReference("activation operation".into()))?;
+        if existing == record {
+            return Ok(());
+        }
+        if !activation_identity_matches(&existing, &record)
+            || !activation_transition_allowed(existing.phase, record.phase)
+            || record.phase == PersistedActivationPhase::Complete
+        {
+            return Err(StoreError::InvalidReference(
+                "activation phase transition".into(),
+            ));
+        }
+        let mut candidate = self.snapshot.clone();
+        candidate
+            .activation_journals
+            .insert(record.operation_id.clone(), record);
+        self.commit_candidate(candidate)
+    }
+
+    /// Atomically publish a completed activation journal and its active/previous pointers.
+    pub fn finish_activation(
+        &mut self,
+        record: PersistedActivationRecord,
+        active: ReleaseIdentity,
+        previous: Option<ReleaseIdentity>,
+    ) -> Result<(), StoreError> {
+        if record.phase != PersistedActivationPhase::Complete
+            || record.participants.is_empty()
+            || record.participants.values().any(|participant| {
+                participant.phase != PersistedActivationPhase::Complete
+                    || participant.commit_ack.is_none()
+            })
+        {
+            return Err(StoreError::InvalidRecord(
+                "activation completion lacks participant acknowledgements".into(),
+            ));
+        }
+        let existing = self
+            .snapshot
+            .activation_journals
+            .get(&record.operation_id)
+            .ok_or_else(|| StoreError::InvalidReference("activation operation".into()))?;
+        if !activation_identity_matches(existing, &record)
+            || !activation_transition_allowed(existing.phase, PersistedActivationPhase::Complete)
+        {
+            return Err(StoreError::InvalidReference(
+                "activation completion transition".into(),
+            ));
+        }
+        let mut candidate = self.snapshot.clone();
+        candidate
+            .activation_journals
+            .insert(record.operation_id.clone(), record);
+        candidate.release_pointers = ReleasePointers {
+            active: Some(active),
+            previous,
+        };
+        let active = candidate
+            .release_pointers
+            .active
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidReference("active release".into()))?;
+        self.verify_release_artifacts(&candidate, active)?;
+        self.commit_candidate(candidate)
+    }
+
     fn ensure_managed_directory(&self, path: &Path) -> Result<(), StoreError> {
         let root = self.root.root();
         if !path.starts_with(root) {
@@ -815,7 +926,11 @@ impl ManagerReleaseStore {
             .map_err(io_error)?;
         let copied = std::io::copy(&mut input, &mut output).map_err(io_error)?;
         output.sync_all().map_err(io_error)?;
-        set_private_file(&temp)?;
+        if draft.kind == ArtifactKind::Build {
+            set_private_executable(&temp)?;
+        } else {
+            set_private_file(&temp)?;
+        }
         drop(output);
         if copied != draft.expected_size {
             let _ = fs::remove_file(&temp);
@@ -1135,6 +1250,76 @@ impl ManagerReleaseStore {
     }
 }
 
+fn activation_identity_matches(
+    existing: &PersistedActivationRecord,
+    next: &PersistedActivationRecord,
+) -> bool {
+    existing.operation_id == next.operation_id
+        && existing.expected_generation == next.expected_generation
+        && existing.policy_epoch == next.policy_epoch
+        && existing.participants.len() == next.participants.len()
+        && existing.participants.iter().all(|(node_id, participant)| {
+            next.participants
+                .get(node_id)
+                .is_some_and(|next_participant| {
+                    participant.node_id == next_participant.node_id
+                        && participant.candidate_profile_id == next_participant.candidate_profile_id
+                        && participant.candidate_digest == next_participant.candidate_digest
+                        && participant.previous_digest == next_participant.previous_digest
+                        && (participant.phase == next_participant.phase
+                            || activation_transition_allowed(
+                                participant.phase,
+                                next_participant.phase,
+                            ))
+                        && ack_is_monotonic(
+                            participant.prepare_ack.as_deref(),
+                            next_participant.prepare_ack.as_deref(),
+                        )
+                        && ack_is_monotonic(
+                            participant.ready_ack.as_deref(),
+                            next_participant.ready_ack.as_deref(),
+                        )
+                        && ack_is_monotonic(
+                            participant.commit_ack.as_deref(),
+                            next_participant.commit_ack.as_deref(),
+                        )
+                })
+        })
+}
+
+fn ack_is_monotonic(existing: Option<&str>, next: Option<&str>) -> bool {
+    existing.is_none() || existing == next
+}
+
+fn activation_transition_allowed(
+    from: PersistedActivationPhase,
+    to: PersistedActivationPhase,
+) -> bool {
+    use PersistedActivationPhase as Phase;
+    matches!(
+        (from, to),
+        (
+            Phase::Preparing,
+            Phase::Draining | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::Draining,
+            Phase::Starting | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::Starting,
+            Phase::Ready | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::Ready,
+            Phase::Committing | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::Committing,
+            Phase::Complete | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::RollingBack,
+            Phase::RolledBack | Phase::ManualIntervention
+        )
+    )
+}
+
 /// Adapter that persists the JobJournal into the shared release-store snapshot.
 /// Callers hold the journal lock before this adapter acquires the store lock.
 #[derive(Clone)]
@@ -1285,6 +1470,15 @@ fn set_private_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn set_private_executable(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+    }
+    Ok(())
+}
+
 fn io_error(error: std::io::Error) -> StoreError {
     StoreError::Io(error.to_string())
 }
@@ -1423,6 +1617,180 @@ mod tests {
             reopened.snapshot().release_pointers.previous,
             Some(ReleaseIdentity::ExternalBaseline { .. })
         ));
+    }
+
+    #[test]
+    fn activation_intent_and_commit_are_durable_store_transitions() {
+        let root_path = root("activation");
+        let manager_root = ManagerRoot::explicit(root_path.clone());
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "local-node").expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root_path);
+        let previous = ReleaseIdentity::ExternalBaseline {
+            config_fingerprint: "d".repeat(64),
+            executable_sha256: "e".repeat(64),
+            model_sha256: "f".repeat(64),
+        };
+        let participant = PersistedParticipantRecord {
+            node_id: "local-node".into(),
+            candidate_profile_id: profile_id.clone(),
+            candidate_digest: "a".repeat(64),
+            previous_digest: Some("f".repeat(64)),
+            phase: PersistedActivationPhase::Preparing,
+            prepare_ack: Some("prepared".into()),
+            ready_ack: None,
+            commit_ack: None,
+        };
+        let preparing = PersistedActivationRecord {
+            operation_id: "activate-1".into(),
+            expected_generation: 7,
+            policy_epoch: 3,
+            phase: PersistedActivationPhase::Preparing,
+            participants: BTreeMap::from([("local-node".into(), participant.clone())]),
+            failure_class: None,
+        };
+        store
+            .record_activation(preparing)
+            .expect("persist activation intent");
+        drop(store);
+
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "local-node").expect("reopen intent");
+        assert_eq!(
+            store.snapshot().activation_journals["activate-1"].phase,
+            PersistedActivationPhase::Preparing
+        );
+        for phase in [
+            PersistedActivationPhase::Draining,
+            PersistedActivationPhase::Starting,
+            PersistedActivationPhase::Ready,
+            PersistedActivationPhase::Committing,
+        ] {
+            let mut advancing = store.snapshot().activation_journals["activate-1"].clone();
+            advancing.phase = phase;
+            let participant = advancing
+                .participants
+                .get_mut("local-node")
+                .expect("local participant");
+            participant.phase = phase;
+            if phase == PersistedActivationPhase::Ready {
+                participant.ready_ack = Some("ready".into());
+            }
+            store
+                .advance_activation(advancing)
+                .expect("persist next activation phase");
+        }
+        let committed = PersistedActivationRecord {
+            phase: PersistedActivationPhase::Complete,
+            participants: BTreeMap::from([(
+                "local-node".into(),
+                PersistedParticipantRecord {
+                    phase: PersistedActivationPhase::Complete,
+                    ready_ack: Some("ready".into()),
+                    commit_ack: Some("committed".into()),
+                    ..participant
+                },
+            )]),
+            ..store.snapshot().activation_journals["activate-1"].clone()
+        };
+        store
+            .finish_activation(
+                committed.clone(),
+                ReleaseIdentity::ManagedProfile(profile_id.clone()),
+                Some(previous),
+            )
+            .expect("atomically publish active pointer and completion");
+        drop(store);
+
+        let reopened =
+            ManagerReleaseStore::open(manager_root, "local-node").expect("reopen committed state");
+        assert_eq!(
+            reopened.snapshot().activation_journals["activate-1"],
+            committed
+        );
+        assert_eq!(
+            reopened.snapshot().release_pointers.active,
+            Some(ReleaseIdentity::ManagedProfile(profile_id))
+        );
+        assert!(reopened.snapshot().release_pointers.previous.is_some());
+    }
+
+    #[test]
+    fn activation_phase_advances_durably_without_changing_immutable_identity() {
+        let root_path = root("activation-advance");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root_path.clone()), "local-node")
+                .expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root_path);
+        let participant = PersistedParticipantRecord {
+            node_id: "local-node".into(),
+            candidate_profile_id: profile_id,
+            candidate_digest: "a".repeat(64),
+            previous_digest: None,
+            phase: PersistedActivationPhase::Preparing,
+            prepare_ack: Some("prepared".into()),
+            ready_ack: None,
+            commit_ack: None,
+        };
+        let preparing = PersistedActivationRecord {
+            operation_id: "activation-phase-1".into(),
+            expected_generation: 4,
+            policy_epoch: 2,
+            phase: PersistedActivationPhase::Preparing,
+            participants: BTreeMap::from([("local-node".into(), participant.clone())]),
+            failure_class: None,
+        };
+        store.record_activation(preparing).expect("record intent");
+        let draining = PersistedActivationRecord {
+            phase: PersistedActivationPhase::Draining,
+            participants: BTreeMap::from([(
+                "local-node".into(),
+                PersistedParticipantRecord {
+                    phase: PersistedActivationPhase::Draining,
+                    ..participant.clone()
+                },
+            )]),
+            ..store.snapshot().activation_journals["activation-phase-1"].clone()
+        };
+        store
+            .advance_activation(draining.clone())
+            .expect("advance to draining");
+        assert_eq!(
+            store.snapshot().activation_journals["activation-phase-1"],
+            draining
+        );
+
+        let mut collision = draining;
+        collision
+            .participants
+            .get_mut("local-node")
+            .unwrap()
+            .candidate_digest = "b".repeat(64);
+        assert!(matches!(
+            store.advance_activation(collision),
+            Err(StoreError::InvalidReference(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_build_artifact_is_executable_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_path = root("build-mode");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root_path.clone()), "local-node")
+                .expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root_path);
+        let profile = &store.snapshot().profiles[&profile_id];
+        let build = &store.snapshot().artifacts[&profile.role_artifact_ids[0]];
+        let path = root_path.join(&build.rel_path);
+        let mode = fs::metadata(path)
+            .expect("published build metadata")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "build artifact must be executable");
+        assert_eq!(mode & 0o077, 0, "build artifact must remain private");
     }
 
     #[test]

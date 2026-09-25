@@ -21,7 +21,6 @@ fn request(kind: JobKind, key: &str) -> ManagerExecutionRequest {
         kind,
         payload_key: key.into(),
         expected_generation: 3,
-        runtime_lease: Some("lease-3".into()),
     }
 }
 
@@ -88,11 +87,10 @@ fn unknown_payload_key_is_rejected_without_domain_call() {
 }
 
 #[test]
-fn activation_without_generation_or_lease_is_rejected() {
+fn activation_without_generation_is_rejected() {
     let backend = FixtureManagerBackend::new();
     let mut req = request(JobKind::Activate, "fixture-activate");
     req.expected_generation = 0;
-    req.runtime_lease = None;
     let result = backend.execute(req, Arc::new(AtomicBool::new(false)));
     assert!(matches!(
         result,
@@ -120,17 +118,30 @@ fn fixture_backend_reaches_each_domain_adapter() {
         (JobKind::Download, "fixture-download"),
         (JobKind::Verify, "fixture-verify"),
         (JobKind::Stage, "fixture-stage"),
-        (JobKind::Activate, "fixture-activate"),
-        (JobKind::Rollback, "fixture-rollback"),
     ] {
         let result = backend.execute(request(kind, key), Arc::new(AtomicBool::new(false)));
         assert!(result.is_ok(), "{kind}: {result:?}");
     }
-    assert_eq!(backend.domain_call_count(), 7);
+    let profile_id = format!("profile-{}", "b".repeat(64));
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Activate, &profile_id),
+            Arc::new(AtomicBool::new(false))
+        ),
+        Err(ManagerExecutionError::Unavailable)
+    ));
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Rollback, "previous"),
+            Arc::new(AtomicBool::new(false))
+        ),
+        Err(ManagerExecutionError::Unavailable)
+    ));
+    assert_eq!(backend.domain_call_count(), 5);
 }
 
 #[tokio::test]
-async fn seven_fixture_jobs_reach_terminal_success() {
+async fn preparation_fixture_jobs_succeed_but_activation_needs_runtime() {
     let journal = Arc::new(Mutex::new(JobJournal::new()));
     let (executor, worker) = ManagerExecutor::start(journal.clone(), FixtureManagerBackend::new());
     let mut ids = Vec::new();
@@ -140,8 +151,6 @@ async fn seven_fixture_jobs_reach_terminal_success() {
         JobKind::Download,
         JobKind::Verify,
         JobKind::Stage,
-        JobKind::Activate,
-        JobKind::Rollback,
     ] {
         let key = format!("fixture-{kind}");
         let id = journal.lock().unwrap().enqueue(kind, &key).unwrap();
@@ -153,6 +162,24 @@ async fn seven_fixture_jobs_reach_terminal_success() {
             .unwrap();
         ids.push(id);
     }
+    let mut rejected_ids = Vec::new();
+    for kind in [JobKind::Activate, JobKind::Rollback] {
+        let key = if kind == JobKind::Activate {
+            format!("profile-{}", "c".repeat(64))
+        } else {
+            "previous".into()
+        };
+        let id = journal.lock().unwrap().enqueue(kind, &key).unwrap();
+        executor
+            .submit(ManagerExecutionRequest {
+                id: id.clone(),
+                kind,
+                payload_key: key,
+                expected_generation: 3,
+            })
+            .unwrap();
+        rejected_ids.push(id);
+    }
     executor.shutdown_for_test();
     worker.await.unwrap();
     let journal = journal.lock().unwrap();
@@ -160,6 +187,14 @@ async fn seven_fixture_jobs_reach_terminal_success() {
         ids.iter()
             .all(|id| journal.get(id).unwrap().phase == JobPhase::Succeeded)
     );
+    for id in &rejected_ids {
+        assert_eq!(journal.get(id).unwrap().phase, JobPhase::Failed);
+        assert_eq!(
+            journal.get(id).unwrap().error,
+            "manager backend unavailable"
+        );
+    }
+    assert_eq!(journal.all().len(), 7);
 }
 
 #[tokio::test]
@@ -460,60 +495,36 @@ fn registered_verify_record_with_missing_file_is_unavailable() {
 
 #[test]
 fn runtime_resolver_preserves_activation_context_and_requires_runtime() {
-    let mut resolver = ManagerJobInputResolver::new();
-    resolver
-        .register(
-            JobKind::Activate,
-            "profile",
-            ManagerJobInput::Activate(siderostat::manager::ActivationRequest {
-                operation_id: "operation".into(),
-                expected_generation: 1,
-                runtime_lease: "configured".into(),
-                policy_epoch: 7,
-                nodes: vec!["local".into(), "peer".into()],
-            }),
-        )
-        .unwrap();
-    let input = resolver
-        .resolve(&request(JobKind::Activate, "profile"))
-        .unwrap();
+    let resolver = ManagerJobInputResolver::new();
+    let profile_id = format!("profile-{}", "a".repeat(64));
+    let mut activation = request(JobKind::Activate, &profile_id);
+    activation.id = "operation".into();
+    activation.expected_generation = 42;
+    let input = resolver.resolve(&activation).unwrap();
     let ManagerJobInput::Activate(input) = input else {
         panic!("wrong plan")
     };
-    assert_eq!(input.expected_generation, 3);
-    assert_eq!(input.runtime_lease, "lease-3");
+    assert_eq!(input.operation_id, "operation");
+    assert_eq!(input.profile_id, profile_id);
+    assert_eq!(input.expected_generation, 42);
     let backend = RuntimeManagerBackend::new(resolver);
     assert!(matches!(
-        backend.execute(
-            request(JobKind::Activate, "profile"),
-            Arc::new(AtomicBool::new(false))
-        ),
+        backend.execute(activation, Arc::new(AtomicBool::new(false))),
         Err(ManagerExecutionError::Unavailable)
     ));
 }
 
 #[test]
-fn submit_context_is_preserved_and_blank_lease_is_rejected() {
+fn submit_context_preserves_generation_without_caller_lease() {
     let submitted = JobSubmitRequest {
         kind: "rollback".into(),
         payload_key: "previous".into(),
         expected_generation: 42,
-        runtime_lease: Some("lease-42".into()),
     };
     let execution = submitted.execution_request("job-42".into()).unwrap();
     assert_eq!(execution.kind, JobKind::Rollback);
     assert_eq!(execution.payload_key, "previous");
     assert_eq!(execution.expected_generation, 42);
-    assert_eq!(execution.runtime_lease.as_deref(), Some("lease-42"));
-
-    let backend = FixtureManagerBackend::new();
-    let mut invalid = request(JobKind::Rollback, "fixture-rollback");
-    invalid.runtime_lease = Some("  ".into());
-    assert!(matches!(
-        backend.execute(invalid, Arc::new(AtomicBool::new(false))),
-        Err(ManagerExecutionError::InputRejected(_))
-    ));
-    assert_eq!(backend.domain_call_count(), 0);
 }
 
 #[test]
@@ -526,7 +537,6 @@ fn missing_previous_digest_is_unavailable_before_runtime_call() {
             ManagerJobInput::Rollback(RollbackRequest {
                 operation_id: "rollback".into(),
                 expected_generation: 1,
-                runtime_lease: "configured".into(),
                 policy_epoch: 1,
                 previous_digest: String::new(),
                 nodes: vec!["local".into(), "peer".into()],

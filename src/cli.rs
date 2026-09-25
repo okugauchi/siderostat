@@ -52,7 +52,7 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ManagerCommand {
     /// `POST /manager/jobs`。kind は fetch/build/download/verify/stage/activate/rollback。
-    /// activate/rollback は expected-generation と runtime-lease を要求する。M10。
+    /// activate/rollback は expected-generation を要求する。runtime lease は runtime が解決する。M10。
     Submit {
         #[arg(long)]
         kind: String,
@@ -60,8 +60,6 @@ enum ManagerCommand {
         payload_key: String,
         #[arg(long)]
         expected_generation: u64,
-        #[arg(long)]
-        runtime_lease: Option<String>,
     },
     /// `GET /manager/status`。job 進捗を観測する。M10。
     Status,
@@ -198,7 +196,6 @@ fn manager_request(
             kind,
             payload_key,
             expected_generation,
-            runtime_lease,
         } => (
             reqwest::Method::POST,
             "/manager/jobs",
@@ -206,7 +203,6 @@ fn manager_request(
                 "kind": kind,
                 "payload_key": payload_key,
                 "expected_generation": expected_generation,
-                "runtime_lease": runtime_lease,
             })),
             true,
         ),

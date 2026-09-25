@@ -72,6 +72,11 @@ pub struct AppState {
     pub manager_store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
     manager_executor: crate::manager::executor::ManagerExecutorHandle,
     manager_worker: tokio::task::JoinHandle<()>,
+    manager_runtime_receiver:
+        std::sync::Mutex<Option<crate::cluster::production::manager::ManagerRuntimeReceiver>>,
+    manager_runtime_actor: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    standalone_lifecycle_lease: crate::cluster::OperationLease,
+    standalone_restart_lease: std::sync::Mutex<Option<crate::cluster::OperationLeaseGuard>>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -220,6 +225,9 @@ impl AppState {
         }
 
         let jobs = Arc::new(std::sync::Mutex::new(job_journal));
+        let (manager_runtime_handle, manager_runtime_receiver) =
+            crate::cluster::production::manager::manager_runtime_channel();
+        backend.attach_runtime_handle(manager_runtime_handle);
         let (manager_executor, manager_worker) =
             crate::manager::executor::ManagerExecutor::start(jobs.clone(), backend);
 
@@ -245,6 +253,10 @@ impl AppState {
             manager_store,
             manager_executor,
             manager_worker,
+            manager_runtime_receiver: std::sync::Mutex::new(Some(manager_runtime_receiver)),
+            manager_runtime_actor: std::sync::Mutex::new(None),
+            standalone_lifecycle_lease: crate::cluster::OperationLease::new(),
+            standalone_restart_lease: std::sync::Mutex::new(None),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -268,6 +280,52 @@ impl AppState {
             .cluster
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cluster);
+    }
+
+    fn attach_manager_runtime_actor<F, Fut>(&self, handler: F) -> anyhow::Result<()>
+    where
+        F: Fn(crate::cluster::production::manager::ManagerRuntimeOperation) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    serde_json::Value,
+                    crate::cluster::production::manager::ManagerRuntimeError,
+                >,
+            > + Send
+            + 'static,
+    {
+        let receiver = self
+            .manager_runtime_receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .context("manager runtime receiver was already attached")?;
+        let actor = receiver.spawn(handler);
+        *self
+            .manager_runtime_actor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(actor);
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn attach_manager_runtime_for_test<F, Fut>(&self, handler: F) -> anyhow::Result<()>
+    where
+        F: Fn(crate::cluster::production::manager::ManagerRuntimeOperation) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    serde_json::Value,
+                    crate::cluster::production::manager::ManagerRuntimeError,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.attach_manager_runtime_actor(handler)
     }
 
     fn cluster_snapshot(&self) -> Option<crate::cluster::ClusterSnapshot> {
@@ -392,15 +450,41 @@ impl AppState {
     /// Try to claim the single in-flight graceful restart slot. Returns `true`
     /// when this caller is the first to claim it (C-04a duplicate guard).
     fn try_claim_graceful_restart(&self) -> bool {
-        !self
+        if self
             .graceful_restart_in_progress
             .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if self.production_runtime().is_none() {
+            let id = crate::cluster::OperationId(uuid::Uuid::new_v4());
+            let guard = match self
+                .standalone_lifecycle_lease
+                .claim(crate::cluster::OperationKind::Restart, id)
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.graceful_restart_in_progress
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    return false;
+                }
+            };
+            *self
+                .standalone_restart_lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        }
+        true
     }
 
     /// Release the graceful restart slot. The process usually exits right after
     /// a successful restart, but a drain-timeout or identity-mismatch failure
     /// must release it so an operator can retry (C-04b).
     fn release_graceful_restart(&self) {
+        self.standalone_restart_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         self.graceful_restart_in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -413,6 +497,14 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.manager_worker.abort();
+        if let Some(actor) = self
+            .manager_runtime_actor
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            actor.abort();
+        }
     }
 }
 
@@ -731,6 +823,30 @@ pub async fn serve_with_options(
         false,
     );
     let supervisor = build_standalone_supervisor(&config, &state, dry_run)?;
+    let manager_manual = !dry_run
+        && crate::cluster::production::manager::prepare_manager_startup(
+            &state.manager_store,
+            &config,
+            &supervisor,
+        )
+        .await;
+    let restart = if manager_manual {
+        let baseline_generation = match restart {
+            RestartDecision::StartSolo {
+                baseline_generation,
+            }
+            | RestartDecision::ManualIntervention {
+                baseline_generation,
+                ..
+            } => baseline_generation,
+        };
+        RestartDecision::ManualIntervention {
+            baseline_generation,
+            reason: crate::cluster::RestartManualReason::ManagerActivationUnresolved,
+        }
+    } else {
+        restart
+    };
     // C-04a: graceful restart の fallback owner として supervisor への参照を保持する。
     // cluster 有効時は ProductionClusterRuntime が優先され、distributed child を所有する。
     state.attach_supervisor(supervisor.clone());
@@ -763,6 +879,45 @@ pub async fn serve_with_options(
     if let (Some(production), Some(store)) = (production.as_ref(), state_store.as_ref()) {
         production.attach_policy_store(store.clone());
     }
+    if config.cluster.enabled {
+        if let Some(production) = production.clone() {
+            let store = state.manager_store.clone();
+            state.attach_manager_runtime_actor(move |operation| {
+                let production = production.clone();
+                let store = store.clone();
+                async move {
+                    crate::cluster::production::manager::handle_cluster_operation(
+                        &production,
+                        &store,
+                        operation,
+                    )
+                    .await
+                }
+            })?;
+        } else {
+            state.attach_manager_runtime_actor(|_| async {
+                Err(crate::cluster::production::manager::ManagerRuntimeError::Unavailable)
+            })?;
+        }
+    } else if dry_run {
+        state.attach_manager_runtime_actor(|_| async {
+            Err(crate::cluster::production::manager::ManagerRuntimeError::NotReady)
+        })?;
+    } else {
+        let owner = Arc::new(
+            crate::cluster::production::manager::StandaloneManagerRuntimeOwner::new(
+                state.manager_store.clone(),
+                Arc::new(config.clone()),
+                runtime.clone(),
+                supervisor.clone(),
+                state.standalone_lifecycle_lease.clone(),
+            ),
+        );
+        state.attach_manager_runtime_actor(move |operation| {
+            let owner = owner.clone();
+            async move { owner.handle(operation).await }
+        })?;
+    }
     let notifier = build_notifier(
         config.notifications.enabled,
         config.notifications.sound,
@@ -781,17 +936,9 @@ pub async fn serve_with_options(
         &runtime,
         &supervisor,
         production.as_ref(),
-        &config.ds4.standalone.profile_id,
     );
     if let Some(store) = &state_store {
-        persist_runtime_state(
-            store,
-            &runtime,
-            &supervisor,
-            production.as_ref(),
-            &config.ds4.standalone.profile_id,
-        )
-        .await?;
+        persist_runtime_state(store, &runtime, &supervisor, production.as_ref()).await?;
     }
     let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
     let local_monitor = spawn_local_monitor(
@@ -799,7 +946,6 @@ pub async fn serve_with_options(
         state_store.clone(),
         &runtime,
         &supervisor,
-        &config.ds4.standalone.profile_id,
         notification_service.clone(),
     );
     // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
@@ -1121,7 +1267,6 @@ fn spawn_transition_monitor(
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     production: Option<&ProductionClusterRuntime>,
-    profile: &str,
 ) -> tokio::task::JoinHandle<()> {
     let mut transition_snapshots = runtime.cluster_handle().subscribe();
     let transition_metrics = state.metrics.clone();
@@ -1129,7 +1274,6 @@ fn spawn_transition_monitor(
     let transition_runtime = runtime.clone();
     let transition_supervisor = supervisor.clone();
     let transition_production = production.cloned();
-    let transition_profile = profile.to_string();
     tokio::spawn(async move {
         let mut previous = *transition_snapshots.borrow_and_update();
         let mut transition_started = std::time::Instant::now();
@@ -1151,7 +1295,6 @@ fn spawn_transition_monitor(
                     &transition_runtime,
                     &transition_supervisor,
                     transition_production.as_ref(),
-                    &transition_profile,
                 )
                 .await
                 {
@@ -1196,13 +1339,11 @@ fn spawn_local_monitor(
     state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
-    profile: &str,
     notifier: Arc<std::sync::Mutex<DesktopNotificationService>>,
 ) -> tokio::task::JoinHandle<()> {
     let local_monitor_runtime = runtime.clone();
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
-    let local_monitor_profile = profile.to_string();
     let local_monitor_metrics = state.metrics.clone();
     let local_monitor_notifier = notifier;
     tokio::spawn(async move {
@@ -1225,7 +1366,6 @@ fn spawn_local_monitor(
                             &local_monitor_runtime,
                             &local_monitor_supervisor,
                             None,
-                            &local_monitor_profile,
                         )
                         .await
                         {
@@ -1465,7 +1605,6 @@ async fn persist_runtime_state(
     runtime: &ModeRuntime,
     supervisor: &StandaloneSupervisor,
     production: Option<&ProductionClusterRuntime>,
-    active_profile: &str,
 ) -> anyhow::Result<()> {
     let snapshot = runtime.snapshot();
     let distributed = if snapshot.stable_mode == StableMode::DistributedLayerParallel {
@@ -1491,6 +1630,15 @@ async fn persist_runtime_state(
         spawned_at_millis: identity.spawned_at_millis,
         process_start_micros: identity.process_start_micros,
     });
+    let active_profile = match production {
+        Some(production) => {
+            production
+                .current_manager_command_snapshot()
+                .await?
+                .profile_id
+        }
+        None => supervisor.command_snapshot().await?.profile_id,
+    };
     let control_session_generation = match production {
         Some(production) => production.control_session_generation().await,
         None => snapshot.generation,
@@ -1525,13 +1673,7 @@ async fn persist_runtime_state(
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
             ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
         },
-        active_profile: Some(
-            if snapshot.stable_mode == StableMode::DistributedLayerParallel {
-                "distributed-layer-parallel".into()
-            } else {
-                active_profile.into()
-            },
-        ),
+        active_profile: Some(active_profile),
         child,
         last_failure: None,
         operator_policy,
@@ -3284,6 +3426,10 @@ mod tests {
             manager_store,
             manager_executor,
             manager_worker,
+            manager_runtime_receiver: std::sync::Mutex::new(None),
+            manager_runtime_actor: std::sync::Mutex::new(None),
+            standalone_lifecycle_lease: crate::cluster::OperationLease::new(),
+            standalone_restart_lease: std::sync::Mutex::new(None),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -3297,6 +3443,72 @@ mod tests {
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
+    }
+
+    #[tokio::test]
+    async fn runtime_state_persists_the_supervisors_selected_profile() {
+        let proxy = Arc::new(
+            ModeAwareProxyState::new(
+                url::Url::parse("http://127.0.0.1:8000").unwrap(),
+                url::Url::parse("http://10.99.0.1:18082").unwrap(),
+                ModeAwareProxyOptions {
+                    max_in_flight: 1,
+                    request_body_limit_bytes: 4096,
+                    response_header_timeout: std::time::Duration::from_secs(1),
+                    first_body_byte_timeout: std::time::Duration::from_secs(1),
+                    stream_idle_timeout: std::time::Duration::from_secs(1),
+                    connect_timeout: std::time::Duration::from_secs(1),
+                },
+            )
+            .unwrap(),
+        );
+        let command = crate::cluster::Ds4Command {
+            executable: std::path::PathBuf::from("/bin/sleep"),
+            working_directory: std::path::PathBuf::from("/"),
+            argv: vec![std::ffi::OsString::from("3600")],
+            profile: crate::cluster::Ds4Profile {
+                profile_id: "runtime-selected-profile".into(),
+                quantization: Quantization::Q2Q4,
+                residency: Residency::SsdStreaming,
+                speculative_support: SpeculativeSupport::None,
+            },
+        };
+        let supervisor = Arc::new(StandaloneSupervisor::new_dry_run(
+            command,
+            url::Url::parse("http://127.0.0.1:8000/v1/models").unwrap(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(1),
+            false,
+            Arc::new(Metrics::default()),
+        ));
+        let runtime = ModeRuntime::spawn_ready(
+            LocalRole::Unknown,
+            proxy,
+            supervisor.clone(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("runtime starts");
+        let state_path = std::env::temp_dir().join(format!(
+            "siderostat-runtime-profile-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_store = StateStore::acquire(&state_path).expect("state store");
+
+        persist_runtime_state(&state_store, &runtime, &supervisor, None)
+            .await
+            .expect("persist runtime snapshot");
+
+        let persisted = state_store
+            .load()
+            .expect("load state")
+            .expect("saved state");
+        assert_eq!(
+            persisted.active_profile.as_deref(),
+            Some("runtime-selected-profile")
+        );
     }
 
     #[derive(Clone, Default)]

@@ -49,6 +49,7 @@ use tokio::sync::Mutex;
 
 pub mod activation;
 mod effects;
+pub mod manager;
 mod pairing;
 pub(crate) mod policy;
 mod reconcile;
@@ -1158,6 +1159,25 @@ impl ProductionClusterRuntime {
                     .await
             }
         }
+    }
+
+    pub(crate) async fn current_manager_command_snapshot(
+        &self,
+    ) -> anyhow::Result<CommandSlotSnapshot> {
+        use super::process::Ds4CommandRole;
+
+        let snapshot = self.inner.mode.snapshot();
+        let command_role = match snapshot.stable_mode {
+            crate::target::StableMode::DistributedLayerParallel
+            | crate::target::StableMode::DistributedTensorParallel => match self.inner.role {
+                LocalRole::Coordinator => Ds4CommandRole::Coordinator,
+                LocalRole::Worker => Ds4CommandRole::Worker,
+                LocalRole::Unknown => anyhow::bail!("runtime role is unavailable"),
+            },
+            crate::target::StableMode::SoloStandalone
+            | crate::target::StableMode::PairedStandalone => Ds4CommandRole::Standalone,
+        };
+        self.manager_command_snapshot(command_role).await
     }
 
     fn manager_activation_active(&self) -> bool {

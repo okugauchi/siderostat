@@ -155,14 +155,11 @@ pub struct JobSubmitRequest {
     /// activation/rollback に要求（C04）。M10。
     #[serde(default)]
     pub expected_generation: u64,
-    /// activation/rollback に要求（C04）。M10。
-    #[serde(default)]
-    pub runtime_lease: Option<String>,
 }
 
 impl JobSubmitRequest {
-    /// Preserve the submitted generation and lease when handing a journaled
-    /// request to the executor. The payload key remains an opaque lookup key.
+    /// Preserve the submitted generation when handing a journaled request to the executor.
+    /// Runtime lease material is resolved only by the runtime owner.
     pub fn execution_request(
         &self,
         id: String,
@@ -174,7 +171,6 @@ impl JobSubmitRequest {
             kind,
             payload_key: self.payload_key.clone(),
             expected_generation: self.expected_generation,
-            runtime_lease: self.runtime_lease.clone(),
         })
     }
 }
@@ -243,19 +239,19 @@ pub fn parse_kind(kind: &str) -> Option<JobKind> {
     }
 }
 
-/// job を submit する。activation/rollback は expected_generation +
-/// runtime_lease を要求する。activate busy → 409。M10。
+/// job を submit する。activation/rollback は expected_generation を要求し、
+/// runtime lease はruntime owner が実行時に解決する。activate busy → 409。M10。
 pub fn submit(
     journal: &mut JobJournal,
     req: JobSubmitRequest,
 ) -> Result<SubmitResponse, ManagerApiError> {
     let kind = parse_kind(&req.kind)
         .ok_or_else(|| ManagerApiError::BadRequest(format!("unknown job kind: {}", req.kind)))?;
-    // activation/rollback だけ generation + lease を要求（C04）。M10。
+    // activation/rollback だけ generation を要求（C04）。M10。
     if matches!(kind, JobKind::Activate | JobKind::Rollback) {
-        if req.expected_generation == 0 || req.runtime_lease.as_deref().unwrap_or("").is_empty() {
+        if req.expected_generation == 0 {
             return Err(ManagerApiError::BadRequest(
-                "activate/rollback requires expected_generation and runtime_lease".to_string(),
+                "activate/rollback requires expected_generation".to_string(),
             ));
         }
         // activate busy → 409（同時 activation は 1、C04）。M10。
@@ -497,7 +493,6 @@ mod tests {
             kind: kind.to_string(),
             payload_key: key.to_string(),
             expected_generation: 0,
-            runtime_lease: None,
         }
     }
 
@@ -506,7 +501,6 @@ mod tests {
             kind: "activate".to_string(),
             payload_key: key.to_string(),
             expected_generation: 3,
-            runtime_lease: Some("lease-3".to_string()),
         }
     }
 
@@ -525,12 +519,12 @@ mod tests {
             assert!(journal.get(&id).expect("job").kind.as_str() == kind);
             journal.succeed(&id).expect("succeed");
         }
-        // activate（generation+lease 必須）。M10。
+        // activate（generation 必須、runtime lease は runtime owner が解決）。M10。
         let id = submit(&mut journal, activate_req("profile-a"))
             .expect("activate")
             .id;
         journal.succeed(&id).expect("succeed");
-        // rollback（generation+lease 必須）。M10。
+        // rollback（generation 必須、runtime lease は runtime owner が解決）。M10。
         let mut rb = activate_req("profile-a");
         rb.kind = "rollback".to_string();
         let id = submit(&mut journal, rb).expect("rollback").id;
@@ -584,6 +578,25 @@ mod tests {
         assert!(matches!(err, ManagerApiError::BadRequest(_)));
     }
 
+    #[test]
+    fn activation_request_uses_generation_without_accepting_a_caller_lease() {
+        let mut journal = JobJournal::new();
+        let without_lease = submit_json(
+            &mut journal,
+            r#"{"kind":"activate","payload_key":"profile-a","expected_generation":7}"#,
+        );
+        assert!(without_lease.is_ok(), "runtime lease is runtime-owned");
+
+        let with_caller_lease = submit_json(
+            &mut journal,
+            r#"{"kind":"rollback","payload_key":"previous","expected_generation":7,"runtime_lease":"caller-controlled"}"#,
+        );
+        assert!(matches!(
+            with_caller_lease,
+            Err(ManagerApiError::BadRequest(_))
+        ));
+    }
+
     /// 受入: activate busy → 409。M10。
     #[test]
     fn activate_busy_conflicts() {
@@ -594,20 +607,20 @@ mod tests {
         assert!(matches!(err, ManagerApiError::Conflict(_)));
     }
 
-    /// activation/rollback は generation+lease 必須。M10。
+    /// activation/rollback は generation 必須。lease はruntime ownerが解決。M10。
     #[test]
-    fn activate_requires_generation_and_lease() {
+    fn activate_requires_generation_only() {
         let mut journal = JobJournal::new();
         // generation 0 → 400。M10。
         let mut a = activate_req("profile-d");
         a.expected_generation = 0;
         let err = submit(&mut journal, a).expect_err("gen required");
         assert!(matches!(err, ManagerApiError::BadRequest(_)));
-        // lease なし → 400。M10。
-        let mut a = activate_req("profile-e");
-        a.runtime_lease = None;
-        let err = submit(&mut journal, a).expect_err("lease required");
-        assert!(matches!(err, ManagerApiError::BadRequest(_)));
+        let accepted = submit_json(
+            &mut journal,
+            r#"{"kind":"activate","payload_key":"profile-e","expected_generation":4}"#,
+        );
+        assert!(accepted.is_ok());
     }
 
     /// DTO は secret/raw build log を含まない。M10。

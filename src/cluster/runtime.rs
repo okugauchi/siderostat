@@ -180,6 +180,129 @@ impl ModeRuntime {
         self.cluster.snapshot()
     }
 
+    /// Enter the local Manager activation window. The journal must already contain a durable
+    /// Draining phase when this method is called. The supervisor owner, not the job executor,
+    /// drains admission and stops the child.
+    pub async fn begin_manager_activation(&self, expected_generation: u64) -> anyhow::Result<u64> {
+        let current = self.snapshot();
+        if current.generation != expected_generation {
+            anyhow::bail!("stale manager generation");
+        }
+        if current.state != ClusterState::SoloStandaloneReady
+            || current.stable_mode != crate::target::StableMode::SoloStandalone
+        {
+            anyhow::bail!("manager local activation requires solo standalone readiness");
+        }
+        if let Err(error) = self
+            .proxy
+            .admission()
+            .drain(current.generation, self.drain_timeout)
+            .await
+        {
+            // Drain timeout leaves the old child authoritative; restore public admission so a
+            // rejected operation does not strand an otherwise healthy standalone runtime.
+            self.proxy.admission().start_serving();
+            return Err(error.into());
+        }
+        self.proxy.set_target(
+            ProxyTarget::Unavailable {
+                reason: crate::target::UnavailableReason::Transition,
+            },
+            false,
+        );
+        let starting = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::LocalStandaloneLost,
+                tp_session: None,
+            })
+            .await?;
+        self.local
+            .stop()
+            .await
+            .map_err(RuntimeError::LocalLifecycle)?;
+        Ok(starting.generation)
+    }
+
+    /// Start the selected Manager command through the existing standalone supervisor. Readiness
+    /// is part of `LocalStandaloneLifecycle::start`; admission remains blocked afterward.
+    pub async fn start_manager_profile(&self, generation: u64) -> anyhow::Result<()> {
+        let current = self.snapshot();
+        if current.generation != generation || current.state != ClusterState::SoloStandaloneStarting
+        {
+            anyhow::bail!("manager start generation is stale");
+        }
+        self.local
+            .start(generation)
+            .await
+            .map_err(RuntimeError::LocalLifecycle)?;
+        Ok(())
+    }
+
+    /// Publish the supervisor's observed readiness while keeping the public route closed until
+    /// the durable Manager commit has completed.
+    pub async fn mark_manager_profile_ready(&self, generation: u64) -> anyhow::Result<u64> {
+        let current = self.snapshot();
+        if current.generation != generation || current.state != ClusterState::SoloStandaloneStarting
+        {
+            anyhow::bail!("manager ready generation is stale");
+        }
+        let ready = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: generation,
+                kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
+            })
+            .await?;
+        apply_proxy_snapshot(&self.proxy, ready);
+        Ok(ready.generation)
+    }
+
+    /// Reopen public admission only after the active release pointer and Complete journal have
+    /// been atomically committed by the Manager store.
+    pub async fn reopen_manager_admission(&self, generation: u64) -> anyhow::Result<()> {
+        let current = self.snapshot();
+        if current.generation != generation || current.state != ClusterState::SoloStandaloneReady {
+            anyhow::bail!("manager commit generation is stale");
+        }
+        if !self
+            .local
+            .is_running()
+            .await
+            .map_err(RuntimeError::LocalLifecycle)?
+        {
+            anyhow::bail!("manager child is not running after commit");
+        }
+        apply_proxy_snapshot(&self.proxy, current);
+        self.proxy.admission().start_serving();
+        Ok(())
+    }
+
+    /// Publish a runtime-visible manual state after rollback could not prove a ready child.
+    pub async fn require_manager_manual_intervention(&self) -> anyhow::Result<()> {
+        self.proxy.admission().block();
+        self.proxy.set_target(
+            ProxyTarget::Unavailable {
+                reason: crate::target::UnavailableReason::Transition,
+            },
+            false,
+        );
+        let current = self.snapshot();
+        let manual = self
+            .cluster
+            .apply(ClusterEvent {
+                expected_generation: current.generation,
+                kind: ClusterEventKind::RequireManualIntervention,
+                tp_session: None,
+            })
+            .await?;
+        apply_proxy_snapshot(&self.proxy, manual);
+        self.proxy.admission().block();
+        Ok(())
+    }
+
     pub fn cluster_handle(&self) -> ClusterHandle {
         self.cluster.clone()
     }
@@ -527,6 +650,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_recovery_state_never_starts_a_candidate_child() {
+        let proxy = proxy();
+        let lifecycle = Arc::new(Lifecycle::default());
+        let runtime = ModeRuntime::spawn_manual_at(
+            LocalRole::Unknown,
+            proxy.clone(),
+            lifecycle.clone(),
+            Duration::from_secs(1),
+            12,
+        )
+        .await
+        .expect("manual recovery runtime");
+
+        assert_eq!(
+            runtime.snapshot().state,
+            ClusterState::ManualInterventionRequired
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            proxy.admission().snapshot().state,
+            crate::admission::AdmissionState::Blocked
+        );
+    }
+
+    #[tokio::test]
     async fn worker_converges_solo_paired_solo_and_reconnects() {
         let proxy = proxy();
         let lifecycle = Arc::new(Lifecycle::default());
@@ -634,6 +782,58 @@ mod tests {
             StableMode::PairedStandalone
         );
         assert_eq!(lifecycle.stops.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn manager_local_restart_keeps_admission_closed_until_explicit_commit() {
+        let proxy = proxy();
+        let lifecycle = Arc::new(Lifecycle::default());
+        let runtime = ModeRuntime::spawn_ready(
+            LocalRole::Unknown,
+            proxy.clone(),
+            lifecycle.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("standalone runtime");
+        let initial = runtime.snapshot();
+
+        let generation = runtime
+            .begin_manager_activation(initial.generation)
+            .await
+            .expect("drain and stop current child");
+        assert_eq!(generation, initial.generation + 1);
+        assert_eq!(lifecycle.stops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            proxy.admission().snapshot().state,
+            crate::admission::AdmissionState::Blocked
+        );
+
+        runtime
+            .start_manager_profile(generation)
+            .await
+            .expect("candidate starts and reaches readiness");
+        let ready_generation = runtime
+            .mark_manager_profile_ready(generation)
+            .await
+            .expect("publish local ready state");
+        assert_eq!(
+            runtime.snapshot().state,
+            crate::target::ClusterState::SoloStandaloneReady
+        );
+        assert_eq!(
+            proxy.admission().snapshot().state,
+            crate::admission::AdmissionState::Blocked
+        );
+
+        runtime
+            .reopen_manager_admission(ready_generation)
+            .await
+            .expect("commit reopens admission");
+        assert_eq!(
+            proxy.admission().snapshot().state,
+            crate::admission::AdmissionState::Serving
+        );
     }
 
     #[tokio::test]
