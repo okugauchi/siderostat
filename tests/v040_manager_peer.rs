@@ -1790,6 +1790,20 @@ async fn explicit_rollback_restores_each_nodes_verified_external_baseline() {
         ))
         .await
         .expect("activate managed release on both nodes");
+    assert!(
+        nodes
+            .coordinator
+            .production
+            .manager_previous_release_ready()
+            .await
+    );
+    assert!(
+        nodes
+            .worker
+            .production
+            .manager_previous_release_ready()
+            .await
+    );
 
     let ReleaseIdentity::ExternalBaseline { model_sha256, .. } = &worker_baseline else {
         panic!("worker fixture starts from an external baseline");
@@ -1826,6 +1840,7 @@ async fn explicit_rollback_restores_each_nodes_verified_external_baseline() {
         status.previous_profile_id.as_deref(),
         Some("external-baseline")
     );
+    assert!(status.previous_release_ready);
     assert!(status.profiles.iter().any(|profile| {
         profile.profile_id == "external-baseline"
             && profile.candidate_digest

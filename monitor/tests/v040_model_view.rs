@@ -123,7 +123,12 @@ fn manager_inventory(node_id: &str, build_id: &str, model_id: &str) -> ManagerIn
         },
         active_digest: None,
         previous_digest: Some("e".repeat(64)),
+        previous_profile_id: Some("profile-previous".to_string()),
+        previous_release_ready: true,
         activation_phase: None,
+        activation_failure_class: None,
+        runtime: None,
+        peer: None,
     }
 }
 
@@ -338,7 +343,7 @@ fn unverified_profile_pending_stage_and_hardware_state_explain_disabled_actions(
     assert!(download.reason.unwrap().contains("catalog"));
     let activate = vm.preparation_action(ManagerPreparationAction::Activate);
     assert!(!activate.enabled);
-    assert!(activate.reason.unwrap().contains("transaction"));
+    assert!(activate.reason.unwrap().contains("runtime readiness"));
 
     vm.apply_status(
         &[ManagerJobDto {

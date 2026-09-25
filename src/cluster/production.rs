@@ -2698,7 +2698,12 @@ mod tests {
             ack_id: "ack-worker-prepare".into(),
             profiles: Vec::new(),
             active_release_digest: None,
+            active_model_digest: None,
             previous_profile_id: None,
+            previous_model_digest: None,
+            previous_release_ready: false,
+            activation_phase: None,
+            activation_failure_class: None,
         }))
     }
 

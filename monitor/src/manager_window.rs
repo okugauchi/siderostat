@@ -70,16 +70,14 @@ pub trait ManagerApi {
     /// 新規 job を開始する。Ok(id)。G03。/
     async fn submit(&mut self, kind: &str, payload_key: &str) -> Result<String, String>;
 
-    /// generation/lease を伴う job を開始する。既存の fake/API 境界を
-    /// 壊さないため、context が無い場合は通常 submit へ委譲する。C04。/
-    async fn submit_with_context(
+    /// generation を伴う job を開始する。runtime lease は実行時に所有者が解決する。C04。/
+    async fn submit_with_generation(
         &mut self,
         kind: &str,
         payload_key: &str,
         expected_generation: Option<u64>,
-        runtime_lease: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (expected_generation, runtime_lease);
+        let _ = expected_generation;
         self.submit(kind, payload_key).await
     }
 
@@ -113,6 +111,7 @@ pub enum ManagerPreparationAction {
     VerifyModel,
     StageProfile,
     Activate,
+    Rollback,
 }
 
 /// UI-safe readiness and the exact local command to enqueue when enabled.
@@ -138,6 +137,7 @@ impl ManagerActionSelection {
             ManagerPreparationAction::VerifyModel,
             ManagerPreparationAction::StageProfile,
             ManagerPreparationAction::Activate,
+            ManagerPreparationAction::Rollback,
         ];
         Self {
             states: actions
@@ -286,7 +286,7 @@ impl ManagerViewModel {
                 .unwrap_or_default()
         ));
         lines.push(format!(
-            "稼働中 digest: {} · previous digest: {} · activation phase: {}",
+            "稼働中 digest: {} · previous digest: {} · activation phase: {} · failure class: {}",
             inventory
                 .active_digest
                 .as_deref()
@@ -300,8 +300,62 @@ impl ManagerViewModel {
             inventory
                 .activation_phase
                 .map(|phase| format!("{phase:?}"))
+                .unwrap_or_else(|| "なし".to_string()),
+            inventory
+                .activation_failure_class
+                .as_deref()
+                .map(redact_secrets)
                 .unwrap_or_else(|| "なし".to_string())
         ));
+        if let Some(runtime) = &inventory.runtime {
+            lines.push(format!(
+                "transaction context: generation={} · state={} · policy={}/{} · epoch={}",
+                runtime.generation,
+                redact_secrets(&runtime.state),
+                redact_secrets(&runtime.desired_policy),
+                redact_secrets(&runtime.applied_policy),
+                runtime.policy_epoch
+            ));
+        }
+        if let Some(peer) = &inventory.peer {
+            lines.push(format!(
+                "peer: {} · role={} · live digest={} · previous={} · previous-ready={} · phase={} · failure class={}",
+                redact_secrets(&peer.node_id),
+                redact_secrets(&peer.node_role),
+                peer.active_digest
+                    .as_deref()
+                    .map(redact_secrets)
+                    .unwrap_or_else(|| "未実測".into()),
+                peer.previous_digest
+                    .as_deref()
+                    .map(redact_secrets)
+                    .unwrap_or_else(|| "なし".into()),
+                peer.previous_release_ready,
+                peer.activation_phase
+                    .map(|phase| format!("{phase:?}"))
+                    .unwrap_or_else(|| "なし".into()),
+                peer.activation_failure_class
+                    .as_deref()
+                    .map(redact_secrets)
+                    .unwrap_or_else(|| "なし".into())
+            ));
+            lines.extend(peer.profiles.iter().map(|profile| {
+                format!(
+                    "peer profile: {} · role={} · source={} · model={} · candidate={}",
+                    redact_secrets(&profile.profile_id),
+                    redact_secrets(&profile.node_role),
+                    redact_secrets(&profile.source_commit),
+                    redact_secrets(&profile.model_digest),
+                    redact_secrets(&profile.candidate_digest)
+                )
+            }));
+        } else if inventory
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.cluster_enabled)
+        {
+            lines.push("peer: readinessを確認できません".into());
+        }
         lines.join("\n")
     }
 
@@ -497,9 +551,224 @@ impl ManagerViewModel {
                 })
             }
             ManagerPreparationAction::Activate => {
-                ManagerActionState::disabled("runtime-owned activation transactionが未接続です")
+                let Some(inventory) = &self.inventory else {
+                    return ManagerActionState::disabled(self.inventory_reason());
+                };
+                if let Some(reason) = self.transaction_precondition_reason(inventory) {
+                    return ManagerActionState::disabled(reason);
+                }
+                let Some(node_role) = inventory.node_role.as_deref() else {
+                    return ManagerActionState::disabled("このnodeのroleが未確定です");
+                };
+                let matching_peer_profiles = if let Some(runtime) = &inventory.runtime {
+                    if runtime.cluster_enabled {
+                        let Some(peer) = &inventory.peer else {
+                            return ManagerActionState::disabled("peer readinessを確認できません");
+                        };
+                        let expected_peer_role = match node_role {
+                            "coordinator" => "worker",
+                            "worker" => "coordinator",
+                            _ => return ManagerActionState::disabled("node roleが不明です"),
+                        };
+                        if peer.node_role != expected_peer_role {
+                            return ManagerActionState::disabled("peer roleが一致しません");
+                        }
+                        Some(peer)
+                    } else {
+                        None
+                    }
+                } else {
+                    return ManagerActionState::disabled("runtime readinessを確認できません");
+                };
+                let candidates = inventory
+                    .profiles
+                    .iter()
+                    .filter(|profile| {
+                        profile.activation_ready
+                            && profile.node_role == node_role
+                            && profile.compatibility
+                                == siderostat_core::manager::ProfileCompatibility::Compatible
+                            && profile.hardware_readiness
+                                == siderostat_core::manager::HardwareReadiness::Ready
+                    })
+                    .filter(|profile| {
+                        let Some((source_commit, model_digest, catalog_id)) =
+                            self.local_profile_identity(inventory, profile)
+                        else {
+                            return false;
+                        };
+                        matching_peer_profiles.is_none_or(|peer| {
+                            peer.profiles.iter().any(|peer_profile| {
+                                peer_profile.node_role
+                                    == if node_role == "coordinator" {
+                                        "worker"
+                                    } else {
+                                        "coordinator"
+                                    }
+                                    && peer_profile.source_commit == source_commit
+                                    && peer_profile.model_digest == model_digest
+                                    && peer_profile.model_catalog_id == catalog_id
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    return ManagerActionState::disabled(
+                        if inventory
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.activation_ready)
+                        {
+                            "peerにsource/model互換のverified profileがありません"
+                        } else {
+                            "このnodeにactivation-ready profileがありません"
+                        },
+                    );
+                }
+                if candidates.len() != 1 {
+                    return ManagerActionState::disabled(
+                        "複数のactivation-ready profileがあり、候補選択が必要です",
+                    );
+                }
+                let generation = inventory.runtime.as_ref().unwrap().generation;
+                ManagerActionState::enabled(ManagerCommand::Activate {
+                    profile: candidates[0].profile_id.clone(),
+                    expected_generation: generation,
+                })
+            }
+            ManagerPreparationAction::Rollback => {
+                let Some(inventory) = &self.inventory else {
+                    return ManagerActionState::disabled(self.inventory_reason());
+                };
+                if let Some(reason) = self.transaction_precondition_reason(inventory) {
+                    return ManagerActionState::disabled(reason);
+                }
+                if inventory.previous_profile_id.is_none()
+                    || inventory.previous_digest.is_none()
+                    || !inventory.previous_release_ready
+                {
+                    return ManagerActionState::disabled(
+                        "このnodeにverified previous releaseがありません",
+                    );
+                }
+                if inventory
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.cluster_enabled)
+                {
+                    let Some(peer) = &inventory.peer else {
+                        return ManagerActionState::disabled("peer readinessを確認できません");
+                    };
+                    if peer.previous_profile_id.is_none()
+                        || peer.previous_digest.is_none()
+                        || !peer.previous_release_ready
+                    {
+                        return ManagerActionState::disabled(
+                            "peerにverified previous releaseがありません",
+                        );
+                    }
+                }
+                ManagerActionState::enabled(ManagerCommand::Rollback {
+                    expected_generation: inventory.runtime.as_ref().unwrap().generation,
+                })
             }
         }
+    }
+
+    fn transaction_precondition_reason(
+        &self,
+        inventory: &siderostat_core::manager::api::ManagerInventoryResponse,
+    ) -> Option<String> {
+        use siderostat_core::manager::PersistedActivationPhase as Phase;
+
+        let Some(runtime) = &inventory.runtime else {
+            return Some("runtime readinessを確認できません".into());
+        };
+        if runtime.generation == 0 {
+            return Some("cluster generationが未確定です".into());
+        }
+        if runtime.desired_policy != "automatic" || runtime.applied_policy != "automatic" {
+            return Some("operation policyがactivationを許可していません".into());
+        }
+        let expected_state = if runtime.cluster_enabled {
+            "paired-standalone-ready"
+        } else {
+            "solo-standalone-ready"
+        };
+        if runtime.state != expected_state {
+            return Some("runtimeが安定したstandalone stateではありません".into());
+        }
+        if !inventory.node_readiness.ready {
+            return Some(
+                inventory
+                    .node_readiness
+                    .reason
+                    .as_deref()
+                    .map(redact_secrets)
+                    .unwrap_or_else(|| "local readinessが未完了です".into()),
+            );
+        }
+        if inventory.active_digest.is_none() {
+            return Some("現在のactive releaseをlive stateから確認できません".into());
+        }
+        if runtime.cluster_enabled {
+            let Some(peer) = &inventory.peer else {
+                return Some("peer readinessを確認できません".into());
+            };
+            if peer.active_digest.is_none() {
+                return Some("peerのactive releaseをlive stateから確認できません".into());
+            }
+        }
+        if inventory
+            .activation_phase
+            .is_some_and(|phase| !matches!(phase, Phase::Complete | Phase::RolledBack))
+            || inventory.peer.as_ref().is_some_and(|peer| {
+                peer.activation_phase
+                    .is_some_and(|phase| !matches!(phase, Phase::Complete | Phase::RolledBack))
+            })
+        {
+            return Some("前回のtransactionが未解決です".into());
+        }
+        if self.jobs.values().any(|job| {
+            (job.kind == "activate" || job.kind == "rollback")
+                && (job.is_active() || job.phase == "interrupted")
+        }) {
+            return Some("activation/rollback jobが進行中またはinterruptedです".into());
+        }
+        None
+    }
+
+    fn local_profile_identity(
+        &self,
+        inventory: &siderostat_core::manager::api::ManagerInventoryResponse,
+        profile: &siderostat_core::manager::api::ManagerStagedProfileDto,
+    ) -> Option<(String, String, String)> {
+        let [build] = profile.role_artifacts.as_slice() else {
+            return None;
+        };
+        if !build.verified {
+            return None;
+        }
+        let build_digest = build.digest.as_ref()?;
+        let build_artifact = inventory.artifacts.iter().find(|artifact| {
+            artifact.id == build.id
+                && artifact.kind == "build"
+                && artifact.verified
+                && &artifact.digest == build_digest
+        })?;
+        let source_commit = build_artifact.source_commit.as_ref()?.clone();
+        if !profile.model_artifact.verified {
+            return None;
+        }
+        let model_digest = profile.model_artifact.digest.as_ref()?.clone();
+        let model_artifact = inventory.artifacts.iter().find(|artifact| {
+            artifact.id == profile.model_artifact.id
+                && artifact.kind == "model"
+                && artifact.verified
+                && artifact.digest == model_digest
+        })?;
+        let catalog_id = model_artifact.catalog_id.as_ref()?.clone();
+        Some((source_commit, model_digest, catalog_id))
     }
 
     fn inventory_reason(&self) -> String {
@@ -685,12 +954,9 @@ pub enum ManagerCommand {
     Activate {
         profile: String,
         expected_generation: u64,
-        runtime_lease: String,
     },
     Rollback {
-        previous: String,
         expected_generation: u64,
-        runtime_lease: String,
     },
     Cancel {
         job_id: String,
@@ -779,27 +1045,14 @@ pub async fn execute_manager_command(
         ManagerCommand::Activate {
             profile,
             expected_generation,
-            runtime_lease,
         } => client
-            .submit_manager_job_with_context(
-                "activate",
-                &profile,
-                expected_generation,
-                &runtime_lease,
-            )
+            .submit_manager_job_with_generation("activate", &profile, expected_generation)
             .await
             .map(|response| manager_submitted_event("activate", response.id)),
         ManagerCommand::Rollback {
-            previous,
             expected_generation,
-            runtime_lease,
         } => client
-            .submit_manager_job_with_context(
-                "rollback",
-                &previous,
-                expected_generation,
-                &runtime_lease,
-            )
+            .submit_manager_job_with_generation("rollback", "previous", expected_generation)
             .await
             .map(|response| manager_submitted_event("rollback", response.id)),
         ManagerCommand::Cancel { job_id } => client
@@ -919,6 +1172,24 @@ define_class!(
             );
         }
 
+        #[unsafe(method(managerActivate:))]
+        fn manager_activate(&self, _sender: Option<&AnyObject>) {
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::Activate,
+            );
+        }
+
+        #[unsafe(method(managerRollback:))]
+        fn manager_rollback(&self, _sender: Option<&AnyObject>) {
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::Rollback,
+            );
+        }
+
         #[unsafe(method(managerCancel:))]
         fn manager_cancel(&self, _sender: Option<&AnyObject>) {
             let _ = send_cancel_command(&self.ivars().command_tx, &self.ivars().cancel_job_id);
@@ -1029,6 +1300,7 @@ fn project_preparation(view_model: &ManagerViewModel) -> String {
         ("Verify", ManagerPreparationAction::VerifyModel),
         ("Stage", ManagerPreparationAction::StageProfile),
         ("Activate", ManagerPreparationAction::Activate),
+        ("Rollback", ManagerPreparationAction::Rollback),
     ]
     .into_iter()
     .map(|(label, action)| {
@@ -1188,19 +1460,14 @@ impl ManagerWindowHost {
                 mtm,
             )
         };
-        let disabled_button = |text: &str| unsafe {
-            let button =
-                NSButton::buttonWithTitle_target_action(&NSString::from_str(text), None, None, mtm);
-            button.setEnabled(false);
-            button
-        };
-
         let fetch_button = active_button("公式sourceを取得", sel!(managerFetch:));
         let build_coordinator_button = active_button("coordinator用をbuild", sel!(managerBuild:));
         let build_worker_button = active_button("worker用をbuild", sel!(managerBuildWorker:));
         let download_button = active_button("modelをdownload", sel!(managerDownload:));
         let verify_button = active_button("verify", sel!(managerVerify:));
         let stage_button = active_button("stage", sel!(managerStage:));
+        let activate_button = active_button("Activate", sel!(managerActivate:));
+        let rollback_button = active_button("Rollback to previous", sel!(managerRollback:));
         let preparation_buttons = vec![
             (ManagerPreparationAction::FetchSource, fetch_button.clone()),
             (
@@ -1217,6 +1484,8 @@ impl ManagerWindowHost {
             ),
             (ManagerPreparationAction::VerifyModel, verify_button.clone()),
             (ManagerPreparationAction::StageProfile, stage_button.clone()),
+            (ManagerPreparationAction::Activate, activate_button.clone()),
+            (ManagerPreparationAction::Rollback, rollback_button.clone()),
         ];
         for (action, button) in &preparation_buttons {
             button.setEnabled(view_model.preparation_action(*action).enabled);
@@ -1246,10 +1515,7 @@ impl ManagerWindowHost {
         inventory.setMaximumNumberOfLines(12);
         root.addArrangedSubview(&inventory);
         section("Activation / rollback");
-        action_row(vec![
-            disabled_button("activate（generation / runtime lease 未接続）"),
-            disabled_button("rollback（generation / runtime lease 未接続）"),
-        ]);
+        action_row(vec![activate_button, rollback_button]);
         section("Jobs");
         let jobs = NSTextField::wrappingLabelWithString(&NSString::from_str(&jobs_summary), mtm);
         jobs.setPreferredMaxLayoutWidth(700.0);
@@ -2251,10 +2517,10 @@ mod tests {
     }
 
     #[test]
-    fn manager_api_context_submit_preserves_plain_fake_boundary() {
+    fn manager_api_generation_submit_preserves_plain_fake_boundary() {
         let mut api = FakeManagerApi::with_jobs(&["fetch-1"]);
-        let id = block_on(api.submit_with_context("fetch", "official", None, None))
-            .expect("plain submit");
+        let id =
+            block_on(api.submit_with_generation("fetch", "official", None)).expect("plain submit");
         assert_eq!(id, "fetch-1");
         assert_eq!(api.submit_calls, vec![("fetch".into(), "official".into())]);
     }

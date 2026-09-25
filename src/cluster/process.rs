@@ -262,7 +262,7 @@ impl VerifiedDs4Command {
         .await?;
         if executable != self.command.executable
             || working_directory != self.command.working_directory
-            || model_path != PathBuf::from(&self.command.argv[model_index])
+            || model_path != self.command.argv[model_index]
         {
             return Err(CommandSlotError::PathOutsideManagedRoot);
         }

@@ -11,7 +11,8 @@ use siderostat_core::manager::{
     HardwareReadiness, ProfileCompatibility,
     api::{
         ManagerArtifactDto, ManagerArtifactReferenceDto, ManagerInventoryResponse, ManagerJobDto,
-        ManagerNodeReadinessDto, ManagerSourceReceiptDto, ManagerStagedProfileDto,
+        ManagerNodeReadinessDto, ManagerPeerInventoryDto, ManagerPeerProfileDto,
+        ManagerRuntimeReadinessDto, ManagerSourceReceiptDto, ManagerStagedProfileDto,
         ManagerStatusResponse,
     },
 };
@@ -51,13 +52,10 @@ fn manager_host_reuses_one_window_and_keeps_commands_local() {
     host.send_command(ManagerCommand::Activate {
         profile: "mxfp4-0731".to_string(),
         expected_generation: 3,
-        runtime_lease: "lease-3".to_string(),
     })
     .expect("send activate");
     host.send_command(ManagerCommand::Rollback {
-        previous: "old-digest".to_string(),
         expected_generation: 3,
-        runtime_lease: "lease-3".to_string(),
     })
     .expect("send rollback");
 
@@ -186,6 +184,148 @@ fn manager_fixture_matrix_keeps_running_cancelled_terminal_and_old_active() {
             .expect("terminal cancel disabled")
     );
     assert!(host.drain_commands().is_empty());
+}
+
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+#[test]
+fn activation_and_rollback_controls_require_verified_two_node_context() {
+    use siderostat_core::manager::PersistedActivationPhase as Phase;
+
+    let mut view_model = ManagerViewModel::new();
+    view_model.set_expected_node_id("local-node");
+    let mut inventory = transaction_ready_inventory();
+    assert!(view_model.apply_inventory(inventory.clone()));
+    assert_eq!(
+        view_model.preparation_action(ManagerPreparationAction::Activate),
+        siderostat_monitor::manager_window::ManagerActionState {
+            enabled: true,
+            reason: None,
+            command: Some(ManagerCommand::Activate {
+                profile: "profile-local".into(),
+                expected_generation: 7,
+            }),
+        }
+    );
+    assert_eq!(
+        view_model
+            .preparation_action(ManagerPreparationAction::Rollback)
+            .command,
+        Some(ManagerCommand::Rollback {
+            expected_generation: 7,
+        })
+    );
+
+    inventory.profiles[0].model_artifact.digest = Some("6".repeat(64));
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .enabled,
+        "the local profile digest must match its inventory artifact"
+    );
+    inventory.profiles[0].model_artifact.digest = Some("c".repeat(64));
+
+    inventory.peer.as_mut().unwrap().profiles[0].model_digest = "6".repeat(64);
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .enabled
+    );
+
+    inventory.peer = Some(ready_peer_inventory());
+    inventory.peer.as_mut().unwrap().active_digest = None;
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .reason
+            .unwrap()
+            .contains("peer")
+    );
+    inventory.peer.as_mut().unwrap().active_digest = Some("e".repeat(64));
+
+    inventory.peer = None;
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .reason
+            .unwrap()
+            .contains("peer")
+    );
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Rollback)
+            .enabled
+    );
+
+    inventory.peer = Some(ready_peer_inventory());
+    inventory.runtime.as_mut().unwrap().desired_policy = "forced-standalone".into();
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .enabled
+    );
+
+    inventory.runtime.as_mut().unwrap().desired_policy = "automatic".into();
+    inventory.activation_phase = Some(Phase::Committing);
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Activate)
+            .enabled
+    );
+
+    inventory.activation_phase = Some(Phase::ManualIntervention);
+    view_model.apply_inventory(inventory.clone());
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Rollback)
+            .enabled
+    );
+
+    inventory.activation_phase = Some(Phase::Complete);
+    inventory.previous_release_ready = false;
+    view_model.apply_inventory(inventory);
+    assert!(
+        !view_model
+            .preparation_action(ManagerPreparationAction::Rollback)
+            .enabled
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+#[test]
+fn activation_job_success_waits_for_inventory_live_observation() {
+    let client = MetricsClient::new(&MonitorConfig::default()).expect("client");
+    let mut host = ManagerWindowHost::for_test(client, ManagerViewModel::new(), ModelView::new());
+    let mut inventory = transaction_ready_inventory();
+    host.apply_event(ManagerEvent::Inventory(inventory.clone()));
+    host.apply_event(ManagerEvent::Submitted {
+        kind: "activate".into(),
+        id: "job-1".into(),
+    });
+    host.apply_event(ManagerEvent::Status(ManagerStatusResponse {
+        jobs: vec![fixture_job("job-1", "activate", "succeeded", "", false)],
+        active_digest: None,
+        queue_depth: 0,
+    }));
+    assert_eq!(
+        host.view_model().active_digest(),
+        Some("f".repeat(64).as_str())
+    );
+    assert!(!host.inventory_summary().contains("phase: Complete"));
+
+    inventory.active_digest = Some("9".repeat(64));
+    inventory.activation_phase = Some(siderostat_core::manager::PersistedActivationPhase::Complete);
+    host.apply_event(ManagerEvent::Inventory(inventory));
+    assert_eq!(
+        host.view_model().active_digest(),
+        Some("9".repeat(64).as_str())
+    );
+    assert!(host.inventory_summary().contains("phase: Complete"));
 }
 
 #[cfg(all(target_os = "macos", feature = "test-support"))]
@@ -353,11 +493,12 @@ fn inventory_event_projects_only_sanitized_node_local_state() {
     let mut view_model = ManagerViewModel::new();
     view_model.set_expected_node_id("local-node");
     let mut host = ManagerWindowHost::for_test(client, view_model, ModelView::new());
-    host.apply_event(ManagerEvent::Inventory(fixture_inventory(
-        "local-node",
-        true,
-        "local",
-    )));
+    let mut inventory = fixture_inventory("local-node", true, "local");
+    inventory.activation_failure_class = Some("rollback-failed".into());
+    let mut peer = ready_peer_inventory();
+    peer.activation_failure_class = Some("peer-rollback-failed".into());
+    inventory.peer = Some(peer);
+    host.apply_event(ManagerEvent::Inventory(inventory));
 
     let rendered = host.inventory_summary();
     for expected in [
@@ -369,6 +510,8 @@ fn inventory_event_projects_only_sanitized_node_local_state() {
         "hardware=Pending",
         "稼働中 digest: 未実測",
         "previous digest:",
+        "failure class: rollback-failed",
+        "failure class=peer-rollback-failed",
     ] {
         assert!(
             rendered.contains(expected),
@@ -506,6 +649,52 @@ fn verified_fixture_model(name: &str, encoder: &str, support: &str) -> ModelEntr
     }
 }
 
+fn transaction_ready_inventory() -> ManagerInventoryResponse {
+    let mut inventory = fixture_inventory("local-node", true, "local");
+    let profile = inventory.profiles.first_mut().expect("staged profile");
+    profile.hardware_readiness = HardwareReadiness::Ready;
+    profile.activation_ready = true;
+    inventory.node_readiness = ManagerNodeReadinessDto {
+        ready: true,
+        reason: None,
+    };
+    inventory.active_digest = Some("f".repeat(64));
+    inventory.previous_profile_id = Some("profile-previous".into());
+    inventory.previous_release_ready = true;
+    inventory.runtime = Some(ManagerRuntimeReadinessDto {
+        cluster_enabled: true,
+        generation: 7,
+        state: "paired-standalone-ready".into(),
+        desired_policy: "automatic".into(),
+        applied_policy: "automatic".into(),
+        policy_epoch: 3,
+    });
+    inventory.peer = Some(ready_peer_inventory());
+    inventory
+}
+
+fn ready_peer_inventory() -> ManagerPeerInventoryDto {
+    ManagerPeerInventoryDto {
+        node_id: "remote-node".into(),
+        node_role: "worker".into(),
+        profiles: vec![ManagerPeerProfileDto {
+            profile_id: "profile-remote".into(),
+            node_role: "worker".into(),
+            candidate_digest: "8".repeat(64),
+            source_commit: "a".repeat(40),
+            model_digest: "c".repeat(64),
+            model_catalog_id: "catalog-ds4".into(),
+            config_fingerprint: "d".repeat(64),
+        }],
+        active_digest: Some("e".repeat(64)),
+        previous_profile_id: Some("previous-remote".into()),
+        previous_digest: Some("7".repeat(64)),
+        previous_release_ready: true,
+        activation_phase: None,
+        activation_failure_class: None,
+    }
+}
+
 fn fixture_inventory(node_id: &str, staged: bool, prefix: &str) -> ManagerInventoryResponse {
     let commit = "a".repeat(40);
     let identity_byte = if prefix == "local" { "1" } else { "3" };
@@ -570,7 +759,12 @@ fn fixture_inventory(node_id: &str, staged: bool, prefix: &str) -> ManagerInvent
         },
         active_digest: None,
         previous_digest: Some("e".repeat(64)),
+        previous_profile_id: Some("profile-previous".to_string()),
+        previous_release_ready: true,
         activation_phase: None,
+        activation_failure_class: None,
+        runtime: None,
+        peer: None,
     }
 }
 

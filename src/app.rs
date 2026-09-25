@@ -2543,31 +2543,60 @@ async fn manager_inventory(
     if let Err(response) = authorized_admin(&headers, &state) {
         return *response;
     }
-    let store = match state.manager_store.lock() {
-        Ok(store) => store,
-        Err(_) => {
-            return json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "manager inventory unavailable"}),
-            );
-        }
+    let mut response = {
+        let store = match state.manager_store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": "manager inventory unavailable"}),
+                );
+            }
+        };
+        crate::manager::api::inventory(store.snapshot())
     };
-    let mut response = crate::manager::api::inventory(store.snapshot());
-    drop(store);
-    response.node_role = if state.config.cluster_enabled {
-        state
-            .production
-            .read()
+    let cluster_snapshot = state.cluster_snapshot();
+    let production = state.production_runtime();
+    response.node_role = production
+        .as_ref()
+        .map(|runtime| runtime.role().name().to_string())
+        .or_else(|| (!state.config.cluster_enabled).then(|| "coordinator".to_string()));
+    let policy_name = |policy| {
+        serde_json::to_value(policy)
             .ok()
-            .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.role()))
-            .and_then(|role| match role {
-                crate::target::LocalRole::Coordinator => Some("coordinator".to_string()),
-                crate::target::LocalRole::Worker => Some("worker".to_string()),
-                crate::target::LocalRole::Unknown => None,
-            })
-    } else {
-        Some("coordinator".to_string())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string())
     };
+    response.runtime = Some(crate::manager::api::ManagerRuntimeReadinessDto {
+        cluster_enabled: state.config.cluster_enabled,
+        generation: cluster_snapshot.map_or(0, |snapshot| snapshot.generation),
+        state: cluster_snapshot.map_or_else(
+            || {
+                if state.config.cluster_enabled {
+                    "unknown".to_string()
+                } else {
+                    "solo-standalone-ready".to_string()
+                }
+            },
+            |snapshot| snapshot.state.name().to_string(),
+        ),
+        desired_policy: production
+            .as_ref()
+            .map(|runtime| policy_name(runtime.operator_policy()))
+            .unwrap_or_else(|| "automatic".to_string()),
+        applied_policy: production
+            .as_ref()
+            .map(|runtime| policy_name(runtime.applied_policy()))
+            .unwrap_or_else(|| "automatic".to_string()),
+        policy_epoch: production
+            .as_ref()
+            .map_or(0, |runtime| runtime.policy_epoch()),
+    });
+    if let Some(runtime) = production {
+        response.active_digest = runtime.manager_active_model_digest().await;
+        response.previous_release_ready = runtime.manager_previous_release_ready().await;
+        response.peer = runtime.manager_peer_inventory().await;
+    }
     json_response(
         StatusCode::OK,
         serde_json::to_value(response).unwrap_or_else(|_| json!({})),

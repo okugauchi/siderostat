@@ -141,7 +141,63 @@ pub struct ManagerInventoryResponse {
     pub active_digest: Option<String>,
     /// Verified stored previous release digest.
     pub previous_digest: Option<String>,
+    /// Local previous release identity. The external baseline uses a fixed sentinel.
+    #[serde(default)]
+    pub previous_profile_id: Option<String>,
+    /// Whether the previous release has a locally verified durable record.
+    #[serde(default)]
+    pub previous_release_ready: bool,
     pub activation_phase: Option<PersistedActivationPhase>,
+    /// Fixed allowlisted transaction failure class, never a raw error message.
+    #[serde(default)]
+    pub activation_failure_class: Option<String>,
+    /// Runtime-owned state used to gate an explicit activation request.
+    #[serde(default)]
+    pub runtime: Option<ManagerRuntimeReadinessDto>,
+    /// Authenticated, sanitized peer inventory. Missing means peer status is unavailable.
+    #[serde(default)]
+    pub peer: Option<ManagerPeerInventoryDto>,
+}
+
+/// Sanitized runtime state required by the Manager action gate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerRuntimeReadinessDto {
+    pub cluster_enabled: bool,
+    pub generation: u64,
+    pub state: String,
+    pub desired_policy: String,
+    pub applied_policy: String,
+    pub policy_epoch: u64,
+}
+
+/// A peer's node-local compatible candidate summary. No paths or command data are exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerPeerProfileDto {
+    pub profile_id: String,
+    pub node_role: String,
+    pub candidate_digest: String,
+    pub source_commit: String,
+    pub model_digest: String,
+    pub model_catalog_id: String,
+    pub config_fingerprint: String,
+}
+
+/// Sanitized peer readiness and durable release pointers from an authenticated peer status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerPeerInventoryDto {
+    pub node_id: String,
+    pub node_role: String,
+    pub profiles: Vec<ManagerPeerProfileDto>,
+    pub active_digest: Option<String>,
+    pub previous_profile_id: Option<String>,
+    pub previous_digest: Option<String>,
+    pub previous_release_ready: bool,
+    pub activation_phase: Option<PersistedActivationPhase>,
+    /// Fixed allowlisted peer transaction failure class.
+    pub activation_failure_class: Option<String>,
 }
 
 /// `POST /manager/jobs` の要求。kind の厳密 payload。M10。
@@ -418,15 +474,155 @@ pub fn inventory_with_live_active_digest(
             snapshot,
             snapshot.release_pointers.previous.as_ref(),
         ),
-        activation_phase: if snapshot.activation_journals.len() == 1 {
-            snapshot
+        previous_profile_id: snapshot
+            .release_pointers
+            .previous
+            .as_ref()
+            .map(release_identity_profile_id),
+        // The store contains durable metadata but cannot prove that the files still exist or
+        // match their recorded digest. The runtime owner overwrites this only after rechecking
+        // the previous command/baseline against the filesystem.
+        previous_release_ready: false,
+        activation_phase: inventory_activation_phase(snapshot),
+        activation_failure_class: inventory_activation_failure_class(snapshot),
+        runtime: None,
+        peer: None,
+    }
+}
+
+pub fn release_identity_profile_id(identity: &ReleaseIdentity) -> String {
+    match identity {
+        ReleaseIdentity::ManagedProfile(profile_id) => profile_id.clone(),
+        ReleaseIdentity::ExternalBaseline { .. } => "external-baseline".into(),
+    }
+}
+
+pub fn inventory_activation_phase(
+    snapshot: &ManagerStoreSnapshot,
+) -> Option<PersistedActivationPhase> {
+    let pending = snapshot
+        .activation_journals
+        .values()
+        .filter(|journal| {
+            !matches!(
+                journal.phase,
+                PersistedActivationPhase::Complete | PersistedActivationPhase::RolledBack
+            )
+        })
+        .map(|journal| journal.phase)
+        .collect::<Vec<_>>();
+    match pending.as_slice() {
+        [phase] => Some(*phase),
+        [] => {
+            if snapshot
                 .activation_journals
                 .values()
-                .next()
-                .map(|journal| journal.phase)
-        } else {
-            None
-        },
+                .any(|journal| journal.phase == PersistedActivationPhase::ManualIntervention)
+            {
+                Some(PersistedActivationPhase::ManualIntervention)
+            } else {
+                snapshot
+                    .activation_journals
+                    .values()
+                    .next_back()
+                    .map(|journal| journal.phase)
+            }
+        }
+        _ => Some(PersistedActivationPhase::ManualIntervention),
+    }
+}
+
+pub fn inventory_activation_failure_class(snapshot: &ManagerStoreSnapshot) -> Option<String> {
+    let pending = snapshot
+        .activation_journals
+        .values()
+        .filter(|journal| {
+            !matches!(
+                journal.phase,
+                PersistedActivationPhase::Complete | PersistedActivationPhase::RolledBack
+            )
+        })
+        .collect::<Vec<_>>();
+    if pending.len() > 1 {
+        return Some("multiple-unresolved-transactions".into());
+    }
+    let journal = pending
+        .first()
+        .copied()
+        .or_else(|| snapshot.activation_journals.values().next_back())?;
+    journal
+        .failure_class
+        .as_deref()
+        .map(sanitize_activation_failure_class)
+}
+
+pub fn sanitize_activation_failure_class(value: &str) -> String {
+    const SAFE_CLASSES: &[&str] = &[
+        "candidate-activation-failed",
+        "interrupted-activation",
+        "multiple-unresolved-transactions",
+        "prepare-ack-persist-failed",
+        "drain-intent-persist-failed",
+        "local-drain-failed",
+        "local-drain-ambiguous",
+        "local-drain-stop-unconfirmed",
+        "local-drain-ack-persist-failed",
+        "local-drain-rollback-intent-persist-failed",
+        "local-drain-rollback-ack-persist-failed",
+        "local-drain-unconfirmed",
+        "local-candidate-start-failed",
+        "local-start-failed",
+        "local-previous-restore-failed",
+        "local-ready-ack-persist-failed",
+        "ready-ack-persist-failed",
+        "commit-intent-persist-failed",
+        "start-intent-persist-failed",
+        "global-complete-persist-failed",
+        "final-live-check-failed",
+        "final-live-check-after-peer-finalize-failed",
+        "rollback-intent-persist-failed",
+        "rollback-result-persist-failed",
+        "rollback-ack-persist-failed",
+        "rollback-drain-failed",
+        "rollback-failed",
+        "rollback-pointer-persist-failed",
+        "rollback-ack-ambiguous",
+        "rollback-start-failed",
+        "peer-prepare-ack-persist-failed",
+        "peer-prepare-ack-ambiguous",
+        "peer-drain-effect-ambiguous",
+        "peer-drain-ack-ambiguous",
+        "peer-drain-ack-persist-failed",
+        "peer-drain-failed",
+        "peer-drain-unconfirmed",
+        "peer-drain-failed-child-not-running",
+        "peer-drain-rollback-intent-persist-failed",
+        "peer-drain-rollback-ack-persist-failed",
+        "peer-start-ack-ambiguous",
+        "peer-start-ack-persist-failed",
+        "peer-candidate-start-ambiguous",
+        "peer-ready-ack-persist-failed",
+        "peer-commit-ack-ambiguous",
+        "peer-commit-ack-persist-failed",
+        "peer-finalize-ack-ambiguous",
+        "peer-rollback-before-drain",
+        "peer-rollback-requested",
+        "peer-rollback-drain-failed",
+        "peer-rollback-unconfirmed",
+        "peer-rollback-failed",
+        "peer-rollback-pointer-persist-failed",
+        "peer-rollback-ack-persist-failed",
+        "peer-candidate-start-failed",
+        "peer-previous-restore-failed",
+        "peer-rollback-intent-persist-failed",
+        "previous-release-restoration-failed",
+        "peer-rollback-ack-ambiguous",
+        "peer-manual-intervention",
+    ];
+    if SAFE_CLASSES.contains(&value) {
+        value.to_string()
+    } else {
+        "runtime-transaction-failed".into()
     }
 }
 
@@ -502,6 +698,18 @@ mod tests {
             payload_key: key.to_string(),
             expected_generation: 3,
         }
+    }
+
+    #[test]
+    fn activation_failure_class_is_restricted_to_fixed_safe_labels() {
+        assert_eq!(
+            sanitize_activation_failure_class("peer-drain-effect-ambiguous"),
+            "peer-drain-effect-ambiguous"
+        );
+        assert_eq!(
+            sanitize_activation_failure_class("/private/path token=private-secret"),
+            "runtime-transaction-failed"
+        );
     }
 
     /// 受入: fetch→build→download→verify→activate→rollback → 状態一致。M10。

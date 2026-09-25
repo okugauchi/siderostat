@@ -1,11 +1,13 @@
 //! Runtime-owned command bridge for Manager activation and rollback.
 
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicU8;
 use std::{
     future::Future,
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -170,10 +172,25 @@ pub struct ManagerPeerResponse {
     /// Digest of this node's currently active release, if one is durably recorded.
     #[serde(default)]
     pub active_release_digest: Option<String>,
+    /// Live-observed model digest, only when the child matches the active release.
+    #[serde(default)]
+    pub active_model_digest: Option<String>,
     /// Node-local profile ID referenced by the previous release pointer; external baselines use
     /// the reserved `external-baseline` identity.
     #[serde(default)]
     pub previous_profile_id: Option<String>,
+    /// Model digest referenced by the previous release pointer.
+    #[serde(default)]
+    pub previous_model_digest: Option<String>,
+    /// Whether the previous release bytes/config can be revalidated on this node.
+    #[serde(default)]
+    pub previous_release_ready: bool,
+    /// Local durable phase, if one transaction is unresolved or one journal exists.
+    #[serde(default)]
+    pub activation_phase: Option<crate::manager::store::PersistedActivationPhase>,
+    /// Fixed allowlisted peer transaction failure class.
+    #[serde(default)]
+    pub activation_failure_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,7 +368,14 @@ impl super::ProductionClusterRuntime {
             .ok_or(ManagerPeerProtocolError::Unavailable)?;
         let result = match request.phase {
             ManagerPeerPhase::Status => {
-                let (node_id, active_release_digest, previous_profile_id, profiles) = {
+                let (
+                    node_id,
+                    active_release_digest,
+                    previous,
+                    profiles,
+                    activation_phase,
+                    activation_failure_class,
+                ) = {
                     let mut store = store
                         .lock()
                         .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
@@ -362,23 +386,44 @@ impl super::ProductionClusterRuntime {
                         .active
                         .as_ref()
                         .map(release_identity_digest);
-                    let previous_profile_id = snapshot.release_pointers.previous.as_ref().map(
-                        |previous| match previous {
-                            crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
-                                profile_id.clone()
-                            }
-                            crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
-                                "external-baseline".into()
-                            }
-                        },
-                    );
+                    let previous = snapshot.release_pointers.previous.clone();
                     let profiles = manager_peer_profiles(&mut store, &request, self.inner.role)?;
+                    let activation_phase =
+                        crate::manager::api::inventory_activation_phase(store.snapshot());
+                    let activation_failure_class =
+                        crate::manager::api::inventory_activation_failure_class(store.snapshot());
                     (
                         node_id,
                         active_release_digest,
-                        previous_profile_id,
+                        previous,
                         profiles,
+                        activation_phase,
+                        activation_failure_class,
                     )
+                };
+                let active_model_digest = if manager_child_matches_current_release(self, &store)
+                    .await
+                    .unwrap_or(false)
+                {
+                    manager_release_model_digest(&store, true)
+                } else {
+                    None
+                };
+                let previous_model_digest = manager_release_model_digest(&store, false);
+                let previous_release_ready = match previous.as_ref() {
+                    Some(crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id)) => {
+                        verified_profile_command(&store, &self.inner.config, profile_id)
+                            .await
+                            .is_ok()
+                    }
+                    Some(
+                        identity @ crate::manager::store::ReleaseIdentity::ExternalBaseline {
+                            ..
+                        },
+                    ) => verify_external_baseline(&self.inner.config, identity)
+                        .await
+                        .is_ok(),
+                    None => false,
                 };
                 let mut response = manager_peer_response(
                     &node_id,
@@ -387,7 +432,14 @@ impl super::ProductionClusterRuntime {
                 );
                 response.profiles = profiles;
                 response.active_release_digest = active_release_digest;
-                response.previous_profile_id = previous_profile_id;
+                response.active_model_digest = active_model_digest;
+                response.previous_profile_id = previous
+                    .as_ref()
+                    .map(crate::manager::api::release_identity_profile_id);
+                response.previous_model_digest = previous_model_digest;
+                response.previous_release_ready = previous_release_ready;
+                response.activation_phase = activation_phase;
+                response.activation_failure_class = activation_failure_class;
                 Ok(response)
             }
             ManagerPeerPhase::ForwardActivate => {
@@ -1394,7 +1446,220 @@ fn manager_peer_response(
         ack_id,
         profiles: Vec::new(),
         active_release_digest: None,
+        active_model_digest: None,
         previous_profile_id: None,
+        previous_model_digest: None,
+        previous_release_ready: false,
+        activation_phase: None,
+        activation_failure_class: None,
+    }
+}
+
+fn manager_release_model_digest(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    active: bool,
+) -> Option<String> {
+    use crate::manager::store::ReleaseIdentity;
+
+    let store = store.lock().ok()?;
+    let snapshot = store.snapshot();
+    let identity = if active {
+        snapshot.release_pointers.active.as_ref()
+    } else {
+        snapshot.release_pointers.previous.as_ref()
+    }?;
+    match identity {
+        ReleaseIdentity::ManagedProfile(profile_id) => {
+            let profile = snapshot.profiles.get(profile_id)?;
+            let artifact = snapshot.artifacts.get(&profile.model_artifact_id)?;
+            (artifact.validation_state == crate::manager::registry::ArtifactState::Verified)
+                .then(|| artifact.sha256.clone())
+        }
+        ReleaseIdentity::ExternalBaseline { model_sha256, .. } => Some(model_sha256.clone()),
+    }
+}
+
+impl super::ProductionClusterRuntime {
+    /// Produce a sanitized peer snapshot for the Manager GUI. The request uses only locally
+    /// verified candidate identities and the existing authenticated peer channel.
+    pub async fn manager_peer_inventory(
+        &self,
+    ) -> Option<crate::manager::api::ManagerPeerInventoryDto> {
+        let store = self
+            .inner
+            .manager_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let mode = self.inner.mode.snapshot();
+        if mode.state != crate::target::ClusterState::PairedStandaloneReady
+            || self.operator_policy() == crate::cluster::OperationPolicy::ForcedStandalone
+            || !self.inner.lease.valid()
+        {
+            return None;
+        }
+
+        let profile_ids = store
+            .lock()
+            .ok()?
+            .snapshot()
+            .profiles
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut profiles = Vec::new();
+        for profile_id in profile_ids {
+            if let Ok(profile) = managed_profile_summary(&store, &profile_id) {
+                profiles.push(profile);
+            }
+        }
+        let has_external_baseline = store.lock().ok().is_some_and(|store| {
+            let pointers = &store.snapshot().release_pointers;
+            pointers
+                .active
+                .iter()
+                .chain(pointers.previous.iter())
+                .any(|identity| {
+                    matches!(
+                        identity,
+                        crate::manager::store::ReleaseIdentity::ExternalBaseline { .. }
+                    )
+                })
+        });
+        if has_external_baseline
+            && let Ok(profile) = activation_target_summary(
+                &store,
+                &self.inner.config,
+                self.inner.role,
+                "external-baseline",
+            )
+            .await
+        {
+            profiles.push(profile);
+        }
+        if profiles.is_empty() {
+            return None;
+        }
+
+        let (expected_node_id, expected_role) = self.peer_identity().await;
+        let node_role = match expected_role? {
+            crate::cluster::ControlRole::Coordinator => "coordinator",
+            crate::cluster::ControlRole::Worker => "worker",
+        };
+        let mut peer_node_id = None;
+        let mut peer_profiles = std::collections::BTreeMap::new();
+        let mut peer_active_digest = None;
+        let mut peer_previous_profile_id = None;
+        let mut peer_previous_digest = None;
+        let mut peer_previous_ready = false;
+        let mut peer_activation_phase = None;
+        let mut peer_failure_class = None;
+        for profile in profiles {
+            let request = manager_peer_request(
+                &uuid::Uuid::new_v4().simple().to_string(),
+                &profile,
+                None,
+                mode.generation,
+                self.policy_epoch(),
+                ManagerPeerPhase::Status,
+                None,
+            );
+            let response = self.inner.client.manager_peer(&request).await.ok()?;
+            if expected_node_id.as_deref() != Some(response.node_id.as_str())
+                || peer_node_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != response.node_id)
+            {
+                return None;
+            }
+            peer_node_id = Some(response.node_id.clone());
+            for profile in response.profiles {
+                peer_profiles
+                    .entry(profile.profile_id.clone())
+                    .or_insert(profile);
+            }
+            peer_active_digest = response.active_model_digest;
+            peer_previous_profile_id = response.previous_profile_id;
+            peer_previous_digest = response.previous_model_digest;
+            peer_previous_ready = response.previous_release_ready;
+            peer_activation_phase = response.activation_phase;
+            peer_failure_class = response
+                .activation_failure_class
+                .as_deref()
+                .map(crate::manager::api::sanitize_activation_failure_class);
+        }
+        Some(crate::manager::api::ManagerPeerInventoryDto {
+            node_id: peer_node_id?,
+            node_role: node_role.into(),
+            profiles: peer_profiles
+                .into_values()
+                .map(|profile| crate::manager::api::ManagerPeerProfileDto {
+                    profile_id: profile.profile_id,
+                    node_role: profile.node_role,
+                    candidate_digest: profile.candidate_digest,
+                    source_commit: profile.source_commit,
+                    model_digest: profile.model_digest,
+                    model_catalog_id: profile.model_catalog_id,
+                    config_fingerprint: profile.config_fingerprint,
+                })
+                .collect(),
+            active_digest: peer_active_digest,
+            previous_profile_id: peer_previous_profile_id,
+            previous_digest: peer_previous_digest,
+            previous_release_ready: peer_previous_ready,
+            activation_phase: peer_activation_phase,
+            activation_failure_class: peer_failure_class,
+        })
+    }
+
+    /// Return the local active model digest only while the durable pointer, verified command
+    /// slot, and running child identity still agree.
+    pub async fn manager_active_model_digest(&self) -> Option<String> {
+        let store = self
+            .inner
+            .manager_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if !manager_child_matches_current_release(self, &store)
+            .await
+            .ok()?
+        {
+            return None;
+        }
+        manager_release_model_digest(&store, true)
+    }
+
+    /// Return true only while the previous release can be revalidated against its current files.
+    pub async fn manager_previous_release_ready(&self) -> bool {
+        let Some(store) = self
+            .inner
+            .manager_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return false;
+        };
+        let Some(previous) = store
+            .lock()
+            .ok()
+            .and_then(|store| store.snapshot().release_pointers.previous.clone())
+        else {
+            return false;
+        };
+        match previous {
+            crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
+                verified_profile_command(&store, &self.inner.config, &profile_id)
+                    .await
+                    .is_ok()
+            }
+            identity @ crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
+                verify_external_baseline(&self.inner.config, &identity)
+                    .await
+                    .is_ok()
+            }
+        }
     }
 }
 
@@ -1625,7 +1890,12 @@ mod manager_peer_protocol_tests {
             ack_id: "worker-node:operation:prepare".into(),
             profiles: Vec::new(),
             active_release_digest: None,
+            active_model_digest: None,
             previous_profile_id: None,
+            previous_model_digest: None,
+            previous_release_ready: false,
+            activation_phase: None,
+            activation_failure_class: None,
         };
         let response_bytes = serde_json::to_vec(&response).expect("serialize response");
 
@@ -3398,9 +3668,9 @@ async fn forward_peer_manager_operation(
                 .release_pointers
                 .previous
                 .as_ref()
-                .and_then(|previous| match previous {
-                    ReleaseIdentity::ManagedProfile(profile_id) => Some(profile_id.clone()),
-                    ReleaseIdentity::ExternalBaseline { .. } => Some("external-baseline".into()),
+                .map(|previous| match previous {
+                    ReleaseIdentity::ManagedProfile(profile_id) => profile_id.clone(),
+                    ReleaseIdentity::ExternalBaseline { .. } => "external-baseline".into(),
                 })
                 .ok_or(ManagerPeerProtocolError::NotReady)?,
         };
@@ -3785,6 +4055,7 @@ async fn mark_cluster_manual<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn abort_cluster_activation(
     runtime: &super::ProductionClusterRuntime,
     store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
@@ -3911,6 +4182,7 @@ async fn cluster_activation_preflight(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_cluster_activation_context(
     expected_generation: u64,
     current_generation: u64,

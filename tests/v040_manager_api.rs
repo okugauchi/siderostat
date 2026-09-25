@@ -128,6 +128,22 @@ mod routes {
     #[tokio::test]
     async fn inventory_requires_the_existing_admin_bearer_authentication() {
         let state = state();
+        let active = siderostat::manager::store::ReleaseIdentity::ExternalBaseline {
+            config_fingerprint: "a".repeat(64),
+            executable_sha256: "b".repeat(64),
+            model_sha256: "d".repeat(64),
+        };
+        let previous = siderostat::manager::store::ReleaseIdentity::ExternalBaseline {
+            config_fingerprint: "a".repeat(64),
+            executable_sha256: "b".repeat(64),
+            model_sha256: "c".repeat(64),
+        };
+        state
+            .manager_store
+            .lock()
+            .expect("manager store")
+            .set_release_pointers(active, Some(previous))
+            .expect("persist test previous pointer");
         let response = admin_router(state.clone())
             .oneshot(
                 Request::get("/manager/inventory")
@@ -143,10 +159,17 @@ mod routes {
         assert_eq!(inventory["node_role"], "coordinator");
         assert_eq!(inventory["node_readiness"]["ready"], false);
         assert_eq!(inventory["source_commits"], serde_json::json!([]));
+        assert_eq!(inventory["runtime"]["cluster_enabled"], false);
+        assert_eq!(inventory["runtime"]["desired_policy"], "automatic");
+        assert_eq!(inventory["peer"], serde_json::Value::Null);
+        assert_eq!(inventory["previous_release_ready"], false);
+        assert_eq!(inventory["previous_profile_id"], "external-baseline");
+        assert_eq!(inventory["previous_digest"], "c".repeat(64));
         let json = inventory.to_string();
         assert!(!json.contains("rel_path"));
         assert!(!json.contains("url"));
-        assert!(!json.contains("lease"));
+        assert!(!json.contains("\"lease\""));
+        assert!(!json.contains("runtime_lease"));
     }
 
     async fn terminal(state: Arc<AppState>, id: &str) -> serde_json::Value {

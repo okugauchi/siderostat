@@ -207,3 +207,51 @@ fn build_and_stage_commands_encode_only_local_inventory_identities() {
         );
     }
 }
+
+#[test]
+fn activation_and_rollback_submit_only_generation_not_a_caller_lease() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock admin listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_request(&mut stream);
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            bodies.push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+            respond_json(&mut stream, r#"{"id":"accepted-job"}"#);
+        }
+        bodies
+    });
+    let config = MonitorConfig {
+        admin_listen: format!("http://{address}"),
+        ..MonitorConfig::default()
+    };
+    let client = MetricsClient::new(&config).expect("client");
+    assert!(matches!(
+        block_on(execute_manager_command(
+            &client,
+            ManagerCommand::Activate {
+                profile: "profile-local".into(),
+                expected_generation: 9,
+            }
+        )),
+        ManagerEvent::Submitted { kind, .. } if kind == "activate"
+    ));
+    assert!(matches!(
+        block_on(execute_manager_command(
+            &client,
+            ManagerCommand::Rollback {
+                expected_generation: 9,
+            }
+        )),
+        ManagerEvent::Submitted { kind, .. } if kind == "rollback"
+    ));
+    let bodies = server.join().expect("server task");
+    assert_eq!(bodies[0]["payload_key"], "profile-local");
+    assert_eq!(bodies[1]["payload_key"], "previous");
+    for body in bodies {
+        assert_eq!(body["expected_generation"], 9);
+        assert!(body.get("runtime_lease").is_none());
+    }
+}
