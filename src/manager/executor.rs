@@ -110,6 +110,10 @@ pub enum ManagerInputError {
     Unavailable,
 }
 
+pub const OFFICIAL_DS4_REMOTE: &str = "https://github.com/antirez/ds4.git";
+pub const OFFICIAL_FETCH_KEY: &str = "official";
+pub const OFFICIAL_DS4_MAIN_REF: &str = "refs/heads/main";
+
 /// Explicitly configured payload keys. An empty resolver is safe for a runtime
 /// that has not yet connected its source, catalog, registry, and cluster state.
 #[derive(Default)]
@@ -153,6 +157,26 @@ impl ManagerJobInputResolver {
         let entry = catalog::validate_entry(entry).map_err(|_| ManagerInputError::Rejected)?;
         self.model_catalog.insert(entry.catalog_id.clone(), entry);
         Ok(())
+    }
+
+    /// Production Fetch accepts one UI key and always resolves it to the
+    /// canonical upstream remote and pinned main branch.
+    pub fn official_fetch(cache: PathBuf) -> Self {
+        let mut resolver = Self::new();
+        resolver
+            .register(
+                JobKind::Fetch,
+                OFFICIAL_FETCH_KEY,
+                ManagerJobInput::Fetch {
+                    cache,
+                    official: source::OfficialRemote::new(OFFICIAL_DS4_REMOTE),
+                    remote: OFFICIAL_DS4_REMOTE.into(),
+                    revision: "main".into(),
+                    main_ref: OFFICIAL_DS4_MAIN_REF.into(),
+                },
+            )
+            .expect("fixed official fetch plan is valid");
+        resolver
     }
 
     pub fn resolve(
@@ -422,6 +446,7 @@ fn file_sha256_streaming(path: &std::path::Path) -> Result<String, ManagerInputE
 pub struct RuntimeManagerBackend {
     resolver: ManagerJobInputResolver,
     transport: Option<Arc<dyn download::HttpTransport + Send + Sync>>,
+    manager_store: Option<Arc<Mutex<crate::manager::store::ManagerReleaseStore>>>,
 }
 
 impl RuntimeManagerBackend {
@@ -429,7 +454,28 @@ impl RuntimeManagerBackend {
         Self {
             resolver,
             transport: None,
+            manager_store: None,
         }
+    }
+
+    /// Construct the production source path. The UI key cannot supply a remote,
+    /// revision, local path, or command argument.
+    pub fn for_release_store(
+        store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+    ) -> Self {
+        let cache = store
+            .lock()
+            .expect("manager store lock poisoned")
+            .official_source_cache_path();
+        Self::new(ManagerJobInputResolver::official_fetch(cache)).with_manager_store(store)
+    }
+
+    pub fn with_manager_store(
+        mut self,
+        store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+    ) -> Self {
+        self.manager_store = Some(store);
+        self
     }
 
     pub fn without_model_catalog() -> Self {
@@ -471,13 +517,30 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                 revision,
                 main_ref,
             } => {
-                source::stage_source_cancellable(
+                let store = self
+                    .manager_store
+                    .as_ref()
+                    .ok_or(ManagerExecutionError::Unavailable)?;
+                store
+                    .lock()
+                    .map_err(|_| ManagerExecutionError::Unavailable)?
+                    .validate_source_cache_path(&cache)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                let record = source::stage_source_cancellable(
                     &cache, &official, &remote, &revision, &main_ref, &cancel,
                 )
                 .map_err(|error| match error {
                     source::SourceError::Canceled => ManagerExecutionError::Canceled,
                     other => ManagerExecutionError::Domain(other.to_string()),
                 })?;
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(ManagerExecutionError::Canceled);
+                }
+                store
+                    .lock()
+                    .map_err(|_| ManagerExecutionError::Unavailable)?
+                    .record_source(record)
+                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
             ManagerJobInput::Build { request, .. } => {
                 build::build_artifacts(&request, &cancel)

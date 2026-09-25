@@ -299,6 +299,33 @@ impl ManagerReleaseStore {
         &self.snapshot
     }
 
+    pub fn official_source_cache_path(&self) -> PathBuf {
+        self.root.paths().sources.join("official.git")
+    }
+
+    pub fn validate_source_cache_path(&self, path: &Path) -> Result<(), StoreError> {
+        let expected = self.official_source_cache_path();
+        if path != expected {
+            return Err(StoreError::PathOutsideRoot);
+        }
+        let sources = self.root.paths().sources;
+        let canonical_sources = fs::canonicalize(&sources).map_err(io_error)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(StoreError::SymlinkEscape);
+                }
+                let canonical = fs::canonicalize(path).map_err(io_error)?;
+                if !canonical.starts_with(canonical_sources) {
+                    return Err(StoreError::PathOutsideRoot);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &ManagerRoot {
         &self.root
     }
@@ -333,14 +360,20 @@ impl ManagerReleaseStore {
     pub fn record_source(&mut self, record: SourceRecord) -> Result<String, StoreError> {
         if !full_git_sha(&record.full_commit)
             || !full_git_sha(&record.main_proof)
-            || !record.remote.starts_with("https://")
+            || !valid_source_remote(&record.remote)
         {
             return Err(StoreError::InvalidRecord("source receipt".into()));
         }
         let id = format!("source-{}", record.full_commit);
         let mut candidate = self.snapshot.clone();
         if let Some(existing) = candidate.source_receipts.get(&id) {
-            if existing != &record {
+            // Receipt identity is commit-pinned. A repeated fetch may happen in
+            // another second, so fetched_at does not turn the same immutable
+            // provenance into a collision.
+            if existing.remote != record.remote
+                || existing.full_commit != record.full_commit
+                || existing.main_proof != record.main_proof
+            {
                 return Err(StoreError::InvalidReference("source id collision".into()));
             }
             return Ok(id);
@@ -573,7 +606,7 @@ impl ManagerReleaseStore {
             if id != &format!("source-{}", source.full_commit)
                 || !full_git_sha(&source.full_commit)
                 || !full_git_sha(&source.main_proof)
-                || !source.remote.starts_with("https://")
+                || !valid_source_remote(&source.remote)
             {
                 return Err(StoreError::InvalidRecord("source receipt".into()));
             }
@@ -824,6 +857,24 @@ fn full_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_source_remote(remote: &str) -> bool {
+    let Ok(url) = url::Url::parse(remote) else {
+        return false;
+    };
+    let clean = url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if url.scheme() == "https" {
+        return clean && url.host_str().is_some();
+    }
+    #[cfg(feature = "test-support")]
+    if url.scheme() == "file" {
+        return clean && url.host().is_none();
+    }
+    false
+}
+
 fn digest_file(path: &Path) -> Result<(u64, String), StoreError> {
     use sha2::Digest;
     let mut file = File::open(path).map_err(io_error)?;
@@ -1000,6 +1051,9 @@ mod tests {
         let mut store =
             ManagerReleaseStore::open(manager_root.clone(), "coordinator").expect("open store");
         let profile_id = publish_test_profile(&mut store, &root);
+        let source_id = store
+            .record_source(source_record())
+            .expect("source receipt");
         store
             .set_release_pointers(
                 ReleaseIdentity::ManagedProfile(profile_id.clone()),
@@ -1017,6 +1071,7 @@ mod tests {
         assert_eq!(reopened.snapshot().schema_version, STORE_SCHEMA_VERSION);
         assert_eq!(reopened.snapshot().node_id, "coordinator");
         assert_eq!(reopened.snapshot().source_receipts.len(), 1);
+        assert!(reopened.snapshot().source_receipts.contains_key(&source_id));
         assert_eq!(reopened.snapshot().artifacts.len(), 2);
         assert_eq!(
             reopened.snapshot().profiles[&profile_id].profile_id,
@@ -1030,6 +1085,46 @@ mod tests {
             reopened.snapshot().release_pointers.previous,
             Some(ReleaseIdentity::ExternalBaseline { .. })
         ));
+    }
+
+    #[test]
+    fn repeated_source_fetch_keeps_commit_pinned_receipt_identity() {
+        let root = root("source-idempotent");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root), "node-a").expect("store");
+        let first = source_record();
+        let id = store.record_source(first.clone()).expect("first receipt");
+        let mut later_fetch = first;
+        later_fetch.fetched_at += 1;
+
+        assert_eq!(store.record_source(later_fetch), Ok(id.clone()));
+        assert_eq!(store.snapshot().source_receipts.len(), 1);
+        assert_eq!(
+            store.snapshot().source_receipts[&id].fetched_at,
+            1_758_795_200,
+            "a stable immutable receipt retains the original fetch timestamp"
+        );
+    }
+
+    #[test]
+    fn source_receipt_rejects_remote_credentials_and_query_secrets() {
+        let root = root("source-secret");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root), "node-a").expect("store");
+        for remote in [
+            "https://user:secret@example.com/ds4.git",
+            "https://example.com/ds4.git?access_token=secret",
+        ] {
+            let record = SourceRecord {
+                remote: remote.into(),
+                ..source_record()
+            };
+            assert!(matches!(
+                store.record_source(record),
+                Err(StoreError::InvalidRecord(_))
+            ));
+        }
+        assert!(store.snapshot().source_receipts.is_empty());
     }
 
     #[test]

@@ -91,10 +91,26 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
-        Self::from_config_with_backend(
-            config,
-            crate::manager::executor::RuntimeManagerBackend::without_model_catalog(),
-        )
+        tokio::runtime::Handle::try_current()
+            .context("manager executor requires a Tokio runtime")?;
+        #[cfg(feature = "test-support")]
+        let manager_root = Self::temporary_manager_root();
+        #[cfg(not(feature = "test-support"))]
+        let manager_root = {
+            let home = std::env::var_os("HOME").context("HOME is required for manager storage")?;
+            crate::manager::registry::ManagerRoot::default_from_home(std::path::Path::new(&home))
+        };
+        let manager_store = Arc::new(std::sync::Mutex::new(
+            crate::manager::store::ManagerReleaseStore::open(
+                manager_root,
+                config.cluster.node_id.clone(),
+            )
+            .context("open manager release store")?,
+        ));
+        let backend = crate::manager::executor::RuntimeManagerBackend::for_release_store(
+            manager_store.clone(),
+        );
+        Self::from_config_with_manager_store(config, backend, manager_store)
     }
 
     #[cfg(feature = "test-support")]
@@ -117,28 +133,6 @@ impl AppState {
         self.manager_executor.shutdown_for_test();
     }
 
-    fn from_config_with_backend<B>(config: ModeAwareConfig, backend: B) -> anyhow::Result<Arc<Self>>
-    where
-        B: crate::manager::executor::ManagerExecutionBackend,
-    {
-        #[cfg(feature = "test-support")]
-        {
-            return Self::from_config_with_manager_root(
-                config,
-                backend,
-                Self::temporary_manager_root(),
-            );
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            let home = std::env::var_os("HOME").context("HOME is required for manager storage")?;
-            let root = crate::manager::registry::ManagerRoot::default_from_home(
-                std::path::Path::new(&home),
-            );
-            Self::from_config_with_manager_root(config, backend, root)
-        }
-    }
-
     #[cfg(feature = "test-support")]
     fn temporary_manager_root() -> crate::manager::registry::ManagerRoot {
         let root = std::env::temp_dir().join(format!(
@@ -149,6 +143,7 @@ impl AppState {
         crate::manager::registry::ManagerRoot::explicit(root)
     }
 
+    #[cfg(feature = "test-support")]
     fn from_config_with_manager_root<B>(
         config: ModeAwareConfig,
         backend: B,
@@ -166,6 +161,17 @@ impl AppState {
             )
             .context("open manager release store")?,
         ));
+        Self::from_config_with_manager_store(config, backend, manager_store)
+    }
+
+    fn from_config_with_manager_store<B>(
+        config: ModeAwareConfig,
+        backend: B,
+        manager_store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    ) -> anyhow::Result<Arc<Self>>
+    where
+        B: crate::manager::executor::ManagerExecutionBackend,
+    {
         let job_persistence = Arc::new(crate::manager::store::ManagerJobStorePersistence::new(
             manager_store.clone(),
         ));

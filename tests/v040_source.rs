@@ -99,7 +99,7 @@ fn w01_fetch_main_records_candidate_not_activation() {
     // full commit が記録され、main の祖先（candidate）。M02。
     assert!(!rec.full_commit.is_empty());
     assert_eq!(rec.remote, remote.to_str().unwrap());
-    assert_eq!(rec.main_proof, "refs/heads/main");
+    assert_eq!(rec.main_proof, rec.full_commit);
     // fetch だけで activation されない（SourceRecord を返すだけ。registry の
     // state は触らない。ここでは cache が bare のまま active ref を指さない）。M02。
     assert!(cache.join("HEAD").exists());

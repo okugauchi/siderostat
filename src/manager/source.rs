@@ -1,7 +1,7 @@
 //! DS4 Manager — 公式 source fetch と commit 固定。M02。
 //!
 //! C04 に基づき、公式 pin 済み source を cache へ fetch し、full commit と
-//! main ancestry を記録して `SourceRecord` を返す。git command は引数配列で
+//! main ancestry を証明する full commit SHA を記録して `SourceRecord` を返す。git command は引数配列で
 //! 実行し、shell 文字列を受理しない。submodule/filter/hook など外部実行
 //! 経路を制限する。利用者の DS4 checkout・branch・global Git config を変更
 //! しない。取得候補（candidate）と active commit は分離され、fetch だけで
@@ -33,6 +33,8 @@ pub enum SourceError {
     UnapprovedRemote,
     /// revision が安全でない（shell 展開・`--upload-pack` 等）。M02。
     UnsafeRevision,
+    /// cache path が通常の bare repository directory ではない。
+    UnsafeCache,
     /// git command の実行失敗。M02。
     GitFailed(String),
     /// 対象 commit が main の祖先でない（reference 扱い）。M02。
@@ -47,6 +49,7 @@ impl std::fmt::Display for SourceError {
             SourceError::Canceled => write!(f, "source fetch canceled"),
             SourceError::UnapprovedRemote => write!(f, "remote is not an approved official source"),
             SourceError::UnsafeRevision => write!(f, "unsafe revision"),
+            SourceError::UnsafeCache => write!(f, "unsafe source cache path"),
             SourceError::GitFailed(msg) => write!(f, "git failed: {msg}"),
             SourceError::NotOnMain => write!(f, "commit is not on main"),
             SourceError::NoCandidate => write!(f, "no source candidate available"),
@@ -235,6 +238,38 @@ fn terminate_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+fn validate_bare_cache_layout(cache: &Path) -> Result<(), SourceError> {
+    for relative in ["HEAD", "config"] {
+        match std::fs::symlink_metadata(cache.join(relative)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(SourceError::UnsafeCache);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SourceError::GitFailed(format!("cache: {error}"))),
+        }
+    }
+    for relative in [
+        "objects",
+        "objects/info",
+        "objects/pack",
+        "refs",
+        "refs/heads",
+        "refs/tags",
+        "refs/remotes",
+    ] {
+        match std::fs::symlink_metadata(cache.join(relative)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(SourceError::UnsafeCache);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SourceError::GitFailed(format!("cache: {error}"))),
+        }
+    }
+    Ok(())
+}
+
 /// revision を安全か検証する。M02。
 ///
 /// git の引数として安全でないパターン（`--upload-pack`、`-c`、shell 展開、
@@ -299,12 +334,22 @@ pub fn stage_source_cancellable(
 
     // cache を bare で初期化（既にあれば fetch のみ）。M02。
     let runner = GitRunner::default();
+    match std::fs::symlink_metadata(cache) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(SourceError::UnsafeCache);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(SourceError::GitFailed(format!("cache: {error}"))),
+    }
+    validate_bare_cache_layout(cache)?;
     if !cache.join("HEAD").exists() {
         runner.run_cancellable(
             ["init", "--bare", cache.to_str().unwrap_or_default()],
             cancel,
         )?;
     }
+    validate_bare_cache_layout(cache)?;
 
     // main_ref を cache のローカル ref に取り込む（main ancestry 検証用）。
     // fetch だけで activation されない（SourceRecord を返すだけ）。M02。
@@ -320,6 +365,23 @@ pub fn stage_source_cancellable(
     );
     if main_fetch == Err(SourceError::Canceled) {
         return Err(SourceError::Canceled);
+    }
+    main_fetch?;
+
+    // Pin the ancestry proof to the exact fetched main commit. A ref name alone
+    // can move after this fetch and is not sufficient durable provenance.
+    let main_proof = runner.run_cancellable(
+        [
+            "--git-dir",
+            cache.to_str().unwrap_or_default(),
+            "rev-parse",
+            "--verify",
+            &format!("{main_ref}^{{commit}}"),
+        ],
+        cancel,
+    )?;
+    if main_proof.is_empty() {
+        return Err(SourceError::GitFailed("empty main proof".into()));
     }
 
     // fetch。network 失敗時は Err を返し、旧 candidate は保持される。M02。
@@ -356,7 +418,7 @@ pub fn stage_source_cancellable(
             "merge-base",
             "--is-ancestor",
             &full_commit,
-            main_ref,
+            &main_proof,
         ],
         cancel,
     );
@@ -371,7 +433,7 @@ pub fn stage_source_cancellable(
     Ok(SourceRecord {
         remote: remote.to_string(),
         full_commit,
-        main_proof: main_ref.to_string(),
+        main_proof,
         fetched_at: now_secs(),
     })
 }
@@ -532,7 +594,7 @@ mod tests {
         assert_eq!(rec.remote, remote.to_str().unwrap());
         assert!(!rec.full_commit.is_empty());
         // main の祖先 → candidate（NotOnMain ではない）。M02。
-        assert_eq!(rec.main_proof, "refs/heads/main");
+        assert_eq!(rec.main_proof, rec.full_commit);
     }
 
     /// 非 main commit → reference（NotOnMain）。M02。
