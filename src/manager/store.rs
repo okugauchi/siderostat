@@ -490,6 +490,49 @@ impl ManagerReleaseStore {
         self.commit_candidate(candidate)
     }
 
+    /// Rehash a managed artifact before Stage or activation consumes it. Any
+    /// changed file is durably quarantined so no later profile can trust it.
+    pub fn verify_managed_artifact(
+        &mut self,
+        artifact_id: &str,
+        expected_kind: ArtifactKind,
+    ) -> Result<PersistedArtifactRecord, StoreError> {
+        let record = self
+            .snapshot
+            .artifacts
+            .get(artifact_id)
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidReference("artifact".into()))?;
+        if record.kind != expected_kind {
+            return Err(StoreError::InvalidReference("artifact kind".into()));
+        }
+        let path = self.resolve_artifact_path(&record.rel_path)?;
+        let (actual_size, actual_digest) = digest_file(&path)?;
+        let mut candidate = self.snapshot.clone();
+        let artifact = candidate
+            .artifacts
+            .get_mut(artifact_id)
+            .ok_or_else(|| StoreError::InvalidReference("artifact".into()))?;
+        if actual_size != record.size || actual_digest != record.sha256 {
+            artifact.validation_state = ArtifactState::Quarantined;
+            self.commit_candidate(candidate)?;
+            return if actual_size != record.size {
+                Err(StoreError::SizeMismatch)
+            } else {
+                Err(StoreError::DigestMismatch)
+            };
+        }
+        if artifact.validation_state != ArtifactState::Verified {
+            artifact.validation_state = ArtifactState::Verified;
+            self.commit_candidate(candidate)?;
+        }
+        self.snapshot
+            .artifacts
+            .get(artifact_id)
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidReference("artifact".into()))
+    }
+
     fn ensure_managed_directory(&self, path: &Path) -> Result<(), StoreError> {
         let root = self.root.root();
         if !path.starts_with(root) {
@@ -843,8 +886,8 @@ impl ManagerReleaseStore {
         if snapshot.schema_version != STORE_SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema(snapshot.schema_version));
         }
-        if snapshot.node_id.trim().is_empty() {
-            return Err(StoreError::InvalidRecord("empty node id".into()));
+        if !valid_record_id(&snapshot.node_id) {
+            return Err(StoreError::InvalidRecord("node id".into()));
         }
         for (id, source) in &snapshot.source_receipts {
             if id != &format!("source-{}", source.full_commit)
@@ -902,9 +945,12 @@ impl ManagerReleaseStore {
         }
         for (id, profile) in &snapshot.profiles {
             if id != &profile.profile_id
-                || id.trim().is_empty()
+                || !valid_record_id(id)
                 || !full_sha256(&profile.config_fingerprint)
-                || profile.node_role.trim().is_empty()
+                || !matches!(
+                    profile.node_role.as_str(),
+                    "ds4" | "ds4-server" | "coordinator" | "worker"
+                )
                 || profile.model_catalog_id.trim().is_empty()
                 || profile.role_artifact_ids.is_empty()
             {
@@ -915,6 +961,7 @@ impl ManagerReleaseStore {
                 .get(&profile.model_artifact_id)
                 .ok_or_else(|| StoreError::InvalidReference("model artifact".into()))?;
             if model.kind != ArtifactKind::Model
+                || model.validation_state != ArtifactState::Verified
                 || !matches!(
                     &model.provenance,
                     ArtifactProvenance::Model { catalog_id } if catalog_id == &profile.model_catalog_id
@@ -927,7 +974,19 @@ impl ManagerReleaseStore {
                     .artifacts
                     .get(role_id)
                     .ok_or_else(|| StoreError::InvalidReference("role artifact".into()))?;
-                if role.kind != ArtifactKind::Build {
+                let expected_role = match profile.node_role.as_str() {
+                    "coordinator" | "ds4-server" => "ds4-server",
+                    "worker" | "ds4" => "ds4",
+                    _ => return Err(StoreError::InvalidRecord("staged profile role".into())),
+                };
+                if role.kind != ArtifactKind::Build
+                    || role.validation_state != ArtifactState::Verified
+                    || !matches!(
+                        &role.provenance,
+                        ArtifactProvenance::Build { record, .. }
+                            if record.role == expected_role && record.target == expected_role
+                    )
+                {
                     return Err(StoreError::InvalidReference("role artifact kind".into()));
                 }
             }
@@ -982,8 +1041,16 @@ impl ManagerReleaseStore {
     ) -> Result<(), StoreError> {
         match identity {
             ReleaseIdentity::ManagedProfile(profile_id) => {
-                if !snapshot.profiles.contains_key(profile_id) {
-                    return Err(StoreError::InvalidReference("release profile".into()));
+                let profile = snapshot
+                    .profiles
+                    .get(profile_id)
+                    .ok_or_else(|| StoreError::InvalidReference("release profile".into()))?;
+                if profile.compatibility != ProfileCompatibility::Compatible
+                    || profile.hardware_readiness != HardwareReadiness::Ready
+                {
+                    return Err(StoreError::InvalidReference(
+                        "release profile is not activation-ready".into(),
+                    ));
                 }
             }
             ReleaseIdentity::ExternalBaseline {
@@ -1014,6 +1081,13 @@ impl ManagerReleaseStore {
             .profiles
             .get(profile_id)
             .ok_or_else(|| StoreError::InvalidReference("release profile".into()))?;
+        if profile.compatibility != ProfileCompatibility::Compatible
+            || profile.hardware_readiness != HardwareReadiness::Ready
+        {
+            return Err(StoreError::InvalidReference(
+                "release profile is not activation-ready".into(),
+            ));
+        }
         for artifact_id in profile
             .role_artifact_ids
             .iter()
@@ -1105,6 +1179,15 @@ fn validate_relative_path(path: &Path) -> Result<(), StoreError> {
 
 fn full_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_record_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn full_git_sha(value: &str) -> bool {

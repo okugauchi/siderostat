@@ -22,3 +22,5 @@
 - 出典: feature/cluster-dry-run（2026-09-05）
 - 外部配布物を catalog の取得対象にする前に、配布元・正確な size・full checksum の根拠を照合する。placeholder URL と仮置き checksum は trust の根拠として採用しない
 - 出典: H06 Manager Model Download/Verify（2026-09-25）
+- 永続 release pointer や設定 manifest は child が実際に読み込んだ状態を証明しない。inventory の active digest は verified profile と一致する live observation がある時だけ出す
+- 出典: H06 Manager Durable Stage and Inventory（2026-09-25）

@@ -17,6 +17,47 @@
 use crate::manager::catalog::ModelCatalogEntry;
 use std::path::PathBuf;
 
+/// Validated runtime settings used by the managed Stage adapter. The fingerprint
+/// is the only persisted representation of the configuration; paths and argv
+/// remain transient process input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRuntimeConfig {
+    /// When configuration/runtime ownership identifies the local role, Stage
+    /// rejects a build artifact intended for the other cluster node.
+    pub expected_node_role: Option<String>,
+    pub expected_family: String,
+    pub context_size: u64,
+    pub expected_prefix_digest: Option<String>,
+    pub config_fingerprint: String,
+    /// Stage does not infer free-memory readiness from configuration. A later
+    /// hardware check may set this only after observing the local node.
+    pub ram_confirmed: bool,
+}
+
+impl StageRuntimeConfig {
+    /// Snapshot the DS4 runtime settings that constrain a staged candidate.
+    /// The serialized debug form is hashed immediately and never persisted.
+    pub fn from_validated_config(config: &crate::config::ModeAwareConfig) -> Self {
+        let context_size = if config.cluster.enabled {
+            config.ds4.distributed.context_size as u64
+        } else {
+            config.ds4.standalone.context_size as u64
+        };
+        let fingerprint_material = format!(
+            "manager-stage-config-v1\nnode={}\ncluster_enabled={}\nds4={:?}",
+            config.cluster.node_id, config.cluster.enabled, config.ds4
+        );
+        Self {
+            expected_node_role: (!config.cluster.enabled).then(|| "coordinator".into()),
+            expected_family: "ds4".into(),
+            context_size,
+            expected_prefix_digest: None,
+            config_fingerprint: super::registry::sha256_hex(fingerprint_material.as_bytes()),
+            ram_confirmed: false,
+        }
+    }
+}
+
 /// stage 状態。M07。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +105,8 @@ pub enum StageError {
     PrefixDigestMismatch(String),
     /// model catalog に prefix-file が無いのに指定された。M07。
     MissingPrefixFile,
+    /// prefix-file が必要だが、runtime config に期待 digest が無い。M07。
+    MissingExpectedPrefixDigest,
     /// 空き RAM 未確認（hardware pending）。M07。
     RamUnconfirmed,
     /// role artifact が無い。M07。
@@ -78,6 +121,9 @@ impl std::fmt::Display for StageError {
                 write!(f, "prefix-file digest mismatch: {msg}")
             }
             StageError::MissingPrefixFile => write!(f, "missing prefix-file"),
+            StageError::MissingExpectedPrefixDigest => {
+                write!(f, "expected prefix-file digest is not configured")
+            }
             StageError::RamUnconfirmed => write!(f, "free RAM unconfirmed (hardware pending)"),
             StageError::NoRoleArtifacts => write!(f, "no role artifacts"),
         }
@@ -133,6 +179,7 @@ pub fn stage_profile(req: StageRequest) -> Result<StagedProfile, StageError> {
             }
         }
         (None, Some(_)) => return Err(StageError::MissingPrefixFile),
+        (Some(_), None) => return Err(StageError::MissingExpectedPrefixDigest),
         _ => {}
     }
     // 空き RAM 未確認 → HardwarePending。M07。

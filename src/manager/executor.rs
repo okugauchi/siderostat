@@ -97,6 +97,10 @@ pub enum ManagerJobInput {
         model_artifact_id: String,
         model_artifact_path: PathBuf,
     },
+    StageManagedArtifacts {
+        build_artifact_id: String,
+        model_artifact_id: String,
+    },
     Activate(activation::ActivationRequest),
     Rollback(rollback::RollbackRequest),
 }
@@ -112,6 +116,7 @@ impl ManagerJobInput {
             Self::Verify { .. } => JobKind::Verify,
             Self::VerifyManagedArtifact { .. } => JobKind::Verify,
             Self::Stage { .. } => JobKind::Stage,
+            Self::StageManagedArtifacts { .. } => JobKind::Stage,
             Self::Activate(_) => JobKind::Activate,
             Self::Rollback(_) => JobKind::Rollback,
         }
@@ -268,6 +273,16 @@ impl ManagerJobInputResolver {
                     artifact_id: request.payload_key.clone(),
                 });
             }
+            if request.kind == JobKind::Stage {
+                if let Some((build_artifact_id, model_artifact_id)) =
+                    parse_manager_stage_payload_key(&request.payload_key)
+                {
+                    return Ok(ManagerJobInput::StageManagedArtifacts {
+                        build_artifact_id,
+                        model_artifact_id,
+                    });
+                }
+            }
             return if matches!(request.kind, JobKind::Download | JobKind::Stage)
                 && self.model_catalog.is_empty()
             {
@@ -366,6 +381,16 @@ impl ManagerJobInputResolver {
                     return Err(ManagerInputError::Rejected);
                 }
             }
+            ManagerJobInput::StageManagedArtifacts {
+                build_artifact_id,
+                model_artifact_id,
+            } => {
+                if !valid_build_artifact_id(build_artifact_id)
+                    || !valid_model_artifact_id(model_artifact_id)
+                {
+                    return Err(ManagerInputError::Rejected);
+                }
+            }
             ManagerJobInput::Stage {
                 request: req,
                 registry,
@@ -455,6 +480,30 @@ fn valid_model_artifact_id(value: &str) -> bool {
     value.strip_prefix("model-").is_some_and(full_sha256)
 }
 
+fn valid_build_artifact_id(value: &str) -> bool {
+    value.strip_prefix("build-").is_some_and(full_sha256)
+}
+
+/// Encode Stage input from two node-local immutable artifact IDs. No path,
+/// model URL, or command argument is accepted in this key.
+pub fn manager_stage_payload_key(
+    build_artifact_id: &str,
+    model_artifact_id: &str,
+) -> Option<String> {
+    (valid_build_artifact_id(build_artifact_id) && valid_model_artifact_id(model_artifact_id))
+        .then(|| format!("{build_artifact_id}:{model_artifact_id}"))
+}
+
+fn parse_manager_stage_payload_key(value: &str) -> Option<(String, String)> {
+    let (build_artifact_id, model_artifact_id) = value.split_once(':')?;
+    if value.matches(':').count() != 1
+        || manager_stage_payload_key(build_artifact_id, model_artifact_id).as_deref() != Some(value)
+    {
+        return None;
+    }
+    Some((build_artifact_id.to_owned(), model_artifact_id.to_owned()))
+}
+
 fn full_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -533,6 +582,7 @@ pub struct RuntimeManagerBackend {
     resolver: ManagerJobInputResolver,
     transport: Option<Arc<dyn download::HttpTransport + Send + Sync>>,
     manager_store: Option<Arc<Mutex<crate::manager::store::ManagerReleaseStore>>>,
+    stage_runtime_config: Option<stage::StageRuntimeConfig>,
 }
 
 impl RuntimeManagerBackend {
@@ -546,6 +596,7 @@ impl RuntimeManagerBackend {
             resolver,
             transport: None,
             manager_store: None,
+            stage_runtime_config: None,
         }
     }
 
@@ -570,6 +621,15 @@ impl RuntimeManagerBackend {
             .with_transport_internal(transport))
     }
 
+    /// Construct the production manager with a snapshot of the already
+    /// validated DS4 runtime settings used when local profiles are staged.
+    pub fn for_release_store_with_stage_config(
+        store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+        stage_config: stage::StageRuntimeConfig,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::for_release_store(store)?.with_stage_runtime_config_internal(stage_config))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_manager_store(
         self,
@@ -578,11 +638,21 @@ impl RuntimeManagerBackend {
         self.with_manager_store_internal(store)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_stage_runtime_config(self, config: stage::StageRuntimeConfig) -> Self {
+        self.with_stage_runtime_config_internal(config)
+    }
+
     fn with_manager_store_internal(
         mut self,
         store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
     ) -> Self {
         self.manager_store = Some(store);
+        self
+    }
+
+    fn with_stage_runtime_config_internal(mut self, config: stage::StageRuntimeConfig) -> Self {
+        self.stage_runtime_config = Some(config);
         self
     }
 
@@ -1017,6 +1087,12 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                     return Err(ManagerExecutionError::Unavailable);
                 }
             }
+            ManagerJobInput::StageManagedArtifacts {
+                build_artifact_id,
+                model_artifact_id,
+            } => {
+                self.stage_managed_artifacts(&build_artifact_id, &model_artifact_id, &cancel)?;
+            }
             ManagerJobInput::Activate(_) | ManagerJobInput::Rollback(_) => {
                 return Err(ManagerExecutionError::Unavailable);
             }
@@ -1029,6 +1105,167 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
 }
 
 impl RuntimeManagerBackend {
+    fn stage_managed_artifacts(
+        &self,
+        build_artifact_id: &str,
+        model_artifact_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerExecutionError> {
+        if !valid_build_artifact_id(build_artifact_id)
+            || !valid_model_artifact_id(model_artifact_id)
+        {
+            return Err(ManagerExecutionError::InputRejected(
+                "invalid staged artifact identity".into(),
+            ));
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let config = self
+            .stage_runtime_config
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?
+            .clone();
+        if config.expected_family.trim().is_empty()
+            || config.context_size == 0
+            || !full_sha256(&config.config_fingerprint)
+            || config
+                .expected_node_role
+                .as_deref()
+                .is_some_and(|role| !matches!(role, "coordinator" | "worker"))
+        {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+        let manager_store = self
+            .manager_store
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let mut store = manager_store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        let build = store
+            .verify_managed_artifact(
+                build_artifact_id,
+                crate::manager::store::ArtifactKind::Build,
+            )
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        let crate::manager::store::ArtifactProvenance::Build {
+            source_receipt_id,
+            record: build_record,
+        } = &build.provenance
+        else {
+            return Err(ManagerExecutionError::InputRejected(
+                "artifact is not a build artifact".into(),
+            ));
+        };
+        // ds4-agent is buildable but cannot own a serving release profile.
+        if !matches!(build_record.role.as_str(), "ds4" | "ds4-server")
+            || build_record.target != build_record.role
+        {
+            return Err(ManagerExecutionError::InputRejected(
+                "build role is not a serving role".into(),
+            ));
+        }
+        let node_role = if build_record.role == "ds4-server" {
+            "coordinator"
+        } else {
+            "worker"
+        };
+        if config
+            .expected_node_role
+            .as_deref()
+            .is_some_and(|expected| expected != node_role)
+        {
+            return Err(ManagerExecutionError::InputRejected(
+                "build role does not match this node".into(),
+            ));
+        }
+        let model = store
+            .snapshot()
+            .artifacts
+            .get(model_artifact_id)
+            .cloned()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let crate::manager::store::ArtifactProvenance::Model { catalog_id } = &model.provenance
+        else {
+            return Err(ManagerExecutionError::InputRejected(
+                "artifact is not a catalog model".into(),
+            ));
+        };
+        let catalog_entry = self
+            .resolver
+            .model_catalog
+            .get(catalog_id)
+            .cloned()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        store
+            .verify_model_artifact(
+                model_artifact_id,
+                catalog_id,
+                &catalog_entry.sha256,
+                catalog_entry.size,
+            )
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let profile_seed = format!(
+            "manager-profile-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{}",
+            build.id,
+            model.id,
+            node_role,
+            config.config_fingerprint,
+            config.expected_family,
+            config.context_size,
+            config.expected_node_role.as_deref().unwrap_or("unknown"),
+            config.expected_prefix_digest,
+            config.ram_confirmed
+        );
+        let profile_id = format!("profile-{}", registry::sha256_hex(profile_seed.as_bytes()));
+        let role_path = store.root().root().join(&build.rel_path);
+        let staged = stage::stage_profile(stage::StageRequest {
+            profile_id: profile_id.clone(),
+            role_artifacts: vec![role_path],
+            model: catalog_entry.clone(),
+            expected_family: config.expected_family,
+            context_size: config.context_size,
+            expected_prefix_digest: config.expected_prefix_digest,
+            ram_confirmed: config.ram_confirmed,
+        })
+        .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let hardware_readiness = match staged.status {
+            stage::StagedProfileStatus::Validated => {
+                crate::manager::store::HardwareReadiness::Ready
+            }
+            stage::StagedProfileStatus::HardwarePending => {
+                crate::manager::store::HardwareReadiness::Pending
+            }
+        };
+        if !store
+            .snapshot()
+            .source_receipts
+            .contains_key(source_receipt_id)
+        {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+        store
+            .record_profile(crate::manager::store::StagedProfileRecord {
+                profile_id,
+                node_role: node_role.into(),
+                role_artifact_ids: vec![build.id],
+                model_artifact_id: model.id,
+                model_catalog_id: catalog_id.clone(),
+                config_fingerprint: config.config_fingerprint,
+                compatibility: crate::manager::store::ProfileCompatibility::Compatible,
+                hardware_readiness,
+            })
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        Ok(())
+    }
+
     fn download_catalog_model(
         &self,
         catalog_id: &str,
@@ -1331,7 +1568,8 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
             ManagerJobInput::DownloadFromCatalog { .. }
-            | ManagerJobInput::VerifyManagedArtifact { .. } => {
+            | ManagerJobInput::VerifyManagedArtifact { .. }
+            | ManagerJobInput::StageManagedArtifacts { .. } => {
                 return Err(ManagerExecutionError::InputRejected(
                     "managed fixture operation is not registered".into(),
                 ));

@@ -1,6 +1,6 @@
 //! DS4 Manager API — ManagerApi / ManagerJob DTO。M10。
 //!
-//! C04 に基づき、`GET /manager/status`、`POST /manager/jobs`、
+//! C04 に基づき、`GET /manager/status`、`GET /manager/inventory`、`POST /manager/jobs`、
 //! `GET /manager/jobs/{id}`、`POST /manager/jobs/{id}/cancel` のロジックと
 //! 公開 DTO を提供する。許可 job kind の厳密 payload と
 //! generation/idempotency を検証する。secret と raw build log を公開 DTO に
@@ -13,6 +13,11 @@
 //! - 入力: activate busy → 409
 use crate::manager::executor::ManagerExecutionRequest;
 use crate::manager::jobs::{JobJournal, JobKind, JobPhase, ManagerJobError};
+use crate::manager::registry::ArtifactState;
+use crate::manager::store::{
+    ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerStoreSnapshot,
+    PersistedActivationPhase, ProfileCompatibility, ReleaseIdentity,
+};
 
 /// 公開 job DTO。secret / raw build log を含まない。M10。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -63,6 +68,76 @@ pub struct ManagerStatusResponse {
     pub active_digest: Option<String>,
     /// 進行中 job 数（queue depth）。M10。
     pub queue_depth: usize,
+}
+
+/// Sanitized source receipt projection. Remote URLs and local cache paths are omitted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerSourceReceiptDto {
+    pub receipt_id: String,
+    pub full_commit: String,
+    pub main_proof: String,
+}
+
+/// Sanitized artifact reference used by inventory profiles.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerArtifactReferenceDto {
+    pub id: String,
+    pub digest: Option<String>,
+    pub verified: bool,
+}
+
+/// Sanitized artifact summary. It never contains a managed path or source URL.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerArtifactDto {
+    pub id: String,
+    pub kind: String,
+    pub digest: String,
+    pub size: u64,
+    pub verified: bool,
+    pub source_commit: Option<String>,
+    pub role: Option<String>,
+    pub catalog_id: Option<String>,
+}
+
+/// Sanitized staged profile projection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerStagedProfileDto {
+    pub profile_id: String,
+    pub node_role: String,
+    pub role_artifacts: Vec<ManagerArtifactReferenceDto>,
+    pub model_artifact: ManagerArtifactReferenceDto,
+    pub config_fingerprint: String,
+    pub compatibility: ProfileCompatibility,
+    pub hardware_readiness: HardwareReadiness,
+    pub activation_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerNodeReadinessDto {
+    pub ready: bool,
+    pub reason: Option<String>,
+}
+
+/// Durable, local-node inventory. Live process state is intentionally absent;
+/// `/manager/status.active_digest` remains unknown until runtime observation is bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ManagerInventoryResponse {
+    pub node_id: String,
+    pub source_commits: Vec<ManagerSourceReceiptDto>,
+    pub artifacts: Vec<ManagerArtifactDto>,
+    pub profiles: Vec<ManagerStagedProfileDto>,
+    pub node_readiness: ManagerNodeReadinessDto,
+    /// Live-observed model digest, only when it matches a verified release pointer.
+    pub active_digest: Option<String>,
+    /// Verified stored previous release digest.
+    pub previous_digest: Option<String>,
+    pub activation_phase: Option<PersistedActivationPhase>,
 }
 
 /// `POST /manager/jobs` の要求。kind の厳密 payload。M10。
@@ -216,6 +291,178 @@ pub fn status(journal: &JobJournal, active_digest: Option<String>) -> ManagerSta
         jobs,
         active_digest,
         queue_depth,
+    }
+}
+
+/// Project the durable store into an API-safe node-local inventory response.
+pub fn inventory(snapshot: &ManagerStoreSnapshot) -> ManagerInventoryResponse {
+    inventory_with_live_active_digest(snapshot, None)
+}
+
+/// Project inventory with a runtime-observed digest. A stored release pointer
+/// alone is not evidence that the child loaded that release.
+pub fn inventory_with_live_active_digest(
+    snapshot: &ManagerStoreSnapshot,
+    live_active_digest: Option<&str>,
+) -> ManagerInventoryResponse {
+    let source_commits = snapshot
+        .source_receipts
+        .iter()
+        .map(|(receipt_id, receipt)| ManagerSourceReceiptDto {
+            receipt_id: receipt_id.clone(),
+            full_commit: receipt.full_commit.clone(),
+            main_proof: receipt.main_proof.clone(),
+        })
+        .collect();
+
+    let artifacts = snapshot
+        .artifacts
+        .values()
+        .map(|artifact| {
+            let (source_commit, role, catalog_id) = match &artifact.provenance {
+                ArtifactProvenance::Build {
+                    source_receipt_id,
+                    record,
+                } => (
+                    snapshot
+                        .source_receipts
+                        .get(source_receipt_id)
+                        .map(|source| source.full_commit.clone()),
+                    super::build::is_approved_role(&record.role).then(|| record.role.clone()),
+                    None,
+                ),
+                ArtifactProvenance::Model { catalog_id } => (None, None, Some(catalog_id.clone())),
+            };
+            ManagerArtifactDto {
+                id: artifact.id.clone(),
+                kind: match artifact.kind {
+                    ArtifactKind::Build => "build".into(),
+                    ArtifactKind::Model => "model".into(),
+                },
+                digest: artifact.sha256.clone(),
+                size: artifact.size,
+                verified: artifact.validation_state == ArtifactState::Verified,
+                source_commit,
+                role,
+                catalog_id,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let profiles = snapshot
+        .profiles
+        .values()
+        .map(|profile| {
+            let role_artifacts = profile
+                .role_artifact_ids
+                .iter()
+                .map(|id| artifact_reference(snapshot, id, ArtifactKind::Build))
+                .collect::<Vec<_>>();
+            let model_artifact =
+                artifact_reference(snapshot, &profile.model_artifact_id, ArtifactKind::Model);
+            let activation_ready = profile.compatibility == ProfileCompatibility::Compatible
+                && profile.hardware_readiness == HardwareReadiness::Ready
+                && !role_artifacts.is_empty()
+                && role_artifacts
+                    .iter()
+                    .all(|artifact| artifact.verified && artifact.digest.is_some())
+                && model_artifact.verified
+                && model_artifact.digest.is_some();
+            ManagerStagedProfileDto {
+                profile_id: profile.profile_id.clone(),
+                node_role: profile.node_role.clone(),
+                role_artifacts,
+                model_artifact,
+                config_fingerprint: profile.config_fingerprint.clone(),
+                compatibility: profile.compatibility,
+                hardware_readiness: profile.hardware_readiness,
+                activation_ready,
+            }
+        })
+        .collect::<Vec<_>>();
+    let ready = profiles.iter().any(|profile| profile.activation_ready);
+    let reason = (!ready).then(|| {
+        if profiles.is_empty() {
+            "no staged profile".to_string()
+        } else if profiles
+            .iter()
+            .all(|p| p.compatibility != ProfileCompatibility::Compatible)
+        {
+            "profile compatibility is not verified".to_string()
+        } else if profiles
+            .iter()
+            .any(|p| p.hardware_readiness == HardwareReadiness::Pending)
+        {
+            "hardware readiness is pending".to_string()
+        } else {
+            "profile artifacts are missing or unverified".to_string()
+        }
+    });
+
+    let recorded_active_digest =
+        release_model_digest(snapshot, snapshot.release_pointers.active.as_ref());
+    let active_digest = live_active_digest
+        .filter(|observed| recorded_active_digest.as_deref() == Some(*observed))
+        .map(str::to_string);
+
+    ManagerInventoryResponse {
+        node_id: snapshot.node_id.clone(),
+        source_commits,
+        artifacts,
+        profiles,
+        node_readiness: ManagerNodeReadinessDto { ready, reason },
+        active_digest,
+        previous_digest: release_model_digest(
+            snapshot,
+            snapshot.release_pointers.previous.as_ref(),
+        ),
+        activation_phase: if snapshot.activation_journals.len() == 1 {
+            snapshot
+                .activation_journals
+                .values()
+                .next()
+                .map(|journal| journal.phase)
+        } else {
+            None
+        },
+    }
+}
+
+fn artifact_reference(
+    snapshot: &ManagerStoreSnapshot,
+    id: &str,
+    expected_kind: ArtifactKind,
+) -> ManagerArtifactReferenceDto {
+    let artifact = snapshot.artifacts.get(id);
+    let valid = artifact.is_some_and(|artifact| {
+        artifact.kind == expected_kind && artifact.validation_state == ArtifactState::Verified
+    });
+    ManagerArtifactReferenceDto {
+        id: id.to_string(),
+        digest: artifact
+            .filter(|artifact| artifact.kind == expected_kind)
+            .map(|artifact| artifact.sha256.clone()),
+        verified: valid,
+    }
+}
+
+fn release_model_digest(
+    snapshot: &ManagerStoreSnapshot,
+    identity: Option<&ReleaseIdentity>,
+) -> Option<String> {
+    match identity? {
+        ReleaseIdentity::ManagedProfile(profile_id) => {
+            let profile = snapshot.profiles.get(profile_id)?;
+            if profile.compatibility != ProfileCompatibility::Compatible
+                || profile.hardware_readiness != HardwareReadiness::Ready
+            {
+                return None;
+            }
+            let model = snapshot.artifacts.get(&profile.model_artifact_id)?;
+            (model.kind == ArtifactKind::Model && model.validation_state == ArtifactState::Verified)
+                .then(|| model.sha256.clone())
+        }
+        ReleaseIdentity::ExternalBaseline { model_sha256, .. } => Some(model_sha256.clone()),
     }
 }
 

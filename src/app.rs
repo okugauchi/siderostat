@@ -107,10 +107,14 @@ impl AppState {
             )
             .context("open manager release store")?,
         ));
-        let backend = crate::manager::executor::RuntimeManagerBackend::for_release_store(
-            manager_store.clone(),
-        )
-        .context("configure manager backend")?;
+        let stage_config =
+            crate::manager::stage::StageRuntimeConfig::from_validated_config(&config);
+        let backend =
+            crate::manager::executor::RuntimeManagerBackend::for_release_store_with_stage_config(
+                manager_store.clone(),
+                stage_config,
+            )
+            .context("configure manager backend")?;
         Self::from_config_with_manager_store(config, backend, manager_store)
     }
 
@@ -1618,6 +1622,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         // DS4 Manager API (M10 / C04)。admin port 専用。public proxy の
         // wildcard には落ちず、DS4 へ転送されない。M10。
         .route("/manager/status", get(manager_status))
+        .route("/manager/inventory", get(manager_inventory))
         .route("/manager/jobs", post(manager_jobs_submit))
         .route("/manager/jobs/{id}", get(manager_job_get))
         .route("/manager/jobs/{id}/cancel", post(manager_job_cancel))
@@ -2375,7 +2380,34 @@ async fn manager_status(headers: HeaderMap, State(state): State<Arc<AppState>>) 
         return *response;
     }
     let journal = state.jobs.lock().unwrap();
+    // `model_manifest` is configured intent, not proof of the model currently loaded by the
+    // owned DS4 child. Until a runtime snapshot can bind the live child/generation to a
+    // verified manifest, keep this explicitly unknown instead of reporting a configured hash.
     let response = crate::manager::api::status(&journal, None);
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+    )
+}
+
+/// `GET /manager/inventory`。Durable store を path-free DTO に投影する。
+async fn manager_inventory(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let store = match state.manager_store.lock() {
+        Ok(store) => store,
+        Err(_) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "manager inventory unavailable"}),
+            );
+        }
+    };
+    let response = crate::manager::api::inventory(store.snapshot());
     json_response(
         StatusCode::OK,
         serde_json::to_value(response).unwrap_or_else(|_| json!({})),
@@ -3456,6 +3488,17 @@ mod tests {
         );
         assert_eq!(metrics_status, StatusCode::OK);
         assert!(metrics_body.contains("ds4_proxy_target_ready{target=\"local-standalone\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn manager_status_does_not_report_configured_model_as_active_digest() {
+        let state = test_state(true);
+        let token = test_admin_token();
+        let (status, body) = get_with_token(state, "/manager/status", &token).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert!(body["active_digest"].is_null());
     }
 
     #[tokio::test]

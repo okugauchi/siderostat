@@ -11,8 +11,12 @@ use siderostat::manager::executor::{
     RuntimeManagerBackend,
 };
 use siderostat::manager::jobs::{JobJournal, JobKind, JobPhase};
-use siderostat::manager::registry::ManagerRoot;
-use siderostat::manager::store::{ArtifactKind, ArtifactProvenance, ManagerReleaseStore};
+use siderostat::manager::registry::{BuildRecord, ManagerRoot, SourceRecord};
+use siderostat::manager::stage::StageRuntimeConfig;
+use siderostat::manager::store::{
+    ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerReleaseStore,
+    ProfileCompatibility, ReleaseIdentity,
+};
 use siderostat::manager::{GitRunner, ManagerExecutor, OfficialRemote};
 
 const OFFICIAL_REMOTE: &str = "https://github.com/antirez/ds4.git";
@@ -82,6 +86,109 @@ fn model_backend(
     RuntimeManagerBackend::new(resolver)
         .with_manager_store(store)
         .with_transport(transport)
+}
+
+fn publish_stage_artifacts(
+    manager_root: &Path,
+    store: &Arc<Mutex<ManagerReleaseStore>>,
+    build_role: &str,
+    model_bytes: &[u8],
+    entry: &ModelCatalogEntry,
+) -> (String, String) {
+    let source_commit = "a".repeat(40);
+    let source_receipt_id = store
+        .lock()
+        .expect("store lock")
+        .record_source(SourceRecord {
+            remote: OFFICIAL_REMOTE.into(),
+            full_commit: source_commit.clone(),
+            main_proof: source_commit.clone(),
+            fetched_at: 1,
+        })
+        .expect("record source receipt");
+
+    let role_bytes = format!("fixture executable for {build_role}").into_bytes();
+    let role_sha256 = siderostat::manager::hex_sha256(&role_bytes);
+    let role_path = manager_root.join("stage-build-input.bin");
+    std::fs::write(&role_path, &role_bytes).expect("write build input");
+    let build_record = BuildRecord {
+        source: source_commit,
+        flags: "default".into(),
+        toolchain: "rustc fixture".into(),
+        arch: std::env::consts::ARCH.into(),
+        role: build_role.into(),
+        target: build_role.into(),
+        digest: role_sha256.clone(),
+        help_digest: "b".repeat(64),
+    };
+    let role_id = store
+        .lock()
+        .expect("store lock")
+        .publish_artifact(
+            &role_path,
+            ArtifactDraft {
+                kind: ArtifactKind::Build,
+                expected_sha256: role_sha256,
+                expected_size: role_bytes.len() as u64,
+                provenance: ArtifactProvenance::Build {
+                    source_receipt_id,
+                    record: build_record,
+                },
+            },
+        )
+        .expect("publish build artifact")
+        .id;
+
+    let model_sha256 = siderostat::manager::hex_sha256(model_bytes);
+    let model_path = manager_root.join("stage-model-input.bin");
+    std::fs::write(&model_path, model_bytes).expect("write model input");
+    let model_id = store
+        .lock()
+        .expect("store lock")
+        .publish_artifact(
+            &model_path,
+            ArtifactDraft {
+                kind: ArtifactKind::Model,
+                expected_sha256: model_sha256,
+                expected_size: model_bytes.len() as u64,
+                provenance: ArtifactProvenance::Model {
+                    catalog_id: entry.catalog_id.clone(),
+                },
+            },
+        )
+        .expect("publish model artifact")
+        .id;
+    (role_id, model_id)
+}
+
+fn stage_backend(
+    store: Arc<Mutex<ManagerReleaseStore>>,
+    entry: ModelCatalogEntry,
+    config: StageRuntimeConfig,
+) -> RuntimeManagerBackend {
+    let mut resolver = ManagerJobInputResolver::new();
+    resolver
+        .register_catalog_entry(entry)
+        .expect("register fixture catalog entry");
+    RuntimeManagerBackend::new(resolver)
+        .with_manager_store(store)
+        .with_stage_runtime_config(config)
+}
+
+#[test]
+fn stage_payload_key_accepts_only_generated_local_artifact_ids() {
+    let build_id = format!("build-{}", "a".repeat(64));
+    let model_id = format!("model-{}", "b".repeat(64));
+    let expected = format!("{build_id}:{model_id}");
+    assert_eq!(
+        siderostat::manager::manager_stage_payload_key(&build_id, &model_id).as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(siderostat::manager::manager_stage_payload_key("/tmp/build.bin", &model_id).is_none());
+    assert!(
+        siderostat::manager::manager_stage_payload_key(&build_id, "https://models.example/x")
+            .is_none()
+    );
 }
 
 struct CancelModelHttp {
@@ -873,6 +980,180 @@ async fn rejected_model_downloads_do_not_publish_records_or_reach_unknown_ids() 
             .artifacts
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn stage_persists_verified_profile_and_inventory_redacts_local_paths() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let model_bytes = b"verified fixture model";
+    let entry = model_entry(model_bytes, None, None);
+    let (build_id, model_id) =
+        publish_stage_artifacts(&manager_root, &store, "ds4-server", model_bytes, &entry);
+    let payload_key =
+        siderostat::manager::executor::manager_stage_payload_key(&build_id, &model_id)
+            .expect("typed artifact IDs");
+    let config = StageRuntimeConfig {
+        expected_node_role: Some("coordinator".into()),
+        expected_family: "ds4".into(),
+        context_size: 4096,
+        expected_prefix_digest: None,
+        config_fingerprint: "c".repeat(64),
+        ram_confirmed: false,
+    };
+
+    let (phase, _) = run_job(
+        stage_backend(store.clone(), entry, config),
+        JobKind::Stage,
+        &payload_key,
+    )
+    .await;
+
+    assert_eq!(phase, JobPhase::Succeeded);
+    let profile = {
+        let guard = store.lock().expect("store lock");
+        assert_eq!(guard.snapshot().profiles.len(), 1);
+        guard
+            .snapshot()
+            .profiles
+            .values()
+            .next()
+            .expect("persisted profile")
+            .clone()
+    };
+    assert_eq!(profile.node_role, "coordinator");
+    assert_eq!(profile.role_artifact_ids, vec![build_id]);
+    assert_eq!(profile.model_artifact_id, model_id);
+    assert_eq!(profile.config_fingerprint, "c".repeat(64));
+    assert_eq!(profile.compatibility, ProfileCompatibility::Compatible);
+    assert_eq!(profile.hardware_readiness, HardwareReadiness::Pending);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .set_release_pointers(
+                ReleaseIdentity::ManagedProfile(profile.profile_id.clone()),
+                None
+            )
+            .is_err()
+    );
+
+    let reopened = ManagerReleaseStore::open(ManagerRoot::explicit(manager_root.clone()), "node-a")
+        .expect("reopen staged profile");
+    assert_eq!(reopened.snapshot().profiles[&profile.profile_id], profile);
+    let staged_inventory = siderostat::manager::api::inventory(reopened.snapshot());
+    assert!(!staged_inventory.profiles[0].activation_ready);
+    let mut pointer_snapshot = reopened.snapshot().clone();
+    pointer_snapshot
+        .profiles
+        .get_mut(&profile.profile_id)
+        .expect("profile")
+        .hardware_readiness = HardwareReadiness::Ready;
+    pointer_snapshot.release_pointers.active =
+        Some(ReleaseIdentity::ManagedProfile(profile.profile_id.clone()));
+    pointer_snapshot.release_pointers.previous = Some(ReleaseIdentity::ExternalBaseline {
+        config_fingerprint: "d".repeat(64),
+        executable_sha256: "e".repeat(64),
+        model_sha256: "f".repeat(64),
+    });
+    let inventory = siderostat::manager::api::inventory(&pointer_snapshot);
+    let json = serde_json::to_string(&inventory).expect("serialize inventory");
+    assert!(inventory.profiles[0].activation_ready);
+    assert_eq!(
+        inventory.active_digest, None,
+        "stored pointer is not live proof"
+    );
+    assert_eq!(
+        inventory.previous_digest.as_deref(),
+        Some("f".repeat(64).as_str())
+    );
+    let live_digest = &pointer_snapshot.artifacts[&model_id].sha256;
+    assert_eq!(
+        siderostat::manager::api::inventory_with_live_active_digest(
+            &pointer_snapshot,
+            Some(live_digest)
+        )
+        .active_digest
+        .as_deref(),
+        Some(live_digest.as_str())
+    );
+    assert!(!json.contains(manager_root.to_str().expect("manager path")));
+    assert!(!json.contains("models.example.com"));
+    assert!(!json.contains("rel_path"));
+}
+
+#[tokio::test]
+async fn stage_refuses_role_family_prefix_and_digest_mismatches() {
+    for (role, expected_node_role, expected_family, expected_prefix, tamper_model) in [
+        ("ds4-server", Some("worker"), "ds4", None, false),
+        ("ds4-agent", Some("coordinator"), "ds4", None, false),
+        (
+            "ds4-server",
+            Some("coordinator"),
+            "other-family",
+            None,
+            false,
+        ),
+        (
+            "ds4-server",
+            Some("coordinator"),
+            "ds4",
+            Some("d".repeat(64)),
+            false,
+        ),
+        ("ds4-server", Some("coordinator"), "ds4", None, true),
+    ] {
+        let fixture = fixture();
+        let manager_root = fixture.base.join("manager");
+        let store = store(&manager_root);
+        let model_bytes = b"verified fixture model";
+        let mut entry = model_entry(model_bytes, None, None);
+        if expected_prefix.is_some() {
+            entry.prefix_file = Some("e".repeat(64));
+        }
+        let (build_id, model_id) =
+            publish_stage_artifacts(&manager_root, &store, role, model_bytes, &entry);
+        if tamper_model {
+            let path = {
+                let guard = store.lock().expect("store lock");
+                manager_root.join(&guard.snapshot().artifacts[&model_id].rel_path)
+            };
+            std::fs::write(path, b"tampered model").expect("tamper model");
+        }
+        let payload_key =
+            siderostat::manager::executor::manager_stage_payload_key(&build_id, &model_id)
+                .expect("typed artifact IDs");
+        let config = StageRuntimeConfig {
+            expected_node_role: expected_node_role.map(str::to_string),
+            expected_family: expected_family.into(),
+            context_size: 4096,
+            expected_prefix_digest: expected_prefix,
+            config_fingerprint: "c".repeat(64),
+            ram_confirmed: false,
+        };
+        let (phase, _) = run_job(
+            stage_backend(store.clone(), entry, config),
+            JobKind::Stage,
+            &payload_key,
+        )
+        .await;
+        assert_eq!(phase, JobPhase::Failed);
+        assert!(
+            store
+                .lock()
+                .expect("store lock")
+                .snapshot()
+                .profiles
+                .is_empty()
+        );
+        if tamper_model {
+            assert_eq!(
+                store.lock().expect("store lock").snapshot().artifacts[&model_id].validation_state,
+                siderostat::manager::ArtifactState::Quarantined
+            );
+        }
+    }
 }
 
 #[test]

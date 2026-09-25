@@ -124,6 +124,29 @@ mod routes {
         assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn inventory_requires_the_existing_admin_bearer_authentication() {
+        let state = state();
+        let response = admin_router(state.clone())
+            .oneshot(
+                Request::get("/manager/inventory")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, inventory) = request(state, "GET", "/manager/inventory", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(inventory["node_readiness"]["ready"], false);
+        assert_eq!(inventory["source_commits"], serde_json::json!([]));
+        let json = inventory.to_string();
+        assert!(!json.contains("rel_path"));
+        assert!(!json.contains("url"));
+        assert!(!json.contains("lease"));
+    }
+
     async fn terminal(state: Arc<AppState>, id: &str) -> serde_json::Value {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {

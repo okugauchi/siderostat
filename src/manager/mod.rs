@@ -38,8 +38,10 @@ pub use activation::{
     mark_ready, prepare_activation,
 };
 pub use api::{
-    JobSubmitRequest, ManagerApiError, ManagerJobDto, ManagerStatusResponse, SubmitResponse,
-    cancel, get, parse_kind, status, submit, submit_json,
+    JobSubmitRequest, ManagerApiError, ManagerArtifactDto, ManagerArtifactReferenceDto,
+    ManagerInventoryResponse, ManagerJobDto, ManagerNodeReadinessDto, ManagerSourceReceiptDto,
+    ManagerStagedProfileDto, ManagerStatusResponse, SubmitResponse, cancel, get, inventory,
+    inventory_with_live_active_digest, parse_kind, status, submit, submit_json,
 };
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
@@ -58,6 +60,7 @@ pub use download::{
 pub use executor::{
     ManagerExecutionBackend, ManagerExecutionError, ManagerExecutionOutcome,
     ManagerExecutionRequest, ManagerExecutor, ManagerExecutorError, ManagerExecutorHandle,
+    manager_stage_payload_key,
 };
 pub use jobs::{
     JobJournal, JobKind, JobPersistence, JobPhase, ManagerJob, ManagerJobError, PersistenceError,
@@ -70,8 +73,8 @@ pub use registry::{
 pub use rollback::{PreviousRecovery, RollbackOutcome, RollbackRequest, rollback_to_previous};
 pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
 pub use stage::{
-    ActivationPlan, StageError, StageRequest, StagedProfile, StagedProfileStatus,
-    build_activation_plan, stage_profile,
+    ActivationPlan, StageError, StageRequest, StageRuntimeConfig, StagedProfile,
+    StagedProfileStatus, build_activation_plan, stage_profile,
 };
 pub use store::{
     ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerJobStorePersistence,
