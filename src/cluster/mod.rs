@@ -93,6 +93,7 @@ pub use network_snapshot::{
     InterfaceObservation, Ipv4Assignment, NetworkObservation, NetworkServiceObservation,
     NetworkSnapshot, PeerObservation, ThunderboltIpState,
 };
+pub(crate) use operation::OperationLeaseGuard;
 pub use operation::{
     IdempotencyOutcome, OperationEnvelope, OperationId, OperationKind, OperationLease,
     OperationLeaseError, PolicyEpoch, TpSessionId, canonical_body_hash,
@@ -111,11 +112,12 @@ pub use policy::OperationPolicy;
 pub use policy_journal::{PolicyJournal, PolicyJournalView};
 pub use process::platform_process_controller;
 pub use process::{
-    ChildIdentity, DistributedCoordinatorSupervisor, DistributedWorkerSupervisor, ManagedChild,
-    ObservedProcess, ProcessControlError, ProcessController, ProcessIdentity, ProcessInspector,
-    ProcessSignal, ProcessSignaler, StandaloneSupervisor, StartupProcessCandidate,
-    StartupProcessKind, TpWorkerSupervisor, VerifiedProcess, argv_sha256,
-    discover_startup_processes, wait_for_http_readiness,
+    ChildIdentity, CommandSlotSnapshot, DistributedCoordinatorSupervisor,
+    DistributedWorkerSupervisor, ManagedChild, ObservedProcess, ProcessControlError,
+    ProcessController, ProcessIdentity, ProcessInspector, ProcessSignal, ProcessSignaler,
+    StandaloneSupervisor, StartupProcessCandidate, StartupProcessKind, TpWorkerSupervisor,
+    VerifiedDs4Command, VerifiedProcess, argv_sha256, discover_startup_processes,
+    wait_for_http_readiness,
 };
 #[cfg(feature = "test-support")]
 pub use production::PairTiming;

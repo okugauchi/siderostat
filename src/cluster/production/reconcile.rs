@@ -1,6 +1,6 @@
 use super::{RoleControl, now_millis};
 use crate::{
-    cluster::EventOwner,
+    cluster::{EventOwner, OperationKind},
     target::{ClusterState, LocalRole},
 };
 use anyhow::Context;
@@ -45,6 +45,7 @@ impl super::ProductionClusterRuntime {
                     .recover_from_peer_loss(EventOwner::PeriodicReconcile)
                     .await;
             }
+            let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
             let runtime = self
                 .inner
                 .coordinator_runtime
@@ -56,6 +57,14 @@ impl super::ProductionClusterRuntime {
     }
 
     pub(super) async fn reconcile_peer(
+        &self,
+        owner: EventOwner,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
+        self.reconcile_peer_unleased(owner).await
+    }
+
+    pub(super) async fn reconcile_peer_unleased(
         &self,
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {

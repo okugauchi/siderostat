@@ -1,17 +1,18 @@
 use super::{
-    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
-    ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
-    CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
-    DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
-    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor,
-    DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle, HEADER_NODE,
-    HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
-    LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
-    NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
+    AuthError, CommandSlotSnapshot, ControlAuthenticator, ControlCommand, ControlEndpoint,
+    ControlError, ControlMessage, ControlMode, ControlResponse, ControlRole, ControlSecret,
+    CoordinatorControl, CoordinatorDistributedRuntime, CoordinatorPeerLifecycle,
+    CoordinatorRuntimeTimeouts, DistributedControlPhase, DistributedCoordinatorLifecycle,
+    DistributedCoordinatorSupervisor, DistributedManifest, DistributedWorkerLifecycle,
+    DistributedWorkerSupervisor, DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe,
+    DryRunWorkerLifecycle, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP,
+    InterfaceObservation, Ipv4Assignment, LocalStandaloneLifecycle, MacOsDynamicStoreWatcher,
+    ModeRuntime, NetworkEvidence, NetworkObservation, NetworkServiceObservation, NetworkSnapshot,
+    NodeDescriptor, OperationId, OperationKind, OperationLease, OperationLeaseGuard,
     PeerObservation, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
     PolicyControlResponse, PolicyControlState, PolicyControlStatus, PromotionRetryPolicy,
-    StandaloneSupervisor, StateStore, WorkerControl, WorkerDistributedRuntime, WorkerEventKind,
-    spawn_network_event_monitor,
+    StandaloneSupervisor, StateStore, VerifiedDs4Command, WorkerControl, WorkerDistributedRuntime,
+    WorkerEventKind, spawn_network_event_monitor,
 };
 #[cfg(feature = "test-support")]
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
@@ -321,6 +322,7 @@ struct ProductionInner {
     manifest: DistributedManifest,
     recovery: Arc<recovery::PeerLossRecovery>,
     recovery_owner_active: AtomicBool,
+    recovery_owner_lease: std::sync::Mutex<Option<OperationLeaseGuard>>,
     automatic_pairing_blocked: AtomicBool,
     /// 現在の操作方針（C03）。ForcedStandalone 保護ラッチを含む。P01 journal から
     /// 復元され、適用調整（P04/P05）で更新される。Automatic を選んでも保護ラッチは
@@ -339,6 +341,11 @@ struct ProductionInner {
     /// committed Applied journal entry (P0 false-success/persistence race).
     policy_persistence: std::sync::Mutex<()>,
     planned_restart: PlannedRestartGate,
+    /// Shared runtime gate used by explicit lifecycle mutations and Manager activation. It keeps
+    /// established concurrency between ordinary operation kinds, while Activation excludes all
+    /// of them in both directions.
+    lifecycle_lease: OperationLease,
+    planned_restart_lease: std::sync::Mutex<Option<OperationLeaseGuard>>,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
     /// actual production input. Fail-closed until a fresh observation is applied.
@@ -775,6 +782,7 @@ impl ProductionClusterRuntime {
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
             recovery_owner_active: AtomicBool::new(false),
+            recovery_owner_lease: std::sync::Mutex::new(None),
             automatic_pairing_blocked: AtomicBool::new(false),
             operator_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
             applied_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
@@ -784,6 +792,8 @@ impl ProductionClusterRuntime {
             policy_store: std::sync::Mutex::new(None),
             policy_persistence: std::sync::Mutex::new(()),
             planned_restart: PlannedRestartGate::default(),
+            lifecycle_lease: OperationLease::new(),
+            planned_restart_lease: std::sync::Mutex::new(None),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
             pair_timings: std::sync::Mutex::new(Vec::new()),
@@ -938,6 +948,7 @@ impl ProductionClusterRuntime {
         operator_policy: OperationPolicy,
         peer_protocol_version: Option<u16>,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
         use crate::cluster::TpSessionId;
         use crate::target::ClusterState;
         let verdict = self.tp_start_verdict(operator_policy, peer_protocol_version);
@@ -1012,6 +1023,7 @@ impl ProductionClusterRuntime {
     /// coordinator promotion tracker, so the local manual state is cleared through the mode
     /// runtime instead.
     pub async fn operator_reconcile(&self) -> anyhow::Result<OperatorReconcileOutcome> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Recovery)?;
         self.inner
             .automatic_pairing_blocked
             .store(false, Ordering::Release);
@@ -1044,16 +1056,140 @@ impl ProductionClusterRuntime {
         self.inner.role
     }
 
+    fn claim_lifecycle_operation(
+        &self,
+        kind: OperationKind,
+    ) -> anyhow::Result<OperationLeaseGuard> {
+        self.inner
+            .lifecycle_lease
+            .claim(kind, OperationId(uuid::Uuid::new_v4()))
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Claim the runtime-owned exclusive window used by the Manager activation actor. This is
+    /// deliberately unavailable through the HTTP request DTO; the actor supplies its persisted
+    /// operation ID only after validating the staged profile and current runtime state.
+    pub(super) fn claim_manager_activation(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> anyhow::Result<OperationLeaseGuard> {
+        self.inner
+            .lifecycle_lease
+            .claim(OperationKind::Activation, OperationId(operation_id))
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(super) async fn set_manager_command(
+        &self,
+        candidate: VerifiedDs4Command,
+    ) -> anyhow::Result<()> {
+        match candidate.role() {
+            super::process::Ds4CommandRole::Standalone => {
+                self.inner.standalone.set_next_command(candidate).await
+            }
+            super::process::Ds4CommandRole::Coordinator => {
+                self.inner
+                    .distributed_coordinator
+                    .get()
+                    .context("coordinator supervisor unavailable")?
+                    .set_next_command(candidate)
+                    .await
+            }
+            super::process::Ds4CommandRole::Worker => {
+                self.inner
+                    .distributed_worker
+                    .as_ref()
+                    .context("worker supervisor unavailable")?
+                    .set_next_command(candidate)
+                    .await
+            }
+        }
+    }
+
+    pub(super) async fn restore_manager_command(
+        &self,
+        role: super::process::Ds4CommandRole,
+    ) -> anyhow::Result<()> {
+        match role {
+            super::process::Ds4CommandRole::Standalone => {
+                self.inner.standalone.restore_previous_command().await
+            }
+            super::process::Ds4CommandRole::Coordinator => {
+                self.inner
+                    .distributed_coordinator
+                    .get()
+                    .context("coordinator supervisor unavailable")?
+                    .restore_previous_command()
+                    .await
+            }
+            super::process::Ds4CommandRole::Worker => {
+                self.inner
+                    .distributed_worker
+                    .as_ref()
+                    .context("worker supervisor unavailable")?
+                    .restore_previous_command()
+                    .await
+            }
+        }
+    }
+
+    pub(super) async fn manager_command_snapshot(
+        &self,
+        role: super::process::Ds4CommandRole,
+    ) -> anyhow::Result<CommandSlotSnapshot> {
+        match role {
+            super::process::Ds4CommandRole::Standalone => {
+                self.inner.standalone.command_snapshot().await
+            }
+            super::process::Ds4CommandRole::Coordinator => {
+                self.inner
+                    .distributed_coordinator
+                    .get()
+                    .context("coordinator supervisor unavailable")?
+                    .command_snapshot()
+                    .await
+            }
+            super::process::Ds4CommandRole::Worker => {
+                self.inner
+                    .distributed_worker
+                    .as_ref()
+                    .context("worker supervisor unavailable")?
+                    .command_snapshot()
+                    .await
+            }
+        }
+    }
+
+    fn manager_activation_active(&self) -> bool {
+        self.inner
+            .lifecycle_lease
+            .owner(OperationKind::Activation)
+            .is_some()
+    }
+
     pub fn planned_restart_active(&self) -> bool {
         self.inner.planned_restart.active()
     }
 
-    pub fn begin_planned_restart(&self) {
+    pub fn begin_planned_restart(&self) -> bool {
+        let mut lease = self
+            .inner
+            .planned_restart_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lease.is_some() {
+            return true;
+        }
+        let Ok(guard) = self.claim_lifecycle_operation(OperationKind::Restart) else {
+            return false;
+        };
         self.inner.planned_restart.begin();
+        *lease = Some(guard);
+        true
     }
 
     pub async fn cancel_planned_restart(&self) -> anyhow::Result<()> {
-        self.inner.planned_restart.cancel();
+        self.clear_planned_restart();
         Ok(())
     }
 
@@ -1112,6 +1248,11 @@ impl ProductionClusterRuntime {
 
     pub(super) fn clear_planned_restart(&self) {
         self.inner.planned_restart.cancel();
+        self.inner
+            .planned_restart_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 
     fn planned_restart_blocks_worker_prepare(&self) -> bool {
@@ -1127,13 +1268,38 @@ impl ProductionClusterRuntime {
     }
 
     pub fn try_claim_recovery_owner(&self) -> bool {
-        self.inner
+        if self
+            .inner
             .recovery_owner_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        match self.claim_lifecycle_operation(OperationKind::Recovery) {
+            Ok(guard) => {
+                *self
+                    .inner
+                    .recovery_owner_lease
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+                true
+            }
+            Err(_) => {
+                self.inner
+                    .recovery_owner_active
+                    .store(false, Ordering::Release);
+                false
+            }
+        }
     }
 
     pub fn release_recovery_owner(&self) {
+        self.inner
+            .recovery_owner_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         self.inner
             .recovery_owner_active
             .store(false, Ordering::Release);
@@ -1230,6 +1396,7 @@ impl ProductionClusterRuntime {
         expected_generation: u64,
         operation_id: uuid::Uuid,
     ) -> anyhow::Result<serde_json::Value> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Policy)?;
         let current_generation = self.inner.mode.snapshot().generation;
         anyhow::ensure!(
             expected_generation == 0 || expected_generation == current_generation,
@@ -1243,7 +1410,7 @@ impl ProductionClusterRuntime {
             phase: PolicyControlPhase::Prepare,
             desired,
         };
-        self.apply_policy_phase(&prepare).await?;
+        self.apply_policy_phase_unleased(&prepare).await?;
         let peer_id = self.peer_node_id().await.unwrap_or_else(|| "peer".into());
         self.inner.client.apply_policy(&prepare).await?;
 
@@ -1254,7 +1421,7 @@ impl ProductionClusterRuntime {
             ..prepare.clone()
         };
         self.inner.client.apply_policy(&commit).await?;
-        self.apply_policy_phase(&commit).await?;
+        self.apply_policy_phase_unleased(&commit).await?;
 
         let local_id = self.inner.descriptor.node_id.clone();
         Ok(serde_json::json!({
@@ -1295,7 +1462,7 @@ impl ProductionClusterRuntime {
 
     /// 認証済みpeerから受けたprepare/commit/abortをlocalへ適用する。副作用の前に
     /// intentをjournalへ保存し、commit完了後だけappliedを更新する。
-    async fn apply_policy_phase(
+    async fn apply_policy_phase_unleased(
         &self,
         request: &PolicyControlRequest,
     ) -> anyhow::Result<PolicyControlResponse> {
@@ -1411,6 +1578,9 @@ impl ProductionClusterRuntime {
         peer_present: bool,
         peer_policy_epoch: u64,
     ) -> AutomaticPromotionVerdict {
+        if self.manager_activation_active() {
+            return AutomaticPromotionVerdict::LifecycleOperationBusy;
+        }
         if self.policy_pending() && self.operator_policy() == OperationPolicy::Automatic {
             return AutomaticPromotionVerdict::EpochMismatch;
         }
@@ -1819,6 +1989,9 @@ async fn control_operation_policy(
     }
     let request: PolicyControlRequest = serde_json::from_slice(&body)
         .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
+    let _lifecycle = runtime
+        .claim_lifecycle_operation(OperationKind::Policy)
+        .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
     let verdict = runtime
         .inner
         .policy_control
@@ -1832,7 +2005,7 @@ async fn control_operation_policy(
         }));
     }
     runtime
-        .apply_policy_phase(&request)
+        .apply_policy_phase_unleased(&request)
         .await
         .map(Json)
         .map_err(|error| ControlHttpError::Effect(error.to_string()))
@@ -2382,6 +2555,19 @@ mod tests {
         assert!(effect_requires_ack(&ControlCommand::PrepareRestart));
         assert!(effect_requires_ack(&ControlCommand::CancelRestart));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
+    }
+
+    #[test]
+    fn manager_activation_conflicts_are_reported_as_lifecycle_conflicts() {
+        assert_eq!(
+            super::super::ControlError::LifecycleOperationInProgress.http_status(),
+            StatusCode::CONFLICT.as_u16()
+        );
+        assert_eq!(
+            AutomaticPromotionVerdict::LifecycleOperationBusy.name(),
+            "auto-promote-lifecycle-operation-busy"
+        );
+        assert!(!AutomaticPromotionVerdict::LifecycleOperationBusy.allows_promotion());
     }
 
     #[test]

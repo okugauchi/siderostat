@@ -5,7 +5,8 @@ use crate::{
     cluster::{
         ClusterEvent, ClusterEventKind, ClusterFailure, ControlCommand, ControlError,
         ControlMessage, ControlMode, DistributedControlPhase, Ds4Hello, Ds4HelloError, EventOwner,
-        NodeDescriptor, RendezvousControlSnapshot, RendezvousListener, WorkerHelloExpectation,
+        NodeDescriptor, OperationKind, RendezvousControlSnapshot, RendezvousListener,
+        WorkerHelloExpectation,
     },
     target::{ClusterState, LocalRole, StableMode},
 };
@@ -36,6 +37,7 @@ impl From<anyhow::Error> for PromotionHelloError {
 
 impl super::ProductionClusterRuntime {
     pub async fn pair(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "pairing must be initiated by the coordinator"
@@ -91,7 +93,7 @@ impl super::ProductionClusterRuntime {
         tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
         #[cfg(feature = "test-support")]
         let stability_achieved_at = now_millis();
-        let snapshot = self.reconcile_peer(EventOwner::Control).await?;
+        let snapshot = self.reconcile_peer_unleased(EventOwner::Control).await?;
         #[cfg(feature = "test-support")]
         let pairing_ready_at = now_millis();
         #[cfg(feature = "test-support")]
@@ -125,6 +127,7 @@ impl super::ProductionClusterRuntime {
         &self,
         resume_admission: bool,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may promote"
@@ -260,6 +263,7 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn demote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Demotion)?;
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may demote"
@@ -281,6 +285,7 @@ impl super::ProductionClusterRuntime {
         &self,
         drain_timeout: std::time::Duration,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Demotion)?;
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may demote"

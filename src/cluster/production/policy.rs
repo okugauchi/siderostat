@@ -224,6 +224,9 @@ pub enum AutomaticPromotionVerdict {
     DeploymentMismatchLatch,
     /// ForcedStandalone 保護ラッチ保持中。promotion / pair を禁止する。。
     ForcedStandaloneLatch,
+    /// Manager activation owns the lifecycle gate. Promotion and automatic pairing wait until
+    /// its transaction releases the runtime owner.
+    LifecycleOperationBusy,
 }
 
 impl AutomaticPromotionVerdict {
@@ -243,6 +246,9 @@ impl AutomaticPromotionVerdict {
             }
             AutomaticPromotionVerdict::ForcedStandaloneLatch => {
                 "auto-promote-forced-standalone-latch"
+            }
+            AutomaticPromotionVerdict::LifecycleOperationBusy => {
+                "auto-promote-lifecycle-operation-busy"
             }
         }
     }

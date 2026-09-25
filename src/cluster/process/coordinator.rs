@@ -1,4 +1,7 @@
-use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
+use super::{
+    ChildIdentity, CommandSlot, CommandSlotError, CommandSlotSnapshot, Ds4CommandRole,
+    ManagedChild, SupervisedChild, SupervisedSlot, VerifiedDs4Command,
+};
 use crate::cluster::{DistributedCoordinatorLifecycle, Ds4Command, Ds4LogEvent};
 use crate::metrics::Metrics;
 use futures::future::BoxFuture;
@@ -11,7 +14,7 @@ pub struct DistributedCoordinatorSupervisor {
 }
 
 struct DistributedCoordinatorSupervisorInner {
-    command: Ds4Command,
+    commands: CommandSlot,
     models_url: Url,
     client: reqwest::Client,
     http_startup_timeout: Duration,
@@ -43,7 +46,7 @@ impl DistributedCoordinatorSupervisor {
         let (route, _) = tokio::sync::watch::channel(CoordinatorRouteState::default());
         Self {
             inner: Arc::new(DistributedCoordinatorSupervisorInner {
-                command,
+                commands: CommandSlot::new(command),
                 models_url,
                 client: reqwest::Client::new(),
                 http_startup_timeout,
@@ -61,6 +64,30 @@ impl DistributedCoordinatorSupervisor {
         self.inner.child.child_identity().await
     }
 
+    pub(crate) async fn set_next_command(
+        &self,
+        candidate: VerifiedDs4Command,
+    ) -> anyhow::Result<()> {
+        if candidate.role() != Ds4CommandRole::Coordinator {
+            return Err(CommandSlotError::RoleMismatch.into());
+        }
+        self.inner
+            .child
+            .set_next_command(&self.inner.commands, candidate)
+            .await
+    }
+
+    pub(crate) async fn restore_previous_command(&self) -> anyhow::Result<()> {
+        self.inner
+            .child
+            .restore_previous_command(&self.inner.commands)
+            .await
+    }
+
+    pub(crate) async fn command_snapshot(&self) -> Result<CommandSlotSnapshot, CommandSlotError> {
+        self.inner.commands.current_snapshot().await
+    }
+
     pub async fn is_running(&self) -> anyhow::Result<bool> {
         self.is_running_inner().await
     }
@@ -70,10 +97,11 @@ impl DistributedCoordinatorSupervisor {
         let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
         };
+        let command = self.inner.commands.current_command().await?;
         self.inner
             .route
             .send_replace(CoordinatorRouteState::default());
-        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
+        let mut child = ManagedChild::spawn(&command, generation).await?;
         let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let route = self.inner.route.clone();
         let metrics = self.inner.metrics.clone();
@@ -257,5 +285,31 @@ impl DistributedCoordinatorLifecycle for DistributedCoordinatorSupervisor {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.child_identity().await })
+    }
+
+    fn set_next_command(
+        &self,
+        candidate: VerifiedDs4Command,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        let supervisor = self.clone();
+        Box::pin(async move {
+            DistributedCoordinatorSupervisor::set_next_command(&supervisor, candidate).await
+        })
+    }
+
+    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        let supervisor = self.clone();
+        Box::pin(async move {
+            DistributedCoordinatorSupervisor::restore_previous_command(&supervisor).await
+        })
+    }
+
+    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
+        let supervisor = self.clone();
+        Box::pin(async move {
+            DistributedCoordinatorSupervisor::command_snapshot(&supervisor)
+                .await
+                .map_err(Into::into)
+        })
     }
 }

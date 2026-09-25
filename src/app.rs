@@ -2616,6 +2616,8 @@ enum GracefulRestartOutcome {
     ChildStopFailed,
     /// Distributed peer could not enter the planned-restart gate.
     PeerPreparationFailed,
+    /// Another runtime lifecycle transaction owns the exclusive gate.
+    LifecycleOperationBusy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2647,7 +2649,9 @@ async fn graceful_restart_sequence(
     drain_timeout: std::time::Duration,
 ) -> GracefulRestartOutcome {
     if let Some(production) = production {
-        production.begin_planned_restart();
+        if !production.begin_planned_restart() {
+            return GracefulRestartOutcome::LifecycleOperationBusy;
+        }
     }
 
     // 1. admission block: 新規リクエストを受け付けない。
@@ -2800,6 +2804,13 @@ async fn perform_graceful_restart(
             json_response(
                 StatusCode::CONFLICT,
                 json!({"error": "peer_prepare_restart_failed"}),
+            )
+        }
+        GracefulRestartOutcome::LifecycleOperationBusy => {
+            state.release_graceful_restart();
+            json_response(
+                StatusCode::CONFLICT,
+                json!({"error": "lifecycle_operation_in_progress"}),
             )
         }
     }

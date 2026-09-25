@@ -1,6 +1,7 @@
 use super::{
     ChildIdentity, ClusterEvent, ClusterEventKind, ClusterHandle, ClusterSnapshot,
-    CoordinatorControl, EventOwner, PeerLease, TransitionError, WorkerControl, spawn_state_machine,
+    CommandSlotSnapshot, CoordinatorControl, EventOwner, PeerLease, TransitionError,
+    VerifiedDs4Command, WorkerControl, spawn_state_machine,
 };
 use crate::{
     admission::DrainError,
@@ -18,6 +19,20 @@ pub trait LocalStandaloneLifecycle: Send + Sync + 'static {
     /// Optional child identity for diagnostics. Defaults to `None`.
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         Box::pin(async { None })
+    }
+    /// Runtime-owner-only command replacement. Implementations reject replacement while a
+    /// supervised child is alive and retain the prior command for rollback.
+    fn set_next_command(
+        &self,
+        _candidate: VerifiedDs4Command,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
+    }
+    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
+    }
+    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
+        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
     }
 }
 

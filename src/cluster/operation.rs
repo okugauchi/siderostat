@@ -123,7 +123,8 @@ impl OperationLease {
             .remove(&id);
     }
 
-    /// 指定 kind の lease を取得する。既に同 kind のオーナーが居れば失敗。。
+    /// 指定 kind の lease を取得する。既に同 kind のオーナーが居れば失敗。Activation は
+    /// 全 lifecycle kind と相互排他。。
     /// promotion は Force intent によりブロックされている場合失敗する。。
     pub fn try_acquire(
         &self,
@@ -137,11 +138,45 @@ impl OperationLease {
             .owners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Activation is the one lifecycle operation that mutates the executable behind
+        // supervisors. It must exclude every other lifecycle owner, while preserving the
+        // established concurrency rules among ordinary policy/recovery/pair/restart work.
+        if kind == OperationKind::Activation {
+            for owner_kind in [
+                OperationKind::Promotion,
+                OperationKind::Demotion,
+                OperationKind::Restart,
+                OperationKind::Recovery,
+                OperationKind::Policy,
+                OperationKind::Activation,
+            ] {
+                if owners.contains_key(&owner_kind) {
+                    return Err(OperationLeaseError::Busy(owner_kind));
+                }
+            }
+        } else if owners.contains_key(&OperationKind::Activation) {
+            return Err(OperationLeaseError::Busy(OperationKind::Activation));
+        }
         if owners.contains_key(&kind) {
             return Err(OperationLeaseError::Busy(kind));
         }
         owners.insert(kind, id);
         Ok(())
+    }
+
+    /// Acquire a lifecycle lease whose lifetime is tied to a guard. Drop releases only the
+    /// matching owner ID, so cancellation and early returns cannot strand the gate.
+    pub fn claim(
+        &self,
+        kind: OperationKind,
+        id: OperationId,
+    ) -> Result<OperationLeaseGuard, OperationLeaseError> {
+        self.try_acquire(kind, id)?;
+        Ok(OperationLeaseGuard {
+            lease: self.clone(),
+            kind,
+            id,
+        })
     }
 
     /// lease を解放する。オーナーが id と一致する場合のみ解放する。。
@@ -177,6 +212,18 @@ impl OperationLease {
     /// 新規 promotion が許可されるか。。
     pub fn promotion_allowed(&self) -> bool {
         !self.promotion_blocked.load(Ordering::SeqCst)
+    }
+}
+
+pub struct OperationLeaseGuard {
+    lease: OperationLease,
+    kind: OperationKind,
+    id: OperationId,
+}
+
+impl Drop for OperationLeaseGuard {
+    fn drop(&mut self) {
+        self.lease.release(self.kind, self.id);
     }
 }
 
@@ -267,12 +314,76 @@ mod tests {
     }
 
     #[test]
+    fn activation_is_exclusive_with_every_lifecycle_mutation() {
+        let lease = OperationLease::new();
+        let activation = OperationId(Uuid::new_v4());
+
+        for kind in [
+            OperationKind::Promotion,
+            OperationKind::Demotion,
+            OperationKind::Restart,
+            OperationKind::Recovery,
+            OperationKind::Policy,
+        ] {
+            let owner = OperationId(Uuid::new_v4());
+            assert!(lease.try_acquire(kind, owner).is_ok());
+            assert_eq!(
+                lease.try_acquire(OperationKind::Activation, activation),
+                Err(OperationLeaseError::Busy(kind))
+            );
+            lease.release(kind, owner);
+        }
+
+        assert!(
+            lease
+                .try_acquire(OperationKind::Activation, activation)
+                .is_ok()
+        );
+        for kind in [
+            OperationKind::Promotion,
+            OperationKind::Demotion,
+            OperationKind::Restart,
+            OperationKind::Recovery,
+            OperationKind::Policy,
+        ] {
+            assert_eq!(
+                lease.try_acquire(kind, OperationId(Uuid::new_v4())),
+                Err(OperationLeaseError::Busy(OperationKind::Activation))
+            );
+        }
+        lease.release(OperationKind::Activation, activation);
+    }
+
+    #[test]
+    fn lifecycle_guard_releases_only_its_owner_when_dropped() {
+        let lease = OperationLease::new();
+        let id = OperationId(Uuid::new_v4());
+        let guard = lease.claim(OperationKind::Activation, id).unwrap();
+        assert_eq!(lease.owner(OperationKind::Activation), Some(id));
+        drop(guard);
+        assert_eq!(lease.owner(OperationKind::Activation), None);
+    }
+
+    #[test]
     fn force_intent_blocks_new_promotion() {
         let lease = OperationLease::new();
         let a = OperationId(Uuid::new_v4());
         let b = OperationId(Uuid::new_v4());
+        let activation = OperationId(Uuid::new_v4());
         assert!(lease.promotion_allowed());
         lease.block_promotion();
+        assert!(!lease.promotion_allowed());
+        assert_eq!(
+            lease.try_acquire(OperationKind::Promotion, a),
+            Err(OperationLeaseError::PromotionBlocked)
+        );
+        // Manager activation does not clear the durable ForcedStandalone latch.
+        assert!(
+            lease
+                .try_acquire(OperationKind::Activation, activation)
+                .is_ok()
+        );
+        lease.release(OperationKind::Activation, activation);
         assert!(!lease.promotion_allowed());
         assert_eq!(
             lease.try_acquire(OperationKind::Promotion, a),
