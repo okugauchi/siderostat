@@ -109,7 +109,8 @@ impl AppState {
         ));
         let backend = crate::manager::executor::RuntimeManagerBackend::for_release_store(
             manager_store.clone(),
-        );
+        )
+        .context("configure manager backend")?;
         Self::from_config_with_manager_store(config, backend, manager_store)
     }
 

@@ -46,13 +46,14 @@ pub use build::{
     is_approved_role, is_approved_target,
 };
 pub use catalog::{
-    CapabilityStatus, CatalogError, ModelCatalogEntry, compute_status, load_and_validate,
-    validate_entry,
+    CapabilityStatus, CatalogError, ModelCatalogEntry, bundled_catalog, compute_status,
+    load_and_validate, validate_entry,
 };
 pub use compatibility::{CompatibilityError, SmokeOutcome, SmokeRequest, compatibility_smoke};
 pub use download::{
     Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
-    HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
+    HttpResponseMetadata, HttpTransport, ReqwestHttpTransport, check_capacity, download_bounded,
+    load_journal, save_journal,
 };
 pub use executor::{
     ManagerExecutionBackend, ManagerExecutionError, ManagerExecutionOutcome,
@@ -80,4 +81,5 @@ pub use store::{
 };
 pub use verify::{
     VerifiedArtifact, VerifyError, hex_sha256, publish_verified, recheck_verified, verify_artifact,
+    verify_stored_model,
 };

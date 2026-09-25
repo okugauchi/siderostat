@@ -1,19 +1,133 @@
 #![cfg(feature = "test-support")]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use siderostat::manager::catalog::{CapabilityStatus, ModelCatalogEntry};
+use siderostat::manager::download::{HttpError, HttpResponse, HttpTransport};
 use siderostat::manager::executor::{
     ManagerExecutionBackend, ManagerExecutionRequest, ManagerJobInput, ManagerJobInputResolver,
     RuntimeManagerBackend,
 };
 use siderostat::manager::jobs::{JobJournal, JobKind, JobPhase};
 use siderostat::manager::registry::ManagerRoot;
-use siderostat::manager::store::{ArtifactProvenance, ManagerReleaseStore};
+use siderostat::manager::store::{ArtifactKind, ArtifactProvenance, ManagerReleaseStore};
 use siderostat::manager::{GitRunner, ManagerExecutor, OfficialRemote};
 
 const OFFICIAL_REMOTE: &str = "https://github.com/antirez/ds4.git";
+
+struct ModelHttp {
+    responses: Mutex<std::collections::VecDeque<Result<HttpResponse, HttpError>>>,
+    calls: AtomicUsize,
+}
+
+impl ModelHttp {
+    fn new(responses: Vec<Result<HttpResponse, HttpError>>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl HttpTransport for ModelHttp {
+    fn get_range(
+        &self,
+        _spec: &siderostat::manager::DownloadSpec,
+        _start: u64,
+        _etag: Option<&str>,
+    ) -> Result<HttpResponse, HttpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.responses
+            .lock()
+            .expect("model HTTP lock")
+            .pop_front()
+            .unwrap_or_else(|| Err(HttpError::InvalidResponse("no fixture response".into())))
+    }
+}
+
+fn model_entry(bytes: &[u8], sha256: Option<&str>, size: Option<u64>) -> ModelCatalogEntry {
+    ModelCatalogEntry {
+        catalog_id: "fixture-model-v1".into(),
+        url: "https://models.example.com/fixture-model-v1.gguf".into(),
+        redirect_allowlist: vec!["https://cdn.example.com/".into()],
+        size: size.unwrap_or(bytes.len() as u64),
+        sha256: sha256
+            .map(str::to_owned)
+            .unwrap_or_else(|| siderostat::manager::hex_sha256(bytes)),
+        license: "fixture-license".into(),
+        family: "ds4".into(),
+        quantization: "q4".into(),
+        encoder: None,
+        support: None,
+        prefix_file: None,
+        reference: Some("https://github.com/example/ds4/releases".into()),
+        main_integrated: true,
+        ram_reference: None,
+        compatibility: vec![],
+        status: CapabilityStatus::Candidate,
+    }
+}
+
+fn model_backend(
+    store: Arc<Mutex<ManagerReleaseStore>>,
+    entry: ModelCatalogEntry,
+    transport: Arc<dyn HttpTransport + Send + Sync>,
+) -> RuntimeManagerBackend {
+    let mut resolver = ManagerJobInputResolver::new();
+    resolver
+        .register_catalog_entry(entry)
+        .expect("register fixture catalog entry");
+    RuntimeManagerBackend::new(resolver)
+        .with_manager_store(store)
+        .with_transport(transport)
+}
+
+struct CancelModelHttp {
+    response: HttpResponse,
+}
+
+impl HttpTransport for CancelModelHttp {
+    fn get_range(
+        &self,
+        _spec: &siderostat::manager::DownloadSpec,
+        _start: u64,
+        _etag: Option<&str>,
+    ) -> Result<HttpResponse, HttpError> {
+        Ok(self.response.clone())
+    }
+
+    fn get_range_to_file(
+        &self,
+        _spec: &siderostat::manager::DownloadSpec,
+        _start: u64,
+        _etag: Option<&str>,
+        destination: &Path,
+        _max_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> Result<siderostat::manager::HttpResponseMetadata, HttpError> {
+        std::fs::write(destination, &self.response.body).expect("write response fixture");
+        cancel.store(true, Ordering::SeqCst);
+        Ok(siderostat::manager::HttpResponseMetadata {
+            status: self.response.status,
+            etag: self.response.etag.clone(),
+            content_range: self.response.content_range.clone(),
+            final_url: self.response.final_url.clone(),
+            body_size: self.response.body.len() as u64,
+        })
+    }
+}
+
+fn model_response(entry: &ModelCatalogEntry, body: &[u8], final_url: Option<&str>) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        etag: Some("fixture-etag".into()),
+        content_range: None,
+        final_url: final_url.unwrap_or(&entry.url).into(),
+        body: body.into(),
+    }
+}
 
 struct Fixture {
     base: PathBuf,
@@ -513,6 +627,252 @@ async fn build_rejects_receipt_without_a_reachable_main_proof() {
     let store_guard = store.lock().expect("store lock");
     assert!(store_guard.snapshot().artifacts.is_empty());
     assert_eq!(store_guard.snapshot().release_pointers.active, None);
+}
+
+#[test]
+fn bundled_catalog_excludes_unverified_placeholder_sources() {
+    let entries = siderostat::manager::catalog::bundled_catalog().expect("bundled catalog");
+    assert!(
+        entries.is_empty(),
+        "placeholder domains and hashes are not downloadable"
+    );
+}
+
+#[tokio::test]
+async fn model_download_and_verify_are_store_backed_and_quarantine_swaps() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let bytes = b"verified fixture model";
+    let entry = model_entry(bytes, None, None);
+    let transport = Arc::new(ModelHttp::new(vec![Ok(model_response(
+        &entry, bytes, None,
+    ))]));
+
+    let (phase, _) = run_job(
+        model_backend(store.clone(), entry.clone(), transport.clone()),
+        JobKind::Download,
+        &entry.catalog_id,
+    )
+    .await;
+    assert_eq!(phase, JobPhase::Succeeded);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    let artifact_id = format!("model-{}", siderostat::manager::hex_sha256(bytes));
+    {
+        let store = store.lock().expect("store lock");
+        let artifact = store
+            .snapshot()
+            .artifacts
+            .get(&artifact_id)
+            .expect("durable model artifact");
+        assert_eq!(artifact.kind, ArtifactKind::Model);
+        assert_eq!(artifact.size, bytes.len() as u64);
+        assert_eq!(artifact.sha256, siderostat::manager::hex_sha256(bytes));
+        assert_eq!(
+            artifact.validation_state,
+            siderostat::manager::ArtifactState::Verified
+        );
+        assert_eq!(
+            artifact.provenance,
+            ArtifactProvenance::Model {
+                catalog_id: entry.catalog_id.clone()
+            }
+        );
+        assert_eq!(store.snapshot().release_pointers.active, None);
+        assert_eq!(
+            std::fs::read(manager_root.join(&artifact.rel_path)).expect("model bytes"),
+            bytes
+        );
+    }
+
+    let verify_transport = Arc::new(ModelHttp::new(vec![]));
+    let (verify_phase, _) = run_job(
+        model_backend(store.clone(), entry.clone(), verify_transport),
+        JobKind::Verify,
+        &artifact_id,
+    )
+    .await;
+    assert_eq!(verify_phase, JobPhase::Succeeded);
+    let reopened = ManagerReleaseStore::open(ManagerRoot::explicit(manager_root.clone()), "node-a")
+        .expect("reopen verified model");
+    assert_eq!(reopened.snapshot().artifacts.len(), 1);
+
+    let artifact = reopened
+        .snapshot()
+        .artifacts
+        .get(&artifact_id)
+        .expect("artifact");
+    std::fs::write(
+        manager_root.join(&artifact.rel_path),
+        b"swapped model bytes",
+    )
+    .expect("tamper model");
+    let store = Arc::new(Mutex::new(reopened));
+    let (tampered_phase, _) = run_job(
+        model_backend(store.clone(), entry, Arc::new(ModelHttp::new(vec![]))),
+        JobKind::Verify,
+        &artifact_id,
+    )
+    .await;
+    assert_eq!(tampered_phase, JobPhase::Failed);
+    assert_eq!(
+        store.lock().expect("store lock").snapshot().artifacts[&artifact_id].validation_state,
+        siderostat::manager::ArtifactState::Quarantined
+    );
+}
+
+#[tokio::test]
+async fn rejected_model_downloads_do_not_publish_records_or_reach_unknown_ids() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let body = b"model bytes";
+    let wrong_hash = model_entry(body, None, None);
+    let transport = Arc::new(ModelHttp::new(vec![Ok(model_response(
+        &wrong_hash,
+        body,
+        Some("https://untrusted.example.net/model.bin"),
+    ))]));
+    let (redirect_phase, _) = run_job(
+        model_backend(store.clone(), wrong_hash.clone(), transport.clone()),
+        JobKind::Download,
+        &wrong_hash.catalog_id,
+    )
+    .await;
+    assert_eq!(redirect_phase, JobPhase::Failed);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .release_pointers
+            .active,
+        None
+    );
+
+    let wrong_digest = model_entry(body, Some(&"f".repeat(64)), None);
+    let digest_transport = Arc::new(ModelHttp::new(vec![Ok(model_response(
+        &wrong_digest,
+        body,
+        None,
+    ))]));
+    let (digest_phase, _) = run_job(
+        model_backend(store.clone(), wrong_digest, digest_transport.clone()),
+        JobKind::Download,
+        "fixture-model-v1",
+    )
+    .await;
+    assert_eq!(digest_phase, JobPhase::Failed);
+    assert_eq!(digest_transport.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
+
+    let size_entry = model_entry(body, None, None);
+    let oversized_body = [body.as_slice(), b"!"].concat();
+    let size_transport = Arc::new(ModelHttp::new(vec![Ok(model_response(
+        &size_entry,
+        &oversized_body,
+        None,
+    ))]));
+    let (size_phase, _) = run_job(
+        model_backend(store.clone(), size_entry, size_transport.clone()),
+        JobKind::Download,
+        "fixture-model-v1",
+    )
+    .await;
+    assert_eq!(size_phase, JobPhase::Failed);
+    assert_eq!(size_transport.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
+
+    let underrun_entry = model_entry(body, None, Some(body.len() as u64 + 1));
+    let underrun_transport = Arc::new(ModelHttp::new(vec![Ok(model_response(
+        &underrun_entry,
+        body,
+        None,
+    ))]));
+    let (underrun_phase, _) = run_job(
+        model_backend(store.clone(), underrun_entry, underrun_transport.clone()),
+        JobKind::Download,
+        "fixture-model-v1",
+    )
+    .await;
+    assert_eq!(underrun_phase, JobPhase::Failed);
+    assert_eq!(underrun_transport.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
+
+    let cancel_entry = model_entry(body, None, None);
+    let cancel_transport = Arc::new(CancelModelHttp {
+        response: model_response(&cancel_entry, body, None),
+    });
+    let (cancel_phase, _) = run_job(
+        model_backend(store.clone(), cancel_entry, cancel_transport),
+        JobKind::Download,
+        "fixture-model-v1",
+    )
+    .await;
+    assert_eq!(cancel_phase, JobPhase::Failed);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_dir(manager_root.join("ds4/operations"))
+            .expect("operations")
+            .all(|entry| !entry
+                .expect("operations entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("model-download-"))
+    );
+
+    let no_catalog_transport = Arc::new(ModelHttp::new(vec![]));
+    let unknown_backend = RuntimeManagerBackend::for_release_store(store.clone())
+        .expect("construct production manager backend")
+        .with_transport(no_catalog_transport.clone());
+    let (unknown_phase, _) = run_job(unknown_backend, JobKind::Download, "external-model-id").await;
+    assert_eq!(unknown_phase, JobPhase::Failed);
+    assert_eq!(no_catalog_transport.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .lock()
+            .expect("store lock")
+            .snapshot()
+            .artifacts
+            .is_empty()
+    );
 }
 
 #[test]

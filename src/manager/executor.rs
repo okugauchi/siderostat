@@ -79,10 +79,16 @@ pub enum ManagerJobInput {
         catalog_id: String,
         part_path: PathBuf,
     },
+    DownloadFromCatalog {
+        catalog_id: String,
+    },
     Verify {
         registry: Arc<Mutex<registry::ArtifactRegistry>>,
         artifact_id: String,
         expected_sha256: String,
+    },
+    VerifyManagedArtifact {
+        artifact_id: String,
     },
     Stage {
         request: Box<stage::StageRequest>,
@@ -102,7 +108,9 @@ impl ManagerJobInput {
             Self::Build { .. } => JobKind::Build,
             Self::BuildFromReceipt { .. } => JobKind::Build,
             Self::Download { .. } => JobKind::Download,
+            Self::DownloadFromCatalog { .. } => JobKind::Download,
             Self::Verify { .. } => JobKind::Verify,
+            Self::VerifyManagedArtifact { .. } => JobKind::Verify,
             Self::Stage { .. } => JobKind::Stage,
             Self::Activate(_) => JobKind::Activate,
             Self::Rollback(_) => JobKind::Rollback,
@@ -169,7 +177,15 @@ impl ManagerJobInputResolver {
 
     /// Register an entry only after its catalog rules, full checksum, URL and
     /// size have been checked. Plans can reference this catalog by ID only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register_catalog_entry(
+        &mut self,
+        entry: catalog::ModelCatalogEntry,
+    ) -> Result<(), ManagerInputError> {
+        self.insert_catalog_entry(entry)
+    }
+
+    fn insert_catalog_entry(
         &mut self,
         entry: catalog::ModelCatalogEntry,
     ) -> Result<(), ManagerInputError> {
@@ -239,6 +255,18 @@ impl ManagerJobInputResolver {
                         role,
                     });
                 }
+            }
+            if request.kind == JobKind::Download
+                && self.model_catalog.contains_key(&request.payload_key)
+            {
+                return Ok(ManagerJobInput::DownloadFromCatalog {
+                    catalog_id: request.payload_key.clone(),
+                });
+            }
+            if request.kind == JobKind::Verify && valid_model_artifact_id(&request.payload_key) {
+                return Ok(ManagerJobInput::VerifyManagedArtifact {
+                    artifact_id: request.payload_key.clone(),
+                });
             }
             return if matches!(request.kind, JobKind::Download | JobKind::Stage)
                 && self.model_catalog.is_empty()
@@ -328,6 +356,16 @@ impl ManagerJobInputResolver {
                     }
                 }
             }
+            ManagerJobInput::DownloadFromCatalog { catalog_id } => {
+                if !self.model_catalog.contains_key(catalog_id) {
+                    return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::VerifyManagedArtifact { artifact_id } => {
+                if !valid_model_artifact_id(artifact_id) {
+                    return Err(ManagerInputError::Rejected);
+                }
+            }
             ManagerJobInput::Stage {
                 request: req,
                 registry,
@@ -413,6 +451,10 @@ impl ManagerJobInputResolver {
     }
 }
 
+fn valid_model_artifact_id(value: &str) -> bool {
+    value.strip_prefix("model-").is_some_and(full_sha256)
+}
+
 fn full_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -494,7 +536,12 @@ pub struct RuntimeManagerBackend {
 }
 
 impl RuntimeManagerBackend {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(resolver: ManagerJobInputResolver) -> Self {
+        Self::new_runtime(resolver)
+    }
+
+    fn new_runtime(resolver: ManagerJobInputResolver) -> Self {
         Self {
             resolver,
             transport: None,
@@ -506,15 +553,32 @@ impl RuntimeManagerBackend {
     /// revision, local path, or command argument.
     pub fn for_release_store(
         store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let cache = store
             .lock()
-            .expect("manager store lock poisoned")
+            .map_err(|_| anyhow::anyhow!("manager store lock poisoned"))?
             .official_source_cache_path();
-        Self::new(ManagerJobInputResolver::official_fetch(cache)).with_manager_store(store)
+        let mut resolver = ManagerJobInputResolver::official_fetch(cache);
+        for entry in catalog::bundled_catalog()? {
+            resolver
+                .insert_catalog_entry(entry)
+                .map_err(|_| anyhow::anyhow!("bundled manager catalog is invalid"))?;
+        }
+        let transport = Arc::new(download::ReqwestHttpTransport::new()?);
+        Ok(Self::new_runtime(resolver)
+            .with_manager_store_internal(store)
+            .with_transport_internal(transport))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_manager_store(
+        self,
+        store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+    ) -> Self {
+        self.with_manager_store_internal(store)
+    }
+
+    fn with_manager_store_internal(
         mut self,
         store: Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
     ) -> Self {
@@ -522,11 +586,17 @@ impl RuntimeManagerBackend {
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn without_model_catalog() -> Self {
-        Self::new(ManagerJobInputResolver::new())
+        Self::new_runtime(ManagerJobInputResolver::new())
     }
 
-    pub fn with_transport(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_transport(self, transport: Arc<dyn download::HttpTransport + Send + Sync>) -> Self {
+        self.with_transport_internal(transport)
+    }
+
+    fn with_transport_internal(
         mut self,
         transport: Arc<dyn download::HttpTransport + Send + Sync>,
     ) -> Self {
@@ -919,7 +989,10 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                     .as_ref()
                     .ok_or(ManagerExecutionError::Unavailable)?;
                 download::download_bounded(&spec, transport.as_ref(), &part_path, None, &cancel)
-                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                    .map_err(map_download_error)?;
+            }
+            ManagerJobInput::DownloadFromCatalog { catalog_id } => {
+                self.download_catalog_model(&catalog_id, &cancel)?;
             }
             ManagerJobInput::Verify {
                 registry,
@@ -931,6 +1004,9 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                     .map_err(|_| ManagerExecutionError::Unavailable)?;
                 verify::verify_artifact(&mut registry, &artifact_id, &expected_sha256)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::VerifyManagedArtifact { artifact_id } => {
+                self.verify_catalog_model(&artifact_id)?;
             }
             ManagerJobInput::Stage { mut request, .. } => {
                 request.model = catalog::validate_entry(request.model.clone())
@@ -949,6 +1025,130 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
             return Err(ManagerExecutionError::Canceled);
         }
         Ok(ManagerExecutionOutcome { progress: 100 })
+    }
+}
+
+impl RuntimeManagerBackend {
+    fn download_catalog_model(
+        &self,
+        catalog_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerExecutionError> {
+        let entry = self
+            .resolver
+            .model_catalog
+            .get(catalog_id)
+            .cloned()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let store = self
+            .manager_store
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let part_path = store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?
+            .create_model_download_part_path()
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        let spec = download::DownloadSpec {
+            url: entry.url.clone(),
+            expected_size: entry.size,
+            sha256: entry.sha256.clone(),
+            redirect_allowlist: entry.redirect_allowlist.clone(),
+            credentials: None,
+        };
+        let result = (|| {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(ManagerExecutionError::Canceled);
+            }
+            store
+                .lock()
+                .map_err(|_| ManagerExecutionError::Unavailable)?
+                .validate_model_download_part_path(&part_path)
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            download::download_bounded(&spec, transport.as_ref(), &part_path, None, cancel)
+                .map_err(map_download_error)?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err(ManagerExecutionError::Canceled);
+            }
+            let mut store = store
+                .lock()
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            store
+                .validate_model_download_part_path(&part_path)
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            store
+                .publish_artifact(
+                    &part_path,
+                    crate::manager::store::ArtifactDraft {
+                        kind: crate::manager::store::ArtifactKind::Model,
+                        expected_sha256: entry.sha256.clone(),
+                        expected_size: entry.size,
+                        provenance: crate::manager::store::ArtifactProvenance::Model {
+                            catalog_id: entry.catalog_id.clone(),
+                        },
+                    },
+                )
+                .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            Ok(())
+        })();
+        let cleanup = store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?
+            .remove_model_download_part(&part_path)
+            .map_err(|_| ManagerExecutionError::Domain("model download cleanup failed".into()));
+        cleanup?;
+        result
+    }
+
+    fn verify_catalog_model(&self, artifact_id: &str) -> Result<(), ManagerExecutionError> {
+        if !valid_model_artifact_id(artifact_id) {
+            return Err(ManagerExecutionError::InputRejected(
+                "invalid model artifact identity".into(),
+            ));
+        }
+        let store = self
+            .manager_store
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let mut store = store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        let record = store
+            .snapshot()
+            .artifacts
+            .get(artifact_id)
+            .cloned()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let crate::manager::store::ArtifactProvenance::Model { catalog_id } = &record.provenance
+        else {
+            return Err(ManagerExecutionError::InputRejected(
+                "artifact is not a catalog model".into(),
+            ));
+        };
+        let entry = self
+            .resolver
+            .model_catalog
+            .get(catalog_id)
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        verify::verify_stored_model(
+            &mut store,
+            artifact_id,
+            catalog_id,
+            &entry.sha256,
+            entry.size,
+        )
+        .map_err(|error| ManagerExecutionError::Domain(error.to_string()))
+    }
+}
+
+fn map_download_error(error: download::DownloadError) -> ManagerExecutionError {
+    match error {
+        download::DownloadError::Canceled => ManagerExecutionError::Canceled,
+        other => ManagerExecutionError::Domain(other.to_string()),
     }
 }
 
@@ -1129,6 +1329,12 @@ impl ManagerExecutionBackend for FixtureManagerBackend {
             ManagerJobInput::Download { spec, .. } => {
                 download::check_capacity(u64::MAX, spec.expected_size, 1, 0)
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+            }
+            ManagerJobInput::DownloadFromCatalog { .. }
+            | ManagerJobInput::VerifyManagedArtifact { .. } => {
+                return Err(ManagerExecutionError::InputRejected(
+                    "managed fixture operation is not registered".into(),
+                ));
             }
             ManagerJobInput::Verify {
                 expected_sha256, ..

@@ -16,7 +16,7 @@
 //!
 //! レビュー重点: 認証を異 origin へ転送しない。圧縮/実測 size/同時
 //! download による容量超過を検査。M05。
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// ダウンロード要求。M05。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,15 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponseMetadata {
+    pub status: u16,
+    pub etag: Option<String>,
+    pub content_range: Option<String>,
+    pub final_url: String,
+    pub body_size: u64,
+}
+
 /// HTTP 転送エラー。M05。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpError {
@@ -77,6 +86,8 @@ pub enum HttpError {
     Transport(String),
     /// 不正なレスポンス。M05。
     InvalidResponse(String),
+    WriteFailed(String),
+    Canceled,
 }
 
 impl std::fmt::Display for HttpError {
@@ -84,6 +95,8 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Transport(msg) => write!(f, "transport: {msg}"),
             HttpError::InvalidResponse(msg) => write!(f, "invalid response: {msg}"),
+            HttpError::WriteFailed(msg) => write!(f, "write failed: {msg}"),
+            HttpError::Canceled => f.write_str("canceled"),
         }
     }
 }
@@ -99,6 +112,255 @@ pub trait HttpTransport {
         start: u64,
         etag: Option<&str>,
     ) -> Result<HttpResponse, HttpError>;
+
+    /// Stream a bounded response body to a newly allocated temporary file.
+    /// Fixture transports may use the byte-vector method; production overrides
+    /// this method to avoid buffering large models in memory.
+    fn get_range_to_file(
+        &self,
+        spec: &DownloadSpec,
+        start: u64,
+        etag: Option<&str>,
+        destination: &Path,
+        max_bytes: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<HttpResponseMetadata, HttpError> {
+        use std::io::Write;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HttpError::Canceled);
+        }
+        let response = self.get_range(spec, start, etag)?;
+        let response_limit = if response.status == 200 {
+            spec.expected_size.saturating_add(1)
+        } else {
+            max_bytes
+        };
+        if response.body.len() as u64 > response_limit {
+            return Err(HttpError::InvalidResponse(
+                "response exceeds catalog size".into(),
+            ));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(destination)
+            .map_err(|_| HttpError::WriteFailed("temporary response file unavailable".into()))?;
+        file.write_all(&response.body)
+            .map_err(|_| HttpError::WriteFailed("response write failed".into()))?;
+        file.sync_all()
+            .map_err(|_| HttpError::WriteFailed("response sync failed".into()))?;
+        Ok(HttpResponseMetadata {
+            status: response.status,
+            etag: response.etag,
+            content_range: response.content_range,
+            final_url: response.final_url,
+            body_size: response.body.len() as u64,
+        })
+    }
+}
+
+/// HTTP transport for the production manager. Redirects are handled manually
+/// so each hop is checked against the catalog allowlist before another request.
+pub struct ReqwestHttpTransport {
+    client: std::sync::OnceLock<Result<reqwest::blocking::Client, HttpError>>,
+}
+
+impl ReqwestHttpTransport {
+    pub fn new() -> Result<Self, HttpError> {
+        // Construct lazily: the app wires this adapter while inside Tokio, but
+        // the synchronous manager executor invokes it from a blocking worker.
+        Ok(Self {
+            client: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn client(&self) -> Result<&reqwest::blocking::Client, HttpError> {
+        self.client
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(900))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|_| HttpError::Transport("HTTP client unavailable".into()))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn send_range(
+        &self,
+        spec: &DownloadSpec,
+        start: u64,
+        etag: Option<&str>,
+    ) -> Result<(reqwest::blocking::Response, url::Url), HttpError> {
+        use reqwest::header::{IF_RANGE, LOCATION, RANGE};
+        validate_download_url(&spec.url)
+            .map_err(|_| HttpError::InvalidResponse("catalog source URL is invalid".into()))?;
+        let mut current = url::Url::parse(&spec.url)
+            .map_err(|_| HttpError::InvalidResponse("catalog source URL is invalid".into()))?;
+        let original_origin = current.origin().ascii_serialization();
+        for redirects in 0..=5 {
+            let mut request = self
+                .client()?
+                .get(current.clone())
+                .header(RANGE, format!("bytes={start}-"));
+            if let Some(etag) = etag {
+                request = request.header(IF_RANGE, etag);
+            }
+            if let Some(credentials) = &spec.credentials {
+                if current.origin().ascii_serialization() != original_origin {
+                    return Err(HttpError::InvalidResponse(
+                        "cross-origin credential forwarding rejected".into(),
+                    ));
+                }
+                request = request.bearer_auth(&credentials.bearer);
+            }
+            let response = request
+                .send()
+                .map_err(|_| HttpError::Transport("model request failed".into()))?;
+            let status = response.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if redirects == 5 {
+                    return Err(HttpError::InvalidResponse("too many redirects".into()));
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| HttpError::InvalidResponse("invalid redirect".into()))?;
+                let next = current
+                    .join(location)
+                    .map_err(|_| HttpError::InvalidResponse("invalid redirect".into()))?;
+                validate_redirect(spec, next.as_str()).map_err(|_| {
+                    HttpError::InvalidResponse("redirect rejected by catalog policy".into())
+                })?;
+                current = next;
+                continue;
+            }
+
+            return Ok((response, current));
+        }
+        Err(HttpError::InvalidResponse("too many redirects".into()))
+    }
+}
+
+impl HttpTransport for ReqwestHttpTransport {
+    fn get_range(
+        &self,
+        spec: &DownloadSpec,
+        start: u64,
+        etag: Option<&str>,
+    ) -> Result<HttpResponse, HttpError> {
+        use reqwest::header::{CONTENT_RANGE, ETAG};
+        use std::io::Read;
+
+        let (mut response, current) = self.send_range(spec, start, etag)?;
+        let status = response.status().as_u16();
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut body = Vec::new();
+        response
+            .by_ref()
+            .take(spec.expected_size.saturating_sub(start).saturating_add(1))
+            .read_to_end(&mut body)
+            .map_err(|_| HttpError::Transport("model response read failed".into()))?;
+        Ok(HttpResponse {
+            status,
+            etag: response_etag,
+            content_range,
+            final_url: current.to_string(),
+            body,
+        })
+    }
+
+    fn get_range_to_file(
+        &self,
+        spec: &DownloadSpec,
+        start: u64,
+        etag: Option<&str>,
+        destination: &Path,
+        max_bytes: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<HttpResponseMetadata, HttpError> {
+        use reqwest::header::{CONTENT_RANGE, ETAG};
+        use std::io::{Read, Write};
+
+        let (mut response, current) = self.send_range(spec, start, etag)?;
+        let status = response.status().as_u16();
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(destination)
+            .map_err(|_| HttpError::WriteFailed("temporary response file unavailable".into()))?;
+        let response_limit = if status == 200 {
+            spec.expected_size.saturating_add(1)
+        } else {
+            max_bytes
+        };
+        let mut body_size = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(file);
+                let _ = std::fs::remove_file(destination);
+                return Err(HttpError::Canceled);
+            }
+            let count = response
+                .read(&mut buffer)
+                .map_err(|_| HttpError::Transport("model response read failed".into()))?;
+            if count == 0 {
+                break;
+            }
+            body_size = body_size.saturating_add(count as u64);
+            if body_size > response_limit {
+                drop(file);
+                let _ = std::fs::remove_file(destination);
+                return Err(HttpError::InvalidResponse(
+                    "response exceeds catalog size".into(),
+                ));
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|_| HttpError::WriteFailed("response write failed".into()))?;
+        }
+        file.sync_all()
+            .map_err(|_| HttpError::WriteFailed("response sync failed".into()))?;
+        Ok(HttpResponseMetadata {
+            status,
+            etag: response_etag,
+            content_range,
+            final_url: current.to_string(),
+            body_size,
+        })
+    }
 }
 
 /// ダウンロードエラー。M05。
@@ -118,6 +380,8 @@ pub enum DownloadError {
     Canceled,
     /// digest 不一致。M05。
     DigestMismatch(String),
+    /// 実測 bytes が catalog size と一致しない。M05。
+    SizeMismatch,
     /// その他。M05。
     Other(String),
 }
@@ -132,6 +396,7 @@ impl std::fmt::Display for DownloadError {
             DownloadError::WriteFailed(msg) => write!(f, "write failed: {msg}"),
             DownloadError::Canceled => write!(f, "canceled"),
             DownloadError::DigestMismatch(msg) => write!(f, "digest mismatch: {msg}"),
+            DownloadError::SizeMismatch => f.write_str("download size mismatch"),
             DownloadError::Other(msg) => write!(f, "error: {msg}"),
         }
     }
@@ -206,30 +471,72 @@ pub fn check_capacity(
 
 /// redirect が allowlist 内か・異 origin への credential 転送がないかを検証。M05。
 fn validate_redirect(spec: &DownloadSpec, final_url: &str) -> Result<(), DownloadError> {
-    // final_url が元 URL と同 origin か。M05。
-    let origin = |u: &str| -> String { u.split('/').take(3).collect::<Vec<_>>().join("/") };
-    let spec_origin = origin(&spec.url);
-    let final_origin = origin(final_url);
+    validate_download_url(&spec.url)?;
+    validate_download_url(final_url)?;
+    let spec_origin = url::Url::parse(&spec.url)
+        .map_err(|_| DownloadError::RedirectRejected("invalid source URL".into()))?
+        .origin()
+        .ascii_serialization();
+    let final_origin = url::Url::parse(final_url)
+        .map_err(|_| DownloadError::RedirectRejected("invalid redirect URL".into()))?
+        .origin()
+        .ascii_serialization();
     let same_origin = spec_origin == final_origin;
 
-    let allowed = spec
-        .redirect_allowlist
-        .iter()
-        .any(|a| origin(a) == final_origin);
+    let allowed = spec.redirect_allowlist.iter().any(|allowlisted| {
+        url::Url::parse(allowlisted)
+            .ok()
+            .is_some_and(|url| url.origin().ascii_serialization() == final_origin)
+    });
 
     // private redirect（allowlist 外）→ 拒否。M05。
     if !same_origin && !allowed {
-        return Err(DownloadError::RedirectRejected(format!(
-            "redirect to {final_url} not in allowlist"
-        )));
+        return Err(DownloadError::RedirectRejected(
+            "origin is not allowlisted".into(),
+        ));
     }
     // 異 origin へ credential を転送 → 拒否。M05。
     if !same_origin && spec.credentials.is_some() {
-        return Err(DownloadError::CredentialLeak(format!(
-            "credentials would be forwarded to {final_url}"
-        )));
+        return Err(DownloadError::CredentialLeak(
+            "cross-origin credentials are not forwarded".into(),
+        ));
     }
     Ok(())
+}
+
+fn validate_download_url(value: &str) -> Result<(), DownloadError> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| DownloadError::RedirectRejected("invalid URL".into()))?;
+    let fixture_scheme = cfg!(feature = "test-support") && parsed.scheme() == "fixture";
+    if (!fixture_scheme && parsed.scheme() != "https")
+        || parsed.host_str().is_none_or(str::is_empty)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+        })
+    {
+        return Err(DownloadError::RedirectRejected("unsafe URL".into()));
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip))
+            if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() =>
+        {
+            Err(DownloadError::RedirectRejected("unsafe address".into()))
+        }
+        Some(url::Host::Ipv6(ip))
+            if ip.is_unique_local()
+                || ip.is_loopback()
+                || ip.is_unicast_link_local()
+                || ip.is_unspecified() =>
+        {
+            Err(DownloadError::RedirectRejected("unsafe address".into()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// bounded download の本体。M05。
@@ -253,21 +560,32 @@ pub fn download_bounded(
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(DownloadError::Canceled);
     }
+    if spec.expected_size == 0
+        || spec.sha256.len() != 64
+        || !spec.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DownloadError::Other(
+            "invalid catalog digest or size".into(),
+        ));
+    }
+    validate_download_url(&spec.url)?;
 
     // 既存 part の状態を確認（resume 判定）。M05。
-    let existing_part = std::fs::metadata(part_path).ok().map(|m| m.len());
+    let existing_part = existing_regular_file_size(part_path)?;
     let mut progress = DownloadProgress {
         expected_size: spec.expected_size,
-        downloaded: existing_part.unwrap_or(0),
+        downloaded: existing_part,
         etag: resume_etag.map(|s| s.to_string()),
     };
+    if progress.downloaded > spec.expected_size {
+        truncate_part(part_path)?;
+        progress.downloaded = 0;
+        progress.etag = None;
+    }
 
     // 既に size に達していれば digest 照合で完了判定。M05。
     if progress.downloaded == spec.expected_size && progress.downloaded > 0 {
-        // full SHA 照合。M05。
-        let bytes =
-            std::fs::read(part_path).map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-        let digest = crate::manager::registry::sha256_hex(&bytes);
+        let (_, digest) = sha256_file(part_path)?;
         if digest != spec.sha256 {
             return Err(DownloadError::DigestMismatch(format!(
                 "expected {} got {}",
@@ -279,25 +597,62 @@ pub fn download_bounded(
 
     // resume 時は ETag を journal から取得。M05。
     let mut start = progress.downloaded;
+    let mut etag_restarts = 0_u8;
 
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DownloadError::Canceled);
         }
-        let resp = transport
-            .get_range(spec, start, progress.etag.as_deref())
-            .map_err(|e| DownloadError::Other(e.to_string()))?;
+        let incoming_path = part_path.with_file_name(format!(
+            ".siderostat-model-response-{}.part",
+            uuid::Uuid::new_v4()
+        ));
+        let incoming = IncomingFile(incoming_path.clone());
+        let response = transport
+            .get_range_to_file(
+                spec,
+                start,
+                progress.etag.as_deref(),
+                &incoming_path,
+                spec.expected_size.saturating_sub(start).saturating_add(1),
+                cancel,
+            )
+            .map_err(|error| match error {
+                HttpError::Canceled => DownloadError::Canceled,
+                HttpError::WriteFailed(message) => DownloadError::WriteFailed(message),
+                HttpError::InvalidResponse(message)
+                    if message.contains("redirect") || message.contains("URL") =>
+                {
+                    DownloadError::RedirectRejected("HTTP redirect or URL rejected".into())
+                }
+                HttpError::InvalidResponse(message) if message.contains("exceeds catalog size") => {
+                    DownloadError::SizeMismatch
+                }
+                _ => DownloadError::Other("model transfer failed".into()),
+            })?;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DownloadError::Canceled);
+        }
+        let incoming_metadata = std::fs::symlink_metadata(&incoming_path)
+            .map_err(|_| DownloadError::WriteFailed("temporary response unavailable".into()))?;
+        if incoming_metadata.file_type().is_symlink()
+            || !incoming_metadata.is_file()
+            || incoming_metadata.len() != response.body_size
+        {
+            return Err(DownloadError::WriteFailed(
+                "temporary response is invalid".into(),
+            ));
+        }
 
         // private redirect → 拒否（allowlist 外・異 origin への credential 転送）。M05。
-        validate_redirect(spec, &resp.final_url)?;
+        validate_redirect(spec, &response.final_url)?;
 
         // 416 → size/full hash で完了判定。M05。
-        if resp.status == 416 {
+        if response.status == 416 {
+            drop(incoming);
             if progress.downloaded == spec.expected_size {
-                let bytes = std::fs::read(part_path)
-                    .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-                let digest = crate::manager::registry::sha256_hex(&bytes);
-                if digest == spec.sha256 {
+                let (actual_size, digest) = sha256_file(part_path)?;
+                if actual_size == spec.expected_size && digest == spec.sha256 {
                     return Ok(progress);
                 }
             }
@@ -307,61 +662,78 @@ pub fn download_bounded(
         }
 
         // 200 on resume → truncate part のみ（追記せず再取得）。M05。
-        if resp.status == 200 {
-            // truncate して最初から。M05。
-            std::fs::write(part_path, &resp.body)
-                .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-            progress.downloaded = resp.body.len() as u64;
-            progress.etag = resp.etag.clone();
-            if progress.downloaded >= spec.expected_size {
-                break;
+        if response.status == 200 {
+            if response.body_size != spec.expected_size {
+                return Err(DownloadError::SizeMismatch);
             }
-            start = progress.downloaded;
-            continue;
+            std::fs::rename(&incoming_path, part_path)
+                .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
+            progress.downloaded = response.body_size;
+            progress.etag = response.etag.clone();
+            break;
         }
 
         // 206 → Content-Range 検証。M05。
-        if resp.status == 206 {
-            let cr = resp.content_range.clone().unwrap_or_default();
+        if response.status == 206 {
+            let cr = response.content_range.clone().unwrap_or_default();
             // Content-Range が `bytes {start}-{end}/{total}` 形式か検証。M05。
-            let expected_prefix = format!("bytes {}-", start);
-            if !cr.starts_with(&expected_prefix) {
-                return Err(DownloadError::RangeMismatch(format!(
-                    "expected prefix {expected_prefix}, got {cr}"
-                )));
+            let parsed_range = parse_content_range(&cr);
+            let Some((range_start, range_end, total)) = parsed_range else {
+                return Err(DownloadError::RangeMismatch("invalid content range".into()));
+            };
+            if range_start != start
+                || total != spec.expected_size
+                || range_end < range_start
+                || range_end - range_start + 1 != response.body_size
+                || range_end >= total
+            {
+                return Err(DownloadError::RangeMismatch(
+                    "content range mismatch".into(),
+                ));
             }
             // ETag 変更 → restart（part 破棄）。M05。
-            if let (Some(new_etag), Some(old_etag)) = (&resp.etag, &progress.etag) {
+            if let (Some(new_etag), Some(old_etag)) = (&response.etag, &progress.etag) {
                 if new_etag != old_etag {
-                    // 破棄して最初から。M05。
-                    std::fs::write(part_path, &resp.body)
-                        .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-                    progress.downloaded = resp.body.len() as u64;
-                    progress.etag = resp.etag.clone();
-                    start = progress.downloaded;
+                    if etag_restarts > 0 {
+                        return Err(DownloadError::Other("model ETag kept changing".into()));
+                    }
+                    truncate_part(part_path)?;
+                    drop(incoming);
+                    progress.downloaded = 0;
+                    progress.etag = response.etag.clone();
+                    start = 0;
+                    etag_restarts += 1;
                     continue;
                 }
             }
+            let next = progress
+                .downloaded
+                .checked_add(response.body_size)
+                .ok_or(DownloadError::SizeMismatch)?;
+            if next > spec.expected_size {
+                return Err(DownloadError::SizeMismatch);
+            }
             // 追記。M05。
-            append_bytes(part_path, &resp.body)?;
-            progress.downloaded += resp.body.len() as u64;
-            progress.etag = resp.etag.clone();
-            if progress.downloaded >= spec.expected_size {
+            append_file(part_path, &incoming_path)?;
+            progress.downloaded = next;
+            progress.etag = response.etag.clone();
+            if progress.downloaded == spec.expected_size {
                 break;
             }
             start = progress.downloaded;
             continue;
         }
 
-        return Err(DownloadError::Other(format!(
-            "unexpected status {}",
-            resp.status
-        )));
+        return Err(DownloadError::Other(
+            "unexpected model response status".into(),
+        ));
     }
 
     // 完了時 full SHA 照合。M05。
-    let bytes = std::fs::read(part_path).map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-    let digest = crate::manager::registry::sha256_hex(&bytes);
+    let (actual_size, digest) = sha256_file(part_path)?;
+    if actual_size != spec.expected_size {
+        return Err(DownloadError::SizeMismatch);
+    }
     if digest != spec.sha256 {
         return Err(DownloadError::DigestMismatch(format!(
             "expected {} got {}",
@@ -371,17 +743,101 @@ pub fn download_bounded(
     Ok(progress)
 }
 
+struct IncomingFile(PathBuf);
+
+impl Drop for IncomingFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+}
+
 /// part へ追記する（disk full で失敗 → WriteFailed、active 不変）。M05。
-fn append_bytes(part_path: &Path, bytes: &[u8]) -> Result<(), DownloadError> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+fn append_file(part_path: &Path, incoming_path: &Path) -> Result<(), DownloadError> {
+    use std::io::copy;
+    let existing = existing_regular_file_size(part_path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).append(true);
+    if existing == 0 && !part_path.exists() {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options
         .open(part_path)
         .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
-    f.write_all(bytes)
+    let mut incoming = std::fs::File::open(incoming_path)
         .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
+    copy(&mut incoming, &mut f).map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
     Ok(())
+}
+
+fn existing_regular_file_size(path: &Path) -> Result<u64, DownloadError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            DownloadError::WriteFailed("download part is invalid".into()),
+        ),
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(DownloadError::WriteFailed(error.to_string())),
+    }
+}
+
+fn truncate_part(path: &Path) -> Result<(), DownloadError> {
+    let _ = existing_regular_file_size(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| DownloadError::WriteFailed(error.to_string()))
+}
+
+fn sha256_file(path: &Path) -> Result<(u64, String), DownloadError> {
+    use sha2::Digest;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DownloadError::WriteFailed(
+            "download part is invalid".into(),
+        ));
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|e| DownloadError::WriteFailed(e.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or(DownloadError::SizeMismatch)?;
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((size, digest))
 }
 
 #[cfg(test)]
@@ -550,6 +1006,27 @@ mod tests {
         assert!(matches!(err, DownloadError::RedirectRejected(_)));
         // part は書かれない（active 不変）。M05。
         assert!(!part.exists());
+    }
+
+    #[test]
+    fn redirects_require_an_allowlisted_https_origin_without_cross_origin_credentials() {
+        let mut spec = DownloadSpec::new(
+            "https://models.example.com/model.bin",
+            4,
+            crate::manager::registry::sha256_hex(b"data"),
+        );
+        spec.redirect_allowlist = vec!["https://cdn.example.com/".into()];
+        assert!(validate_redirect(&spec, "https://cdn.example.com/model.bin").is_ok());
+        assert!(validate_redirect(&spec, "http://cdn.example.com/model.bin").is_err());
+        assert!(validate_redirect(&spec, "https://127.0.0.1/model.bin").is_err());
+
+        spec.credentials = Some(Credentials {
+            bearer: "secret".into(),
+        });
+        assert!(matches!(
+            validate_redirect(&spec, "https://cdn.example.com/model.bin"),
+            Err(DownloadError::CredentialLeak(_))
+        ));
     }
 
     /// 容量予約: 同時 download による容量超過を検査。M05。

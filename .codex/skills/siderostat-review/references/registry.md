@@ -20,3 +20,5 @@
 - 新モードの統合テストは、実 control HTTP で pair → promote → demote を通し、実プロセス無し（pid=None）を検証すること
 - 同一ホストに複数ノードを同居させるテストでは、peer の制御ポートを明示分離できること
 - 出典: feature/cluster-dry-run（2026-09-05）
+- 外部配布物を catalog の取得対象にする前に、配布元・正確な size・full checksum の根拠を照合する。placeholder URL と仮置き checksum は trust の根拠として採用しない
+- 出典: H06 Manager Model Download/Verify（2026-09-25）
