@@ -177,6 +177,63 @@ impl ProductionControlClient {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// Send a versioned Manager participant request over the same source-pinned, signed peer
+    /// channel used by the control and policy protocols. A missing route or an unsupported
+    /// response version fails before the caller begins any local drain.
+    pub async fn manager_peer(
+        &self,
+        request: &manager::ManagerPeerRequest,
+    ) -> anyhow::Result<manager::ManagerPeerResponse> {
+        request.validate().map_err(anyhow::Error::new)?;
+        let path = request.phase.path();
+        let body = serde_json::to_vec(request)?;
+        let timestamp = now_millis();
+        let signed = self.inner.authenticator.sign(
+            self.inner.local_node_id.clone(),
+            reqwest::Method::POST.as_str(),
+            path,
+            timestamp,
+            uuid::Uuid::new_v4().simple().to_string(),
+            &body,
+        )?;
+        let response = self
+            .inner
+            .client
+            .post(self.inner.base.join(path.trim_start_matches('/'))?)
+            .header(HEADER_NODE, signed.node_id())
+            .header(HEADER_TIMESTAMP, signed.timestamp_millis())
+            .header(HEADER_NONCE, signed.nonce())
+            .header(HEADER_SIGNATURE, signed.signature())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(self.inner.lifecycle_timeout)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            // Do not include peer response bodies in errors: this boundary must not propagate
+            // credentials, paths, or child output into job logs.
+            anyhow::bail!("peer manager control {path} returned {status}");
+        }
+        let response: manager::ManagerPeerResponse = response.json().await?;
+        anyhow::ensure!(
+            response.protocol_version == manager::MANAGER_PEER_PROTOCOL_VERSION,
+            "peer manager protocol version is unsupported"
+        );
+        anyhow::ensure!(
+            response.operation_id == request.operation_id
+                && response.profile_id == request.profile_id
+                && response.candidate_digest == request.candidate_digest
+                && response.previous_digest == request.previous_digest
+                && response.expected_generation == request.expected_generation
+                && response.policy_epoch == request.policy_epoch
+                && response.phase == request.phase
+                && !response.ack_id.is_empty(),
+            "peer manager acknowledgement does not match the request"
+        );
+        Ok(response)
+    }
+
     pub async fn node(&self) -> anyhow::Result<ControlResponse> {
         self.request(reqwest::Method::GET, "/v1/node", Vec::new(), None)
             .await
@@ -337,6 +394,9 @@ struct ProductionInner {
     policy_pending: AtomicBool,
     policy_control: Arc<PolicyControlState>,
     policy_store: std::sync::Mutex<Option<Arc<StateStore>>>,
+    manager_store:
+        std::sync::Mutex<Option<Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>>>,
+    manager_peer_guard: tokio::sync::Mutex<Option<manager::ManagerPeerActive>>,
     /// Serializes policy-journal writes with the app-level runtime-state snapshot. Without this
     /// lock a background snapshot could read IntentSaved, then overwrite a concurrently
     /// committed Applied journal entry (P0 false-success/persistence race).
@@ -791,6 +851,8 @@ impl ProductionClusterRuntime {
             policy_pending: AtomicBool::new(false),
             policy_control: Arc::new(PolicyControlState::new()),
             policy_store: std::sync::Mutex::new(None),
+            manager_store: std::sync::Mutex::new(None),
+            manager_peer_guard: tokio::sync::Mutex::new(None),
             policy_persistence: std::sync::Mutex::new(()),
             planned_restart: PlannedRestartGate::default(),
             lifecycle_lease: OperationLease::new(),
@@ -1398,6 +1460,18 @@ impl ProductionClusterRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
     }
 
+    /// Connect the node-local Manager release journal before the control listener starts.
+    pub fn attach_manager_store(
+        &self,
+        store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    ) {
+        *self
+            .inner
+            .manager_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+    }
+
     /// Lock the policy journal/runtime-state persistence critical section. The guard is held only
     /// across synchronous journal load/save and in-memory policy updates; callers must not await
     /// while holding it.
@@ -1669,6 +1743,30 @@ impl ProductionClusterRuntime {
             .route("/v1/prepare-restart", post(control_prepare_restart))
             .route("/v1/cancel-restart", post(control_cancel_restart))
             .route("/v2/operation-policy", post(control_operation_policy))
+            .route(
+                manager::ManagerPeerPhase::Status.path(),
+                post(control_manager_status),
+            )
+            .route(
+                manager::ManagerPeerPhase::Prepare.path(),
+                post(control_manager_prepare),
+            )
+            .route(
+                manager::ManagerPeerPhase::Drain.path(),
+                post(control_manager_drain),
+            )
+            .route(
+                manager::ManagerPeerPhase::Start.path(),
+                post(control_manager_start),
+            )
+            .route(
+                manager::ManagerPeerPhase::Commit.path(),
+                post(control_manager_commit),
+            )
+            .route(
+                manager::ManagerPeerPhase::Rollback.path(),
+                post(control_manager_rollback),
+            )
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self.clone())
     }
@@ -1943,6 +2041,7 @@ enum ControlHttpError {
     Auth(AuthError),
     Control(super::ControlError),
     Policy(PolicyControlError),
+    Manager(manager::ManagerPeerProtocolError),
     Effect(String),
     MissingHeader(&'static str),
     BadJson(String),
@@ -1960,6 +2059,12 @@ impl From<super::ControlError> for ControlHttpError {
     }
 }
 
+impl From<manager::ManagerPeerProtocolError> for ControlHttpError {
+    fn from(value: manager::ManagerPeerProtocolError) -> Self {
+        Self::Manager(value)
+    }
+}
+
 impl IntoResponse for ControlHttpError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -1972,6 +2077,24 @@ impl IntoResponse for ControlHttpError {
                 StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
                 format!("{error:?}"),
             ),
+            Self::Manager(error) => {
+                let status = match error {
+                    manager::ManagerPeerProtocolError::InvalidRequest => StatusCode::BAD_REQUEST,
+                    manager::ManagerPeerProtocolError::WrongRole
+                    | manager::ManagerPeerProtocolError::WrongPeer => StatusCode::FORBIDDEN,
+                    manager::ManagerPeerProtocolError::Conflict
+                    | manager::ManagerPeerProtocolError::StaleGeneration
+                    | manager::ManagerPeerProtocolError::StalePolicyEpoch => StatusCode::CONFLICT,
+                    manager::ManagerPeerProtocolError::Unavailable => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    manager::ManagerPeerProtocolError::NotReady => StatusCode::PRECONDITION_FAILED,
+                    manager::ManagerPeerProtocolError::LifecycleFailure => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                };
+                (status, error.to_string())
+            }
             Self::Effect(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
             Self::MissingHeader(name) => (StatusCode::UNAUTHORIZED, format!("missing {name}")),
             Self::BadJson(error) => (StatusCode::BAD_REQUEST, error),
@@ -2118,6 +2241,32 @@ control_handler!(
     control_cancel_restart,
     ControlEndpoint::CancelRestart,
     "POST"
+);
+
+macro_rules! manager_peer_handler {
+    ($name:ident, $phase:expr) => {
+        async fn $name(
+            State(runtime): State<ProductionClusterRuntime>,
+            ConnectInfo(source): ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<Json<manager::ManagerPeerResponse>, ControlHttpError> {
+            runtime
+                .handle_manager_peer($phase, body, source, headers)
+                .await
+                .map(Json)
+        }
+    };
+}
+
+manager_peer_handler!(control_manager_status, manager::ManagerPeerPhase::Status);
+manager_peer_handler!(control_manager_prepare, manager::ManagerPeerPhase::Prepare);
+manager_peer_handler!(control_manager_drain, manager::ManagerPeerPhase::Drain);
+manager_peer_handler!(control_manager_start, manager::ManagerPeerPhase::Start);
+manager_peer_handler!(control_manager_commit, manager::ManagerPeerPhase::Commit);
+manager_peer_handler!(
+    control_manager_rollback,
+    manager::ManagerPeerPhase::Rollback
 );
 
 fn endpoint_path(endpoint: ControlEndpoint) -> &'static str {
@@ -2470,6 +2619,42 @@ mod tests {
         Ok((StatusCode::OK, "coordinator metrics").into_response())
     }
 
+    async fn signed_manager_peer(
+        State(authenticator): State<Arc<ControlAuthenticator>>,
+        ConnectInfo(source): ConnectInfo<SocketAddr>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Json<manager::ManagerPeerResponse>, ControlHttpError> {
+        let request: manager::ManagerPeerRequest = serde_json::from_slice(&body)
+            .map_err(|_| ControlHttpError::BadJson("invalid manager peer request".into()))?;
+        let signed = SignedControlHeaders::from_header_values(
+            header(&headers, HEADER_NODE)?,
+            header(&headers, HEADER_TIMESTAMP)?,
+            header(&headers, HEADER_NONCE)?,
+            header(&headers, HEADER_SIGNATURE)?,
+        )?;
+        ControlRequest {
+            method: "POST",
+            path_and_query: request.phase.path(),
+            body: &body,
+            source_ip: source.ip(),
+            headers: &signed,
+        }
+        .authenticate(&authenticator, now_millis())?;
+        Ok(Json(manager::ManagerPeerResponse {
+            protocol_version: manager::MANAGER_PEER_PROTOCOL_VERSION,
+            node_id: "worker-node".into(),
+            operation_id: request.operation_id,
+            profile_id: request.profile_id,
+            candidate_digest: request.candidate_digest,
+            previous_digest: request.previous_digest,
+            expected_generation: request.expected_generation,
+            policy_epoch: request.policy_epoch,
+            phase: request.phase,
+            ack_id: "ack-worker-prepare".into(),
+        }))
+    }
+
     #[tokio::test]
     async fn real_http_client_pins_source_and_authenticates_control_body() {
         let secret = vec![0x61; 32];
@@ -2553,6 +2738,100 @@ mod tests {
         .unwrap();
 
         assert_eq!(client.metrics().await.unwrap(), "coordinator metrics");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manager_peer_client_signs_the_versioned_route_and_checks_the_ack() {
+        let secret = vec![0x63; 32];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                manager::ManagerPeerPhase::Prepare.path(),
+                post(signed_manager_peer),
+            )
+            .with_state(Arc::new(ControlAuthenticator::new_at_source(
+                ControlSecret::new(secret.clone()).unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            )));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ProductionControlClient::new(
+            "coordinator-node".into(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            port,
+            secret,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let request = manager::ManagerPeerRequest {
+            operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
+            profile_id: "worker-profile".into(),
+            candidate_digest: "a".repeat(64),
+            previous_digest: Some("b".repeat(64)),
+            expected_generation: 3,
+            policy_epoch: 4,
+            phase: manager::ManagerPeerPhase::Prepare,
+            ack_id: None,
+        };
+
+        let response = client.manager_peer(&request).await.unwrap();
+        assert_eq!(response.node_id, "worker-node");
+        assert_eq!(response.ack_id, "ack-worker-prepare");
+        let unauthenticated = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/manager/prepare"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manager_peer_client_rejects_an_older_peer_without_the_protocol_route() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // An older runtime has no /v1/manager/prepare endpoint; this is the same preflight
+        // failure the coordinator must observe before beginning a local drain.
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ProductionControlClient::new(
+            "coordinator-node".into(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            port,
+            vec![0x64; 32],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let request = manager::ManagerPeerRequest {
+            operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
+            profile_id: "worker-profile".into(),
+            candidate_digest: "a".repeat(64),
+            previous_digest: Some("b".repeat(64)),
+            expected_generation: 3,
+            policy_epoch: 4,
+            phase: manager::ManagerPeerPhase::Status,
+            ack_id: None,
+        };
+        assert!(client.manager_peer(&request).await.is_err());
         server.abort();
     }
 

@@ -148,8 +148,12 @@ pub struct PersistedParticipantRecord {
     pub previous_digest: Option<String>,
     pub phase: PersistedActivationPhase,
     pub prepare_ack: Option<String>,
+    #[serde(default)]
+    pub drain_ack: Option<String>,
     pub ready_ack: Option<String>,
     pub commit_ack: Option<String>,
+    #[serde(default)]
+    pub rollback_ack: Option<String>,
 }
 
 /// Activation journal schema intentionally has no runtime lease field.
@@ -1125,6 +1129,16 @@ impl ManagerReleaseStore {
                         .previous_digest
                         .as_deref()
                         .is_some_and(|digest| !full_sha256(digest))
+                    || [
+                        participant.prepare_ack.as_deref(),
+                        participant.drain_ack.as_deref(),
+                        participant.ready_ack.as_deref(),
+                        participant.commit_ack.as_deref(),
+                        participant.rollback_ack.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|ack| !valid_activation_ack(ack))
                 {
                     return Err(StoreError::InvalidRecord("activation participant".into()));
                 }
@@ -1276,12 +1290,20 @@ fn activation_identity_matches(
                             next_participant.prepare_ack.as_deref(),
                         )
                         && ack_is_monotonic(
+                            participant.drain_ack.as_deref(),
+                            next_participant.drain_ack.as_deref(),
+                        )
+                        && ack_is_monotonic(
                             participant.ready_ack.as_deref(),
                             next_participant.ready_ack.as_deref(),
                         )
                         && ack_is_monotonic(
                             participant.commit_ack.as_deref(),
                             next_participant.commit_ack.as_deref(),
+                        )
+                        && ack_is_monotonic(
+                            participant.rollback_ack.as_deref(),
+                            next_participant.rollback_ack.as_deref(),
                         )
                 })
         })
@@ -1313,6 +1335,9 @@ fn activation_transition_allowed(
         ) | (
             Phase::Committing,
             Phase::Complete | Phase::RollingBack | Phase::ManualIntervention
+        ) | (
+            Phase::Complete,
+            Phase::RollingBack | Phase::ManualIntervention
         ) | (
             Phase::RollingBack,
             Phase::RolledBack | Phase::ManualIntervention
@@ -1373,6 +1398,14 @@ fn valid_record_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_activation_ack(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn full_git_sha(value: &str) -> bool {
@@ -1638,8 +1671,10 @@ mod tests {
             previous_digest: Some("f".repeat(64)),
             phase: PersistedActivationPhase::Preparing,
             prepare_ack: Some("prepared".into()),
+            drain_ack: None,
             ready_ack: None,
             commit_ack: None,
+            rollback_ack: None,
         };
         let preparing = PersistedActivationRecord {
             operation_id: "activate-1".into(),
@@ -1729,8 +1764,10 @@ mod tests {
             previous_digest: None,
             phase: PersistedActivationPhase::Preparing,
             prepare_ack: Some("prepared".into()),
+            drain_ack: None,
             ready_ack: None,
             commit_ack: None,
+            rollback_ack: None,
         };
         let preparing = PersistedActivationRecord {
             operation_id: "activation-phase-1".into(),
@@ -1747,6 +1784,7 @@ mod tests {
                 "local-node".into(),
                 PersistedParticipantRecord {
                     phase: PersistedActivationPhase::Draining,
+                    drain_ack: Some("ack-drained".into()),
                     ..participant.clone()
                 },
             )]),
@@ -1755,10 +1793,24 @@ mod tests {
         store
             .advance_activation(draining.clone())
             .expect("advance to draining");
+        store
+            .advance_activation(draining.clone())
+            .expect("duplicate phase returns the same durable acknowledgement");
         assert_eq!(
             store.snapshot().activation_journals["activation-phase-1"],
             draining
         );
+
+        let mut ack_collision = draining.clone();
+        ack_collision
+            .participants
+            .get_mut("local-node")
+            .unwrap()
+            .drain_ack = Some("ack-changed".into());
+        assert!(matches!(
+            store.advance_activation(ack_collision),
+            Err(StoreError::InvalidReference(_))
+        ));
 
         let mut collision = draining;
         collision

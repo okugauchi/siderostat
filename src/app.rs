@@ -879,6 +879,9 @@ pub async fn serve_with_options(
     if let (Some(production), Some(store)) = (production.as_ref(), state_store.as_ref()) {
         production.attach_policy_store(store.clone());
     }
+    if let Some(production) = production.as_ref() {
+        production.attach_manager_store(state.manager_store.clone());
+    }
     if config.cluster.enabled {
         if let Some(production) = production.clone() {
             let store = state.manager_store.clone();

@@ -5,7 +5,7 @@ use crate::{
         ControlRequest, ControlResponse, EventOwner, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE,
         HEADER_TIMESTAMP, SignedControlHeaders, WorkerEventKind,
     },
-    target::LocalRole,
+    target::{ClusterState, LocalRole},
 };
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -276,7 +276,28 @@ impl super::ProductionClusterRuntime {
         &self,
         planned_completion: bool,
     ) -> anyhow::Result<()> {
-        let lifecycle = self.claim_lifecycle_operation(crate::cluster::OperationKind::Promotion)?;
+        let lifecycle =
+            match self.claim_lifecycle_operation(crate::cluster::OperationKind::Promotion) {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(_error)
+                    if self.inner.role == LocalRole::Coordinator
+                        && matches!(
+                            self.inner.mode.snapshot().state,
+                            ClusterState::SoloStandaloneReady | ClusterState::PairedStandaloneReady
+                        )
+                        && self
+                            .inner
+                            .lifecycle_lease
+                            .owner(crate::cluster::OperationKind::Promotion)
+                            .is_some() =>
+                {
+                    // The coordinator's outbound `pair()` owns Promotion while awaiting the
+                    // worker's reciprocal Pair. That authenticated request is part of the same
+                    // transaction, so reuse the in-flight lease only in the pre-pair stable state.
+                    None
+                }
+                Err(error) => return Err(error),
+            };
         let result = async {
             if self.inner.role == LocalRole::Worker {
                 let reply = ControlMessage {
