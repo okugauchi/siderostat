@@ -224,6 +224,8 @@ impl ProductionControlClient {
             response.operation_id == request.operation_id
                 && response.profile_id == request.profile_id
                 && response.candidate_digest == request.candidate_digest
+                && response.source_commit == request.source_commit
+                && response.model_digest == request.model_digest
                 && response.previous_digest == request.previous_digest
                 && response.expected_generation == request.expected_generation
                 && response.policy_epoch == request.policy_epoch
@@ -1472,6 +1474,30 @@ impl ProductionClusterRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
     }
 
+    /// Exercise the installed Manager command actor with the same runtime-owned handler used by
+    /// the application. This is available only to integration tests, which need to observe a
+    /// complete transaction across two production-equivalent control planes.
+    #[cfg(feature = "test-support")]
+    pub async fn manager_operation_for_test(
+        &self,
+        operation: manager::ManagerRuntimeOperation,
+    ) -> Result<serde_json::Value, manager::ManagerRuntimeError> {
+        let store = self
+            .inner
+            .manager_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or(manager::ManagerRuntimeError::Unavailable)?;
+        manager::handle_cluster_operation(self, &store, operation).await
+    }
+
+    /// Simulate a participant completing a durable phase while its HTTP acknowledgement is lost.
+    #[cfg(feature = "test-support")]
+    pub fn lose_next_manager_peer_ack_for_test(&self, phase: manager::ManagerPeerPhase) {
+        manager::lose_next_manager_peer_ack_for_test(phase);
+    }
+
     /// Lock the policy journal/runtime-state persistence critical section. The guard is held only
     /// across synchronous journal load/save and in-memory policy updates; callers must not await
     /// while holding it.
@@ -1746,6 +1772,14 @@ impl ProductionClusterRuntime {
             .route(
                 manager::ManagerPeerPhase::Status.path(),
                 post(control_manager_status),
+            )
+            .route(
+                manager::ManagerPeerPhase::ForwardActivate.path(),
+                post(control_manager_forward_activate),
+            )
+            .route(
+                manager::ManagerPeerPhase::ForwardRollback.path(),
+                post(control_manager_forward_rollback),
             )
             .route(
                 manager::ManagerPeerPhase::Prepare.path(),
@@ -2260,6 +2294,14 @@ macro_rules! manager_peer_handler {
 }
 
 manager_peer_handler!(control_manager_status, manager::ManagerPeerPhase::Status);
+manager_peer_handler!(
+    control_manager_forward_activate,
+    manager::ManagerPeerPhase::ForwardActivate
+);
+manager_peer_handler!(
+    control_manager_forward_rollback,
+    manager::ManagerPeerPhase::ForwardRollback
+);
 manager_peer_handler!(control_manager_prepare, manager::ManagerPeerPhase::Prepare);
 manager_peer_handler!(control_manager_drain, manager::ManagerPeerPhase::Drain);
 manager_peer_handler!(control_manager_start, manager::ManagerPeerPhase::Start);
@@ -2647,11 +2689,16 @@ mod tests {
             operation_id: request.operation_id,
             profile_id: request.profile_id,
             candidate_digest: request.candidate_digest,
+            source_commit: request.source_commit,
+            model_digest: request.model_digest,
             previous_digest: request.previous_digest,
             expected_generation: request.expected_generation,
             policy_epoch: request.policy_epoch,
             phase: request.phase,
             ack_id: "ack-worker-prepare".into(),
+            profiles: Vec::new(),
+            active_release_digest: None,
+            previous_profile_id: None,
         }))
     }
 
@@ -2777,6 +2824,8 @@ mod tests {
             operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
             profile_id: "worker-profile".into(),
             candidate_digest: "a".repeat(64),
+            source_commit: "c".repeat(40),
+            model_digest: "d".repeat(64),
             previous_digest: Some("b".repeat(64)),
             expected_generation: 3,
             policy_epoch: 4,
@@ -2788,7 +2837,7 @@ mod tests {
         assert_eq!(response.node_id, "worker-node");
         assert_eq!(response.ack_id, "ack-worker-prepare");
         let unauthenticated = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/v1/manager/prepare"))
+            .post(format!("http://127.0.0.1:{port}/v2/manager/prepare"))
             .json(&request)
             .send()
             .await
@@ -2801,7 +2850,7 @@ mod tests {
     async fn manager_peer_client_rejects_an_older_peer_without_the_protocol_route() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        // An older runtime has no /v1/manager/prepare endpoint; this is the same preflight
+        // An older runtime has no /v2/manager/prepare endpoint; this is the same preflight
         // failure the coordinator must observe before beginning a local drain.
         let server = tokio::spawn(async move {
             axum::serve(
@@ -2825,6 +2874,8 @@ mod tests {
             operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
             profile_id: "worker-profile".into(),
             candidate_digest: "a".repeat(64),
+            source_commit: "c".repeat(40),
+            model_digest: "d".repeat(64),
             previous_digest: Some("b".repeat(64)),
             expected_generation: 3,
             policy_epoch: 4,

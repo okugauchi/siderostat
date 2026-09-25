@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
@@ -15,13 +15,49 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 /// Wire protocol version carried by the authenticated Manager control routes.
-pub const MANAGER_PEER_PROTOCOL_VERSION: u16 = 1;
+pub const MANAGER_PEER_PROTOCOL_VERSION: u16 = 2;
+
+#[cfg(feature = "test-support")]
+static LOST_MANAGER_PEER_ACK_PHASE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(feature = "test-support")]
+pub(crate) fn lose_next_manager_peer_ack_for_test(phase: ManagerPeerPhase) {
+    LOST_MANAGER_PEER_ACK_PHASE.store(manager_peer_phase_code(phase), Ordering::Release);
+}
+
+#[cfg(feature = "test-support")]
+fn consume_lost_manager_peer_ack_for_test(phase: ManagerPeerPhase) -> bool {
+    LOST_MANAGER_PEER_ACK_PHASE
+        .compare_exchange(
+            manager_peer_phase_code(phase),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+#[cfg(feature = "test-support")]
+const fn manager_peer_phase_code(phase: ManagerPeerPhase) -> u8 {
+    match phase {
+        ManagerPeerPhase::Status => 1,
+        ManagerPeerPhase::ForwardActivate => 2,
+        ManagerPeerPhase::ForwardRollback => 3,
+        ManagerPeerPhase::Prepare => 4,
+        ManagerPeerPhase::Drain => 5,
+        ManagerPeerPhase::Start => 6,
+        ManagerPeerPhase::Commit => 7,
+        ManagerPeerPhase::Rollback => 8,
+    }
+}
 
 /// Operation accepted by one authenticated Manager participant route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagerPeerPhase {
     Status,
+    ForwardActivate,
+    ForwardRollback,
     Prepare,
     Drain,
     Start,
@@ -32,18 +68,22 @@ pub enum ManagerPeerPhase {
 impl ManagerPeerPhase {
     pub const fn path(self) -> &'static str {
         match self {
-            Self::Status => "/v1/manager/status",
-            Self::Prepare => "/v1/manager/prepare",
-            Self::Drain => "/v1/manager/drain",
-            Self::Start => "/v1/manager/start",
-            Self::Commit => "/v1/manager/commit",
-            Self::Rollback => "/v1/manager/rollback",
+            Self::Status => "/v2/manager/status",
+            Self::ForwardActivate => "/v2/manager/forward-activate",
+            Self::ForwardRollback => "/v2/manager/forward-rollback",
+            Self::Prepare => "/v2/manager/prepare",
+            Self::Drain => "/v2/manager/drain",
+            Self::Start => "/v2/manager/start",
+            Self::Commit => "/v2/manager/commit",
+            Self::Rollback => "/v2/manager/rollback",
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::ForwardActivate => "forward_activate",
+            Self::ForwardRollback => "forward_rollback",
             Self::Prepare => "prepare",
             Self::Drain => "drain",
             Self::Start => "start",
@@ -61,6 +101,8 @@ pub struct ManagerPeerRequest {
     pub operation_id: String,
     pub profile_id: String,
     pub candidate_digest: String,
+    pub source_commit: String,
+    pub model_digest: String,
     pub previous_digest: Option<String>,
     pub expected_generation: u64,
     pub policy_epoch: u64,
@@ -73,6 +115,8 @@ impl ManagerPeerRequest {
         if !valid_peer_token(&self.operation_id)
             || !valid_peer_token(&self.profile_id)
             || !full_digest(&self.candidate_digest)
+            || !full_git_sha(&self.source_commit)
+            || !full_digest(&self.model_digest)
             || self
                 .previous_digest
                 .as_deref()
@@ -82,8 +126,15 @@ impl ManagerPeerRequest {
             return Err(ManagerPeerProtocolError::InvalidRequest);
         }
         match self.phase {
-            ManagerPeerPhase::Status | ManagerPeerPhase::Prepare if self.ack_id.is_none() => {}
-            ManagerPeerPhase::Status | ManagerPeerPhase::Prepare => {
+            ManagerPeerPhase::Status
+            | ManagerPeerPhase::ForwardActivate
+            | ManagerPeerPhase::ForwardRollback
+            | ManagerPeerPhase::Prepare
+                if self.ack_id.is_none() => {}
+            ManagerPeerPhase::Status
+            | ManagerPeerPhase::ForwardActivate
+            | ManagerPeerPhase::ForwardRollback
+            | ManagerPeerPhase::Prepare => {
                 return Err(ManagerPeerProtocolError::InvalidRequest);
             }
             ManagerPeerPhase::Drain
@@ -106,11 +157,35 @@ pub struct ManagerPeerResponse {
     pub operation_id: String,
     pub profile_id: String,
     pub candidate_digest: String,
+    pub source_commit: String,
+    pub model_digest: String,
     pub previous_digest: Option<String>,
     pub expected_generation: u64,
     pub policy_epoch: u64,
     pub phase: ManagerPeerPhase,
     pub ack_id: String,
+    /// Sanitized local staged candidates matching the requested source and model identity.
+    #[serde(default)]
+    pub profiles: Vec<ManagerPeerProfileSummary>,
+    /// Digest of this node's currently active release, if one is durably recorded.
+    #[serde(default)]
+    pub active_release_digest: Option<String>,
+    /// Node-local profile ID referenced by the previous release pointer; external baselines use
+    /// the reserved `external-baseline` identity.
+    #[serde(default)]
+    pub previous_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerPeerProfileSummary {
+    pub profile_id: String,
+    pub node_role: String,
+    pub candidate_digest: String,
+    pub source_commit: String,
+    pub model_digest: String,
+    pub model_catalog_id: String,
+    pub config_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +228,8 @@ pub(super) struct ManagerPeerActive {
     previous_digest: Option<String>,
     expected_generation: u64,
     policy_epoch: u64,
+    source_commit: String,
+    model_digest: String,
     _lease: crate::cluster::OperationLeaseGuard,
 }
 
@@ -164,6 +241,8 @@ impl ManagerPeerActive {
             && self.previous_digest == request.previous_digest
             && self.expected_generation == request.expected_generation
             && self.policy_epoch == request.policy_epoch
+            && self.source_commit == request.source_commit
+            && self.model_digest == request.model_digest
     }
 }
 
@@ -180,6 +259,10 @@ fn full_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn full_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl super::ProductionClusterRuntime {
@@ -218,27 +301,44 @@ impl super::ProductionClusterRuntime {
         if request.phase != route_phase {
             return Err(ManagerPeerProtocolError::InvalidRequest.into());
         }
-        validate_manager_peer_role(self.inner.role, None)?;
         let (expected_peer, expected_peer_role) = self.peer_identity().await;
         if expected_peer.as_deref() != Some(authenticated.node_id()) {
             return Err(ManagerPeerProtocolError::WrongPeer.into());
         }
-        validate_manager_peer_role(self.inner.role, expected_peer_role)?;
-        if !self.inner.lease.valid()
-            || !self.inner.network.route_scoped()
+        validate_manager_peer_route_role(self.inner.role, expected_peer_role, request.phase)?;
+        let active_rollback = if request.phase == ManagerPeerPhase::Rollback {
+            self.inner
+                .manager_peer_guard
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active| active.matches(&request))
+                || manager_peer_rollback_ack_exists(self, &request)
+        } else {
+            false
+        };
+        if !self.inner.network.route_scoped()
             || !self.peer_present().await
+            || (!self.inner.lease.valid() && !active_rollback)
         {
             return Err(ManagerPeerProtocolError::Unavailable.into());
         }
         let current = self.inner.mode.snapshot();
-        validate_manager_peer_epoch(
-            &request,
-            current.generation,
-            self.policy_epoch(),
-            self.inner.policy_pending.load(Ordering::Acquire),
-        )?;
-        if current.state != crate::target::ClusterState::PairedStandaloneReady
-            || self.operator_policy() == crate::cluster::OperationPolicy::ForcedStandalone
+        if active_rollback {
+            // The authenticated coordinator may unwind its exact durable transaction after a
+            // policy change or generation advance. The active operation lease binds this
+            // exception to the original request; it cannot be used for another operation.
+        } else {
+            validate_manager_peer_epoch(
+                &request,
+                current.generation,
+                self.policy_epoch(),
+                self.inner.policy_pending.load(Ordering::Acquire),
+            )?;
+        }
+        if !active_rollback
+            && (current.state != crate::target::ClusterState::PairedStandaloneReady
+                || self.operator_policy() == crate::cluster::OperationPolicy::ForcedStandalone)
         {
             return Err(ManagerPeerProtocolError::NotReady.into());
         }
@@ -249,19 +349,52 @@ impl super::ProductionClusterRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .ok_or(ManagerPeerProtocolError::Unavailable)?;
-        match request.phase {
+        let result = match request.phase {
             ManagerPeerPhase::Status => {
-                let node_id = store
-                    .lock()
-                    .map_err(|_| ManagerPeerProtocolError::Unavailable)?
-                    .snapshot()
-                    .node_id
-                    .clone();
-                Ok(manager_peer_response(
+                let (node_id, active_release_digest, previous_profile_id, profiles) = {
+                    let mut store = store
+                        .lock()
+                        .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
+                    let snapshot = store.snapshot();
+                    let node_id = snapshot.node_id.clone();
+                    let active_release_digest = snapshot
+                        .release_pointers
+                        .active
+                        .as_ref()
+                        .map(release_identity_digest);
+                    let previous_profile_id = snapshot.release_pointers.previous.as_ref().map(
+                        |previous| match previous {
+                            crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
+                                profile_id.clone()
+                            }
+                            crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
+                                "external-baseline".into()
+                            }
+                        },
+                    );
+                    let profiles = manager_peer_profiles(&mut store, &request, self.inner.role)?;
+                    (
+                        node_id,
+                        active_release_digest,
+                        previous_profile_id,
+                        profiles,
+                    )
+                };
+                let mut response = manager_peer_response(
                     &node_id,
                     &request,
                     manager_peer_ack_id(&node_id, &request, ManagerPeerPhase::Status),
-                ))
+                );
+                response.profiles = profiles;
+                response.active_release_digest = active_release_digest;
+                response.previous_profile_id = previous_profile_id;
+                Ok(response)
+            }
+            ManagerPeerPhase::ForwardActivate => {
+                forward_peer_manager_operation(self, &store, &request, false).await
+            }
+            ManagerPeerPhase::ForwardRollback => {
+                forward_peer_manager_operation(self, &store, &request, true).await
             }
             ManagerPeerPhase::Prepare => {
                 let node_id = self.prepare_peer_participant(&store, &request).await?;
@@ -286,7 +419,12 @@ impl super::ProductionClusterRuntime {
             ManagerPeerPhase::Start => self.start_peer_participant(&store, &request).await,
             ManagerPeerPhase::Commit => self.commit_peer_participant(&store, &request).await,
             ManagerPeerPhase::Rollback => self.rollback_peer_participant(&store, &request).await,
+        };
+        #[cfg(feature = "test-support")]
+        if result.is_ok() && consume_lost_manager_peer_ack_for_test(request.phase) {
+            return Err(ManagerPeerProtocolError::Unavailable.into());
         }
+        result
     }
 
     async fn peer_identity(&self) -> (Option<String>, Option<crate::cluster::ControlRole>) {
@@ -339,49 +477,96 @@ impl super::ProductionClusterRuntime {
             PersistedParticipantRecord, ProfileCompatibility,
         };
 
-        let (node_id, candidate_digest, previous_digest) = {
+        let (node_id, candidate_digest, previous_digest, baseline) = {
             let mut store = store
                 .lock()
                 .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
             let node_id = store.snapshot().node_id.clone();
-            let profile = store
-                .snapshot()
-                .profiles
-                .get(&request.profile_id)
-                .cloned()
-                .ok_or(ManagerPeerProtocolError::NotReady)?;
-            if profile.compatibility != ProfileCompatibility::Compatible
-                || profile.hardware_readiness != HardwareReadiness::Ready
-                || profile.role_artifact_ids.len() != 1
-            {
-                return Err(ManagerPeerProtocolError::NotReady);
+            if request.profile_id == "external-baseline" {
+                let Some(baseline) = store.snapshot().release_pointers.previous.clone() else {
+                    return Err(ManagerPeerProtocolError::NotReady);
+                };
+                let crate::manager::store::ReleaseIdentity::ExternalBaseline {
+                    model_sha256, ..
+                } = &baseline
+                else {
+                    return Err(ManagerPeerProtocolError::NotReady);
+                };
+                let previous = store
+                    .snapshot()
+                    .release_pointers
+                    .active
+                    .clone()
+                    .ok_or(ManagerPeerProtocolError::NotReady)?;
+                let candidate_digest = release_identity_digest(&baseline);
+                let previous_digest = release_identity_digest(&previous);
+                let source_commit = "0".repeat(40);
+                validate_manager_peer_release_digests(
+                    request,
+                    &candidate_digest,
+                    &source_commit,
+                    model_sha256,
+                    &previous_digest,
+                )?;
+                (node_id, candidate_digest, previous_digest, Some(baseline))
+            } else {
+                let profile = store
+                    .snapshot()
+                    .profiles
+                    .get(&request.profile_id)
+                    .cloned()
+                    .ok_or(ManagerPeerProtocolError::NotReady)?;
+                if profile.compatibility != ProfileCompatibility::Compatible
+                    || profile.hardware_readiness != HardwareReadiness::Ready
+                    || profile.role_artifact_ids.len() != 1
+                {
+                    return Err(ManagerPeerProtocolError::NotReady);
+                }
+                let build = store
+                    .verify_managed_artifact(
+                        &profile.role_artifact_ids[0],
+                        crate::manager::store::ArtifactKind::Build,
+                    )
+                    .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+                let model = store
+                    .verify_managed_artifact(
+                        &profile.model_artifact_id,
+                        crate::manager::store::ArtifactKind::Model,
+                    )
+                    .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+                let crate::manager::store::ArtifactProvenance::Build { record, .. } =
+                    &build.provenance
+                else {
+                    return Err(ManagerPeerProtocolError::NotReady);
+                };
+                let source_commit = record.source.clone();
+                let model_digest = model.sha256.clone();
+                let candidate_digest = digest_text(&format!(
+                    "manager-release-v1\n{}\n{}",
+                    build.sha256, model.sha256
+                ));
+                let previous = store
+                    .snapshot()
+                    .release_pointers
+                    .active
+                    .clone()
+                    .ok_or(ManagerPeerProtocolError::NotReady)?;
+                let previous_digest = release_identity_digest(&previous);
+                validate_manager_peer_release_digests(
+                    request,
+                    &candidate_digest,
+                    &source_commit,
+                    &model_digest,
+                    &previous_digest,
+                )?;
+                (node_id, candidate_digest, previous_digest, None)
             }
-            let build = store
-                .verify_managed_artifact(
-                    &profile.role_artifact_ids[0],
-                    crate::manager::store::ArtifactKind::Build,
-                )
-                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
-            let model = store
-                .verify_managed_artifact(
-                    &profile.model_artifact_id,
-                    crate::manager::store::ArtifactKind::Model,
-                )
-                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
-            let candidate_digest = digest_text(&format!(
-                "manager-release-v1\n{}\n{}",
-                build.sha256, model.sha256
-            ));
-            let previous = store
-                .snapshot()
-                .release_pointers
-                .active
-                .clone()
-                .ok_or(ManagerPeerProtocolError::NotReady)?;
-            let previous_digest = release_identity_digest(&previous);
-            validate_manager_peer_release_digests(request, &candidate_digest, &previous_digest)?;
-            (node_id, candidate_digest, previous_digest)
         };
+        if let Some(baseline) = baseline.as_ref() {
+            verify_external_baseline(&self.inner.config, baseline)
+                .await
+                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+        }
 
         let ack_id = manager_peer_ack_id(&node_id, request, ManagerPeerPhase::Prepare);
         let record = PersistedActivationRecord {
@@ -472,6 +657,8 @@ impl super::ProductionClusterRuntime {
                 previous_digest: request.previous_digest.clone(),
                 expected_generation: request.expected_generation,
                 policy_epoch: request.policy_epoch,
+                source_commit: request.source_commit.clone(),
+                model_digest: request.model_digest.clone(),
                 _lease: lease,
             });
         }
@@ -571,7 +758,10 @@ impl super::ProductionClusterRuntime {
         node_id: &str,
     ) -> Result<ManagerPeerResponse, super::ControlHttpError> {
         use crate::manager::store::PersistedActivationPhase as Phase;
-        if self.inner.standalone.is_running().await.unwrap_or(false) {
+        if manager_child_matches_current_release(self, store)
+            .await
+            .unwrap_or(false)
+        {
             self.inner.proxy.admission().start_serving();
             self.inner
                 .proxy
@@ -646,23 +836,41 @@ impl super::ProductionClusterRuntime {
         if record.phase != Phase::Draining {
             return Err(ManagerPeerProtocolError::NotReady.into());
         }
-        let command = verified_profile_command(store, &self.inner.config, &request.profile_id)
-            .await
-            .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+        let command = if request.profile_id == "external-baseline" {
+            let baseline = activation_target_identity(store, &request.profile_id)
+                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+            verify_external_baseline(&self.inner.config, &baseline)
+                .await
+                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+            None
+        } else {
+            Some(
+                verified_profile_command(store, &self.inner.config, &request.profile_id)
+                    .await
+                    .map_err(|_| ManagerPeerProtocolError::NotReady)?,
+            )
+        };
         set_peer_phase(&mut record, Phase::Starting);
         store
             .lock()
             .map_err(|_| ManagerPeerProtocolError::Unavailable)?
             .advance_activation(record.clone())
             .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
-        if self.set_manager_command(command).await.is_err()
+        let command_selected = match command {
+            Some(command) => self.set_manager_command(command).await,
+            None => {
+                self.restore_manager_command(crate::cluster::process::Ds4CommandRole::Standalone)
+                    .await
+            }
+        };
+        if command_selected.is_err()
             || self
                 .inner
                 .standalone
                 .start(request.expected_generation)
                 .await
                 .is_err()
-            || !self.inner.standalone.is_running().await.unwrap_or(false)
+            || !manager_child_matches_profile(self, store, &request.profile_id).await
         {
             return self
                 .rollback_failed_peer_start(store, &mut active, record, request, &node_id)
@@ -717,9 +925,7 @@ impl super::ProductionClusterRuntime {
             && !self.inner.standalone.is_running().await.unwrap_or(true);
         let restored = stopped
             && self
-                .inner
-                .standalone
-                .restore_previous_command()
+                .restore_manager_command(crate::cluster::process::Ds4CommandRole::Standalone)
                 .await
                 .is_ok()
             && self
@@ -728,7 +934,9 @@ impl super::ProductionClusterRuntime {
                 .start(request.expected_generation)
                 .await
                 .is_ok()
-            && self.inner.standalone.is_running().await.unwrap_or(false);
+            && manager_child_matches_current_release(self, store)
+                .await
+                .unwrap_or(false);
         if restored {
             set_peer_phase(&mut record, Phase::RolledBack);
             let ack_id = manager_peer_ack_id(node_id, request, ManagerPeerPhase::Rollback);
@@ -771,7 +979,7 @@ impl super::ProductionClusterRuntime {
         store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
         request: &ManagerPeerRequest,
     ) -> Result<ManagerPeerResponse, super::ControlHttpError> {
-        use crate::manager::store::{PersistedActivationPhase as Phase, ReleaseIdentity};
+        use crate::manager::store::PersistedActivationPhase as Phase;
         let mut active = self.inner.manager_peer_guard.lock().await;
         let mut record = load_peer_record(store, request)?;
         let node_id = store_node_id(store)?;
@@ -807,31 +1015,44 @@ impl super::ProductionClusterRuntime {
         if record.phase != Phase::Complete {
             ensure_active_peer(&active, request)?;
             if record.phase != Phase::Committing
-                || !self.inner.standalone.is_running().await.unwrap_or(false)
+                || !manager_child_matches_profile(self, store, &request.profile_id).await
             {
                 return Err(ManagerPeerProtocolError::NotReady.into());
             }
-            let (previous, candidate) = {
+            let previous = {
                 let store = store
                     .lock()
                     .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
                 let snapshot = store.snapshot();
-                let previous = snapshot
+                snapshot
                     .release_pointers
                     .active
                     .clone()
-                    .ok_or(ManagerPeerProtocolError::NotReady)?;
-                (
-                    previous,
-                    ReleaseIdentity::ManagedProfile(request.profile_id.clone()),
-                )
+                    .ok_or(ManagerPeerProtocolError::NotReady)?
             };
+            let candidate = activation_target_identity(store, &request.profile_id)
+                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
             set_peer_phase(&mut record, Phase::Complete);
             store
                 .lock()
                 .map_err(|_| ManagerPeerProtocolError::Unavailable)?
                 .finish_activation(record, candidate.clone(), Some(previous))
                 .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
+        } else {
+            let candidate = activation_target_identity(store, &request.profile_id)
+                .map_err(|_| ManagerPeerProtocolError::NotReady)?;
+            let active_identity = store
+                .lock()
+                .map_err(|_| ManagerPeerProtocolError::Unavailable)?
+                .snapshot()
+                .release_pointers
+                .active
+                .clone();
+            if active_identity.as_ref() != Some(&candidate)
+                || !manager_child_matches_profile(self, store, &request.profile_id).await
+            {
+                return Err(ManagerPeerProtocolError::NotReady.into());
+            }
         }
         self.inner
             .proxy
@@ -906,6 +1127,7 @@ impl super::ProductionClusterRuntime {
             .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
 
         let child_running = self.inner.standalone.is_running().await.unwrap_or(false);
+        let runtime_generation = self.inner.mode.snapshot().generation;
         let candidate_command_selected = participant.ready_ack.is_some()
             || matches!(
                 phase_before_rollback,
@@ -921,10 +1143,7 @@ impl super::ProductionClusterRuntime {
             .inner
             .proxy
             .admission()
-            .drain(
-                request.expected_generation,
-                self.inner.config.cluster.timeouts.drain,
-            )
+            .drain(runtime_generation, self.inner.config.cluster.timeouts.drain)
             .await
             .is_err()
         {
@@ -943,19 +1162,19 @@ impl super::ProductionClusterRuntime {
         let command_restored = stopped
             && (!candidate_command_selected
                 || self
-                    .inner
-                    .standalone
-                    .restore_previous_command()
+                    .restore_manager_command(crate::cluster::process::Ds4CommandRole::Standalone)
                     .await
                     .is_ok());
         let restarted = command_restored
             && self
                 .inner
                 .standalone
-                .start(request.expected_generation)
+                .start(runtime_generation)
                 .await
                 .is_ok()
-            && self.inner.standalone.is_running().await.unwrap_or(false);
+            && manager_child_matches_current_release(self, store)
+                .await
+                .unwrap_or(false);
         if !restarted {
             self.mark_peer_manual_intervention(
                 store,
@@ -1091,6 +1310,40 @@ fn ensure_active_peer(
     }
 }
 
+fn manager_peer_rollback_ack_exists(
+    runtime: &super::ProductionClusterRuntime,
+    request: &ManagerPeerRequest,
+) -> bool {
+    let store = runtime
+        .inner
+        .manager_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(store) = store else {
+        return false;
+    };
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    let Some(record) = store
+        .snapshot()
+        .activation_journals
+        .get(&request.operation_id)
+    else {
+        return false;
+    };
+    let node_id = &store.snapshot().node_id;
+    record.expected_generation == request.expected_generation
+        && record.policy_epoch == request.policy_epoch
+        && record.participants.get(node_id).is_some_and(|participant| {
+            participant.candidate_profile_id == request.profile_id
+                && participant.candidate_digest == request.candidate_digest
+                && participant.previous_digest == request.previous_digest
+                && participant.rollback_ack.is_some()
+        })
+}
+
 fn set_peer_phase(
     record: &mut crate::manager::store::PersistedActivationRecord,
     phase: crate::manager::store::PersistedActivationPhase,
@@ -1111,6 +1364,7 @@ fn set_peer_ack(
         return;
     };
     match phase {
+        ManagerPeerPhase::ForwardActivate | ManagerPeerPhase::ForwardRollback => {}
         ManagerPeerPhase::Prepare => participant.prepare_ack = Some(ack_id.into()),
         ManagerPeerPhase::Drain => participant.drain_ack = Some(ack_id.into()),
         ManagerPeerPhase::Start => participant.ready_ack = Some(ack_id.into()),
@@ -1131,12 +1385,142 @@ fn manager_peer_response(
         operation_id: request.operation_id.clone(),
         profile_id: request.profile_id.clone(),
         candidate_digest: request.candidate_digest.clone(),
+        source_commit: request.source_commit.clone(),
+        model_digest: request.model_digest.clone(),
         previous_digest: request.previous_digest.clone(),
         expected_generation: request.expected_generation,
         policy_epoch: request.policy_epoch,
         phase: request.phase,
         ack_id,
+        profiles: Vec::new(),
+        active_release_digest: None,
+        previous_profile_id: None,
     }
+}
+
+fn manager_peer_profiles(
+    store: &mut crate::manager::store::ManagerReleaseStore,
+    request: &ManagerPeerRequest,
+    local_role: crate::target::LocalRole,
+) -> Result<Vec<ManagerPeerProfileSummary>, ManagerPeerProtocolError> {
+    use crate::manager::store::{
+        ArtifactKind, ArtifactProvenance, HardwareReadiness, ProfileCompatibility,
+    };
+
+    let profile_ids = store
+        .snapshot()
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut matching = Vec::new();
+    for profile_id in profile_ids {
+        let profile = store
+            .snapshot()
+            .profiles
+            .get(&profile_id)
+            .cloned()
+            .ok_or(ManagerPeerProtocolError::Unavailable)?;
+        if profile.compatibility != ProfileCompatibility::Compatible
+            || profile.hardware_readiness != HardwareReadiness::Ready
+            || profile.role_artifact_ids.len() != 1
+        {
+            continue;
+        }
+        let build = match store
+            .verify_managed_artifact(&profile.role_artifact_ids[0], ArtifactKind::Build)
+        {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let model =
+            match store.verify_managed_artifact(&profile.model_artifact_id, ArtifactKind::Model) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+        let ArtifactProvenance::Build { record, .. } = &build.provenance else {
+            continue;
+        };
+        let ArtifactProvenance::Model { catalog_id } = &model.provenance else {
+            continue;
+        };
+        if record.source != request.source_commit
+            || model.sha256 != request.model_digest
+            || catalog_id.as_str() != profile.model_catalog_id
+        {
+            continue;
+        }
+        matching.push(ManagerPeerProfileSummary {
+            profile_id: profile.profile_id,
+            node_role: profile.node_role,
+            candidate_digest: digest_text(&format!(
+                "manager-release-v1\n{}\n{}",
+                build.sha256, model.sha256
+            )),
+            source_commit: record.source.clone(),
+            model_digest: model.sha256,
+            model_catalog_id: profile.model_catalog_id,
+            config_fingerprint: profile.config_fingerprint,
+        });
+    }
+    let baseline_identity = {
+        let snapshot = store.snapshot();
+        snapshot
+            .release_pointers
+            .previous
+            .as_ref()
+            .filter(|identity| {
+                matches!(
+                    identity,
+                    crate::manager::store::ReleaseIdentity::ExternalBaseline { .. }
+                )
+            })
+            .or_else(|| {
+                snapshot
+                    .release_pointers
+                    .active
+                    .as_ref()
+                    .filter(|identity| {
+                        matches!(
+                            identity,
+                            crate::manager::store::ReleaseIdentity::ExternalBaseline { .. }
+                        )
+                    })
+            })
+    };
+    if request.profile_id == "external-baseline"
+        && request.source_commit == "0".repeat(40)
+        && let Some(crate::manager::store::ReleaseIdentity::ExternalBaseline {
+            config_fingerprint,
+            executable_sha256,
+            model_sha256,
+        }) = baseline_identity
+    {
+        let baseline = crate::manager::store::ReleaseIdentity::ExternalBaseline {
+            config_fingerprint: config_fingerprint.clone(),
+            executable_sha256: executable_sha256.clone(),
+            model_sha256: model_sha256.clone(),
+        };
+        matching.push(ManagerPeerProfileSummary {
+            profile_id: "external-baseline".into(),
+            node_role: match local_role {
+                crate::target::LocalRole::Coordinator => "coordinator",
+                crate::target::LocalRole::Worker => "worker",
+                crate::target::LocalRole::Unknown => {
+                    return Err(ManagerPeerProtocolError::WrongRole);
+                }
+            }
+            .into(),
+            // Baseline identity is deliberately node-local: executable/model bytes and the
+            // validated config fingerprint can differ between the paired nodes.
+            candidate_digest: release_identity_digest(&baseline),
+            source_commit: request.source_commit.clone(),
+            model_digest: model_sha256.clone(),
+            model_catalog_id: "external-baseline".into(),
+            config_fingerprint: config_fingerprint.clone(),
+        });
+    }
+    Ok(matching)
 }
 
 fn manager_peer_ack_id(
@@ -1145,10 +1529,12 @@ fn manager_peer_ack_id(
     phase: ManagerPeerPhase,
 ) -> String {
     let material = format!(
-        "manager-peer-ack-v1\n{node_id}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "manager-peer-ack-v2\n{node_id}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         request.operation_id,
         request.profile_id,
         request.candidate_digest,
+        request.source_commit,
+        request.model_digest,
         request.expected_generation,
         request.policy_epoch,
         phase.as_str(),
@@ -1156,6 +1542,7 @@ fn manager_peer_ack_id(
     format!("ack-{}", digest_text(&material))
 }
 
+#[cfg(test)]
 fn validate_manager_peer_role(
     local_role: crate::target::LocalRole,
     peer_role: Option<crate::cluster::ControlRole>,
@@ -1186,9 +1573,13 @@ fn validate_manager_peer_epoch(
 fn validate_manager_peer_release_digests(
     request: &ManagerPeerRequest,
     actual_candidate_digest: &str,
+    actual_source_commit: &str,
+    actual_model_digest: &str,
     actual_previous_digest: &str,
 ) -> Result<(), ManagerPeerProtocolError> {
     if request.candidate_digest != actual_candidate_digest
+        || request.source_commit != actual_source_commit
+        || request.model_digest != actual_model_digest
         || request.previous_digest.as_deref() != Some(actual_previous_digest)
     {
         return Err(ManagerPeerProtocolError::Conflict);
@@ -1205,6 +1596,8 @@ mod manager_peer_protocol_tests {
             operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
             profile_id: "profile-local-01".into(),
             candidate_digest: "a".repeat(64),
+            source_commit: "c".repeat(40),
+            model_digest: "d".repeat(64),
             previous_digest: Some("b".repeat(64)),
             expected_generation: 7,
             policy_epoch: 11,
@@ -1223,11 +1616,16 @@ mod manager_peer_protocol_tests {
             operation_id: request.operation_id.clone(),
             profile_id: request.profile_id.clone(),
             candidate_digest: request.candidate_digest.clone(),
+            source_commit: request.source_commit.clone(),
+            model_digest: request.model_digest.clone(),
             previous_digest: request.previous_digest.clone(),
             expected_generation: request.expected_generation,
             policy_epoch: request.policy_epoch,
             phase: request.phase,
             ack_id: "worker-node:operation:prepare".into(),
+            profiles: Vec::new(),
+            active_release_digest: None,
+            previous_profile_id: None,
         };
         let response_bytes = serde_json::to_vec(&response).expect("serialize response");
 
@@ -1266,12 +1664,20 @@ mod manager_peer_protocol_tests {
     #[test]
     fn peer_phases_map_to_versioned_authenticated_control_paths() {
         let cases = [
-            (ManagerPeerPhase::Status, "/v1/manager/status"),
-            (ManagerPeerPhase::Prepare, "/v1/manager/prepare"),
-            (ManagerPeerPhase::Drain, "/v1/manager/drain"),
-            (ManagerPeerPhase::Start, "/v1/manager/start"),
-            (ManagerPeerPhase::Commit, "/v1/manager/commit"),
-            (ManagerPeerPhase::Rollback, "/v1/manager/rollback"),
+            (ManagerPeerPhase::Status, "/v2/manager/status"),
+            (
+                ManagerPeerPhase::ForwardActivate,
+                "/v2/manager/forward-activate",
+            ),
+            (
+                ManagerPeerPhase::ForwardRollback,
+                "/v2/manager/forward-rollback",
+            ),
+            (ManagerPeerPhase::Prepare, "/v2/manager/prepare"),
+            (ManagerPeerPhase::Drain, "/v2/manager/drain"),
+            (ManagerPeerPhase::Start, "/v2/manager/start"),
+            (ManagerPeerPhase::Commit, "/v2/manager/commit"),
+            (ManagerPeerPhase::Rollback, "/v2/manager/rollback"),
         ];
         for (phase, path) in cases {
             assert_eq!(phase.path(), path);
@@ -1284,6 +1690,22 @@ mod manager_peer_protocol_tests {
             validate_manager_peer_role(
                 crate::target::LocalRole::Coordinator,
                 Some(crate::cluster::ControlRole::Coordinator)
+            ),
+            Err(ManagerPeerProtocolError::WrongRole)
+        );
+        assert_eq!(
+            validate_manager_peer_route_role(
+                crate::target::LocalRole::Coordinator,
+                Some(crate::cluster::ControlRole::Worker),
+                ManagerPeerPhase::ForwardActivate,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_manager_peer_route_role(
+                crate::target::LocalRole::Worker,
+                Some(crate::cluster::ControlRole::Coordinator),
+                ManagerPeerPhase::ForwardActivate,
             ),
             Err(ManagerPeerProtocolError::WrongRole)
         );
@@ -1314,13 +1736,21 @@ mod manager_peer_protocol_tests {
     fn peer_profile_digest_mismatch_fails_before_a_journal_can_be_created() {
         let request = request(ManagerPeerPhase::Prepare);
         assert_eq!(
-            validate_manager_peer_release_digests(&request, &"c".repeat(64), &"b".repeat(64)),
+            validate_manager_peer_release_digests(
+                &request,
+                &"c".repeat(64),
+                &request.source_commit,
+                &request.model_digest,
+                &"b".repeat(64),
+            ),
             Err(ManagerPeerProtocolError::Conflict)
         );
         assert_eq!(
             validate_manager_peer_release_digests(
                 &request,
                 &request.candidate_digest,
+                &request.source_commit,
+                &request.model_digest,
                 &"c".repeat(64)
             ),
             Err(ManagerPeerProtocolError::Conflict)
@@ -1329,6 +1759,8 @@ mod manager_peer_protocol_tests {
             validate_manager_peer_release_digests(
                 &request,
                 &request.candidate_digest,
+                &request.source_commit,
+                &request.model_digest,
                 request.previous_digest.as_deref().unwrap()
             )
             .is_ok()
@@ -1337,6 +1769,28 @@ mod manager_peer_protocol_tests {
             manager_peer_ack_id("worker", &request, ManagerPeerPhase::Prepare),
             manager_peer_ack_id("worker", &request, ManagerPeerPhase::Prepare)
         );
+    }
+}
+
+fn validate_manager_peer_route_role(
+    local_role: crate::target::LocalRole,
+    peer_role: Option<crate::cluster::ControlRole>,
+    phase: ManagerPeerPhase,
+) -> Result<(), ManagerPeerProtocolError> {
+    let (required_local, required_peer) = match phase {
+        ManagerPeerPhase::ForwardActivate | ManagerPeerPhase::ForwardRollback => (
+            crate::target::LocalRole::Coordinator,
+            crate::cluster::ControlRole::Worker,
+        ),
+        _ => (
+            crate::target::LocalRole::Worker,
+            crate::cluster::ControlRole::Coordinator,
+        ),
+    };
+    if local_role == required_local && peer_role == Some(required_peer) {
+        Ok(())
+    } else {
+        Err(ManagerPeerProtocolError::WrongRole)
     }
 }
 
@@ -1444,7 +1898,9 @@ impl StandaloneManagerRuntimeOwner {
                     crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
                         Some(profile_id.clone())
                     }
-                    crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => None,
+                    crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
+                        Some("external-baseline".into())
+                    }
                 };
                 self.activate_to_previous(
                     request.operation_id,
@@ -2032,6 +2488,73 @@ async fn verify_external_baseline(
     Ok(())
 }
 
+async fn manager_child_matches_profile(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    profile_id: &str,
+) -> bool {
+    let expected_profile_id = if profile_id == "external-baseline" {
+        runtime.inner.config.ds4.standalone.profile_id.as_str()
+    } else {
+        profile_id
+    };
+    if !runtime.inner.standalone.is_running().await.unwrap_or(false)
+        || !runtime
+            .inner
+            .standalone
+            .child_identity()
+            .await
+            .is_some_and(|identity| identity.profile_id == expected_profile_id)
+    {
+        return false;
+    }
+    let Ok(command_snapshot) = runtime.inner.standalone.command_snapshot().await else {
+        return false;
+    };
+    if command_snapshot.profile_id != expected_profile_id {
+        return false;
+    }
+    if profile_id == "external-baseline" {
+        let Ok(baseline) = activation_target_identity(store, profile_id) else {
+            return false;
+        };
+        command_snapshot.command_sha256.is_empty()
+            && verify_external_baseline(&runtime.inner.config, &baseline)
+                .await
+                .is_ok()
+    } else {
+        let Ok(command) = verified_profile_command(store, &runtime.inner.config, profile_id).await
+        else {
+            return false;
+        };
+        command_snapshot.command_sha256 == command.digest_hex()
+    }
+}
+
+async fn manager_child_matches_current_release(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+) -> Result<bool, ManagerRuntimeError> {
+    let profile_id = {
+        let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+        match store
+            .snapshot()
+            .release_pointers
+            .active
+            .as_ref()
+            .ok_or(ManagerRuntimeError::NotReady)?
+        {
+            crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
+                profile_id.clone()
+            }
+            crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
+                "external-baseline".into()
+            }
+        }
+    };
+    Ok(manager_child_matches_profile(runtime, store, &profile_id).await)
+}
+
 async fn digest_file(path: &Path) -> Result<String, ManagerRuntimeError> {
     let bytes = tokio::fs::read(path)
         .await
@@ -2071,20 +2594,1304 @@ pub(crate) async fn handle_cluster_operation(
             }))
         }
         ManagerRuntimeOperation::Activate(request) => {
-            cluster_activation_preflight(runtime, request.expected_generation).await?;
-            let _lease = runtime
-                .claim_manager_activation(manager_operation_uuid(&request.operation_id))
-                .map_err(|_| ManagerRuntimeError::Busy)?;
-            Err(ManagerRuntimeError::NotReady)
+            if runtime.inner.role == crate::target::LocalRole::Coordinator {
+                activate_cluster_profile(
+                    runtime,
+                    store,
+                    request.operation_id,
+                    request.profile_id,
+                    request.expected_generation,
+                    false,
+                    None,
+                )
+                .await
+            } else {
+                forward_worker_manager_operation(
+                    runtime,
+                    store,
+                    request.operation_id,
+                    request.profile_id,
+                    request.expected_generation,
+                    false,
+                )
+                .await
+            }
         }
         ManagerRuntimeOperation::Rollback(request) => {
-            cluster_activation_preflight(runtime, request.expected_generation).await?;
-            let _lease = runtime
-                .claim_manager_activation(manager_operation_uuid(&request.operation_id))
-                .map_err(|_| ManagerRuntimeError::Busy)?;
-            Err(ManagerRuntimeError::NotReady)
+            let replay_profile_id = completed_activation_profile_id(store, &request.operation_id)?;
+            if runtime.inner.role == crate::target::LocalRole::Worker
+                && let Some(profile_id) = replay_profile_id.as_deref()
+            {
+                return completed_activation_replay(
+                    runtime,
+                    store,
+                    &request.operation_id,
+                    profile_id,
+                    request.expected_generation,
+                )
+                .await?
+                .ok_or(ManagerRuntimeError::ManualIntervention);
+            }
+            let profile_id = if let Some(profile_id) = replay_profile_id.as_ref() {
+                profile_id.clone()
+            } else {
+                let previous = store
+                    .lock()
+                    .map_err(|_| ManagerRuntimeError::Unavailable)?
+                    .snapshot()
+                    .release_pointers
+                    .previous
+                    .clone()
+                    .ok_or(ManagerRuntimeError::NotReady)?;
+                match previous {
+                    crate::manager::store::ReleaseIdentity::ManagedProfile(profile_id) => {
+                        profile_id
+                    }
+                    crate::manager::store::ReleaseIdentity::ExternalBaseline { .. } => {
+                        "external-baseline".into()
+                    }
+                }
+            };
+            if runtime.inner.role == crate::target::LocalRole::Coordinator {
+                activate_cluster_profile(
+                    runtime,
+                    store,
+                    request.operation_id,
+                    profile_id,
+                    request.expected_generation,
+                    replay_profile_id.is_none(),
+                    None,
+                )
+                .await
+            } else {
+                forward_worker_manager_operation(
+                    runtime,
+                    store,
+                    request.operation_id,
+                    profile_id,
+                    request.expected_generation,
+                    true,
+                )
+                .await
+            }
         }
     }
+}
+
+async fn activate_cluster_profile(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    operation_id: String,
+    profile_id: String,
+    expected_generation: u64,
+    require_peer_previous: bool,
+    preferred_peer_request: Option<&ManagerPeerRequest>,
+) -> Result<Value, ManagerRuntimeError> {
+    use crate::manager::store::{
+        PersistedActivationPhase as Phase, PersistedActivationRecord, PersistedParticipantRecord,
+    };
+
+    cluster_activation_preflight(runtime, expected_generation).await?;
+    if !valid_peer_token(&operation_id) {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    let _lease = runtime
+        .claim_manager_activation(manager_operation_uuid(&operation_id))
+        .map_err(|_| ManagerRuntimeError::Busy)?;
+
+    if let Some(result) = completed_activation_replay(
+        runtime,
+        store,
+        &operation_id,
+        &profile_id,
+        expected_generation,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
+
+    let completed_replay = store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .snapshot()
+        .activation_journals
+        .get(&operation_id)
+        .is_some_and(|record| record.phase == Phase::Complete);
+
+    let local = activation_target_summary(
+        store,
+        &runtime.inner.config,
+        runtime.inner.role,
+        &profile_id,
+    )
+    .await?;
+    let target = activation_target_identity(store, &profile_id)?;
+    let local_command = if profile_id == "external-baseline" {
+        None
+    } else {
+        Some(verified_profile_command(store, &runtime.inner.config, &profile_id).await?)
+    };
+    let local_node_id = store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .snapshot()
+        .node_id
+        .clone();
+    let (local_previous, local_previous_digest) = {
+        let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+        let previous = store
+            .snapshot()
+            .release_pointers
+            .active
+            .clone()
+            .ok_or(ManagerRuntimeError::NotReady)?;
+        let digest = release_identity_digest(&previous);
+        (previous, digest)
+    };
+
+    // A completed replay returns the durable result; any interrupted replay is held for
+    // reconciliation so it cannot issue a second child start under the same operation ID.
+    {
+        let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+        if let Some(existing) = store.snapshot().activation_journals.get(&operation_id) {
+            return match existing.phase {
+                Phase::Complete
+                    if store.snapshot().release_pointers.active == Some(target.clone()) =>
+                {
+                    Ok(serde_json::json!({
+                        "operation_id": operation_id,
+                        "phase": "complete",
+                        "active": target,
+                        "generation": expected_generation,
+                    }))
+                }
+                Phase::ManualIntervention => Err(ManagerRuntimeError::ManualIntervention),
+                _ => Err(ManagerRuntimeError::Busy),
+            };
+        }
+        if store
+            .snapshot()
+            .activation_journals
+            .values()
+            .any(|record| !matches!(record.phase, Phase::Complete | Phase::RolledBack))
+        {
+            return Err(ManagerRuntimeError::ManualIntervention);
+        }
+    }
+    if local_previous == target {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+
+    let policy_epoch = runtime.policy_epoch();
+    let status_request = manager_peer_request(
+        &operation_id,
+        &local,
+        Some(local_previous_digest.clone()),
+        expected_generation,
+        policy_epoch,
+        ManagerPeerPhase::Status,
+        None,
+    );
+    let status = runtime
+        .inner
+        .client
+        .manager_peer(&status_request)
+        .await
+        .map_err(|_| ManagerRuntimeError::UnpairedPeer)?;
+    let (expected_peer_id, expected_peer_role) = runtime.peer_identity().await;
+    if expected_peer_id.as_deref() != Some(status.node_id.as_str())
+        || expected_peer_role != Some(crate::cluster::ControlRole::Worker)
+    {
+        return Err(ManagerRuntimeError::UnpairedPeer);
+    }
+    let remote_previous_profile_id = status.previous_profile_id.clone();
+    let baseline_target = profile_id == "external-baseline";
+    let mut compatible = status.profiles.into_iter().filter(|candidate| {
+        matches!(candidate.node_role.as_str(), "worker" | "ds4")
+            && (baseline_target && candidate.profile_id == "external-baseline"
+                || !baseline_target
+                    && candidate.model_catalog_id == local.model_catalog_id
+                    && candidate.source_commit == local.source_commit
+                    && candidate.model_digest == local.model_digest)
+            && preferred_peer_request.is_none_or(|preferred| {
+                candidate.profile_id == preferred.profile_id
+                    && candidate.candidate_digest == preferred.candidate_digest
+            })
+            && (!require_peer_previous
+                || completed_replay
+                || remote_previous_profile_id.as_deref() == Some(candidate.profile_id.as_str()))
+    });
+    let peer = compatible.next().ok_or(ManagerRuntimeError::NotReady)?;
+    if compatible.next().is_some() {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    let peer_previous_digest = status
+        .active_release_digest
+        .filter(|digest| full_digest(digest))
+        .ok_or(ManagerRuntimeError::NotReady)?;
+    if preferred_peer_request.is_some_and(|preferred| {
+        preferred.source_commit != peer.source_commit
+            || preferred.model_digest != peer.model_digest
+            || preferred.previous_digest.as_deref() != Some(peer_previous_digest.as_str())
+    }) {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    let peer_node_id = status.node_id;
+
+    let local_prepare_request = manager_peer_request(
+        &operation_id,
+        &local,
+        Some(local_previous_digest.clone()),
+        expected_generation,
+        policy_epoch,
+        ManagerPeerPhase::Prepare,
+        None,
+    );
+    let peer_prepare_request = manager_peer_request(
+        &operation_id,
+        &peer,
+        Some(peer_previous_digest.clone()),
+        expected_generation,
+        policy_epoch,
+        ManagerPeerPhase::Prepare,
+        None,
+    );
+    let local_prepare_ack = manager_peer_ack_id(
+        &local_node_id,
+        &local_prepare_request,
+        ManagerPeerPhase::Prepare,
+    );
+    let mut record = PersistedActivationRecord {
+        operation_id: operation_id.clone(),
+        expected_generation,
+        policy_epoch,
+        phase: Phase::Preparing,
+        participants: std::collections::BTreeMap::from([
+            (
+                local_node_id.clone(),
+                PersistedParticipantRecord {
+                    node_id: local_node_id.clone(),
+                    candidate_profile_id: local.profile_id.clone(),
+                    candidate_digest: local.candidate_digest.clone(),
+                    previous_digest: Some(local_previous_digest),
+                    phase: Phase::Preparing,
+                    prepare_ack: Some(local_prepare_ack),
+                    drain_ack: None,
+                    ready_ack: None,
+                    commit_ack: None,
+                    rollback_ack: None,
+                },
+            ),
+            (
+                peer_node_id.clone(),
+                PersistedParticipantRecord {
+                    node_id: peer_node_id.clone(),
+                    candidate_profile_id: peer.profile_id.clone(),
+                    candidate_digest: peer.candidate_digest.clone(),
+                    previous_digest: Some(peer_previous_digest),
+                    phase: Phase::Preparing,
+                    prepare_ack: None,
+                    drain_ack: None,
+                    ready_ack: None,
+                    commit_ack: None,
+                    rollback_ack: None,
+                },
+            ),
+        ]),
+        failure_class: None,
+    };
+    store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .record_activation(record.clone())
+        .map_err(|_| ManagerRuntimeError::Unavailable)?;
+
+    let peer_prepare = match runtime
+        .inner
+        .client
+        .manager_peer(&peer_prepare_request)
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return mark_cluster_manual(runtime, store, &mut record, "peer-prepare-ack-ambiguous")
+                .await;
+        }
+    };
+    set_cluster_ack(
+        &mut record,
+        &peer_node_id,
+        ManagerPeerPhase::Prepare,
+        &peer_prepare.ack_id,
+    );
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "prepare-ack-persist-failed")
+            .await;
+    }
+
+    set_cluster_phase(&mut record, Phase::Draining);
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "drain-intent-persist-failed")
+            .await;
+    }
+    if runtime
+        .inner
+        .proxy
+        .admission()
+        .drain(
+            expected_generation,
+            runtime.inner.config.cluster.timeouts.drain,
+        )
+        .await
+        .is_err()
+    {
+        return abort_cluster_activation(
+            runtime,
+            store,
+            &mut record,
+            &peer_prepare_request,
+            &peer_prepare.ack_id,
+            false,
+            false,
+            "local-drain-failed",
+        )
+        .await;
+    }
+    runtime.inner.proxy.set_target(
+        crate::target::ProxyTarget::Unavailable {
+            reason: crate::target::UnavailableReason::Transition,
+        },
+        false,
+    );
+    let stop_result = runtime.inner.standalone.stop().await;
+    let local_running = runtime.inner.standalone.is_running().await;
+    if stop_result.is_err() || !matches!(local_running, Ok(false)) {
+        if matches!(local_running, Ok(false)) {
+            return abort_cluster_activation(
+                runtime,
+                store,
+                &mut record,
+                &peer_prepare_request,
+                &peer_prepare.ack_id,
+                true,
+                false,
+                "local-drain-stop-unconfirmed",
+            )
+            .await;
+        }
+        return mark_cluster_manual(runtime, store, &mut record, "local-drain-ambiguous").await;
+    }
+    let local_drain_ack = manager_peer_ack_id(
+        &local_node_id,
+        &local_prepare_request,
+        ManagerPeerPhase::Drain,
+    );
+    set_cluster_ack(
+        &mut record,
+        &local_node_id,
+        ManagerPeerPhase::Drain,
+        &local_drain_ack,
+    );
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(
+            runtime,
+            store,
+            &mut record,
+            "local-drain-ack-persist-failed",
+        )
+        .await;
+    }
+    let peer_drain_request = with_peer_phase(
+        &peer_prepare_request,
+        ManagerPeerPhase::Drain,
+        Some(peer_prepare.ack_id.clone()),
+    );
+    let peer_drain = match runtime.inner.client.manager_peer(&peer_drain_request).await {
+        Ok(response) => response,
+        Err(_) => {
+            return abort_cluster_activation(
+                runtime,
+                store,
+                &mut record,
+                &peer_prepare_request,
+                &peer_prepare.ack_id,
+                true,
+                false,
+                "peer-drain-ack-ambiguous",
+            )
+            .await;
+        }
+    };
+    set_cluster_ack(
+        &mut record,
+        &peer_node_id,
+        ManagerPeerPhase::Drain,
+        &peer_drain.ack_id,
+    );
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "peer-drain-ack-persist-failed")
+            .await;
+    }
+
+    set_cluster_phase(&mut record, Phase::Starting);
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "start-intent-persist-failed")
+            .await;
+    }
+    let local_start = match local_command {
+        Some(command) => runtime.inner.standalone.set_next_command(command).await,
+        None => {
+            if verify_external_baseline(&runtime.inner.config, &target)
+                .await
+                .is_err()
+            {
+                Err(anyhow::anyhow!(
+                    "external baseline changed during activation"
+                ))
+            } else {
+                runtime
+                    .restore_manager_command(crate::cluster::process::Ds4CommandRole::Standalone)
+                    .await
+            }
+        }
+    };
+    if local_start.is_err()
+        || runtime
+            .inner
+            .standalone
+            .start(expected_generation)
+            .await
+            .is_err()
+        || !manager_child_matches_profile(runtime, store, &profile_id).await
+    {
+        return abort_cluster_activation(
+            runtime,
+            store,
+            &mut record,
+            &peer_prepare_request,
+            &peer_drain.ack_id,
+            true,
+            local_start.is_ok(),
+            "local-candidate-start-failed",
+        )
+        .await;
+    }
+    let local_ready_ack = manager_peer_ack_id(
+        &local_node_id,
+        &local_prepare_request,
+        ManagerPeerPhase::Start,
+    );
+    set_cluster_ack(
+        &mut record,
+        &local_node_id,
+        ManagerPeerPhase::Start,
+        &local_ready_ack,
+    );
+    let peer_start_request = with_peer_phase(
+        &peer_prepare_request,
+        ManagerPeerPhase::Start,
+        Some(peer_drain.ack_id.clone()),
+    );
+    let peer_ready = match runtime.inner.client.manager_peer(&peer_start_request).await {
+        Ok(response) => response,
+        Err(_) => {
+            return abort_cluster_activation(
+                runtime,
+                store,
+                &mut record,
+                &peer_prepare_request,
+                &peer_drain.ack_id,
+                true,
+                true,
+                "peer-candidate-start-ambiguous",
+            )
+            .await;
+        }
+    };
+    set_cluster_ack(
+        &mut record,
+        &peer_node_id,
+        ManagerPeerPhase::Start,
+        &peer_ready.ack_id,
+    );
+    set_cluster_phase(&mut record, Phase::Ready);
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "ready-ack-persist-failed").await;
+    }
+
+    set_cluster_phase(&mut record, Phase::Committing);
+    set_cluster_ack(
+        &mut record,
+        &local_node_id,
+        ManagerPeerPhase::Commit,
+        &manager_peer_ack_id(
+            &local_node_id,
+            &local_prepare_request,
+            ManagerPeerPhase::Commit,
+        ),
+    );
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(runtime, store, &mut record, "commit-intent-persist-failed")
+            .await;
+    }
+    let peer_commit_request = with_peer_phase(
+        &peer_prepare_request,
+        ManagerPeerPhase::Commit,
+        Some(peer_ready.ack_id.clone()),
+    );
+    let peer_commit = match runtime
+        .inner
+        .client
+        .manager_peer(&peer_commit_request)
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return abort_cluster_activation(
+                runtime,
+                store,
+                &mut record,
+                &peer_prepare_request,
+                &peer_ready.ack_id,
+                true,
+                true,
+                "peer-commit-ack-ambiguous",
+            )
+            .await;
+        }
+    };
+    set_cluster_ack(
+        &mut record,
+        &peer_node_id,
+        ManagerPeerPhase::Commit,
+        &peer_commit.ack_id,
+    );
+    if persist_cluster_record(store, &record).is_err() {
+        return mark_cluster_manual(
+            runtime,
+            store,
+            &mut record,
+            "peer-commit-ack-persist-failed",
+        )
+        .await;
+    }
+
+    if validate_cluster_commit(
+        runtime,
+        store,
+        expected_generation,
+        policy_epoch,
+        &profile_id,
+    )
+    .await
+    .is_err()
+    {
+        return abort_cluster_activation(
+            runtime,
+            store,
+            &mut record,
+            &peer_prepare_request,
+            &peer_commit.ack_id,
+            true,
+            true,
+            "final-live-check-failed",
+        )
+        .await;
+    }
+
+    let completed = complete_activation_record(record.clone());
+    if store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .finish_activation(completed, target.clone(), Some(local_previous))
+        .is_err()
+    {
+        return mark_cluster_manual(
+            runtime,
+            store,
+            &mut record,
+            "global-complete-persist-failed",
+        )
+        .await;
+    }
+
+    // The peer's second Commit request is the finalize acknowledgement. The global journal is
+    // already durable Complete, but coordinator admission stays closed until the peer confirms
+    // its active pointer and admission boundary have both been published.
+    let peer_finalize = with_peer_phase(
+        &peer_prepare_request,
+        ManagerPeerPhase::Commit,
+        Some(peer_commit.ack_id.clone()),
+    );
+    if runtime
+        .inner
+        .client
+        .manager_peer(&peer_finalize)
+        .await
+        .is_err()
+    {
+        let mut complete = store
+            .lock()
+            .map_err(|_| ManagerRuntimeError::Unavailable)?
+            .snapshot()
+            .activation_journals
+            .get(&operation_id)
+            .cloned()
+            .ok_or(ManagerRuntimeError::Unavailable)?;
+        return mark_cluster_manual(runtime, store, &mut complete, "peer-finalize-ack-ambiguous")
+            .await;
+    }
+
+    if validate_cluster_commit(
+        runtime,
+        store,
+        expected_generation,
+        policy_epoch,
+        &profile_id,
+    )
+    .await
+    .is_err()
+    {
+        let mut complete = store
+            .lock()
+            .map_err(|_| ManagerRuntimeError::Unavailable)?
+            .snapshot()
+            .activation_journals
+            .get(&operation_id)
+            .cloned()
+            .ok_or(ManagerRuntimeError::Unavailable)?;
+        return mark_cluster_manual(
+            runtime,
+            store,
+            &mut complete,
+            "final-live-check-after-peer-finalize-failed",
+        )
+        .await;
+    }
+
+    runtime
+        .inner
+        .proxy
+        .set_target(runtime.inner.mode.snapshot().target, true);
+    runtime.inner.proxy.admission().start_serving();
+    Ok(serde_json::json!({
+        "operation_id": operation_id,
+        "phase": "complete",
+        "active": target,
+        "generation": expected_generation,
+    }))
+}
+
+async fn forward_worker_manager_operation(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    operation_id: String,
+    profile_id: String,
+    expected_generation: u64,
+    rollback: bool,
+) -> Result<Value, ManagerRuntimeError> {
+    let snapshot = runtime.inner.mode.snapshot();
+    if snapshot.generation != expected_generation {
+        return Err(ManagerRuntimeError::StaleGeneration);
+    }
+    if snapshot.state != crate::target::ClusterState::PairedStandaloneReady {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    if runtime.inner.policy_pending.load(Ordering::Acquire) {
+        return Err(ManagerRuntimeError::StalePolicyEpoch);
+    }
+    if runtime.operator_policy() == crate::cluster::OperationPolicy::ForcedStandalone {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    if !runtime.inner.lease.valid() {
+        return Err(ManagerRuntimeError::LeaseUnavailable);
+    }
+    if !runtime.peer_present().await {
+        return Err(ManagerRuntimeError::UnpairedPeer);
+    }
+
+    let profile = activation_target_summary(
+        store,
+        &runtime.inner.config,
+        runtime.inner.role,
+        &profile_id,
+    )
+    .await?;
+    let target = activation_target_identity(store, &profile_id)?;
+    let active_digest = store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .snapshot()
+        .release_pointers
+        .active
+        .as_ref()
+        .map(release_identity_digest)
+        .ok_or(ManagerRuntimeError::NotReady)?;
+    let phase = if rollback {
+        ManagerPeerPhase::ForwardRollback
+    } else {
+        ManagerPeerPhase::ForwardActivate
+    };
+    let request = manager_peer_request(
+        &operation_id,
+        &profile,
+        Some(active_digest),
+        expected_generation,
+        runtime.policy_epoch(),
+        phase,
+        None,
+    );
+    let response = runtime
+        .inner
+        .client
+        .manager_peer(&request)
+        .await
+        .map_err(|_| ManagerRuntimeError::UnpairedPeer)?;
+    Ok(serde_json::json!({
+        "operation_id": operation_id,
+        "phase": "complete",
+        "active": target,
+        "coordinator_node_id": response.node_id,
+        "generation": expected_generation,
+    }))
+}
+
+async fn forward_peer_manager_operation(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    request: &ManagerPeerRequest,
+    rollback: bool,
+) -> Result<ManagerPeerResponse, super::ControlHttpError> {
+    use crate::manager::store::ReleaseIdentity;
+    let replay_profile_id = if rollback {
+        completed_activation_profile_id(store, &request.operation_id)
+            .map_err(manager_runtime_protocol_error)?
+    } else {
+        None
+    };
+    if replay_profile_id
+        .as_deref()
+        .is_some_and(|profile_id| profile_id != request.profile_id)
+    {
+        return Err(ManagerPeerProtocolError::Conflict.into());
+    }
+    let completed_replay = replay_profile_id.is_some();
+    let mut candidates = {
+        let mut store = store
+            .lock()
+            .map_err(|_| ManagerPeerProtocolError::Unavailable)?;
+        manager_peer_profiles(&mut store, request, runtime.inner.role)?
+            .into_iter()
+            .filter(|candidate| {
+                matches!(candidate.node_role.as_str(), "coordinator" | "ds4-server")
+            })
+            .collect::<Vec<_>>()
+    };
+    if rollback {
+        let previous_profile_id = match replay_profile_id {
+            Some(profile_id) => profile_id,
+            None => store
+                .lock()
+                .map_err(|_| ManagerPeerProtocolError::Unavailable)?
+                .snapshot()
+                .release_pointers
+                .previous
+                .as_ref()
+                .and_then(|previous| match previous {
+                    ReleaseIdentity::ManagedProfile(profile_id) => Some(profile_id.clone()),
+                    ReleaseIdentity::ExternalBaseline { .. } => Some("external-baseline".into()),
+                })
+                .ok_or(ManagerPeerProtocolError::NotReady)?,
+        };
+        candidates.retain(|candidate| candidate.profile_id == previous_profile_id);
+    }
+    let [local_profile] = candidates.as_slice() else {
+        return Err(ManagerPeerProtocolError::NotReady.into());
+    };
+    let node_id = store
+        .lock()
+        .map_err(|_| ManagerPeerProtocolError::Unavailable)?
+        .snapshot()
+        .node_id
+        .clone();
+    activate_cluster_profile(
+        runtime,
+        store,
+        request.operation_id.clone(),
+        local_profile.profile_id.clone(),
+        request.expected_generation,
+        rollback && !completed_replay,
+        Some(request),
+    )
+    .await
+    .map_err(manager_runtime_protocol_error)?;
+    Ok(manager_peer_response(
+        &node_id,
+        request,
+        manager_peer_ack_id(&node_id, request, request.phase),
+    ))
+}
+
+fn manager_runtime_protocol_error(error: ManagerRuntimeError) -> ManagerPeerProtocolError {
+    match error {
+        ManagerRuntimeError::Unavailable => ManagerPeerProtocolError::Unavailable,
+        ManagerRuntimeError::Busy => ManagerPeerProtocolError::Conflict,
+        ManagerRuntimeError::StaleGeneration => ManagerPeerProtocolError::StaleGeneration,
+        ManagerRuntimeError::LeaseUnavailable => ManagerPeerProtocolError::Unavailable,
+        ManagerRuntimeError::StalePolicyEpoch => ManagerPeerProtocolError::StalePolicyEpoch,
+        ManagerRuntimeError::UnpairedPeer => ManagerPeerProtocolError::WrongPeer,
+        ManagerRuntimeError::NotReady => ManagerPeerProtocolError::NotReady,
+        ManagerRuntimeError::ManualIntervention => ManagerPeerProtocolError::LifecycleFailure,
+    }
+}
+
+fn managed_profile_summary(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    profile_id: &str,
+) -> Result<ManagerPeerProfileSummary, ManagerRuntimeError> {
+    use crate::manager::store::{
+        ArtifactKind, ArtifactProvenance, HardwareReadiness, ProfileCompatibility,
+    };
+    let mut store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+    let profile = store
+        .snapshot()
+        .profiles
+        .get(profile_id)
+        .cloned()
+        .ok_or(ManagerRuntimeError::NotReady)?;
+    if profile.compatibility != ProfileCompatibility::Compatible
+        || profile.hardware_readiness != HardwareReadiness::Ready
+        || profile.role_artifact_ids.len() != 1
+    {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    let build = store
+        .verify_managed_artifact(&profile.role_artifact_ids[0], ArtifactKind::Build)
+        .map_err(|_| ManagerRuntimeError::NotReady)?;
+    let model = store
+        .verify_managed_artifact(&profile.model_artifact_id, ArtifactKind::Model)
+        .map_err(|_| ManagerRuntimeError::NotReady)?;
+    let ArtifactProvenance::Build { record, .. } = &build.provenance else {
+        return Err(ManagerRuntimeError::NotReady);
+    };
+    let ArtifactProvenance::Model { catalog_id } = &model.provenance else {
+        return Err(ManagerRuntimeError::NotReady);
+    };
+    if catalog_id != &profile.model_catalog_id || !full_git_sha(&record.source) {
+        return Err(ManagerRuntimeError::NotReady);
+    }
+    Ok(ManagerPeerProfileSummary {
+        profile_id: profile.profile_id,
+        node_role: profile.node_role,
+        candidate_digest: digest_text(&format!(
+            "manager-release-v1\n{}\n{}",
+            build.sha256, model.sha256
+        )),
+        source_commit: record.source.clone(),
+        model_digest: model.sha256,
+        model_catalog_id: profile.model_catalog_id,
+        config_fingerprint: profile.config_fingerprint,
+    })
+}
+
+fn activation_target_identity(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    profile_id: &str,
+) -> Result<crate::manager::store::ReleaseIdentity, ManagerRuntimeError> {
+    use crate::manager::store::ReleaseIdentity;
+
+    if profile_id != "external-baseline" {
+        return Ok(ReleaseIdentity::ManagedProfile(profile_id.into()));
+    }
+    let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+    let snapshot = store.snapshot();
+    let previous = snapshot.release_pointers.previous.clone();
+    match previous {
+        Some(identity @ ReleaseIdentity::ExternalBaseline { .. }) => Ok(identity),
+        _ => match snapshot.release_pointers.active.clone() {
+            Some(identity @ ReleaseIdentity::ExternalBaseline { .. }) => Ok(identity),
+            _ => Err(ManagerRuntimeError::NotReady),
+        },
+    }
+}
+
+fn completed_activation_profile_id(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    operation_id: &str,
+) -> Result<Option<String>, ManagerRuntimeError> {
+    use crate::manager::store::{PersistedActivationPhase as Phase, ReleaseIdentity};
+
+    let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+    let snapshot = store.snapshot();
+    let Some(record) = snapshot.activation_journals.get(operation_id) else {
+        return Ok(None);
+    };
+    if record.phase != Phase::Complete {
+        return Ok(None);
+    }
+    let participant = record
+        .participants
+        .get(&snapshot.node_id)
+        .ok_or(ManagerRuntimeError::ManualIntervention)?;
+    let active = snapshot
+        .release_pointers
+        .active
+        .as_ref()
+        .ok_or(ManagerRuntimeError::ManualIntervention)?;
+    let active_matches = match (&participant.candidate_profile_id[..], active) {
+        ("external-baseline", ReleaseIdentity::ExternalBaseline { .. }) => {
+            release_identity_digest(active) == participant.candidate_digest
+        }
+        (profile_id, ReleaseIdentity::ManagedProfile(active_profile_id)) => {
+            profile_id == active_profile_id
+        }
+        _ => false,
+    };
+    if !active_matches {
+        return Err(ManagerRuntimeError::Busy);
+    }
+    Ok(Some(participant.candidate_profile_id.clone()))
+}
+
+async fn completed_activation_replay(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    operation_id: &str,
+    requested_profile_id: &str,
+    expected_generation: u64,
+) -> Result<Option<Value>, ManagerRuntimeError> {
+    use crate::manager::store::PersistedActivationPhase as Phase;
+
+    let (profile_id, candidate_digest, active) = {
+        let store = store.lock().map_err(|_| ManagerRuntimeError::Unavailable)?;
+        let snapshot = store.snapshot();
+        let Some(record) = snapshot.activation_journals.get(operation_id) else {
+            return Ok(None);
+        };
+        if record.phase == Phase::ManualIntervention {
+            return Err(ManagerRuntimeError::ManualIntervention);
+        }
+        if record.phase != Phase::Complete {
+            return Ok(None);
+        }
+        let participant = record
+            .participants
+            .get(&snapshot.node_id)
+            .ok_or(ManagerRuntimeError::ManualIntervention)?;
+        if participant.candidate_profile_id != requested_profile_id {
+            return Err(ManagerRuntimeError::Busy);
+        }
+        (
+            participant.candidate_profile_id.clone(),
+            participant.candidate_digest.clone(),
+            snapshot
+                .release_pointers
+                .active
+                .clone()
+                .ok_or(ManagerRuntimeError::ManualIntervention)?,
+        )
+    };
+    if completed_activation_profile_id(store, operation_id)?.as_deref() != Some(&profile_id) {
+        return Err(ManagerRuntimeError::ManualIntervention);
+    }
+    let summary = activation_target_summary(
+        store,
+        &runtime.inner.config,
+        runtime.inner.role,
+        &profile_id,
+    )
+    .await?;
+    if summary.candidate_digest != candidate_digest {
+        return Err(ManagerRuntimeError::ManualIntervention);
+    }
+    let current = runtime.inner.mode.snapshot();
+    if current.generation != expected_generation {
+        return Err(ManagerRuntimeError::StaleGeneration);
+    }
+    if current.state != crate::target::ClusterState::PairedStandaloneReady
+        || runtime.inner.proxy.admission().snapshot().state
+            != crate::admission::AdmissionState::Serving
+    {
+        return Err(ManagerRuntimeError::ManualIntervention);
+    }
+    if !manager_child_matches_profile(runtime, store, &profile_id).await {
+        return Err(ManagerRuntimeError::ManualIntervention);
+    }
+    Ok(Some(serde_json::json!({
+        "operation_id": operation_id,
+        "phase": "complete",
+        "active": active,
+        "generation": expected_generation,
+    })))
+}
+
+async fn activation_target_summary(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    config: &crate::config::ModeAwareConfig,
+    local_role: crate::target::LocalRole,
+    profile_id: &str,
+) -> Result<ManagerPeerProfileSummary, ManagerRuntimeError> {
+    use crate::manager::store::ReleaseIdentity;
+
+    if profile_id != "external-baseline" {
+        return managed_profile_summary(store, profile_id);
+    }
+
+    let baseline = activation_target_identity(store, profile_id)?;
+    verify_external_baseline(config, &baseline).await?;
+    let ReleaseIdentity::ExternalBaseline {
+        config_fingerprint,
+        model_sha256,
+        ..
+    } = &baseline
+    else {
+        return Err(ManagerRuntimeError::NotReady);
+    };
+    let node_role = match local_role {
+        crate::target::LocalRole::Coordinator => "coordinator",
+        crate::target::LocalRole::Worker => "worker",
+        crate::target::LocalRole::Unknown => return Err(ManagerRuntimeError::NotReady),
+    };
+    Ok(ManagerPeerProfileSummary {
+        profile_id: "external-baseline".into(),
+        node_role: node_role.into(),
+        candidate_digest: release_identity_digest(&baseline),
+        source_commit: "0".repeat(40),
+        model_digest: model_sha256.clone(),
+        model_catalog_id: "external-baseline".into(),
+        config_fingerprint: config_fingerprint.clone(),
+    })
+}
+
+fn manager_peer_request(
+    operation_id: &str,
+    profile: &ManagerPeerProfileSummary,
+    previous_digest: Option<String>,
+    expected_generation: u64,
+    policy_epoch: u64,
+    phase: ManagerPeerPhase,
+    ack_id: Option<String>,
+) -> ManagerPeerRequest {
+    ManagerPeerRequest {
+        operation_id: operation_id.into(),
+        profile_id: profile.profile_id.clone(),
+        candidate_digest: profile.candidate_digest.clone(),
+        source_commit: profile.source_commit.clone(),
+        model_digest: profile.model_digest.clone(),
+        previous_digest,
+        expected_generation,
+        policy_epoch,
+        phase,
+        ack_id,
+    }
+}
+
+fn with_peer_phase(
+    request: &ManagerPeerRequest,
+    phase: ManagerPeerPhase,
+    ack_id: Option<String>,
+) -> ManagerPeerRequest {
+    let mut request = request.clone();
+    request.phase = phase;
+    request.ack_id = ack_id;
+    request
+}
+
+fn set_cluster_phase(
+    record: &mut crate::manager::store::PersistedActivationRecord,
+    phase: crate::manager::store::PersistedActivationPhase,
+) {
+    record.phase = phase;
+    for participant in record.participants.values_mut() {
+        participant.phase = phase;
+    }
+}
+
+fn set_cluster_ack(
+    record: &mut crate::manager::store::PersistedActivationRecord,
+    node_id: &str,
+    phase: ManagerPeerPhase,
+    ack_id: &str,
+) {
+    set_peer_ack(record, node_id, phase, ack_id);
+}
+
+fn persist_cluster_record(
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    record: &crate::manager::store::PersistedActivationRecord,
+) -> Result<(), ManagerRuntimeError> {
+    store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .advance_activation(record.clone())
+        .map_err(|_| ManagerRuntimeError::ManualIntervention)
+}
+
+async fn validate_cluster_commit(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    expected_generation: u64,
+    policy_epoch: u64,
+    profile_id: &str,
+) -> Result<(), ManagerRuntimeError> {
+    let snapshot = runtime.inner.mode.snapshot();
+    validate_cluster_activation_context(
+        expected_generation,
+        snapshot.generation,
+        runtime.inner.role,
+        snapshot.state,
+        runtime.inner.lease.valid(),
+        runtime.peer_present().await,
+        runtime.inner.policy_pending.load(Ordering::Acquire),
+        runtime.operator_policy(),
+    )?;
+    if runtime.policy_epoch() != policy_epoch
+        || !manager_child_matches_profile(runtime, store, profile_id).await
+    {
+        return Err(ManagerRuntimeError::StalePolicyEpoch);
+    }
+    Ok(())
+}
+
+async fn mark_cluster_manual<T>(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    record: &mut crate::manager::store::PersistedActivationRecord,
+    reason: &str,
+) -> Result<T, ManagerRuntimeError> {
+    set_cluster_phase(
+        record,
+        crate::manager::store::PersistedActivationPhase::ManualIntervention,
+    );
+    record.failure_class = Some(reason.into());
+    let persisted = persist_cluster_record(store, record).is_ok();
+    runtime.inner.proxy.admission().block();
+    runtime.inner.proxy.set_target(
+        crate::target::ProxyTarget::Unavailable {
+            reason: crate::target::UnavailableReason::Transition,
+        },
+        false,
+    );
+    let _ = runtime
+        .inner
+        .mode
+        .require_manager_manual_intervention()
+        .await;
+    if persisted {
+        Err(ManagerRuntimeError::ManualIntervention)
+    } else {
+        Err(ManagerRuntimeError::Unavailable)
+    }
+}
+
+async fn abort_cluster_activation(
+    runtime: &super::ProductionClusterRuntime,
+    store: &Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
+    record: &mut crate::manager::store::PersistedActivationRecord,
+    peer_request: &ManagerPeerRequest,
+    peer_ack: &str,
+    local_drained: bool,
+    local_candidate_selected: bool,
+    reason: &str,
+) -> Result<Value, ManagerRuntimeError> {
+    use crate::manager::store::PersistedActivationPhase as Phase;
+    set_cluster_phase(record, Phase::RollingBack);
+    record.failure_class = Some(reason.into());
+    if persist_cluster_record(store, record).is_err() {
+        return mark_cluster_manual(runtime, store, record, "rollback-intent-persist-failed").await;
+    }
+
+    let rollback_request = with_peer_phase(
+        peer_request,
+        ManagerPeerPhase::Rollback,
+        Some(peer_ack.into()),
+    );
+    let peer_rollback_result = runtime.inner.client.manager_peer(&rollback_request).await;
+    let local_node_id = store
+        .lock()
+        .map_err(|_| ManagerRuntimeError::Unavailable)?
+        .snapshot()
+        .node_id
+        .clone();
+    let local_restored = if local_drained {
+        let stop = if runtime.inner.standalone.is_running().await.unwrap_or(false) {
+            runtime.inner.standalone.stop().await.is_ok()
+                && !runtime.inner.standalone.is_running().await.unwrap_or(true)
+        } else {
+            true
+        };
+        let command = !local_candidate_selected
+            || runtime
+                .restore_manager_command(crate::cluster::process::Ds4CommandRole::Standalone)
+                .await
+                .is_ok();
+        stop && command
+            && runtime
+                .inner
+                .standalone
+                .start(runtime.inner.mode.snapshot().generation)
+                .await
+                .is_ok()
+            && manager_child_matches_current_release(runtime, store)
+                .await
+                .unwrap_or(false)
+    } else {
+        manager_child_matches_current_release(runtime, store)
+            .await
+            .unwrap_or(false)
+    };
+    if !local_restored {
+        return mark_cluster_manual(runtime, store, record, "local-previous-restore-failed").await;
+    }
+    let peer_rollback = match peer_rollback_result {
+        Ok(response) => response,
+        Err(_) => {
+            return mark_cluster_manual(runtime, store, record, "peer-rollback-unconfirmed").await;
+        }
+    };
+    let local_participant = record
+        .participants
+        .get(&local_node_id)
+        .ok_or(ManagerRuntimeError::Unavailable)?;
+    let local_rollback_request = with_peer_phase(
+        peer_request,
+        ManagerPeerPhase::Rollback,
+        Some(peer_ack.into()),
+    );
+    let local_rollback_request = ManagerPeerRequest {
+        profile_id: local_participant.candidate_profile_id.clone(),
+        candidate_digest: local_participant.candidate_digest.clone(),
+        previous_digest: local_participant.previous_digest.clone(),
+        ..local_rollback_request
+    };
+    let local_rollback_ack = manager_peer_ack_id(
+        &local_node_id,
+        &local_rollback_request,
+        ManagerPeerPhase::Rollback,
+    );
+    set_cluster_ack(
+        record,
+        &local_node_id,
+        ManagerPeerPhase::Rollback,
+        &local_rollback_ack,
+    );
+    set_cluster_ack(
+        record,
+        &peer_rollback.node_id,
+        ManagerPeerPhase::Rollback,
+        &peer_rollback.ack_id,
+    );
+    set_cluster_phase(record, Phase::RolledBack);
+    if persist_cluster_record(store, record).is_err() {
+        return mark_cluster_manual(runtime, store, record, "rollback-result-persist-failed").await;
+    }
+    runtime
+        .inner
+        .proxy
+        .set_target(runtime.inner.mode.snapshot().target, true);
+    runtime.inner.proxy.admission().start_serving();
+    Err(ManagerRuntimeError::NotReady)
 }
 
 async fn cluster_activation_preflight(

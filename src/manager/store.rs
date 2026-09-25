@@ -1320,28 +1320,40 @@ fn activation_transition_allowed(
     use PersistedActivationPhase as Phase;
     matches!(
         (from, to),
-        (
-            Phase::Preparing,
-            Phase::Draining | Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::Draining,
-            Phase::Starting | Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::Starting,
-            Phase::Ready | Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::Ready,
-            Phase::Committing | Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::Committing,
-            Phase::Complete | Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::Complete,
-            Phase::RollingBack | Phase::ManualIntervention
-        ) | (
-            Phase::RollingBack,
-            Phase::RolledBack | Phase::ManualIntervention
-        )
+        (Phase::Preparing, Phase::Preparing)
+            | (Phase::Draining, Phase::Draining)
+            | (Phase::Starting, Phase::Starting)
+            | (Phase::Ready, Phase::Ready)
+            | (Phase::Committing, Phase::Committing)
+            | (Phase::RollingBack, Phase::RollingBack)
+            | (
+                Phase::Preparing,
+                Phase::Draining | Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::Draining,
+                Phase::Starting | Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::Starting,
+                Phase::Ready | Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::Ready,
+                Phase::Committing | Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::Committing,
+                Phase::Complete | Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::Complete,
+                Phase::RollingBack | Phase::ManualIntervention
+            )
+            | (
+                Phase::RollingBack,
+                Phase::RolledBack | Phase::ManualIntervention
+            )
     )
 }
 
@@ -1748,6 +1760,62 @@ mod tests {
             Some(ReleaseIdentity::ManagedProfile(profile_id))
         );
         assert!(reopened.snapshot().release_pointers.previous.is_some());
+    }
+
+    #[test]
+    fn activation_journal_accepts_monotonic_ack_updates_within_a_phase() {
+        let root_path = root("activation-same-phase-ack");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root_path.clone()), "local-node")
+                .expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root_path);
+        let participant = PersistedParticipantRecord {
+            node_id: "local-node".into(),
+            candidate_profile_id: profile_id,
+            candidate_digest: "a".repeat(64),
+            previous_digest: Some("b".repeat(64)),
+            phase: PersistedActivationPhase::Preparing,
+            prepare_ack: None,
+            drain_ack: None,
+            ready_ack: None,
+            commit_ack: None,
+            rollback_ack: None,
+        };
+        let preparing = PersistedActivationRecord {
+            operation_id: "activation-same-phase-1".into(),
+            expected_generation: 4,
+            policy_epoch: 2,
+            phase: PersistedActivationPhase::Preparing,
+            participants: BTreeMap::from([("local-node".into(), participant)]),
+            failure_class: None,
+        };
+        store
+            .record_activation(preparing.clone())
+            .expect("record prepare intent before acknowledgement");
+        let mut acknowledged = preparing;
+        acknowledged
+            .participants
+            .get_mut("local-node")
+            .unwrap()
+            .prepare_ack = Some("prepare-ack".into());
+        store
+            .advance_activation(acknowledged.clone())
+            .expect("persist the received prepare acknowledgement in the same phase");
+        assert_eq!(
+            store.snapshot().activation_journals["activation-same-phase-1"],
+            acknowledged
+        );
+
+        let mut changed_ack = acknowledged;
+        changed_ack
+            .participants
+            .get_mut("local-node")
+            .unwrap()
+            .prepare_ack = Some("different-prepare-ack".into());
+        assert!(matches!(
+            store.advance_activation(changed_ack),
+            Err(StoreError::InvalidReference(_))
+        ));
     }
 
     #[test]

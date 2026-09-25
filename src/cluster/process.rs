@@ -278,11 +278,11 @@ impl VerifiedDs4Command {
         self.role
     }
 
-    pub(crate) fn digest_hex(&self) -> String {
+    pub fn digest_hex(&self) -> String {
         hex_digest(&self.command_sha256)
     }
 
-    fn profile_id(&self) -> &str {
+    pub fn profile_id(&self) -> &str {
         &self.command.profile.profile_id
     }
 }
@@ -369,10 +369,12 @@ impl CommandSlot {
         let mut selection = self.selection.write().await;
         let previous = selection
             .previous_command
-            .take()
+            .as_ref()
+            .cloned()
             .ok_or(CommandSlotError::PreviousCommandUnavailable)?;
         previous.command().await?;
-        selection.current_command = previous;
+        let displaced = std::mem::replace(&mut selection.current_command, previous);
+        selection.previous_command = Some(displaced);
         Ok(selection.current_command.snapshot())
     }
 }
@@ -1378,6 +1380,12 @@ mod tests {
         let restored = commands.restore_previous().await.unwrap();
         assert_eq!(restored.profile_id, "initial-worker");
         assert!(restored.command_sha256.is_empty());
+        std::fs::write(&model_path, b"verified test model").unwrap();
+        assert_eq!(
+            commands.restore_previous().await.unwrap().profile_id,
+            "staged-worker",
+            "the displaced command remains available as the next rollback target"
+        );
     }
 
     #[tokio::test]
