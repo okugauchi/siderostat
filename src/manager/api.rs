@@ -77,6 +77,7 @@ pub struct ManagerSourceReceiptDto {
     pub receipt_id: String,
     pub full_commit: String,
     pub main_proof: String,
+    pub fetched_at: u64,
 }
 
 /// Sanitized artifact reference used by inventory profiles.
@@ -129,6 +130,9 @@ pub struct ManagerNodeReadinessDto {
 #[serde(rename_all = "snake_case")]
 pub struct ManagerInventoryResponse {
     pub node_id: String,
+    /// Runtime-observed role for this local node. `None` means role is unknown.
+    #[serde(default)]
+    pub node_role: Option<String>,
     pub source_commits: Vec<ManagerSourceReceiptDto>,
     pub artifacts: Vec<ManagerArtifactDto>,
     pub profiles: Vec<ManagerStagedProfileDto>,
@@ -312,6 +316,7 @@ pub fn inventory_with_live_active_digest(
             receipt_id: receipt_id.clone(),
             full_commit: receipt.full_commit.clone(),
             main_proof: receipt.main_proof.clone(),
+            fetched_at: receipt.fetched_at,
         })
         .collect();
 
@@ -407,6 +412,7 @@ pub fn inventory_with_live_active_digest(
 
     ManagerInventoryResponse {
         node_id: snapshot.node_id.clone(),
+        node_role: None,
         source_commits,
         artifacts,
         profiles,

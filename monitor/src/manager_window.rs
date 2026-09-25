@@ -97,11 +97,416 @@ pub struct ManagerViewModel {
     sources: Vec<SourceEntry>,
     active_digest: Option<String>,
     build_targets: Vec<String>,
+    inventory: Option<siderostat_core::manager::api::ManagerInventoryResponse>,
+    expected_node_id: Option<String>,
+    inventory_error: Option<String>,
+}
+
+/// Node-local action whose readiness is derived from the authenticated
+/// `/manager/inventory` snapshot and current job status. H06.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ManagerPreparationAction {
+    FetchSource,
+    BuildCoordinator,
+    BuildWorker,
+    DownloadModel,
+    VerifyModel,
+    StageProfile,
+    Activate,
+}
+
+/// UI-safe readiness and the exact local command to enqueue when enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerActionState {
+    pub enabled: bool,
+    pub reason: Option<String>,
+    pub command: Option<ManagerCommand>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManagerActionSelection {
+    states: BTreeMap<ManagerPreparationAction, ManagerActionState>,
+}
+
+impl ManagerActionSelection {
+    fn from_view_model(view_model: &ManagerViewModel) -> Self {
+        let actions = [
+            ManagerPreparationAction::FetchSource,
+            ManagerPreparationAction::BuildCoordinator,
+            ManagerPreparationAction::BuildWorker,
+            ManagerPreparationAction::DownloadModel,
+            ManagerPreparationAction::VerifyModel,
+            ManagerPreparationAction::StageProfile,
+            ManagerPreparationAction::Activate,
+        ];
+        Self {
+            states: actions
+                .into_iter()
+                .map(|action| (action, view_model.preparation_action(action)))
+                .collect(),
+        }
+    }
+
+    fn command(&self, action: ManagerPreparationAction) -> Option<ManagerCommand> {
+        self.states.get(&action)?.command.clone()
+    }
+}
+
+impl ManagerActionState {
+    fn enabled(command: ManagerCommand) -> Self {
+        Self {
+            enabled: true,
+            reason: None,
+            command: Some(command),
+        }
+    }
+
+    fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            enabled: false,
+            reason: Some(reason.into()),
+            command: None,
+        }
+    }
 }
 
 impl ManagerViewModel {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind snapshots to the node this GUI connects to. A response carrying a
+    /// different node identity is rejected and cannot supply artifact IDs.
+    pub fn set_expected_node_id(&mut self, node_id: impl Into<String>) {
+        self.expected_node_id = Some(node_id.into());
+    }
+
+    pub fn apply_inventory(
+        &mut self,
+        inventory: siderostat_core::manager::api::ManagerInventoryResponse,
+    ) -> bool {
+        if self
+            .expected_node_id
+            .as_deref()
+            .is_some_and(|expected| expected != inventory.node_id)
+        {
+            self.inventory = None;
+            self.active_digest = None;
+            self.inventory_error = Some("inventory node identity mismatch".to_string());
+            return false;
+        }
+        self.inventory_error = None;
+        self.active_digest = inventory.active_digest.clone();
+        self.inventory = Some(inventory);
+        true
+    }
+
+    pub fn inventory(&self) -> Option<&siderostat_core::manager::api::ManagerInventoryResponse> {
+        self.inventory.as_ref()
+    }
+
+    pub fn mark_inventory_unavailable(&mut self, message: &str) {
+        self.inventory = None;
+        self.active_digest = None;
+        self.inventory_error = Some(redact_secrets(message));
+    }
+
+    pub fn inventory_summary(&self) -> String {
+        let Some(inventory) = &self.inventory else {
+            return self
+                .inventory_error
+                .as_deref()
+                .map(redact_secrets)
+                .unwrap_or_else(|| "inventory未取得".to_string());
+        };
+        let mut lines = vec![format!(
+            "node: {} · role: {}",
+            redact_secrets(&inventory.node_id),
+            inventory
+                .node_role
+                .as_deref()
+                .map(redact_secrets)
+                .unwrap_or_else(|| "未確定".to_string())
+        )];
+        if inventory.source_commits.is_empty() {
+            lines.push("source: 未取得".to_string());
+        } else {
+            lines.extend(inventory.source_commits.iter().map(|source| {
+                format!(
+                    "source: {} · main {}",
+                    redact_secrets(&source.full_commit),
+                    redact_secrets(&source.main_proof)
+                )
+            }));
+        }
+        if inventory.artifacts.is_empty() {
+            lines.push("artifact: なし".to_string());
+        } else {
+            lines.extend(inventory.artifacts.iter().map(|artifact| {
+                format!(
+                    "{} · {} · {} · {} · {}",
+                    redact_secrets(&artifact.kind),
+                    redact_secrets(&artifact.id),
+                    redact_secrets(&artifact.digest),
+                    artifact.size,
+                    if artifact.verified {
+                        "verified"
+                    } else {
+                        "未検証"
+                    }
+                )
+            }));
+        }
+        if inventory.profiles.is_empty() {
+            lines.push("profile: 未stage".to_string());
+        } else {
+            lines.extend(inventory.profiles.iter().map(|profile| {
+                format!(
+                    "profile: {} · role={} · compatibility={:?} · hardware={:?} · activation_ready={}",
+                    redact_secrets(&profile.profile_id),
+                    redact_secrets(&profile.node_role),
+                    profile.compatibility,
+                    profile.hardware_readiness,
+                    profile.activation_ready
+                )
+            }));
+        }
+        lines.push(format!(
+            "node readiness: {}{}",
+            if inventory.node_readiness.ready {
+                "ready"
+            } else {
+                "pending"
+            },
+            inventory
+                .node_readiness
+                .reason
+                .as_deref()
+                .map(|reason| format!(" · {}", redact_secrets(reason)))
+                .unwrap_or_default()
+        ));
+        lines.push(format!(
+            "稼働中 digest: {} · previous digest: {} · activation phase: {}",
+            inventory
+                .active_digest
+                .as_deref()
+                .map(redact_secrets)
+                .unwrap_or_else(|| "未実測".to_string()),
+            inventory
+                .previous_digest
+                .as_deref()
+                .map(redact_secrets)
+                .unwrap_or_else(|| "なし".to_string()),
+            inventory
+                .activation_phase
+                .map(|phase| format!("{phase:?}"))
+                .unwrap_or_else(|| "なし".to_string())
+        ));
+        lines.join("\n")
+    }
+
+    /// Derive UI readiness and a node-local command from this node's inventory.
+    /// IDs are never sourced from a peer view or user-entered paths.
+    pub fn preparation_action(&self, action: ManagerPreparationAction) -> ManagerActionState {
+        let active_job = |kind: &str| {
+            self.jobs
+                .values()
+                .any(|job| job.kind == kind && job.is_active())
+        };
+        match action {
+            ManagerPreparationAction::FetchSource => {
+                if active_job("fetch") {
+                    ManagerActionState::disabled("source取得jobが進行中")
+                } else {
+                    ManagerActionState::enabled(ManagerCommand::FetchSource)
+                }
+            }
+            ManagerPreparationAction::BuildCoordinator | ManagerPreparationAction::BuildWorker => {
+                if active_job("build") {
+                    return ManagerActionState::disabled("build jobが進行中");
+                }
+                let Some(inventory) = &self.inventory else {
+                    return ManagerActionState::disabled(self.inventory_reason());
+                };
+                let Some(source) = inventory
+                    .source_commits
+                    .iter()
+                    .max_by_key(|source| (source.fetched_at, &source.receipt_id))
+                else {
+                    return ManagerActionState::disabled("このnodeのsource commitが未取得");
+                };
+                let role = match action {
+                    ManagerPreparationAction::BuildCoordinator => "ds4-server",
+                    ManagerPreparationAction::BuildWorker => "ds4",
+                    _ => unreachable!(),
+                };
+                let expected_node_role = match action {
+                    ManagerPreparationAction::BuildCoordinator => "coordinator",
+                    ManagerPreparationAction::BuildWorker => "worker",
+                    _ => unreachable!(),
+                };
+                let Some(node_role) = inventory.node_role.as_deref() else {
+                    return ManagerActionState::disabled("このnodeのruntime roleが未確定です");
+                };
+                if node_role != expected_node_role {
+                    return ManagerActionState::disabled(format!(
+                        "このnodeは{node_role} roleです。{expected_node_role}用buildは実行できません"
+                    ));
+                }
+                if siderostat_core::manager::executor::manager_build_payload_key(
+                    &source.receipt_id,
+                    role,
+                )
+                .is_none()
+                {
+                    return ManagerActionState::disabled(
+                        "このnodeのsource receipt identityが不正です",
+                    );
+                }
+                ManagerActionState::enabled(ManagerCommand::Build {
+                    source_receipt_id: source.receipt_id.clone(),
+                    role: role.to_string(),
+                })
+            }
+            ManagerPreparationAction::DownloadModel => {
+                if active_job("download") {
+                    ManagerActionState::disabled("model download jobが進行中")
+                } else {
+                    ManagerActionState::disabled(
+                        "このnodeのinventoryから利用可能なverified catalog候補を確認できません",
+                    )
+                }
+            }
+            ManagerPreparationAction::VerifyModel => {
+                if active_job("verify") {
+                    return ManagerActionState::disabled("verify jobが進行中");
+                }
+                let Some(inventory) = &self.inventory else {
+                    return ManagerActionState::disabled(self.inventory_reason());
+                };
+                if let Some(artifact) = inventory.artifacts.iter().find(|artifact| {
+                    artifact.kind == "model" && !artifact.verified && artifact.catalog_id.is_some()
+                }) {
+                    ManagerActionState::enabled(ManagerCommand::Verify {
+                        artifact_id: artifact.id.clone(),
+                    })
+                } else {
+                    ManagerActionState::disabled(
+                        "このnodeにcatalog provenance付き未検証model artifactがありません",
+                    )
+                }
+            }
+            ManagerPreparationAction::StageProfile => {
+                if active_job("stage") {
+                    return ManagerActionState::disabled("stage jobが進行中");
+                }
+                let Some(inventory) = &self.inventory else {
+                    return ManagerActionState::disabled(self.inventory_reason());
+                };
+                let Some(node_role) = inventory.node_role.as_deref() else {
+                    return ManagerActionState::disabled("このnodeのruntime roleが未確定です");
+                };
+                let expected_build_role = match node_role {
+                    "coordinator" => "ds4-server",
+                    "worker" => "ds4",
+                    _ => {
+                        return ManagerActionState::disabled("このnodeのruntime roleが不明です");
+                    }
+                };
+                let models = inventory
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.kind == "model"
+                            && artifact.verified
+                            && artifact.catalog_id.is_some()
+                    })
+                    .collect::<Vec<_>>();
+                if models.len() > 1 {
+                    return ManagerActionState::disabled(
+                        "verified model候補が複数あり、選択UIが必要です",
+                    );
+                }
+                let Some(model) = models.first().copied() else {
+                    return ManagerActionState::disabled(
+                        "このnodeのmodel artifactが未検証またはcatalog provenanceなし",
+                    );
+                };
+                let builds = inventory
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.kind == "build"
+                            && artifact.verified
+                            && artifact.role.as_deref() == Some(expected_build_role)
+                    })
+                    .collect::<Vec<_>>();
+                if builds.len() > 1 {
+                    return ManagerActionState::disabled(
+                        "verified serving build候補が複数あり、選択UIが必要です",
+                    );
+                }
+                let Some(build) = builds.first().copied() else {
+                    return ManagerActionState::disabled(
+                        "このnodeにverified serving build artifactがありません",
+                    );
+                };
+                if siderostat_core::manager::executor::manager_stage_payload_key(
+                    &build.id, &model.id,
+                )
+                .is_none()
+                {
+                    return ManagerActionState::disabled("このnodeのartifact identityが不正です");
+                }
+                if inventory.profiles.iter().any(|profile| {
+                    profile
+                        .role_artifacts
+                        .iter()
+                        .any(|reference| reference.id == build.id)
+                        && profile.model_artifact.id == model.id
+                }) {
+                    let reason = inventory
+                        .profiles
+                        .iter()
+                        .find(|profile| {
+                            profile
+                                .role_artifacts
+                                .iter()
+                                .any(|reference| reference.id == build.id)
+                                && profile.model_artifact.id == model.id
+                        })
+                        .map(|profile| {
+                            if profile.hardware_readiness
+                                == siderostat_core::manager::HardwareReadiness::Pending
+                            {
+                                "既存profileのhardware readinessがpending"
+                            } else if profile.compatibility
+                                != siderostat_core::manager::ProfileCompatibility::Compatible
+                            {
+                                "既存profileのcompatibilityが未確認"
+                            } else {
+                                "同じartifact pairはすでにstage済み"
+                            }
+                        })
+                        .unwrap_or("同じartifact pairはすでにstage済み");
+                    return ManagerActionState::disabled(reason);
+                }
+                ManagerActionState::enabled(ManagerCommand::Stage {
+                    build_artifact_id: build.id.clone(),
+                    model_artifact_id: model.id.clone(),
+                })
+            }
+            ManagerPreparationAction::Activate => {
+                ManagerActionState::disabled("runtime-owned activation transactionが未接続です")
+            }
+        }
+    }
+
+    fn inventory_reason(&self) -> String {
+        self.inventory_error
+            .as_deref()
+            .map(redact_secrets)
+            .unwrap_or_else(|| "inventory未取得".to_string())
     }
 
     /// `/manager/status` の反映。job を個別更新し、active digest を
@@ -112,7 +517,11 @@ impl ManagerViewModel {
         jobs: &[siderostat_core::manager::api::ManagerJobDto],
         active_digest: Option<&str>,
     ) {
-        self.active_digest = active_digest.map(str::to_string);
+        if let Some(active_digest) = active_digest {
+            self.active_digest = Some(active_digest.to_string());
+        } else if self.inventory.is_none() {
+            self.active_digest = None;
+        }
         self.latest_cancellable_id = jobs
             .iter()
             .filter(|job| job.phase == "running")
@@ -238,6 +647,14 @@ impl ManagerViewModel {
         self.active_digest.as_deref()
     }
 
+    /// Display unknown manager status explicitly; None is not proof that no
+    /// profile is active. H06.
+    pub fn active_digest_display(&self) -> &str {
+        self.active_digest
+            .as_deref()
+            .unwrap_or("active digest 未実測（runtime / registry 未接続）")
+    }
+
     /// job エラーの redacted 表示。資格情報・URL userinfo・query 等を
     /// 隠し、生のエラー文字列をそのまま GUI に出さない（C04:
     /// URL query/credentials/token をログ/表示へ出さない）。G03。/
@@ -252,16 +669,18 @@ impl ManagerViewModel {
 pub enum ManagerCommand {
     FetchSource,
     Build {
-        target: String,
+        source_receipt_id: String,
+        role: String,
     },
     Download {
-        profile: String,
+        catalog_id: String,
     },
     Verify {
-        profile: String,
+        artifact_id: String,
     },
     Stage {
-        profile: String,
+        build_artifact_id: String,
+        model_artifact_id: String,
     },
     Activate {
         profile: String,
@@ -277,6 +696,7 @@ pub enum ManagerCommand {
         job_id: String,
     },
     Refresh,
+    RefreshInventory,
 }
 
 /// workerからmain threadへ返すmanager状態更新。非terminal jobを成功へ
@@ -284,6 +704,7 @@ pub enum ManagerCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerEvent {
     Status(ManagerStatusResponse),
+    Inventory(siderostat_core::manager::api::ManagerInventoryResponse),
     Submitted { kind: String, id: String },
     Failed { message: String },
 }
@@ -317,22 +738,44 @@ pub async fn execute_manager_command(
             .submit_manager_job("fetch", "official")
             .await
             .map(|response| manager_submitted_event("fetch", response.id)),
-        ManagerCommand::Build { target } => client
-            .submit_manager_job("build", &target)
-            .await
-            .map(|response| manager_submitted_event("build", response.id)),
-        ManagerCommand::Download { profile } => client
-            .submit_manager_job("download", &profile)
+        ManagerCommand::Build {
+            source_receipt_id,
+            role,
+        } => match siderostat_core::manager::executor::manager_build_payload_key(
+            &source_receipt_id,
+            &role,
+        ) {
+            Some(payload_key) => client
+                .submit_manager_job("build", &payload_key)
+                .await
+                .map(|response| manager_submitted_event("build", response.id)),
+            None => Err(anyhow::anyhow!(
+                "local source receipt or build role is invalid"
+            )),
+        },
+        ManagerCommand::Download { catalog_id } => client
+            .submit_manager_job("download", &catalog_id)
             .await
             .map(|response| manager_submitted_event("download", response.id)),
-        ManagerCommand::Verify { profile } => client
-            .submit_manager_job("verify", &profile)
+        ManagerCommand::Verify { artifact_id } => client
+            .submit_manager_job("verify", &artifact_id)
             .await
             .map(|response| manager_submitted_event("verify", response.id)),
-        ManagerCommand::Stage { profile } => client
-            .submit_manager_job("stage", &profile)
-            .await
-            .map(|response| manager_submitted_event("stage", response.id)),
+        ManagerCommand::Stage {
+            build_artifact_id,
+            model_artifact_id,
+        } => match siderostat_core::manager::executor::manager_stage_payload_key(
+            &build_artifact_id,
+            &model_artifact_id,
+        ) {
+            Some(payload_key) => client
+                .submit_manager_job("stage", &payload_key)
+                .await
+                .map(|response| manager_submitted_event("stage", response.id)),
+            None => Err(anyhow::anyhow!(
+                "local managed artifact identity is invalid"
+            )),
+        },
         ManagerCommand::Activate {
             profile,
             expected_generation,
@@ -364,6 +807,11 @@ pub async fn execute_manager_command(
             .await
             .map(|()| manager_submitted_event("cancel", job_id)),
         ManagerCommand::Refresh => client.fetch_manager_jobs().await.map(ManagerEvent::Status),
+        ManagerCommand::RefreshInventory => client
+            .fetch_manager_inventory()
+            .await
+            .map(ManagerEvent::Inventory)
+            .map_err(|error| anyhow::anyhow!("inventory refresh failed: {error}")),
     };
     result.unwrap_or_else(|error| manager_failed_event(error.to_string()))
 }
@@ -373,6 +821,7 @@ pub async fn execute_manager_command(
 struct ManagerActionIvars {
     command_tx: Sender<ManagerCommand>,
     cancel_job_id: Arc<Mutex<Option<String>>>,
+    action_selection: Arc<Mutex<ManagerActionSelection>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -394,6 +843,21 @@ fn send_cancel_command(
 }
 
 #[cfg(target_os = "macos")]
+fn send_preparation_command(
+    sender: &Sender<ManagerCommand>,
+    selection: &Mutex<ManagerActionSelection>,
+    action: ManagerPreparationAction,
+) {
+    let command = selection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .command(action);
+    if let Some(command) = command {
+        let _ = sender.send(command);
+    }
+}
+
+#[cfg(target_os = "macos")]
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
@@ -403,35 +867,56 @@ define_class!(
     impl ManagerActionTarget {
         #[unsafe(method(managerFetch:))]
         fn manager_fetch(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().command_tx.send(ManagerCommand::FetchSource);
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::FetchSource,
+            );
         }
 
         #[unsafe(method(managerBuild:))]
         fn manager_build(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().command_tx.send(ManagerCommand::Build {
-                target: "ds4-server".to_string(),
-            });
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::BuildCoordinator,
+            );
+        }
+
+        #[unsafe(method(managerBuildWorker:))]
+        fn manager_build_worker(&self, _sender: Option<&AnyObject>) {
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::BuildWorker,
+            );
         }
 
         #[unsafe(method(managerDownload:))]
         fn manager_download(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().command_tx.send(ManagerCommand::Download {
-                profile: "mxfp4-0731".to_string(),
-            });
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::DownloadModel,
+            );
         }
 
         #[unsafe(method(managerVerify:))]
         fn manager_verify(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().command_tx.send(ManagerCommand::Verify {
-                profile: "mxfp4-0731".to_string(),
-            });
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::VerifyModel,
+            );
         }
 
         #[unsafe(method(managerStage:))]
         fn manager_stage(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().command_tx.send(ManagerCommand::Stage {
-                profile: "mxfp4-0731".to_string(),
-            });
+            send_preparation_command(
+                &self.ivars().command_tx,
+                &self.ivars().action_selection,
+                ManagerPreparationAction::StageProfile,
+            );
         }
 
         #[unsafe(method(managerCancel:))]
@@ -442,6 +927,10 @@ define_class!(
         #[unsafe(method(managerRefresh:))]
         fn manager_refresh(&self, _sender: Option<&AnyObject>) {
             let _ = self.ivars().command_tx.send(ManagerCommand::Refresh);
+            let _ = self
+                .ivars()
+                .command_tx
+                .send(ManagerCommand::RefreshInventory);
         }
     }
 );
@@ -452,10 +941,12 @@ impl ManagerActionTarget {
         mtm: MainThreadMarker,
         command_tx: Sender<ManagerCommand>,
         cancel_job_id: Arc<Mutex<Option<String>>>,
+        action_selection: Arc<Mutex<ManagerActionSelection>>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ManagerActionIvars {
             command_tx,
             cancel_job_id,
+            action_selection,
         });
         // SAFETY: ManagerActionTarget directly subclasses NSObject and uses
         // NSObject's standard init implementation.
@@ -499,19 +990,61 @@ fn project_profiles(model_view: &ModelView) -> String {
         .models()
         .iter()
         .map(|model| {
-            let state = match model_view.profile_readiness(&model.name) {
+            let state = match model_view.profile_entry_readiness(model) {
                 ProfileReadiness::Pending(reason) => format!("Pending（{reason}）· 操作不可"),
                 ProfileReadiness::Ready => "Ready（検証入力上）".to_string(),
                 ProfileReadiness::Rejected(reason) => format!("Rejected（{reason}）· 操作不可"),
             };
-            format!(
-                "{} · {}",
-                redact_secrets(&model.name),
-                redact_secrets(&state)
-            )
+            let name = model.origin.as_deref().map_or_else(
+                || redact_secrets(&model.name),
+                |origin| {
+                    format!(
+                        "{} · {}",
+                        redact_secrets(origin),
+                        redact_secrets(&model.name)
+                    )
+                },
+            );
+            let declared_digest = model
+                .origin
+                .as_ref()
+                .and(model.checksum.as_deref())
+                .map(|digest| format!(" · 設定値 digest={}", redact_secrets(digest)))
+                .unwrap_or_default();
+            format!("{name} · {}{declared_digest}", redact_secrets(&state))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn project_preparation(view_model: &ManagerViewModel) -> String {
+    [
+        ("Fetch", ManagerPreparationAction::FetchSource),
+        (
+            "Build coordinator",
+            ManagerPreparationAction::BuildCoordinator,
+        ),
+        ("Build worker", ManagerPreparationAction::BuildWorker),
+        ("Download", ManagerPreparationAction::DownloadModel),
+        ("Verify", ManagerPreparationAction::VerifyModel),
+        ("Stage", ManagerPreparationAction::StageProfile),
+        ("Activate", ManagerPreparationAction::Activate),
+    ]
+    .into_iter()
+    .map(|(label, action)| {
+        let state = view_model.preparation_action(action);
+        let status = if state.enabled {
+            "実行可能".to_string()
+        } else {
+            state
+                .reason
+                .map(|reason| redact_secrets(&reason))
+                .unwrap_or_else(|| "操作不可".to_string())
+        };
+        format!("{label}: {status}")
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 /// AppKit manager window host. The view model and command channel outlive the
@@ -524,7 +1057,10 @@ pub struct ManagerWindowHost {
     status_label: Option<Retained<NSTextField>>,
     jobs_label: Option<Retained<NSTextField>>,
     profiles_label: Option<Retained<NSTextField>>,
+    inventory_label: Option<Retained<NSTextField>>,
+    preparation_label: Option<Retained<NSTextField>>,
     cancel_button: Option<Retained<NSButton>>,
+    preparation_buttons: Vec<(ManagerPreparationAction, Retained<NSButton>)>,
     _action_target: Option<Retained<ManagerActionTarget>>,
     command_tx: Sender<ManagerCommand>,
     command_rx: Option<Receiver<ManagerCommand>>,
@@ -532,6 +1068,10 @@ pub struct ManagerWindowHost {
     model_view: ModelView,
     jobs_summary: String,
     profiles_summary: String,
+    inventory_summary: String,
+    preparation_summary: String,
+    status_summary: String,
+    action_selection: Arc<Mutex<ManagerActionSelection>>,
     cancel_job_id: Arc<Mutex<Option<String>>>,
     test_window_identity: usize,
     test_visible: bool,
@@ -543,16 +1083,27 @@ impl ManagerWindowHost {
         mtm: MainThreadMarker,
         client: MetricsClient,
         view_model: ManagerViewModel,
+        model_view: ModelView,
     ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let cancel_job_id = Arc::new(Mutex::new(
             view_model.latest_cancellable_job_id().map(str::to_string),
         ));
-        let action_target =
-            ManagerActionTarget::new(mtm, command_tx.clone(), Arc::clone(&cancel_job_id));
-        let model_view = ModelView::new();
+        let action_selection = Arc::new(Mutex::new(ManagerActionSelection::from_view_model(
+            &view_model,
+        )));
+        let action_target = ManagerActionTarget::new(
+            mtm,
+            command_tx.clone(),
+            Arc::clone(&cancel_job_id),
+            Arc::clone(&action_selection),
+        );
         let jobs_summary = project_jobs(&view_model);
         let profiles_summary = project_profiles(&model_view);
+        let inventory_summary = view_model.inventory_summary();
+        let preparation_summary = project_preparation(&view_model);
+        let status_summary =
+            "待機中。runtime/modelは変更されていません。job状態を確認してください。".to_string();
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -644,26 +1195,60 @@ impl ManagerWindowHost {
             button
         };
 
+        let fetch_button = active_button("公式sourceを取得", sel!(managerFetch:));
+        let build_coordinator_button = active_button("coordinator用をbuild", sel!(managerBuild:));
+        let build_worker_button = active_button("worker用をbuild", sel!(managerBuildWorker:));
+        let download_button = active_button("modelをdownload", sel!(managerDownload:));
+        let verify_button = active_button("verify", sel!(managerVerify:));
+        let stage_button = active_button("stage", sel!(managerStage:));
+        let preparation_buttons = vec![
+            (ManagerPreparationAction::FetchSource, fetch_button.clone()),
+            (
+                ManagerPreparationAction::BuildCoordinator,
+                build_coordinator_button.clone(),
+            ),
+            (
+                ManagerPreparationAction::BuildWorker,
+                build_worker_button.clone(),
+            ),
+            (
+                ManagerPreparationAction::DownloadModel,
+                download_button.clone(),
+            ),
+            (ManagerPreparationAction::VerifyModel, verify_button.clone()),
+            (ManagerPreparationAction::StageProfile, stage_button.clone()),
+        ];
+        for (action, button) in &preparation_buttons {
+            button.setEnabled(view_model.preparation_action(*action).enabled);
+        }
+
         section("Runtime / source");
         action_row(vec![
-            active_button("公式sourceを取得", sel!(managerFetch:)),
-            active_button("ds4-serverをbuild", sel!(managerBuild:)),
+            fetch_button,
+            build_coordinator_button,
+            build_worker_button,
         ]);
         section("Artifact pipeline");
-        action_row(vec![
-            active_button("modelをdownload", sel!(managerDownload:)),
-            active_button("verify", sel!(managerVerify:)),
-            active_button("stage", sel!(managerStage:)),
-        ]);
+        action_row(vec![download_button, verify_button, stage_button]);
+        let preparation_label =
+            NSTextField::wrappingLabelWithString(&NSString::from_str(&preparation_summary), mtm);
+        preparation_label.setPreferredMaxLayoutWidth(700.0);
+        root.addArrangedSubview(&preparation_label);
         section("Profiles");
         let profiles =
             NSTextField::wrappingLabelWithString(&NSString::from_str(&profiles_summary), mtm);
         profiles.setPreferredMaxLayoutWidth(700.0);
         root.addArrangedSubview(&profiles);
+        section("This node inventory");
+        let inventory =
+            NSTextField::wrappingLabelWithString(&NSString::from_str(&inventory_summary), mtm);
+        inventory.setPreferredMaxLayoutWidth(700.0);
+        inventory.setMaximumNumberOfLines(12);
+        root.addArrangedSubview(&inventory);
         section("Activation / rollback");
         action_row(vec![
-            disabled_button("activate（準備中）"),
-            disabled_button("rollback（準備中）"),
+            disabled_button("activate（generation / runtime lease 未接続）"),
+            disabled_button("rollback（generation / runtime lease 未接続）"),
         ]);
         section("Jobs");
         let jobs = NSTextField::wrappingLabelWithString(&NSString::from_str(&jobs_summary), mtm);
@@ -690,7 +1275,10 @@ impl ManagerWindowHost {
             status_label: Some(status_label),
             jobs_label: Some(jobs),
             profiles_label: Some(profiles),
+            inventory_label: Some(inventory),
+            preparation_label: Some(preparation_label),
             cancel_button: Some(cancel_button),
+            preparation_buttons,
             _action_target: Some(action_target),
             command_tx,
             command_rx: Some(command_rx),
@@ -698,6 +1286,10 @@ impl ManagerWindowHost {
             model_view,
             jobs_summary,
             profiles_summary,
+            inventory_summary,
+            preparation_summary,
+            status_summary,
+            action_selection,
             cancel_job_id,
             test_window_identity: 0,
             test_visible: false,
@@ -705,12 +1297,21 @@ impl ManagerWindowHost {
     }
 
     #[cfg(feature = "test-support")]
-    pub fn for_test(client: MetricsClient, view_model: ManagerViewModel) -> Self {
+    pub fn for_test(
+        client: MetricsClient,
+        view_model: ManagerViewModel,
+        model_view: ModelView,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let identity = (&command_tx as *const Sender<ManagerCommand>) as usize;
         let jobs_summary = project_jobs(&view_model);
-        let model_view = ModelView::new();
         let profiles_summary = project_profiles(&model_view);
+        let inventory_summary = view_model.inventory_summary();
+        let preparation_summary = project_preparation(&view_model);
+        let status_summary = "待機中".to_string();
+        let action_selection = Arc::new(Mutex::new(ManagerActionSelection::from_view_model(
+            &view_model,
+        )));
         let cancel_job_id = Arc::new(Mutex::new(
             view_model.latest_cancellable_job_id().map(str::to_string),
         ));
@@ -721,7 +1322,10 @@ impl ManagerWindowHost {
             status_label: None,
             jobs_label: None,
             profiles_label: None,
+            inventory_label: None,
+            preparation_label: None,
             cancel_button: None,
+            preparation_buttons: Vec::new(),
             _action_target: None,
             command_tx,
             command_rx: Some(command_rx),
@@ -729,6 +1333,10 @@ impl ManagerWindowHost {
             model_view,
             jobs_summary,
             profiles_summary,
+            inventory_summary,
+            preparation_summary,
+            status_summary,
+            action_selection,
             cancel_job_id,
             test_window_identity: identity,
             test_visible: false,
@@ -794,10 +1402,14 @@ impl ManagerWindowHost {
     pub fn apply_event(&mut self, event: ManagerEvent) {
         match event {
             ManagerEvent::Status(status) => {
+                let active_digest = status
+                    .active_digest
+                    .clone()
+                    .or_else(|| self.view_model.active_digest().map(str::to_string));
                 self.view_model
-                    .apply_status(&status.jobs, status.active_digest.as_deref());
+                    .apply_status(&status.jobs, active_digest.as_deref());
                 self.model_view
-                    .apply_status(&status.jobs, status.active_digest.as_deref());
+                    .apply_status(&status.jobs, active_digest.as_deref());
                 self.jobs_summary = project_jobs(&self.view_model);
                 self.profiles_summary = project_profiles(&self.model_view);
                 *self
@@ -828,24 +1440,76 @@ impl ManagerWindowHost {
                 if let Some(status_label) = &self.status_label {
                     status_label.setStringValue(&NSString::from_str(&format!(
                         "active={} / queue={} / jobs={}",
-                        self.view_model.active_digest().unwrap_or("未設定"),
+                        self.view_model.active_digest_display(),
                         status.queue_depth,
                         status.jobs.len()
                     )));
                 }
+                self.status_summary = format!(
+                    "active={} / queue={} / jobs={}",
+                    self.view_model.active_digest_display(),
+                    status.queue_depth,
+                    status.jobs.len()
+                );
+                self.refresh_preparation_projection();
+            }
+            ManagerEvent::Inventory(inventory) => {
+                let accepted = self.view_model.apply_inventory(inventory);
+                if let Some(inventory) = self.view_model.inventory() {
+                    self.model_view
+                        .apply_status(&[], inventory.active_digest.as_deref());
+                }
+                self.inventory_summary = self.view_model.inventory_summary();
+                if let Some(inventory_label) = &self.inventory_label {
+                    inventory_label.setStringValue(&NSString::from_str(&self.inventory_summary));
+                }
+                self.status_summary = if accepted {
+                    "このnodeのmanager inventoryを更新しました".to_string()
+                } else {
+                    "manager inventoryのnode identityが一致しません".to_string()
+                };
+                if let Some(status_label) = &self.status_label {
+                    status_label.setStringValue(&NSString::from_str(&self.status_summary));
+                }
+                self.refresh_preparation_projection();
             }
             ManagerEvent::Submitted { kind, id } => {
+                self.status_summary = format!("{kind} jobを開始しました: {id}");
                 if let Some(status_label) = &self.status_label {
-                    status_label.setStringValue(&NSString::from_str(&format!(
-                        "{kind} jobを開始しました: {id}"
-                    )));
+                    status_label.setStringValue(&NSString::from_str(&self.status_summary));
                 }
             }
             ManagerEvent::Failed { message } => {
+                self.status_summary = redact_secrets(&message);
+                if message.starts_with("inventory refresh failed:") {
+                    self.view_model
+                        .mark_inventory_unavailable(&self.status_summary);
+                    self.inventory_summary = self.view_model.inventory_summary();
+                    if let Some(inventory_label) = &self.inventory_label {
+                        inventory_label
+                            .setStringValue(&NSString::from_str(&self.inventory_summary));
+                    }
+                    self.refresh_preparation_projection();
+                }
                 if let Some(status_label) = &self.status_label {
-                    status_label.setStringValue(&NSString::from_str(&redact_secrets(&message)));
+                    status_label.setStringValue(&NSString::from_str(&self.status_summary));
                 }
             }
+        }
+    }
+
+    fn refresh_preparation_projection(&mut self) {
+        self.preparation_summary = project_preparation(&self.view_model);
+        *self
+            .action_selection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ManagerActionSelection::from_view_model(&self.view_model);
+        if let Some(label) = &self.preparation_label {
+            label.setStringValue(&NSString::from_str(&self.preparation_summary));
+        }
+        for (action, button) in &self.preparation_buttons {
+            button.setEnabled(self.view_model.preparation_action(*action).enabled);
         }
     }
 
@@ -857,7 +1521,31 @@ impl ManagerWindowHost {
         &self.model_view
     }
 
-    /// 外部のcatalog/manifest検証結果を純粋なModelViewとして受け取る。H06。
+    pub fn inventory_summary(&self) -> &str {
+        &self.inventory_summary
+    }
+
+    pub fn preparation_summary(&self) -> &str {
+        &self.preparation_summary
+    }
+
+    pub fn status_summary(&self) -> &str {
+        &self.status_summary
+    }
+
+    pub fn preparation_action(&self, action: ManagerPreparationAction) -> ManagerActionState {
+        self.view_model.preparation_action(action)
+    }
+
+    pub fn request_preparation_action(&self, action: ManagerPreparationAction) -> Result<bool> {
+        let Some(command) = self.view_model.preparation_action(action).command else {
+            return Ok(false);
+        };
+        self.send_command(command)?;
+        Ok(true)
+    }
+
+    /// 表示用のcatalog/manifest viewを差し替える。H06。
     pub fn set_model_view(&mut self, model_view: ModelView) {
         self.model_view = model_view;
         self.profiles_summary = project_profiles(&self.model_view);
@@ -881,7 +1569,8 @@ impl ManagerWindowHost {
 
     /// AppKitの再読込actionと同じworker channelに送る。H06。
     pub fn request_refresh(&self) -> Result<()> {
-        self.send_command(ManagerCommand::Refresh)
+        self.send_command(ManagerCommand::Refresh)?;
+        self.send_command(ManagerCommand::RefreshInventory)
     }
 }
 
@@ -1023,9 +1712,19 @@ pub mod test_util {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEntry {
     pub name: String,
-    pub size: u64,
-    /// 検証済み SHA が無ければ None（activate disabled）。G04。/
+    /// Manifest/catalog family used only to distinguish runtime config rows.
+    pub origin: Option<String>,
+    pub size: Option<u64>,
+    /// manifest / catalog が宣言する model SHA-256。これだけでは検証済みと
+    /// みなさず、完全な64桁の形式と検証状態を別々に確認する。H06。
     pub checksum: Option<String>,
+    /// ローカル artifact の実 checksum が宣言値と一致したことを示す。H06。
+    pub checksum_verified: bool,
+    /// artifact が Manager registry の検証済み記録として確認されたことを示す。
+    /// runtime manifest の宣言だけでは true にしない。H06。
+    pub registry_verified: bool,
+    /// Read/validation failure for one configured manifest, if any.
+    pub pending_reason: Option<String>,
     pub license: String,
     /// Vision encoder（例: "openai-whisper"）。runtime と不整合なら理由。G04。/
     pub encoder: String,
@@ -1041,6 +1740,26 @@ pub enum ProfileReadiness {
     Pending(String),
     Ready,
     Rejected(String),
+}
+
+/// Fixed classification for an unreadable or invalid configured manifest.
+/// Dynamic paths and parser/validator errors are intentionally excluded from
+/// the value so they cannot cross into logs or the GUI. H06.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestProjectionFailure {
+    Read,
+    Parse,
+    Validation,
+}
+
+impl ManifestProjectionFailure {
+    pub const fn pending_reason(self) -> &'static str {
+        match self {
+            Self::Read => "manifest読込失敗（path非表示）",
+            Self::Parse => "manifest解析失敗（内容非表示）",
+            Self::Validation => "manifest検証失敗（詳細非表示）",
+        }
+    }
 }
 
 /// model 選択・download・activate・rollback の view（C04）。各 stage ごとに
@@ -1071,6 +1790,57 @@ impl ModelView {
         self.models = models;
     }
 
+    /// Build a read-only profile row from a runtime manifest that has already
+    /// passed its schema validator. The manifest declares the profile and
+    /// digest, but it does not prove that the local artifact is present or
+    /// registered, so readiness remains Pending until those checks are wired.
+    pub fn from_declared_runtime_profile(name: &str, size: Option<u64>, checksum: &str) -> Self {
+        let mut view = Self::new();
+        view.add_declared_runtime_profile("runtime", name, size, checksum);
+        view
+    }
+
+    /// Append a declared profile from a validated runtime manifest. `origin`
+    /// lets the UI distinguish standalone and distributed config rows even
+    /// when their profile names happen to match.
+    pub fn add_declared_runtime_profile(
+        &mut self,
+        origin: &str,
+        name: &str,
+        size: Option<u64>,
+        checksum: &str,
+    ) {
+        self.models.push(ModelEntry {
+            name: name.to_string(),
+            origin: Some(origin.to_string()),
+            size,
+            checksum: Some(checksum.to_string()),
+            checksum_verified: false,
+            registry_verified: false,
+            pending_reason: None,
+            license: "manifest未記載".to_string(),
+            encoder: "未確認".to_string(),
+            support: "未確認".to_string(),
+        });
+    }
+
+    /// Keep a failed manifest visible alongside any profile rows that loaded
+    /// successfully, using a fixed classified reason. H06.
+    pub fn add_manifest_failure(&mut self, origin: &str, failure: ManifestProjectionFailure) {
+        self.models.push(ModelEntry {
+            name: "profile manifest unavailable".to_string(),
+            origin: Some(origin.to_string()),
+            size: None,
+            checksum: None,
+            checksum_verified: false,
+            registry_verified: false,
+            pending_reason: Some(failure.pending_reason().to_string()),
+            license: "manifest未読込".to_string(),
+            encoder: "未確認".to_string(),
+            support: "未確認".to_string(),
+        });
+    }
+
     /// Set the verified prefix-file compatibility result for one profile.
     /// A mismatch is a hard rejection and is kept separate from checksum and
     /// encoder validation. H06。
@@ -1083,9 +1853,8 @@ impl ModelView {
         &self.models
     }
 
-    /// checksum 有り + Vision 整合 → activate 可能。checksum が無い model
-    /// は activate disabled（受入 case 1）。Vision 不整合も disabled（受入
-    /// case 2）。G04。/
+    /// full SHA-256、checksum 検証、registry 検証、Vision 整合がそろう場合だけ
+    /// activate 可能。G04/H06。
     pub fn can_activate(&self, name: &str) -> bool {
         matches!(self.profile_readiness(name), ProfileReadiness::Ready)
     }
@@ -1094,14 +1863,38 @@ impl ModelView {
     /// is the single source of truth used by both activation gating and the
     /// AppKit profile display. H06。
     pub fn profile_readiness(&self, name: &str) -> ProfileReadiness {
-        let Some(model) = self.models.iter().find(|m| m.name == name) else {
+        let mut matching = self.models.iter().filter(|model| model.name == name);
+        let Some(model) = matching.next() else {
             return ProfileReadiness::Pending("profile未準備".to_string());
         };
-        if self.prefix_file_compatibility.get(name) == Some(&false) {
+        if matching.next().is_some() {
+            return ProfileReadiness::Pending("同名profileの選択元が曖昧".to_string());
+        }
+        self.profile_entry_readiness(model)
+    }
+
+    fn profile_entry_readiness(&self, model: &ModelEntry) -> ProfileReadiness {
+        if let Some(reason) = &model.pending_reason {
+            return ProfileReadiness::Pending(reason.clone());
+        }
+        if self.prefix_file_compatibility.get(&model.name) == Some(&false) {
             return ProfileReadiness::Rejected("prefix-file不一致".to_string());
         }
-        if model.checksum.is_none() {
-            return ProfileReadiness::Pending("checksum未検証".to_string());
+        let Some(checksum) = model.checksum.as_deref() else {
+            return ProfileReadiness::Pending("checksum未宣言".to_string());
+        };
+        if !is_full_sha256(checksum) {
+            return ProfileReadiness::Pending("SHA-256形式不正".to_string());
+        }
+        let mut pending_checks = Vec::new();
+        if !model.checksum_verified {
+            pending_checks.push("checksum未検証");
+        }
+        if !model.registry_verified {
+            pending_checks.push("Manager registry未検証");
+        }
+        if !pending_checks.is_empty() {
+            return ProfileReadiness::Pending(pending_checks.join("・"));
         }
         if model.support != "supported" {
             return ProfileReadiness::Rejected(format!("Vision 対応外（{}）", model.support));
@@ -1205,6 +1998,13 @@ impl ModelView {
     }
 }
 
+fn is_full_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Vision encoder が runtime と整合するか。G04。/
 fn vision_consistent(model: &ModelEntry) -> bool {
     // 既定の Vision encoder は "openai-whisper"。空は不整合。G04。/
@@ -1304,14 +2104,29 @@ mod tests {
         assert_eq!(ManagerViewModel::redacted_reason(&job), "missing toolchain");
     }
 
+    const VALID_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn model(name: &str, checksum: Option<&str>, encoder: &str, support: &str) -> ModelEntry {
         ModelEntry {
             name: name.to_string(),
-            size: 1024,
+            origin: None,
+            size: Some(1024),
             checksum: checksum.map(str::to_string),
+            checksum_verified: false,
+            registry_verified: false,
+            pending_reason: None,
             license: "MIT".to_string(),
             encoder: encoder.to_string(),
             support: support.to_string(),
+        }
+    }
+
+    fn verified_model(name: &str, encoder: &str, support: &str) -> ModelEntry {
+        ModelEntry {
+            checksum: Some(VALID_SHA256.to_string()),
+            checksum_verified: true,
+            registry_verified: true,
+            ..model(name, None, encoder, support)
         }
     }
 
@@ -1327,14 +2142,43 @@ mod tests {
         assert!(api.submit_calls.is_empty(), "no POST when checksum missing");
     }
 
+    #[test]
+    fn declared_runtime_profile_stays_pending_until_registry_verification() {
+        let view =
+            ModelView::from_declared_runtime_profile("configured-profile", Some(42), VALID_SHA256);
+        assert_eq!(view.models()[0].name, "configured-profile");
+        assert_eq!(view.models()[0].size, Some(42));
+        assert!(!view.models()[0].checksum_verified);
+        assert!(!view.models()[0].registry_verified);
+        assert_eq!(
+            view.profile_readiness("configured-profile"),
+            ProfileReadiness::Pending("checksum未検証・Manager registry未検証".to_string())
+        );
+        assert!(!view.can_activate("configured-profile"));
+    }
+
+    #[test]
+    fn short_checksum_never_becomes_ready_even_with_verification_flags() {
+        let mut entry = model("short", Some("sha"), "openai-whisper", "supported");
+        entry.checksum_verified = true;
+        entry.registry_verified = true;
+        let mut view = ModelView::new();
+        view.set_models(vec![entry]);
+        assert_eq!(
+            view.profile_readiness("short"),
+            ProfileReadiness::Pending("SHA-256形式不正".to_string())
+        );
+        assert!(!view.can_activate("short"));
+    }
+
     /// 入力: Vision 不整合 → 理由。G04。/
     #[test]
     fn vision_mismatch_surfaces_reason() {
         let mut view = ModelView::new();
         view.set_models(vec![
-            model("m-ok", Some("sha"), "openai-whisper", "supported"),
-            model("m-enc", Some("sha"), "other-encoder", "supported"),
-            model("m-unsup", Some("sha"), "openai-whisper", "unsupported"),
+            verified_model("m-ok", "openai-whisper", "supported"),
+            verified_model("m-enc", "other-encoder", "supported"),
+            verified_model("m-unsup", "openai-whisper", "unsupported"),
         ]);
         assert!(view.can_activate("m-ok"));
         assert!(view.vision_reason("m-ok").is_none());
@@ -1378,12 +2222,7 @@ mod tests {
     fn rollback_keeps_previous() {
         let mut api = FakeManagerApi::with_jobs(&["rollback-1"]);
         let mut view = ModelView::new();
-        view.set_models(vec![model(
-            "m1",
-            Some("sha"),
-            "openai-whisper",
-            "supported",
-        )]);
+        view.set_models(vec![verified_model("m1", "openai-whisper", "supported")]);
         // activation で current_active を previous に追加。G04。/
         view.apply_status(&[], Some("active-a"));
         let _ = block_on(view.start_activation("m1", &mut api)).expect("activate");
@@ -1402,12 +2241,7 @@ mod tests {
     fn activation_is_single_operation() {
         let mut api = FakeManagerApi::with_jobs(&["act-1"]);
         let mut view = ModelView::new();
-        view.set_models(vec![model(
-            "m1",
-            Some("sha"),
-            "openai-whisper",
-            "supported",
-        )]);
+        view.set_models(vec![verified_model("m1", "openai-whisper", "supported")]);
         let id = block_on(view.start_activation("m1", &mut api)).expect("activate");
         assert_eq!(id, "act-1");
         // download / stage / activate を分割せず、一つの activate 操作に

@@ -12,10 +12,13 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_core_foundation::{
     CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
 };
-use siderostat_core::config::ModeAwareConfig;
 use siderostat_core::notify::{
     DesktopNotificationService, Notification, NotifyPlatform, build_notifier,
     start_notification_relay,
+};
+use siderostat_core::{
+    cluster::{DistributedManifest, StandaloneManifest},
+    config::ModeAwareConfig,
 };
 use siderostat_monitor::{
     client::MetricsClient,
@@ -23,8 +26,8 @@ use siderostat_monitor::{
     connection_mode::{ConnectionModeUi, ConnectionPolicy},
     localization::{app_metadata_info, text},
     manager_window::{
-        ManagerCommand, ManagerEvent, ManagerViewModel, ManagerWindowHost, execute_manager_command,
-        manager_failed_event,
+        ManagerCommand, ManagerEvent, ManagerViewModel, ManagerWindowHost,
+        ManifestProjectionFailure, ModelView, execute_manager_command, manager_failed_event,
     },
     migration::LegacyInventory,
     operation::{OperationKind, OperationOutcome, OperationState},
@@ -66,6 +69,7 @@ struct UpdateContext {
     manager_events: Arc<Mutex<Vec<ManagerEvent>>>,
     manager_open_requested: Arc<AtomicBool>,
     manager_refresh_checked_at: Cell<Instant>,
+    manager_inventory_refresh_checked_at: Cell<Instant>,
     service_statuses: Cell<(ServiceStatus, ServiceStatus)>,
     service_status_checked_at: Cell<Instant>,
 }
@@ -97,17 +101,25 @@ fn main() -> Result<()> {
     } else {
         tracing::info!("monitor configuration loaded with defaults");
     }
-    let config_valid = if siderostat_monitor::launchd::is_bundle_mode() {
-        match validate_runtime_configuration() {
-            Ok(()) => monitor_config_valid,
-            Err(error) => {
-                tracing::error!(error = %error, "runtime configuration validation failed");
-                false
+    let (config_valid, manager_model_view, manager_node_id) =
+        if siderostat_monitor::launchd::is_bundle_mode() {
+            match load_valid_runtime_configuration() {
+                Ok(runtime_config) => {
+                    let model_view = runtime_model_view(&runtime_config);
+                    (
+                        monitor_config_valid,
+                        model_view,
+                        Some(runtime_config.cluster.node_id.clone()),
+                    )
+                }
+                Err(_) => {
+                    tracing::error!("runtime configuration validation failed (details hidden)");
+                    (false, ModelView::new(), None)
+                }
             }
-        }
-    } else {
-        monitor_config_valid
-    };
+        } else {
+            (monitor_config_valid, ModelView::new(), None)
+        };
 
     // Runtime is a helper executable rather than an app bundle, so it forwards
     // desktop notifications to the signed Siderostat.app process over this
@@ -165,7 +177,12 @@ fn main() -> Result<()> {
     tracing::info!("NSApplication ready (accessory policy)");
 
     let tray = MonitorTray::new(config.show_decode_tps, config.live_metric)?;
-    let mut manager_host = ManagerWindowHost::new(mtm, client.clone(), ManagerViewModel::new())?;
+    let mut manager_view_model = ManagerViewModel::new();
+    if let Some(node_id) = manager_node_id {
+        manager_view_model.set_expected_node_id(node_id);
+    }
+    let mut manager_host =
+        ManagerWindowHost::new(mtm, client.clone(), manager_view_model, manager_model_view)?;
     let manager_command_rx = manager_host.take_command_receiver()?;
     let manager_host = Box::into_raw(Box::new(manager_host));
     let manager_events = Arc::new(Mutex::new(Vec::<ManagerEvent>::new()));
@@ -201,6 +218,7 @@ fn main() -> Result<()> {
     // the worker above; no HTTP call is made on the AppKit thread.
     unsafe {
         (*manager_host).send_command(ManagerCommand::Refresh)?;
+        (*manager_host).send_command(ManagerCommand::RefreshInventory)?;
     }
     {
         let display = shared
@@ -461,6 +479,7 @@ fn main() -> Result<()> {
         manager_events,
         manager_open_requested,
         manager_refresh_checked_at: Cell::new(Instant::now() - Duration::from_secs(2)),
+        manager_inventory_refresh_checked_at: Cell::new(Instant::now()),
         service_statuses: Cell::new((runtime_status, login_item_status)),
         service_status_checked_at: Cell::new(Instant::now()),
     });
@@ -592,6 +611,15 @@ unsafe extern "C-unwind" fn refresh_callback(_timer: *mut CFRunLoopTimer, info: 
         let host = unsafe { &*context.manager_host };
         if let Err(error) = host.send_command(ManagerCommand::Refresh) {
             tracing::debug!(error = %error, "manager refresh request was dropped");
+        }
+    }
+    if context.manager_inventory_refresh_checked_at.get().elapsed() >= Duration::from_secs(10) {
+        context
+            .manager_inventory_refresh_checked_at
+            .set(Instant::now());
+        let host = unsafe { &*context.manager_host };
+        if let Err(error) = host.send_command(ManagerCommand::RefreshInventory) {
+            tracing::debug!(error = %error, "manager inventory refresh request was dropped");
         }
     }
     let events = {
@@ -855,7 +883,7 @@ fn collect_legacy_inventory() -> Result<LegacyInventory> {
 /// application bundle uses the same schema validator as the runtime so a
 /// configuration accepted here will not be presented as valid when the
 /// background service starts.
-fn validate_runtime_configuration() -> Result<()> {
+fn load_valid_runtime_configuration() -> Result<ModeAwareConfig> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let path = PathBuf::from(home).join("Library/Application Support/siderostat/config.toml");
     let contents = std::fs::read_to_string(&path)
@@ -864,7 +892,86 @@ fn validate_runtime_configuration() -> Result<()> {
     config
         .expand_paths()
         .context("expand runtime configuration paths")?;
-    config.validate().context("validate runtime configuration")
+    config
+        .validate()
+        .context("validate runtime configuration")?;
+    Ok(config)
+}
+
+fn runtime_model_view(config: &ModeAwareConfig) -> ModelView {
+    let mut model_view = ModelView::new();
+    match load_standalone_manifest(&config.ds4.standalone.model_manifest) {
+        Ok(manifest) => model_view.add_declared_runtime_profile(
+            "standalone",
+            &manifest.profile,
+            None,
+            &manifest.model_sha256,
+        ),
+        Err(failure) => {
+            match failure {
+                ManifestProjectionFailure::Read => {
+                    tracing::warn!("standalone profile manifest read failed");
+                }
+                ManifestProjectionFailure::Parse => {
+                    tracing::warn!("standalone profile manifest parse failed");
+                }
+                ManifestProjectionFailure::Validation => {
+                    tracing::warn!("standalone profile manifest validation failed");
+                }
+            }
+            model_view.add_manifest_failure("standalone", failure);
+        }
+    }
+
+    if config.cluster.enabled {
+        match load_distributed_manifest(&config.ds4.distributed.model_manifest) {
+            Ok(manifest) => model_view.add_declared_runtime_profile(
+                "distributed",
+                &manifest.profile,
+                Some(manifest.model_size),
+                &manifest.model_sha256,
+            ),
+            Err(failure) => {
+                match failure {
+                    ManifestProjectionFailure::Read => {
+                        tracing::warn!("distributed profile manifest read failed");
+                    }
+                    ManifestProjectionFailure::Parse => {
+                        tracing::warn!("distributed profile manifest parse failed");
+                    }
+                    ManifestProjectionFailure::Validation => {
+                        tracing::warn!("distributed profile manifest validation failed");
+                    }
+                }
+                model_view.add_manifest_failure("distributed", failure);
+            }
+        }
+    }
+    model_view
+}
+
+fn load_standalone_manifest(
+    path: &Path,
+) -> std::result::Result<StandaloneManifest, ManifestProjectionFailure> {
+    let manifest_bytes = std::fs::read(path).map_err(|_| ManifestProjectionFailure::Read)?;
+    let manifest: StandaloneManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| ManifestProjectionFailure::Parse)?;
+    manifest
+        .validate()
+        .map_err(|_| ManifestProjectionFailure::Validation)?;
+    Ok(manifest)
+}
+
+fn load_distributed_manifest(
+    path: &Path,
+) -> std::result::Result<DistributedManifest, ManifestProjectionFailure> {
+    let manifest_bytes = std::fs::read(path).map_err(|_| ManifestProjectionFailure::Read)?;
+    let manifest: DistributedManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| ManifestProjectionFailure::Parse)?;
+    manifest
+        .validate()
+        .map_err(|_| ManifestProjectionFailure::Validation)?;
+    Ok(manifest)
 }
 
 #[cfg(target_os = "macos")]
@@ -1359,6 +1466,17 @@ fn initialize_logging() {
 #[cfg(test)]
 mod version_notification_tests {
     use super::*;
+
+    #[test]
+    fn manifest_read_failure_is_reduced_to_fixed_classification() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("private-user-manifest.json");
+        let failure = load_standalone_manifest(&path).expect_err("missing manifest");
+
+        assert_eq!(failure, ManifestProjectionFailure::Read);
+        assert_eq!(failure.pending_reason(), "manifest読込失敗（path非表示）");
+        assert!(!failure.pending_reason().contains("private-user-manifest"));
+    }
 
     #[test]
     fn approval_opens_login_items_once() {

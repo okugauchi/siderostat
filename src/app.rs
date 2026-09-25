@@ -2407,7 +2407,22 @@ async fn manager_inventory(
             );
         }
     };
-    let response = crate::manager::api::inventory(store.snapshot());
+    let mut response = crate::manager::api::inventory(store.snapshot());
+    drop(store);
+    response.node_role = if state.config.cluster_enabled {
+        state
+            .production
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.role()))
+            .and_then(|role| match role {
+                crate::target::LocalRole::Coordinator => Some("coordinator".to_string()),
+                crate::target::LocalRole::Worker => Some("worker".to_string()),
+                crate::target::LocalRole::Unknown => None,
+            })
+    } else {
+        Some("coordinator".to_string())
+    };
     json_response(
         StatusCode::OK,
         serde_json::to_value(response).unwrap_or_else(|_| json!({})),

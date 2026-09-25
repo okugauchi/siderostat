@@ -24,3 +24,5 @@
 - 出典: H06 Manager Model Download/Verify（2026-09-25）
 - 永続 release pointer や設定 manifest は child が実際に読み込んだ状態を証明しない。inventory の active digest は verified profile と一致する live observation がある時だけ出す
 - 出典: H06 Manager Durable Stage and Inventory（2026-09-25）
+- node-local Manager UI は期待 node ID とruntime-observed roleを照合し、最新 fetched_at のreceiptから当該role用buildだけを許可する。verified artifact候補が複数なら自動選択しない
+- 出典: H06 Manager Per-node Preparation Flow（2026-09-25）

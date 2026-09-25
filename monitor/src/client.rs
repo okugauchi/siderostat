@@ -182,6 +182,32 @@ impl MetricsClient {
             .context("parse manager/status response")
     }
 
+    /// Fetch the sanitized, node-local Manager inventory. This uses the same
+    /// admin bearer token as job polling and never requests peer inventory.
+    pub async fn fetch_manager_inventory(
+        &self,
+    ) -> Result<siderostat_core::manager::api::ManagerInventoryResponse> {
+        let url = format!("{}/manager/inventory", self.base_url);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(anyhow!("manager inventory unavailable (old runtime)"));
+        }
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "manager/inventory endpoint returned {}",
+                response.status()
+            ));
+        }
+        response
+            .json()
+            .await
+            .context("parse manager/inventory response")
+    }
+
     /// 接続モードを `/cluster/operation-policy`（P06 / C03）へ適用する。
     ///
     /// 選択を直接 `StableMode` へ書換えず、API へ送る（レビュー重点）。

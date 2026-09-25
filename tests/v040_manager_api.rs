@@ -139,6 +139,7 @@ mod routes {
 
         let (status, inventory) = request(state, "GET", "/manager/inventory", "").await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(inventory["node_role"], "coordinator");
         assert_eq!(inventory["node_readiness"]["ready"], false);
         assert_eq!(inventory["source_commits"], serde_json::json!([]));
         let json = inventory.to_string();
