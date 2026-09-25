@@ -10,7 +10,7 @@ use siderostat::manager::executor::{
 };
 use siderostat::manager::jobs::{JobJournal, JobKind, JobPhase};
 use siderostat::manager::registry::ManagerRoot;
-use siderostat::manager::store::ManagerReleaseStore;
+use siderostat::manager::store::{ArtifactProvenance, ManagerReleaseStore};
 use siderostat::manager::{GitRunner, ManagerExecutor, OfficialRemote};
 
 const OFFICIAL_REMOTE: &str = "https://github.com/antirez/ds4.git";
@@ -46,6 +46,11 @@ fn fixture() -> Fixture {
     git.run(["-C", work_text, "config", "user.name", "fixture"])
         .expect("set name");
     std::fs::write(work.join("main.txt"), "main").expect("write main");
+    std::fs::write(
+        work.join("Makefile"),
+        ".PHONY: ds4-server ds4-agent\nds4-server:\n\t@pwd > ds4-server\n\t@printf 'fixture help\\n' > help.txt\nds4-agent:\n\t@printf 'fixture help\\n' > help.txt\n",
+    )
+    .expect("write fixture Makefile");
     git.run(["-C", work_text, "add", "."]).expect("add main");
     git.run(["-C", work_text, "commit", "-m", "main"])
         .expect("commit main");
@@ -110,15 +115,27 @@ fn fetch_request(id: &str) -> ManagerExecutionRequest {
     }
 }
 
-async fn run_fetch(backend: RuntimeManagerBackend) -> (JobPhase, Arc<Mutex<JobJournal>>) {
+async fn run_job(
+    backend: RuntimeManagerBackend,
+    kind: JobKind,
+    payload_key: &str,
+) -> (JobPhase, Arc<Mutex<JobJournal>>) {
     let journal = Arc::new(Mutex::new(JobJournal::new()));
     let id = journal
         .lock()
         .expect("journal lock")
-        .enqueue(JobKind::Fetch, "official")
-        .expect("enqueue fetch");
+        .enqueue(kind, payload_key)
+        .expect("enqueue manager job");
     let (executor, worker) = ManagerExecutor::start(journal.clone(), backend);
-    executor.submit(fetch_request(&id)).expect("submit fetch");
+    executor
+        .submit(ManagerExecutionRequest {
+            id: id.clone(),
+            kind,
+            payload_key: payload_key.into(),
+            expected_generation: 0,
+            runtime_lease: None,
+        })
+        .expect("submit manager job");
     executor.shutdown_for_test();
     worker.await.expect("manager worker");
     let phase = journal
@@ -128,6 +145,14 @@ async fn run_fetch(backend: RuntimeManagerBackend) -> (JobPhase, Arc<Mutex<JobJo
         .expect("fetch job")
         .phase;
     (phase, journal)
+}
+
+async fn run_fetch(backend: RuntimeManagerBackend) -> (JobPhase, Arc<Mutex<JobJournal>>) {
+    run_job(backend, JobKind::Fetch, "official").await
+}
+
+fn build_key(source_receipt_id: &str, role: &str) -> String {
+    format!("{source_receipt_id}:{role}")
 }
 
 #[tokio::test]
@@ -298,6 +323,221 @@ async fn fetch_refuses_symlinked_git_object_storage() {
     let store = store.lock().expect("store lock");
     assert!(store.snapshot().source_receipts.is_empty());
     assert_eq!(store.snapshot().release_pointers.active, None);
+}
+
+#[tokio::test]
+async fn build_from_receipt_uses_unique_pinned_worktrees_and_reopens_artifacts() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let remote = url::Url::from_file_path(&fixture.remote)
+        .expect("file URL")
+        .to_string();
+    let (fetch_phase, _) = run_fetch(backend(&manager_root, &remote, "main", store.clone())).await;
+    assert_eq!(fetch_phase, JobPhase::Succeeded);
+    let source_receipt_id = format!("source-{}", fixture.main_commit);
+
+    let (first_phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&source_receipt_id, "ds4-server"),
+    )
+    .await;
+    assert_eq!(first_phase, JobPhase::Succeeded);
+    let first_artifact = {
+        let store = store.lock().expect("store lock");
+        assert_eq!(store.snapshot().artifacts.len(), 1);
+        assert_eq!(store.snapshot().release_pointers.active, None);
+        let artifact = store
+            .snapshot()
+            .artifacts
+            .values()
+            .next()
+            .expect("first build artifact");
+        let ArtifactProvenance::Build {
+            source_receipt_id: provenance_id,
+            record,
+        } = &artifact.provenance
+        else {
+            panic!("build provenance");
+        };
+        assert_eq!(provenance_id, &source_receipt_id);
+        assert_eq!(record.source, fixture.main_commit);
+        assert_eq!(record.role, "ds4-server");
+        assert_eq!(record.target, "ds4-server");
+        assert_eq!(record.arch, std::env::consts::ARCH);
+        assert_eq!(record.flags, "default");
+        assert!(!record.toolchain.is_empty());
+        assert!(!record.help_digest.is_empty());
+        std::fs::read(manager_root.join(&artifact.rel_path)).expect("published build bytes")
+    };
+
+    let (second_phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&source_receipt_id, "ds4-server"),
+    )
+    .await;
+    assert_eq!(second_phase, JobPhase::Succeeded);
+    let store_guard = store.lock().expect("store lock");
+    assert_eq!(store_guard.snapshot().artifacts.len(), 2);
+    let artifact_bytes = store_guard
+        .snapshot()
+        .artifacts
+        .values()
+        .map(|artifact| {
+            std::fs::read(manager_root.join(&artifact.rel_path)).expect("build artifact bytes")
+        })
+        .collect::<Vec<_>>();
+    assert!(artifact_bytes.iter().any(|bytes| bytes == &first_artifact));
+    assert_ne!(
+        artifact_bytes[0], artifact_bytes[1],
+        "workspaces are unique"
+    );
+    drop(store_guard);
+
+    let cache = manager_root.join("ds4/sources/official.git");
+    let worktrees = GitRunner::default()
+        .run([
+            "--git-dir",
+            cache.to_str().unwrap(),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .expect("list worktrees after cleanup");
+    assert_eq!(worktrees.matches("worktree ").count(), 1);
+    let reopened = ManagerReleaseStore::open(ManagerRoot::explicit(manager_root.clone()), "node-a")
+        .expect("reopen release store");
+    assert_eq!(reopened.snapshot().artifacts.len(), 2);
+    assert_eq!(reopened.snapshot().source_receipts.len(), 1);
+}
+
+#[tokio::test]
+async fn build_failures_never_publish_artifact_records() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let remote = url::Url::from_file_path(&fixture.remote)
+        .expect("file URL")
+        .to_string();
+    assert_eq!(
+        run_fetch(backend(&manager_root, &remote, "main", store.clone()))
+            .await
+            .0,
+        JobPhase::Succeeded
+    );
+    let source_id = format!("source-{}", fixture.main_commit);
+
+    let (unknown_phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&format!("source-{}", "0".repeat(40)), "ds4-server"),
+    )
+    .await;
+    assert_eq!(unknown_phase, JobPhase::Failed);
+    let (role_phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&source_id, "unapproved-role"),
+    )
+    .await;
+    assert_eq!(role_phase, JobPhase::Failed);
+    let (missing_output_phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&source_id, "ds4-agent"),
+    )
+    .await;
+    assert_eq!(missing_output_phase, JobPhase::Failed);
+
+    let canceled = backend(&manager_root, &remote, "main", store.clone()).execute(
+        ManagerExecutionRequest {
+            id: "build-canceled".into(),
+            kind: JobKind::Build,
+            payload_key: build_key(&source_id, "ds4-server"),
+            expected_generation: 0,
+            runtime_lease: None,
+        },
+        Arc::new(AtomicBool::new(true)),
+    );
+    assert!(matches!(
+        canceled,
+        Err(siderostat::manager::executor::ManagerExecutionError::Canceled)
+    ));
+    let store_guard = store.lock().expect("store lock");
+    assert!(store_guard.snapshot().artifacts.is_empty());
+    assert_eq!(store_guard.snapshot().release_pointers.active, None);
+}
+
+#[tokio::test]
+async fn build_rejects_receipt_without_a_reachable_main_proof() {
+    let fixture = fixture();
+    let manager_root = fixture.base.join("manager");
+    let store = store(&manager_root);
+    let remote = url::Url::from_file_path(&fixture.remote)
+        .expect("file URL")
+        .to_string();
+    assert_eq!(
+        run_fetch(backend(&manager_root, &remote, "main", store.clone()))
+            .await
+            .0,
+        JobPhase::Succeeded
+    );
+    let source_receipt_id = format!("source-{}", fixture.main_commit);
+    drop(store);
+
+    let index = manager_root.join("ds4/operations/manager-release-store.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).expect("read release store"))
+            .expect("decode release store");
+    snapshot["source_receipts"][&source_receipt_id]["main_proof"] =
+        serde_json::Value::String("0".repeat(40));
+    std::fs::write(
+        &index,
+        serde_json::to_vec(&snapshot).expect("encode release store"),
+    )
+    .expect("replace stale proof");
+    let store = Arc::new(Mutex::new(
+        ManagerReleaseStore::open(ManagerRoot::explicit(manager_root.clone()), "node-a")
+            .expect("reopen modified store"),
+    ));
+
+    let (phase, _) = run_job(
+        backend(&manager_root, &remote, "main", store.clone()),
+        JobKind::Build,
+        &build_key(&source_receipt_id, "ds4-server"),
+    )
+    .await;
+    assert_eq!(phase, JobPhase::Failed);
+    let store_guard = store.lock().expect("store lock");
+    assert!(store_guard.snapshot().artifacts.is_empty());
+    assert_eq!(store_guard.snapshot().release_pointers.active, None);
+}
+
+#[test]
+fn build_payload_key_contains_only_receipt_identity_and_allowlisted_role() {
+    assert_eq!(
+        siderostat::manager::executor::manager_build_payload_key(
+            &format!("source-{}", "a".repeat(40)),
+            "ds4-server"
+        ),
+        Some(build_key(
+            &format!("source-{}", "a".repeat(40)),
+            "ds4-server"
+        ))
+    );
+    assert_eq!(
+        siderostat::manager::executor::manager_build_payload_key("source-unknown", "ds4-server"),
+        None
+    );
+    assert_eq!(
+        siderostat::manager::executor::manager_build_payload_key(
+            &format!("source-{}", "a".repeat(40)),
+            "../../bin/sh"
+        ),
+        None
+    );
 }
 
 #[test]

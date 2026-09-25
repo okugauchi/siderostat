@@ -326,6 +326,125 @@ impl ManagerReleaseStore {
         Ok(())
     }
 
+    /// Create a fresh build workspace under the managed builds directory.
+    /// The path is generated here and is never supplied by a job payload.
+    pub fn create_build_workspace(&self) -> Result<PathBuf, StoreError> {
+        let builds = self.root.paths().builds;
+        self.ensure_managed_directory(&builds)?;
+        let workspaces = builds.join("workspaces");
+        self.ensure_managed_directory(&workspaces)?;
+        for _ in 0..4 {
+            let path = workspaces.join(format!("build-{}", uuid::Uuid::new_v4()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    set_private_dir(&path)?;
+                    self.validate_build_workspace(&path)?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Err(StoreError::InvalidRecord(
+            "build workspace allocation".into(),
+        ))
+    }
+
+    /// Validate an allocated build workspace immediately before passing it to
+    /// Git or a build child process.
+    pub fn validate_build_workspace(&self, path: &Path) -> Result<(), StoreError> {
+        let workspaces = self.root.paths().builds.join("workspaces");
+        if path.parent() != Some(workspaces.as_path())
+            || !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("build-"))
+        {
+            return Err(StoreError::PathOutsideRoot);
+        }
+        self.validate_managed_directory(&self.root.paths().builds)?;
+        self.validate_managed_directory(&workspaces)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(StoreError::SymlinkEscape);
+            }
+            Ok(_) => {
+                let canonical = fs::canonicalize(path).map_err(io_error)?;
+                if !canonical.starts_with(&self.canonical_root) {
+                    return Err(StoreError::PathOutsideRoot);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::InvalidRecord("build workspace missing".into()));
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        Ok(())
+    }
+
+    fn ensure_managed_directory(&self, path: &Path) -> Result<(), StoreError> {
+        let root = self.root.root();
+        if !path.starts_with(root) {
+            return Err(StoreError::PathOutsideRoot);
+        }
+        if fs::canonicalize(root).map_err(io_error)? != self.canonical_root {
+            return Err(StoreError::SymlinkEscape);
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| StoreError::PathOutsideRoot)?;
+        let mut cursor = root.to_path_buf();
+        self.validate_directory_component(&cursor)?;
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => cursor.push(part),
+                _ => return Err(StoreError::PathOutsideRoot),
+            }
+            match fs::symlink_metadata(&cursor) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(StoreError::SymlinkEscape);
+                }
+                Ok(_) => self.validate_directory_component(&cursor)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cursor).map_err(io_error)?;
+                    set_private_dir(&cursor)?;
+                    self.validate_directory_component(&cursor)?;
+                }
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_managed_directory(&self, path: &Path) -> Result<(), StoreError> {
+        let root = self.root.root();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| StoreError::PathOutsideRoot)?;
+        let mut cursor = root.to_path_buf();
+        self.validate_directory_component(&cursor)?;
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => cursor.push(part),
+                _ => return Err(StoreError::PathOutsideRoot),
+            }
+            self.validate_directory_component(&cursor)?;
+        }
+        Ok(())
+    }
+
+    fn validate_directory_component(&self, path: &Path) -> Result<(), StoreError> {
+        let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StoreError::SymlinkEscape);
+        }
+        let canonical = fs::canonicalize(path).map_err(io_error)?;
+        if !canonical.starts_with(&self.canonical_root) {
+            return Err(StoreError::PathOutsideRoot);
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &ManagerRoot {
         &self.root
     }
@@ -390,6 +509,14 @@ impl ManagerReleaseStore {
     ) -> Result<PersistedArtifactRecord, StoreError> {
         if !full_sha256(&draft.expected_sha256) || draft.expected_size == 0 {
             return Err(StoreError::InvalidDigest);
+        }
+        if let ArtifactProvenance::Build { record, .. } = &draft.provenance {
+            if !super::build::is_approved_role(&record.role)
+                || !super::build::is_approved_target(&record.target)
+                || record.target != record.role
+            {
+                return Err(StoreError::InvalidRecord("build target".into()));
+            }
         }
         self.validate_provenance(
             &self.snapshot,
@@ -580,6 +707,10 @@ impl ManagerReleaseStore {
                     || record.digest != sha256
                     || !full_sha256(&record.help_digest)
                     || record.role.is_empty()
+                    || (!record.target.is_empty()
+                        && (!super::build::is_approved_role(&record.role)
+                            || !super::build::is_approved_target(&record.target)
+                            || record.target != record.role))
                 {
                     return Err(StoreError::InvalidRecord("build provenance".into()));
                 }
@@ -993,6 +1124,7 @@ mod tests {
             toolchain: "rustc-test".into(),
             arch: "arm64".into(),
             role: "ds4-server".into(),
+            target: "ds4-server".into(),
             digest: HELLO_SHA256.into(),
             help_digest: "b".repeat(64),
         }
@@ -1085,6 +1217,69 @@ mod tests {
             reopened.snapshot().release_pointers.previous,
             Some(ReleaseIdentity::ExternalBaseline { .. })
         ));
+    }
+
+    #[test]
+    fn build_workspace_is_managed_and_rejects_symlink_replacement() {
+        let root_path = root("build-workspace");
+        let outside = root("build-workspace-outside");
+        fs::create_dir_all(&outside).expect("create outside");
+        let store = ManagerReleaseStore::open(ManagerRoot::explicit(root_path.clone()), "node-a")
+            .expect("open store");
+        let workspace = store.create_build_workspace().expect("allocate workspace");
+        store
+            .validate_build_workspace(&workspace)
+            .expect("validate managed workspace");
+        fs::remove_dir(&workspace).expect("remove workspace directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &workspace).expect("replace with symlink");
+        assert_eq!(
+            store.validate_build_workspace(&workspace),
+            Err(StoreError::SymlinkEscape)
+        );
+        let _ = fs::remove_dir_all(&root_path);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn build_publication_rejects_unapproved_persisted_target() {
+        let root_path = root("build-target");
+        let mut store =
+            ManagerReleaseStore::open(ManagerRoot::explicit(root_path.clone()), "node-a")
+                .expect("open store");
+        let source = source_record();
+        let source_id = store.record_source(source.clone()).expect("source receipt");
+        let build_path = source_file(&root_path, "unsafe-target", b"hello");
+        let mut record = build_record(&source);
+        record.target = "../../bin/sh".into();
+        let error = store
+            .publish_artifact(
+                &build_path,
+                ArtifactDraft {
+                    kind: ArtifactKind::Build,
+                    expected_sha256: HELLO_SHA256.into(),
+                    expected_size: 5,
+                    provenance: ArtifactProvenance::Build {
+                        source_receipt_id: source_id,
+                        record,
+                    },
+                },
+            )
+            .expect_err("reject unapproved target");
+        assert_eq!(error, StoreError::InvalidRecord("build target".into()));
+        assert!(store.snapshot().artifacts.is_empty());
+        let _ = fs::remove_dir_all(&root_path);
+    }
+
+    #[test]
+    fn legacy_build_record_without_target_remains_readable() {
+        let mut value = serde_json::to_value(build_record(&source_record())).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("build record object")
+            .remove("target");
+        let record: BuildRecord = serde_json::from_value(value).expect("legacy record");
+        assert!(record.target.is_empty());
     }
 
     #[test]

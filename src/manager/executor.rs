@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::manager::catalog;
 use crate::manager::jobs::{JobJournal, JobKind, JobPhase, ManagerJobError};
+use crate::manager::process::{CommandSpec, GroupRunner};
 use crate::manager::{activation, build, download, registry, rollback, source, stage, verify};
 
 /// The immutable context passed from a submitted job to its backend.
@@ -69,6 +70,10 @@ pub enum ManagerJobInput {
         request: Box<build::BuildRequest>,
         source: registry::SourceRecord,
     },
+    BuildFromReceipt {
+        source_receipt_id: String,
+        role: String,
+    },
     Download {
         spec: download::DownloadSpec,
         catalog_id: String,
@@ -95,6 +100,7 @@ impl ManagerJobInput {
         match self {
             Self::Fetch { .. } => JobKind::Fetch,
             Self::Build { .. } => JobKind::Build,
+            Self::BuildFromReceipt { .. } => JobKind::Build,
             Self::Download { .. } => JobKind::Download,
             Self::Verify { .. } => JobKind::Verify,
             Self::Stage { .. } => JobKind::Stage,
@@ -113,6 +119,26 @@ pub enum ManagerInputError {
 pub const OFFICIAL_DS4_REMOTE: &str = "https://github.com/antirez/ds4.git";
 pub const OFFICIAL_FETCH_KEY: &str = "official";
 pub const OFFICIAL_DS4_MAIN_REF: &str = "refs/heads/main";
+
+/// Format the only data accepted by a receipt-backed Build request.
+pub fn manager_build_payload_key(source_receipt_id: &str, role: &str) -> Option<String> {
+    (valid_source_receipt_id(source_receipt_id) && build::is_approved_role(role))
+        .then(|| format!("{source_receipt_id}:{role}"))
+}
+
+fn parse_manager_build_payload_key(value: &str) -> Option<(String, String)> {
+    let (source_receipt_id, role) = value.split_once(':')?;
+    if value.matches(':').count() != 1
+        || manager_build_payload_key(source_receipt_id, role).as_deref() != Some(value)
+    {
+        return None;
+    }
+    Some((source_receipt_id.to_owned(), role.to_owned()))
+}
+
+fn valid_source_receipt_id(value: &str) -> bool {
+    value.strip_prefix("source-").is_some_and(full_git_commit)
+}
 
 /// Explicitly configured payload keys. An empty resolver is safe for a runtime
 /// that has not yet connected its source, catalog, registry, and cluster state.
@@ -204,6 +230,16 @@ impl ManagerJobInputResolver {
             return Err(ManagerInputError::Rejected);
         }
         let Some(plan) = self.plans.get(&(request.kind, request.payload_key.clone())) else {
+            if request.kind == JobKind::Build {
+                if let Some((source_receipt_id, role)) =
+                    parse_manager_build_payload_key(&request.payload_key)
+                {
+                    return Ok(ManagerJobInput::BuildFromReceipt {
+                        source_receipt_id,
+                        role,
+                    });
+                }
+            }
             return if matches!(request.kind, JobKind::Download | JobKind::Stage)
                 && self.model_catalog.is_empty()
             {
@@ -241,6 +277,14 @@ impl ManagerJobInputResolver {
                 }
                 if check_real_inputs && !pinned_checkout_matches(req) {
                     return Err(ManagerInputError::Unavailable);
+                }
+            }
+            ManagerJobInput::BuildFromReceipt {
+                source_receipt_id,
+                role,
+            } => {
+                if !valid_source_receipt_id(source_receipt_id) || !build::is_approved_role(role) {
+                    return Err(ManagerInputError::Rejected);
                 }
             }
             ManagerJobInput::Download {
@@ -491,6 +535,322 @@ impl RuntimeManagerBackend {
     }
 }
 
+impl RuntimeManagerBackend {
+    fn build_from_receipt(
+        &self,
+        source_receipt_id: &str,
+        role: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerExecutionError> {
+        if !valid_source_receipt_id(source_receipt_id) || !build::is_approved_role(role) {
+            return Err(ManagerExecutionError::InputRejected(
+                "invalid build input".into(),
+            ));
+        }
+        let store = self
+            .manager_store
+            .as_ref()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let (receipt, cache, workspace) = {
+            let store_guard = store
+                .lock()
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            let receipt = store_guard
+                .snapshot()
+                .source_receipts
+                .get(source_receipt_id)
+                .cloned()
+                .ok_or(ManagerExecutionError::Unavailable)?;
+            if format!("source-{}", receipt.full_commit) != source_receipt_id
+                || !full_git_commit(&receipt.full_commit)
+                || !full_git_commit(&receipt.main_proof)
+                || !approved_source_remote(&receipt.remote)
+            {
+                return Err(ManagerExecutionError::Unavailable);
+            }
+            let cache = store_guard.official_source_cache_path();
+            store_guard
+                .validate_source_cache_path(&cache)
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            let workspace = store_guard
+                .create_build_workspace()
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            (receipt, cache, workspace)
+        };
+
+        let result =
+            self.build_from_receipt_in_workspace(store, &cache, &workspace, &receipt, role, cancel);
+        let cleanup = cleanup_build_workspace(store, &cache, &workspace);
+        match cleanup {
+            Err(error) => Err(error),
+            Ok(()) => result,
+        }
+    }
+
+    fn build_from_receipt_in_workspace(
+        &self,
+        store: &Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+        cache: &std::path::Path,
+        workspace: &std::path::Path,
+        receipt: &registry::SourceRecord,
+        role: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerExecutionError> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        validate_build_paths(store, cache, workspace)?;
+        let cache_text = cache.to_str().ok_or(ManagerExecutionError::Unavailable)?;
+        let workspace_text = workspace
+            .to_str()
+            .ok_or(ManagerExecutionError::Unavailable)?;
+        let git = source::GitRunner::default();
+        let commit_expr = format!("{}^{{commit}}", receipt.full_commit);
+        validate_build_paths(store, cache, workspace)?;
+        let commit = git
+            .run_cancellable(
+                [
+                    "--git-dir",
+                    cache_text,
+                    "rev-parse",
+                    "--verify",
+                    commit_expr.as_str(),
+                ],
+                cancel,
+            )
+            .map_err(map_source_error)?;
+        if commit != receipt.full_commit {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+        let main_expr = format!("{}^{{commit}}", receipt.main_proof);
+        validate_build_paths(store, cache, workspace)?;
+        let main_commit = git
+            .run_cancellable(
+                [
+                    "--git-dir",
+                    cache_text,
+                    "rev-parse",
+                    "--verify",
+                    main_expr.as_str(),
+                ],
+                cancel,
+            )
+            .map_err(map_source_error)?;
+        if main_commit != receipt.main_proof {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+        validate_build_paths(store, cache, workspace)?;
+        git.run_cancellable(
+            [
+                "--git-dir",
+                cache_text,
+                "merge-base",
+                "--is-ancestor",
+                receipt.full_commit.as_str(),
+                receipt.main_proof.as_str(),
+            ],
+            cancel,
+        )
+        .map_err(map_source_error)?;
+        validate_build_paths(store, cache, workspace)?;
+        git.run_cancellable(
+            [
+                "--git-dir",
+                cache_text,
+                "worktree",
+                "add",
+                "--detach",
+                workspace_text,
+                receipt.full_commit.as_str(),
+            ],
+            cancel,
+        )
+        .map_err(map_source_error)?;
+        validate_build_paths(store, cache, workspace)?;
+        let head = git
+            .run_cancellable(
+                [
+                    "-C",
+                    workspace_text,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                ],
+                cancel,
+            )
+            .map_err(map_source_error)?;
+        validate_build_paths(store, cache, workspace)?;
+        let status = git
+            .run_cancellable(
+                [
+                    "-C",
+                    workspace_text,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ],
+                cancel,
+            )
+            .map_err(map_source_error)?;
+        if head != receipt.full_commit || !status.is_empty() {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+
+        validate_build_paths(store, cache, workspace)?;
+        let make_version = GroupRunner::new()
+            .run_group(
+                &CommandSpec::minimal("make", vec!["--version".into()], workspace),
+                cancel,
+            )
+            .map_err(|error| {
+                if cancel.load(Ordering::SeqCst) {
+                    ManagerExecutionError::Canceled
+                } else {
+                    ManagerExecutionError::Domain(error.to_string())
+                }
+            })?;
+        let toolchain = make_version
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if toolchain.is_empty() || toolchain.len() > 256 {
+            return Err(ManagerExecutionError::Unavailable);
+        }
+        let request = build::BuildRequest {
+            role: role.into(),
+            target: role.into(),
+            flags: "default".into(),
+            toolchain: toolchain.into(),
+            arch: std::env::consts::ARCH.into(),
+            source: receipt.full_commit.clone(),
+            make_program: "make".into(),
+            workspace: workspace.to_path_buf(),
+            output_rel: PathBuf::from(role),
+            help_rel: PathBuf::from("help.txt"),
+            disk_needed: 2 << 30,
+        };
+        validate_build_paths(store, cache, workspace)?;
+        let outcome = build::build_artifacts(&request, cancel).map_err(map_build_error)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ManagerExecutionError::Canceled);
+        }
+        let output = workspace.join(&request.output_rel);
+        let metadata = std::fs::symlink_metadata(&output)
+            .map_err(|_| ManagerExecutionError::Domain("build output unavailable".into()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(ManagerExecutionError::Domain(
+                "build output unavailable".into(),
+            ));
+        }
+        let draft = crate::manager::store::ArtifactDraft {
+            kind: crate::manager::store::ArtifactKind::Build,
+            expected_sha256: outcome.record.digest.clone(),
+            expected_size: metadata.len(),
+            provenance: crate::manager::store::ArtifactProvenance::Build {
+                source_receipt_id: format!("source-{}", receipt.full_commit),
+                record: outcome.record,
+            },
+        };
+        store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?
+            .publish_artifact(&output, draft)
+            .map_err(|_| {
+                ManagerExecutionError::Domain("build artifact publication failed".into())
+            })?;
+        Ok(())
+    }
+}
+
+fn approved_source_remote(remote: &str) -> bool {
+    if remote == OFFICIAL_DS4_REMOTE {
+        return true;
+    }
+    #[cfg(feature = "test-support")]
+    {
+        url::Url::parse(remote).is_ok_and(|url| url.scheme() == "file" && url.host_str().is_none())
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        false
+    }
+}
+
+fn map_build_error(error: build::BuildError) -> ManagerExecutionError {
+    match error {
+        build::BuildError::Canceled => ManagerExecutionError::Canceled,
+        other => ManagerExecutionError::Domain(other.to_string()),
+    }
+}
+
+fn map_source_error(error: source::SourceError) -> ManagerExecutionError {
+    match error {
+        source::SourceError::Canceled => ManagerExecutionError::Canceled,
+        _ => ManagerExecutionError::Domain("pinned source validation failed".into()),
+    }
+}
+
+fn validate_build_paths(
+    store: &Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+    cache: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<(), ManagerExecutionError> {
+    let store_guard = store
+        .lock()
+        .map_err(|_| ManagerExecutionError::Unavailable)?;
+    store_guard
+        .validate_source_cache_path(cache)
+        .and_then(|_| store_guard.validate_build_workspace(workspace))
+        .map_err(|_| ManagerExecutionError::Unavailable)
+}
+
+fn cleanup_build_workspace(
+    store: &Arc<Mutex<crate::manager::store::ManagerReleaseStore>>,
+    cache: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<(), ManagerExecutionError> {
+    let store_guard = store
+        .lock()
+        .map_err(|_| ManagerExecutionError::Unavailable)?;
+    store_guard
+        .validate_source_cache_path(cache)
+        .and_then(|_| store_guard.validate_build_workspace(workspace))
+        .map_err(|_| ManagerExecutionError::Unavailable)?;
+    drop(store_guard);
+    let cache_text = cache.to_str().ok_or(ManagerExecutionError::Unavailable)?;
+    let workspace_text = workspace
+        .to_str()
+        .ok_or(ManagerExecutionError::Unavailable)?;
+    let git = source::GitRunner::default();
+    // Cleanup is local metadata work and must still run after cancellation.
+    let _ = git.run([
+        "--git-dir",
+        cache_text,
+        "worktree",
+        "remove",
+        "--force",
+        workspace_text,
+    ]);
+    {
+        let store_guard = store
+            .lock()
+            .map_err(|_| ManagerExecutionError::Unavailable)?;
+        if std::fs::symlink_metadata(workspace).is_ok() {
+            store_guard
+                .validate_build_workspace(workspace)
+                .map_err(|_| ManagerExecutionError::Unavailable)?;
+            std::fs::remove_dir_all(workspace).map_err(|_| {
+                ManagerExecutionError::Domain("build workspace cleanup failed".into())
+            })?;
+        }
+    }
+    git.run(["--git-dir", cache_text, "worktree", "prune"])
+        .map_err(map_source_error)?;
+    Ok(())
+}
+
 impl ManagerExecutionBackend for RuntimeManagerBackend {
     fn execute(
         &self,
@@ -543,8 +903,13 @@ impl ManagerExecutionBackend for RuntimeManagerBackend {
                     .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
             }
             ManagerJobInput::Build { request, .. } => {
-                build::build_artifacts(&request, &cancel)
-                    .map_err(|error| ManagerExecutionError::Domain(error.to_string()))?;
+                build::build_artifacts(&request, &cancel).map_err(map_build_error)?;
+            }
+            ManagerJobInput::BuildFromReceipt {
+                source_receipt_id,
+                role,
+            } => {
+                self.build_from_receipt(&source_receipt_id, &role, &cancel)?;
             }
             ManagerJobInput::Download {
                 spec, part_path, ..

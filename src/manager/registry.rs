@@ -447,7 +447,7 @@ pub struct SourceRecord {
     pub fetched_at: u64,
 }
 
-/// BuildRecord。C04: source/flags/toolchain/arch/role digest/help digest。M01。
+/// BuildRecord。C04: source/flags/toolchain/arch/role/target digest/help digest。M01。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuildRecord {
     /// source の commit ref。M01。
@@ -460,6 +460,9 @@ pub struct BuildRecord {
     pub arch: String,
     /// role（worker/coordinator 等）。M01。
     pub role: String,
+    /// 実行した固定 make target。旧 store record との互換用に欠落時は空。
+    #[serde(default)]
+    pub target: String,
     /// binary digest（full SHA-256）。M01。
     pub digest: String,
     /// help text digest。M01。
