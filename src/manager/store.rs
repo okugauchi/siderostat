@@ -6,8 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use super::jobs::ManagerJob;
+use super::jobs::{JobPersistence, ManagerJob, PersistenceError};
 use super::registry::{ArtifactState, BuildRecord, ManagerRoot, SourceRecord};
+use std::sync::{Arc, Mutex};
 
 /// Current on-disk release-store schema.
 pub const STORE_SCHEMA_VERSION: u32 = 1;
@@ -283,7 +284,7 @@ impl ManagerReleaseStore {
                         found: snapshot.node_id,
                     });
                 }
-                store.validate_snapshot(&snapshot)?;
+                store.validate_snapshot(&snapshot, true)?;
                 store.snapshot = snapshot;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -300,6 +301,33 @@ impl ManagerReleaseStore {
 
     pub fn root(&self) -> &ManagerRoot {
         &self.root
+    }
+
+    /// Load the durable job set and ID sequence from this store.
+    pub fn load_jobs(&self) -> (Vec<ManagerJob>, u64) {
+        (
+            self.snapshot.jobs.values().cloned().collect(),
+            self.snapshot.next_job_id,
+        )
+    }
+
+    /// Atomically replace jobs and next ID while preserving the rest of the snapshot.
+    pub fn save_jobs(
+        &mut self,
+        records: &[ManagerJob],
+        next_job_id: u64,
+    ) -> Result<(), StoreError> {
+        let mut jobs = BTreeMap::new();
+        for job in records {
+            if job.id.trim().is_empty() || job.progress > 100 || jobs.contains_key(&job.id) {
+                return Err(StoreError::InvalidRecord("job journal".into()));
+            }
+            jobs.insert(job.id.clone(), job.clone());
+        }
+        let mut candidate = self.snapshot.clone();
+        candidate.jobs = jobs;
+        candidate.next_job_id = next_job_id;
+        self.commit_candidate(candidate)
     }
 
     pub fn record_source(&mut self, record: SourceRecord) -> Result<String, StoreError> {
@@ -415,7 +443,6 @@ impl ManagerReleaseStore {
             return Ok(id);
         }
         candidate.profiles.insert(id.clone(), record);
-        self.validate_snapshot(&candidate)?;
         self.commit_candidate(candidate)?;
         Ok(id)
     }
@@ -430,7 +457,9 @@ impl ManagerReleaseStore {
             active: Some(active),
             previous,
         };
-        self.validate_snapshot(&candidate)?;
+        if let Some(active) = candidate.release_pointers.active.as_ref() {
+            self.verify_release_artifacts(&candidate, active)?;
+        }
         self.commit_candidate(candidate)
     }
 
@@ -439,7 +468,7 @@ impl ManagerReleaseStore {
     }
 
     fn commit_candidate(&mut self, candidate: ManagerStoreSnapshot) -> Result<(), StoreError> {
-        self.validate_snapshot(&candidate)?;
+        self.validate_snapshot(&candidate, false)?;
         self.persist_candidate(&candidate)?;
         self.snapshot = candidate;
         Ok(())
@@ -529,7 +558,11 @@ impl ManagerReleaseStore {
         Ok(())
     }
 
-    fn validate_snapshot(&self, snapshot: &ManagerStoreSnapshot) -> Result<(), StoreError> {
+    fn validate_snapshot(
+        &self,
+        snapshot: &ManagerStoreSnapshot,
+        verify_artifact_digests: bool,
+    ) -> Result<(), StoreError> {
         if snapshot.schema_version != STORE_SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema(snapshot.schema_version));
         }
@@ -565,12 +598,18 @@ impl ManagerReleaseStore {
                 return Err(StoreError::PathOutsideRoot);
             }
             let path = self.resolve_artifact_path(&artifact.rel_path)?;
-            let (size, digest) = digest_file(&path)?;
-            if size != artifact.size {
+            let metadata = fs::metadata(&path).map_err(io_error)?;
+            if !metadata.is_file() {
+                return Err(StoreError::InvalidRecord("artifact is not a file".into()));
+            }
+            if metadata.len() != artifact.size {
                 return Err(StoreError::SizeMismatch);
             }
-            if digest != artifact.sha256 {
-                return Err(StoreError::DigestMismatch);
+            if verify_artifact_digests {
+                let (_, digest) = digest_file(&path)?;
+                if digest != artifact.sha256 {
+                    return Err(StoreError::DigestMismatch);
+                }
             }
             self.validate_provenance(
                 snapshot,
@@ -681,6 +720,39 @@ impl ManagerReleaseStore {
         Ok(())
     }
 
+    fn verify_release_artifacts(
+        &self,
+        snapshot: &ManagerStoreSnapshot,
+        identity: &ReleaseIdentity,
+    ) -> Result<(), StoreError> {
+        let ReleaseIdentity::ManagedProfile(profile_id) = identity else {
+            return Ok(());
+        };
+        let profile = snapshot
+            .profiles
+            .get(profile_id)
+            .ok_or_else(|| StoreError::InvalidReference("release profile".into()))?;
+        for artifact_id in profile
+            .role_artifact_ids
+            .iter()
+            .chain(std::iter::once(&profile.model_artifact_id))
+        {
+            let artifact = snapshot
+                .artifacts
+                .get(artifact_id)
+                .ok_or_else(|| StoreError::InvalidReference("release artifact".into()))?;
+            let path = self.resolve_artifact_path(&artifact.rel_path)?;
+            let (size, digest) = digest_file(&path)?;
+            if size != artifact.size {
+                return Err(StoreError::SizeMismatch);
+            }
+            if digest != artifact.sha256 {
+                return Err(StoreError::DigestMismatch);
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_artifact_path(&self, rel_path: &Path) -> Result<PathBuf, StoreError> {
         validate_relative_path(rel_path)?;
         let mut current = self.root.root().to_path_buf();
@@ -699,6 +771,36 @@ impl ManagerReleaseStore {
             return Err(StoreError::SymlinkEscape);
         }
         Ok(canonical)
+    }
+}
+
+/// Adapter that persists the JobJournal into the shared release-store snapshot.
+/// Callers hold the journal lock before this adapter acquires the store lock.
+#[derive(Clone)]
+pub struct ManagerJobStorePersistence {
+    store: Arc<Mutex<ManagerReleaseStore>>,
+}
+
+impl ManagerJobStorePersistence {
+    pub fn new(store: Arc<Mutex<ManagerReleaseStore>>) -> Self {
+        Self { store }
+    }
+}
+
+impl JobPersistence for ManagerJobStorePersistence {
+    fn load(&self) -> Result<(Vec<ManagerJob>, u64), PersistenceError> {
+        self.store
+            .lock()
+            .map_err(|_| PersistenceError::new("manager store lock poisoned"))
+            .map(|store| store.load_jobs())
+    }
+
+    fn save(&self, records: &[ManagerJob], next_id: u64) -> Result<(), PersistenceError> {
+        self.store
+            .lock()
+            .map_err(|_| PersistenceError::new("manager store lock poisoned"))?
+            .save_jobs(records, next_id)
+            .map_err(|error| PersistenceError::new(error.to_string()))
     }
 }
 
@@ -979,6 +1081,36 @@ mod tests {
         let reopened =
             ManagerReleaseStore::open(manager_root, "coordinator").expect("reopen unchanged store");
         assert!(reopened.snapshot().release_pointers.active.is_none());
+    }
+
+    #[test]
+    fn metadata_updates_do_not_rehash_artifacts_but_reopen_still_checks_digest() {
+        let root = root("metadata-update");
+        let manager_root = ManagerRoot::explicit(root.clone());
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "node-a").expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root);
+        let artifact = store
+            .snapshot()
+            .artifacts
+            .values()
+            .next()
+            .expect("artifact")
+            .clone();
+        fs::write(root.join(artifact.rel_path), b"jello").expect("tamper same size");
+
+        assert!(matches!(
+            store.set_release_pointers(ReleaseIdentity::ManagedProfile(profile_id), None),
+            Err(StoreError::DigestMismatch)
+        ));
+        assert!(store.snapshot().release_pointers.active.is_none());
+
+        store.save_jobs(&[], 0).expect("metadata-only update");
+        drop(store);
+        assert!(matches!(
+            ManagerReleaseStore::open(manager_root, "node-a"),
+            Err(StoreError::DigestMismatch)
+        ));
     }
 
     #[test]

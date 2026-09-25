@@ -58,7 +58,9 @@ pub use executor::{
     ManagerExecutionBackend, ManagerExecutionError, ManagerExecutionOutcome,
     ManagerExecutionRequest, ManagerExecutor, ManagerExecutorError, ManagerExecutorHandle,
 };
-pub use jobs::{JobJournal, JobKind, ManagerJob, ManagerJobError};
+pub use jobs::{
+    JobJournal, JobKind, JobPersistence, JobPhase, ManagerJob, ManagerJobError, PersistenceError,
+};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
 pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,
@@ -71,8 +73,8 @@ pub use stage::{
     build_activation_plan, stage_profile,
 };
 pub use store::{
-    ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerReleaseStore,
-    ManagerStoreSnapshot, PersistedActivationPhase, PersistedActivationRecord,
+    ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerJobStorePersistence,
+    ManagerReleaseStore, ManagerStoreSnapshot, PersistedActivationPhase, PersistedActivationRecord,
     PersistedArtifactRecord, PersistedParticipantRecord, ProfileCompatibility, ReleaseIdentity,
     ReleasePointers, STORE_SCHEMA_VERSION, StagedProfileRecord, StoreError,
 };

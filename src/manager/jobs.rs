@@ -11,6 +11,7 @@
 //! 契約: CONTRACTS.md C04 / ManagerJob。M01。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// job の種類。C04: fetch/build/download/verify/stage/activate/rollback。M01。
@@ -66,6 +67,8 @@ pub enum JobPhase {
     Failed,
     /// キャンセル要求済み。
     Cancelling,
+    /// 再起動前に実行中だったため、再実行は行わず中断扱い。
+    Interrupted,
 }
 
 /// managed job。C04 の `ManagerJob`。M01。
@@ -151,6 +154,12 @@ pub enum ManagerJobError {
     UnknownKind,
     /// 進行中 job が無い。
     NotFound,
+    /// durable journal の読み書きに失敗。
+    Persistence,
+    /// job がすでに terminal phase にある。
+    InvalidTransition,
+    /// job ID sequence が上限に達した。
+    IdExhausted,
 }
 
 impl std::fmt::Display for ManagerJobError {
@@ -158,11 +167,43 @@ impl std::fmt::Display for ManagerJobError {
         match self {
             ManagerJobError::UnknownKind => write!(f, "unknown job kind"),
             ManagerJobError::NotFound => write!(f, "job not found"),
+            ManagerJobError::Persistence => write!(f, "job persistence failed"),
+            ManagerJobError::InvalidTransition => write!(f, "job phase transition is invalid"),
+            ManagerJobError::IdExhausted => write!(f, "job id sequence exhausted"),
         }
     }
 }
 
 impl std::error::Error for ManagerJobError {}
+
+/// Persistence error deliberately carries details only for startup diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistenceError {
+    message: String,
+}
+
+impl PersistenceError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PersistenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PersistenceError {}
+
+/// Durable boundary for the job journal. Implementations must atomically replace
+/// the complete job set and next ID counter.
+pub trait JobPersistence: Send + Sync {
+    fn load(&self) -> Result<(Vec<ManagerJob>, u64), PersistenceError>;
+    fn save(&self, records: &[ManagerJob], next_id: u64) -> Result<(), PersistenceError>;
+}
 
 /// job journal。同一 payload の進行中 job を同 ID で返す。M01。
 ///
@@ -170,19 +211,79 @@ impl std::error::Error for ManagerJobError {}
 /// 文字列が同一の進行中 job が既にあれば、その job の ID を返す。
 /// payload は fetch/build/download/verify/stage/activate/rollback の各
 /// 入力（URL・source ref・artifact ID 等）。M01。
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct JobJournal {
     jobs: HashMap<String, ManagerJob>,
     /// 進行中（Running/Cancelling）の重複キー → job ID。M01。
     running_by_key: HashMap<(JobKind, String), String>,
     /// 次 ID カウンタ（決定論的 ID のための連番）。M01。
     next_id: u64,
+    persistence: Option<Arc<dyn JobPersistence>>,
+}
+
+impl std::fmt::Debug for JobJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobJournal")
+            .field("jobs", &self.jobs)
+            .field("next_id", &self.next_id)
+            .field("persistent", &self.persistence.is_some())
+            .finish()
+    }
 }
 
 impl JobJournal {
     /// 新しい journal。M01。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Durable backend から journal を開く。
+    ///
+    /// 前回終了時に Running/Cancelling だったjobは再開せずInterruptedへ
+    /// 遷移し、その変更を保存してから呼び出し元へ返す。
+    pub fn open(persistence: Arc<dyn JobPersistence>) -> Result<Self, PersistenceError> {
+        let (records, next_id) = persistence.load()?;
+        let mut jobs = HashMap::with_capacity(records.len());
+        let mut changed = false;
+        for mut job in records {
+            if job.id.trim().is_empty() || job.progress > 100 || jobs.contains_key(&job.id) {
+                return Err(PersistenceError::new("invalid persisted manager job"));
+            }
+            if matches!(job.phase, JobPhase::Running | JobPhase::Cancelling) {
+                job.phase = JobPhase::Interrupted;
+                job.cancel = false;
+                job.error = "manager process restarted; work was not resumed".into();
+                job.updated_at = now_secs();
+                changed = true;
+            }
+            jobs.insert(job.id.clone(), job);
+        }
+        if changed {
+            let mut sorted: Vec<_> = jobs.values().cloned().collect();
+            sorted.sort_by(|left, right| left.id.cmp(&right.id));
+            persistence.save(&sorted, next_id)?;
+        }
+        Ok(Self {
+            jobs,
+            running_by_key: HashMap::new(),
+            next_id,
+            persistence: Some(persistence),
+        })
+    }
+
+    fn persist_candidate(
+        &self,
+        jobs: &HashMap<String, ManagerJob>,
+        next_id: u64,
+    ) -> Result<(), ManagerJobError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let mut records: Vec<_> = jobs.values().cloned().collect();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        persistence
+            .save(&records, next_id)
+            .map_err(|_| ManagerJobError::Persistence)
     }
 
     /// job を作成または既存の進行中 job を返す。M01。
@@ -196,16 +297,31 @@ impl JobJournal {
             return Ok(id.clone());
         }
         let id = format!("{}-{}", kind.as_str(), self.next_id);
-        self.next_id += 1;
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ManagerJobError::IdExhausted)?;
         let job = ManagerJob::new(id.clone(), kind);
-        self.running_by_key.insert(key, job.id.clone());
-        self.jobs.insert(id.clone(), job);
+        let mut jobs = self.jobs.clone();
+        jobs.insert(id.clone(), job);
+        self.persist_candidate(&jobs, next_id)?;
+        self.jobs = jobs;
+        self.running_by_key.insert(key, id.clone());
+        self.next_id = next_id;
         Ok(id)
     }
 
-    /// 指定 ID の job を可変参照で取得する。M01。
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut ManagerJob> {
-        self.jobs.get_mut(id)
+    /// 進捗を更新し、保存成功後にだけ新しい値を公開する。
+    pub fn set_progress(&mut self, id: &str, progress: u8) -> Result<(), ManagerJobError> {
+        let mut jobs = self.jobs.clone();
+        let job = jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
+        if !matches!(job.phase, JobPhase::Running | JobPhase::Cancelling) {
+            return Err(ManagerJobError::InvalidTransition);
+        }
+        job.set_progress(progress);
+        self.persist_candidate(&jobs, self.next_id)?;
+        self.jobs = jobs;
+        Ok(())
     }
 
     /// 指定 ID の job を取得する。M01。
@@ -231,24 +347,33 @@ impl JobJournal {
 
     /// job を成功で閉じる。重複キーを解放する。M01。
     pub fn succeed(&mut self, id: &str) -> Result<(), ManagerJobError> {
-        let kind = {
-            let job = self.jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
-            job.succeed();
-            job.kind
-        };
-        self.release_key(kind, id);
+        let mut jobs = self.jobs.clone();
+        let job = jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
+        if job.phase != JobPhase::Running {
+            return Err(ManagerJobError::InvalidTransition);
+        }
+        job.succeed();
+        let mut running_by_key = self.running_by_key.clone();
+        Self::release_key(&mut running_by_key, id);
+        self.persist_candidate(&jobs, self.next_id)?;
+        self.jobs = jobs;
+        self.running_by_key = running_by_key;
         Ok(())
     }
 
     /// job を失敗で閉じる。重複キーを解放する。M01。
     pub fn fail(&mut self, id: &str, error: impl Into<String>) -> Result<(), ManagerJobError> {
-        let kind = {
-            let job = self.jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
-            let error = error.into();
-            job.fail(error);
-            job.kind
-        };
-        self.release_key(kind, id);
+        let mut jobs = self.jobs.clone();
+        let job = jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
+        if !matches!(job.phase, JobPhase::Running | JobPhase::Cancelling) {
+            return Err(ManagerJobError::InvalidTransition);
+        }
+        job.fail(error);
+        let mut running_by_key = self.running_by_key.clone();
+        Self::release_key(&mut running_by_key, id);
+        self.persist_candidate(&jobs, self.next_id)?;
+        self.jobs = jobs;
+        self.running_by_key = running_by_key;
         Ok(())
     }
 
@@ -284,8 +409,14 @@ impl JobJournal {
 
     /// キャンセル要求する。重複キーは保持（キャンセル中も進行扱い）。M01。
     pub fn request_cancel(&mut self, id: &str) -> Result<(), ManagerJobError> {
-        let job = self.jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
+        let mut jobs = self.jobs.clone();
+        let job = jobs.get_mut(id).ok_or(ManagerJobError::NotFound)?;
+        if !matches!(job.phase, JobPhase::Running | JobPhase::Cancelling) {
+            return Err(ManagerJobError::InvalidTransition);
+        }
         job.request_cancel();
+        self.persist_candidate(&jobs, self.next_id)?;
+        self.jobs = jobs;
         Ok(())
     }
 
@@ -297,23 +428,21 @@ impl JobJournal {
     }
 
     /// job 完了時に重複キーを解放する。M01。
-    fn release_key(&mut self, kind: JobKind, id: &str) {
+    fn release_key(running_by_key: &mut HashMap<(JobKind, String), String>, id: &str) {
         // kind が一致し、ID が一致する進行中エントリだけを除去する。
         // （終了した job が別 payload の新規 job の重複判定を誤らないように）
-        let stale: Vec<(JobKind, String)> = self
-            .running_by_key
+        let stale: Vec<(JobKind, String)> = running_by_key
             .iter()
             .filter(|(_, v)| **v == id)
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {
-            if let Some(existing_id) = self.running_by_key.get(&k) {
+            if let Some(existing_id) = running_by_key.get(&k) {
                 if existing_id == id {
-                    self.running_by_key.remove(&k);
+                    running_by_key.remove(&k);
                 }
             }
         }
-        let _ = kind;
     }
 }
 
@@ -386,7 +515,7 @@ mod tests {
     fn job_lifecycle_transitions() {
         let mut journal = JobJournal::new();
         let id = journal.enqueue(JobKind::Stage, "artifact").expect("job");
-        journal.get_mut(&id).expect("job").set_progress(50);
+        journal.set_progress(&id, 50).expect("persist progress");
         assert_eq!(journal.get(&id).expect("job").progress, 50);
         journal.succeed(&id).expect("succeed");
         let job = journal.get(&id).expect("job");

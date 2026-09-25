@@ -68,6 +68,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
     pub jobs: Arc<std::sync::Mutex<crate::manager::jobs::JobJournal>>,
+    /// JobJournal と他の Manager metadata が共有する永続正本。job lock の後に取得する。
+    pub manager_store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
     manager_executor: crate::manager::executor::ManagerExecutorHandle,
     manager_worker: tokio::task::JoinHandle<()>,
     cluster: RwLock<Option<ClusterHandle>>,
@@ -104,7 +106,8 @@ impl AppState {
     where
         B: crate::manager::executor::ManagerExecutionBackend,
     {
-        let state = Self::from_config_with_backend(config, backend)?;
+        let state =
+            Self::from_config_with_manager_root(config, backend, Self::temporary_manager_root())?;
         state.attach_admin(admin);
         Ok(state)
     }
@@ -118,8 +121,56 @@ impl AppState {
     where
         B: crate::manager::executor::ManagerExecutionBackend,
     {
+        #[cfg(feature = "test-support")]
+        {
+            return Self::from_config_with_manager_root(
+                config,
+                backend,
+                Self::temporary_manager_root(),
+            );
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let home = std::env::var_os("HOME").context("HOME is required for manager storage")?;
+            let root = crate::manager::registry::ManagerRoot::default_from_home(
+                std::path::Path::new(&home),
+            );
+            Self::from_config_with_manager_root(config, backend, root)
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn temporary_manager_root() -> crate::manager::registry::ManagerRoot {
+        let root = std::env::temp_dir().join(format!(
+            "siderostat-manager-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::manager::registry::ManagerRoot::explicit(root)
+    }
+
+    fn from_config_with_manager_root<B>(
+        config: ModeAwareConfig,
+        backend: B,
+        manager_root: crate::manager::registry::ManagerRoot,
+    ) -> anyhow::Result<Arc<Self>>
+    where
+        B: crate::manager::executor::ManagerExecutionBackend,
+    {
         tokio::runtime::Handle::try_current()
             .context("manager executor requires a Tokio runtime")?;
+        let manager_store = Arc::new(std::sync::Mutex::new(
+            crate::manager::store::ManagerReleaseStore::open(
+                manager_root,
+                config.cluster.node_id.clone(),
+            )
+            .context("open manager release store")?,
+        ));
+        let job_persistence = Arc::new(crate::manager::store::ManagerJobStorePersistence::new(
+            manager_store.clone(),
+        ));
+        let job_journal = crate::manager::jobs::JobJournal::open(job_persistence)
+            .context("open manager job journal")?;
         let recovery_config = config.recovery.clone();
         let metrics = Arc::new(Metrics::default());
         let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
@@ -157,9 +208,7 @@ impl AppState {
             proxy.admission().start_serving();
         }
 
-        let jobs = Arc::new(std::sync::Mutex::new(
-            crate::manager::jobs::JobJournal::new(),
-        ));
+        let jobs = Arc::new(std::sync::Mutex::new(job_journal));
         let (manager_executor, manager_worker) =
             crate::manager::executor::ManagerExecutor::start(jobs.clone(), backend);
 
@@ -182,6 +231,7 @@ impl AppState {
             proxy,
             metrics,
             jobs,
+            manager_store,
             manager_executor,
             manager_worker,
             cluster: RwLock::new(None),
@@ -2304,6 +2354,10 @@ fn manager_api_error_response(error: &crate::manager::api::ManagerApiError) -> R
             (StatusCode::NOT_FOUND, "job not found".to_string())
         }
         crate::manager::api::ManagerApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+        crate::manager::api::ManagerApiError::Persistence => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "manager job storage unavailable".to_string(),
+        ),
     };
     json_response(status, json!({"error": message}))
 }
@@ -3125,8 +3179,23 @@ mod tests {
             proxy.set_target(ProxyTarget::LocalStandalone, true);
             proxy.admission().start_serving();
         }
+        let store_root = std::env::temp_dir().join(format!(
+            "siderostat-app-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let manager_store = Arc::new(std::sync::Mutex::new(
+            crate::manager::store::ManagerReleaseStore::open(
+                crate::manager::registry::ManagerRoot::explicit(store_root),
+                "test-node",
+            )
+            .expect("manager store"),
+        ));
+        let job_persistence = Arc::new(crate::manager::store::ManagerJobStorePersistence::new(
+            manager_store.clone(),
+        ));
         let jobs = Arc::new(std::sync::Mutex::new(
-            crate::manager::jobs::JobJournal::new(),
+            crate::manager::jobs::JobJournal::open(job_persistence).expect("job journal"),
         ));
         let (manager_executor, manager_worker) = crate::manager::executor::ManagerExecutor::start(
             jobs.clone(),
@@ -3147,6 +3216,7 @@ mod tests {
             proxy,
             metrics: Arc::new(Metrics::default()),
             jobs,
+            manager_store,
             manager_executor,
             manager_worker,
             cluster: RwLock::new(None),

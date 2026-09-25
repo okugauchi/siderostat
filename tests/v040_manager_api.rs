@@ -5,7 +5,7 @@
 //! fake 境界として駆動する。secret / raw build log を公開 DTO に含めない
 //! ことも確認する。M10。
 use siderostat::manager::{
-    JobJournal,
+    JobJournal, JobKind, JobPhase, ManagerJob,
     api::{
         JobSubmitRequest, ManagerApiError, cancel, get, parse_kind, status, submit, submit_json,
     },
@@ -230,6 +230,29 @@ mod routes {
     }
 
     #[tokio::test]
+    async fn persistence_failure_returns_503_without_publishing_a_job() {
+        let state = state();
+        let store = state.manager_store.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = store.lock().expect("store lock");
+            panic!("poison store lock for persistence failure test");
+        })
+        .join();
+
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/manager/jobs",
+            r#"{"kind":"fetch","payload_key":"must-not-publish"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("id").is_none());
+        let (_, status_body) = request(state, "GET", "/manager/status", "").await;
+        assert_eq!(status_body["jobs"].as_array().expect("jobs").len(), 0);
+    }
+
+    #[tokio::test]
     async fn production_backend_with_no_registered_plan_never_succeeds() {
         let state = state_with_backend(RuntimeManagerBackend::without_model_catalog());
         let (status, body) = request(
@@ -297,6 +320,28 @@ fn full_pipeline_states_match() {
     let s = status(&journal, Some("old-digest".to_string()));
     assert_eq!(s.queue_depth, 0);
     assert_eq!(s.active_digest.as_deref(), Some("old-digest"));
+}
+
+#[test]
+fn interrupted_job_dto_is_explicit_and_contains_no_raw_output_fields() {
+    let job = ManagerJob {
+        id: "verify-7".into(),
+        kind: JobKind::Verify,
+        progress: 37,
+        phase: JobPhase::Interrupted,
+        error: "manager process restarted; work was not resumed".into(),
+        created_at: 1,
+        updated_at: 2,
+        cancel: false,
+    };
+    let dto = siderostat::manager::api::ManagerJobDto::from(&job);
+    let value = serde_json::to_value(dto).expect("serialize DTO");
+    assert_eq!(value["phase"], "interrupted");
+    assert_eq!(value.as_object().expect("object").len(), 8);
+    let json = value.to_string();
+    assert!(!json.contains("secret"));
+    assert!(!json.contains("raw_output"));
+    assert!(!json.contains("build_log"));
 }
 
 /// 受入: cancel 後 poll → terminal 保持。M10。

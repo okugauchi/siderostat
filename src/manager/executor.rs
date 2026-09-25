@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::manager::catalog;
-use crate::manager::jobs::{JobJournal, JobKind, JobPhase};
+use crate::manager::jobs::{JobJournal, JobKind, JobPhase, ManagerJobError};
 use crate::manager::{activation, build, download, registry, rollback, source, stage, verify};
 
 /// The immutable context passed from a submitted job to its backend.
@@ -767,6 +767,7 @@ pub enum ManagerExecutorError {
     QueueClosed,
     JobNotFound,
     RequestMismatch,
+    Persistence,
 }
 
 impl std::fmt::Display for ManagerExecutorError {
@@ -776,6 +777,7 @@ impl std::fmt::Display for ManagerExecutorError {
             Self::QueueClosed => "manager executor queue is closed",
             Self::JobNotFound => "manager job not found",
             Self::RequestMismatch => "manager job request does not match journal",
+            Self::Persistence => "manager job storage unavailable",
         };
         f.write_str(message)
     }
@@ -859,9 +861,16 @@ impl ManagerExecutorHandle {
             .map(|job| job.phase)
             .ok_or(ManagerExecutorError::JobNotFound)?;
         if matches!(phase, JobPhase::Running | JobPhase::Cancelling) {
-            journal
-                .request_cancel(id)
-                .map_err(|_| ManagerExecutorError::JobNotFound)?;
+            if phase == JobPhase::Running {
+                journal.request_cancel(id).map_err(|error| match error {
+                    ManagerJobError::NotFound => ManagerExecutorError::JobNotFound,
+                    ManagerJobError::Persistence => ManagerExecutorError::Persistence,
+                    ManagerJobError::InvalidTransition => ManagerExecutorError::RequestMismatch,
+                    ManagerJobError::UnknownKind | ManagerJobError::IdExhausted => {
+                        ManagerExecutorError::RequestMismatch
+                    }
+                })?;
+            }
             if let Some(cancel) = self
                 .state
                 .cancellation

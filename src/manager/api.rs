@@ -35,6 +35,7 @@ fn phase_name(phase: JobPhase) -> &'static str {
         JobPhase::Succeeded => "succeeded",
         JobPhase::Failed => "failed",
         JobPhase::Cancelling => "cancelling",
+        JobPhase::Interrupted => "interrupted",
     }
 }
 
@@ -115,6 +116,8 @@ pub enum ManagerApiError {
     NotFound,
     /// 409: activate busy（同時 activation は 1）。M10。
     Conflict(String),
+    /// 503: job journal の永続化に失敗。
+    Persistence,
 }
 
 impl std::fmt::Display for ManagerApiError {
@@ -123,6 +126,7 @@ impl std::fmt::Display for ManagerApiError {
             ManagerApiError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             ManagerApiError::NotFound => write!(f, "job not found"),
             ManagerApiError::Conflict(msg) => write!(f, "conflict: {msg}"),
+            ManagerApiError::Persistence => write!(f, "manager job storage unavailable"),
         }
     }
 }
@@ -136,6 +140,12 @@ impl From<ManagerJobError> for ManagerApiError {
                 ManagerApiError::BadRequest("unknown job kind".to_string())
             }
             ManagerJobError::NotFound => ManagerApiError::NotFound,
+            ManagerJobError::Persistence | ManagerJobError::IdExhausted => {
+                ManagerApiError::Persistence
+            }
+            ManagerJobError::InvalidTransition => {
+                ManagerApiError::Conflict("job is not in an active phase".into())
+            }
         }
     }
 }
