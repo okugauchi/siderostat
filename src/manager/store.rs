@@ -1,0 +1,1118 @@
+//! Durable, versioned DS4 Manager release metadata and immutable artifacts.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+
+use super::jobs::ManagerJob;
+use super::registry::{ArtifactState, BuildRecord, ManagerRoot, SourceRecord};
+
+/// Current on-disk release-store schema.
+pub const STORE_SCHEMA_VERSION: u32 = 1;
+const STORE_FILE_NAME: &str = "manager-release-store.json";
+const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Immutable artifact kind controls its managed directory and generated ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Build,
+    Model,
+}
+
+impl ArtifactKind {
+    fn directory(self, root: &ManagerRoot) -> PathBuf {
+        match self {
+            Self::Build => root.paths().builds,
+            Self::Model => root.paths().models,
+        }
+    }
+
+    fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Model => "model",
+        }
+    }
+}
+
+/// Immutable provenance attached before an artifact can enter the registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactProvenance {
+    Build {
+        source_receipt_id: String,
+        record: BuildRecord,
+    },
+    Model {
+        catalog_id: String,
+    },
+}
+
+/// Metadata required to publish bytes; the caller cannot choose an ID or path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactDraft {
+    pub kind: ArtifactKind,
+    pub expected_sha256: String,
+    pub expected_size: u64,
+    pub provenance: ArtifactProvenance,
+}
+
+/// Persisted immutable artifact record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedArtifactRecord {
+    pub id: String,
+    pub kind: ArtifactKind,
+    pub rel_path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
+    pub validation_state: ArtifactState,
+    pub provenance: ArtifactProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileCompatibility {
+    Compatible,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareReadiness {
+    Pending,
+    Ready,
+}
+
+/// Persisted profile references only typed IDs and a fingerprint, never raw paths or argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedProfileRecord {
+    pub profile_id: String,
+    pub node_role: String,
+    pub role_artifact_ids: Vec<String>,
+    pub model_artifact_id: String,
+    pub model_catalog_id: String,
+    pub config_fingerprint: String,
+    pub compatibility: ProfileCompatibility,
+    pub hardware_readiness: HardwareReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ReleaseIdentity {
+    ManagedProfile(String),
+    ExternalBaseline {
+        config_fingerprint: String,
+        executable_sha256: String,
+        model_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasePointers {
+    pub active: Option<ReleaseIdentity>,
+    pub previous: Option<ReleaseIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedActivationPhase {
+    Preparing,
+    Draining,
+    Starting,
+    Committing,
+    RollingBack,
+    Complete,
+    ManualIntervention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedParticipantRecord {
+    pub node_id: String,
+    pub candidate_profile_id: String,
+    pub candidate_digest: String,
+    pub previous_digest: Option<String>,
+    pub phase: PersistedActivationPhase,
+    pub prepare_ack: Option<String>,
+    pub ready_ack: Option<String>,
+    pub commit_ack: Option<String>,
+}
+
+/// Activation journal schema intentionally has no runtime lease field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedActivationRecord {
+    pub operation_id: String,
+    pub expected_generation: u64,
+    pub policy_epoch: u64,
+    pub phase: PersistedActivationPhase,
+    pub participants: BTreeMap<String, PersistedParticipantRecord>,
+    pub failure_class: Option<String>,
+}
+
+/// All durable Manager metadata for one runtime node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerStoreSnapshot {
+    pub schema_version: u32,
+    pub node_id: String,
+    pub source_receipts: BTreeMap<String, SourceRecord>,
+    pub artifacts: BTreeMap<String, PersistedArtifactRecord>,
+    pub profiles: BTreeMap<String, StagedProfileRecord>,
+    pub release_pointers: ReleasePointers,
+    pub jobs: BTreeMap<String, ManagerJob>,
+    pub next_job_id: u64,
+    pub activation_journals: BTreeMap<String, PersistedActivationRecord>,
+}
+
+impl ManagerStoreSnapshot {
+    fn new(node_id: String) -> Self {
+        Self {
+            schema_version: STORE_SCHEMA_VERSION,
+            node_id,
+            source_receipts: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            release_pointers: ReleasePointers::default(),
+            jobs: BTreeMap::new(),
+            next_job_id: 0,
+            activation_journals: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    Io(String),
+    Schema(String),
+    UnknownSchema(u32),
+    NodeMismatch { expected: String, found: String },
+    InvalidDigest,
+    DigestMismatch,
+    SizeMismatch,
+    PathOutsideRoot,
+    SymlinkEscape,
+    InvalidReference(String),
+    InvalidRecord(String),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(_) => f.write_str("manager store I/O failed"),
+            Self::Schema(_) => f.write_str("manager store schema is invalid"),
+            Self::UnknownSchema(version) => write!(f, "unsupported manager store schema {version}"),
+            Self::NodeMismatch { .. } => f.write_str("manager store belongs to another node"),
+            Self::InvalidDigest => f.write_str("manager store digest is invalid"),
+            Self::DigestMismatch => f.write_str("manager artifact digest mismatch"),
+            Self::SizeMismatch => f.write_str("manager artifact size mismatch"),
+            Self::PathOutsideRoot => f.write_str("manager store path escapes its root"),
+            Self::SymlinkEscape => f.write_str("manager store path uses a symlink"),
+            Self::InvalidReference(_) => f.write_str("manager store reference is invalid"),
+            Self::InvalidRecord(_) => f.write_str("manager store record is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// Opened durable store. Mutations publish a candidate index before changing memory.
+#[derive(Debug, Clone)]
+pub struct ManagerReleaseStore {
+    root: ManagerRoot,
+    canonical_root: PathBuf,
+    snapshot: ManagerStoreSnapshot,
+}
+
+impl ManagerReleaseStore {
+    pub fn open(root: ManagerRoot, node_id: impl Into<String>) -> Result<Self, StoreError> {
+        let node_id = node_id.into();
+        if node_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord("empty node id".into()));
+        }
+        fs::create_dir_all(root.root()).map_err(io_error)?;
+        set_private_dir(root.root())?;
+        let canonical_root = fs::canonicalize(root.root()).map_err(io_error)?;
+        for path in [
+            root.paths().sources,
+            root.paths().builds,
+            root.paths().models,
+            root.paths().operations,
+            root.paths().logs,
+        ] {
+            fs::create_dir_all(&path).map_err(io_error)?;
+            let canonical = fs::canonicalize(&path).map_err(io_error)?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(StoreError::SymlinkEscape);
+            }
+            set_private_dir(&path)?;
+        }
+
+        let mut store = Self {
+            root,
+            canonical_root,
+            snapshot: ManagerStoreSnapshot::new(node_id.clone()),
+        };
+        let index_path = store.index_path();
+        match fs::symlink_metadata(&index_path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(StoreError::SymlinkEscape),
+            Ok(meta) => {
+                if !meta.is_file() || meta.len() > MAX_STORE_BYTES {
+                    return Err(StoreError::Schema("invalid store file".into()));
+                }
+                let bytes = fs::read(&index_path).map_err(io_error)?;
+                let snapshot: ManagerStoreSnapshot = serde_json::from_slice(&bytes)
+                    .map_err(|error| StoreError::Schema(error.to_string()))?;
+                if snapshot.schema_version != STORE_SCHEMA_VERSION {
+                    return Err(StoreError::UnknownSchema(snapshot.schema_version));
+                }
+                if snapshot.node_id != node_id {
+                    return Err(StoreError::NodeMismatch {
+                        expected: node_id,
+                        found: snapshot.node_id,
+                    });
+                }
+                store.validate_snapshot(&snapshot)?;
+                store.snapshot = snapshot;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                store.persist_candidate(&store.snapshot.clone())?;
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        Ok(store)
+    }
+
+    pub fn snapshot(&self) -> &ManagerStoreSnapshot {
+        &self.snapshot
+    }
+
+    pub fn root(&self) -> &ManagerRoot {
+        &self.root
+    }
+
+    pub fn record_source(&mut self, record: SourceRecord) -> Result<String, StoreError> {
+        if !full_git_sha(&record.full_commit)
+            || !full_git_sha(&record.main_proof)
+            || !record.remote.starts_with("https://")
+        {
+            return Err(StoreError::InvalidRecord("source receipt".into()));
+        }
+        let id = format!("source-{}", record.full_commit);
+        let mut candidate = self.snapshot.clone();
+        if let Some(existing) = candidate.source_receipts.get(&id) {
+            if existing != &record {
+                return Err(StoreError::InvalidReference("source id collision".into()));
+            }
+            return Ok(id);
+        }
+        candidate.source_receipts.insert(id.clone(), record);
+        self.commit_candidate(candidate)?;
+        Ok(id)
+    }
+
+    pub fn publish_artifact(
+        &mut self,
+        source: &Path,
+        draft: ArtifactDraft,
+    ) -> Result<PersistedArtifactRecord, StoreError> {
+        if !full_sha256(&draft.expected_sha256) || draft.expected_size == 0 {
+            return Err(StoreError::InvalidDigest);
+        }
+        self.validate_provenance(
+            &self.snapshot,
+            &draft.kind,
+            &draft.provenance,
+            &draft.expected_sha256,
+        )?;
+        let source_meta = fs::symlink_metadata(source).map_err(io_error)?;
+        if source_meta.file_type().is_symlink() || !source_meta.is_file() {
+            return Err(StoreError::SymlinkEscape);
+        }
+        let source_canonical = fs::canonicalize(source).map_err(io_error)?;
+        if !source_canonical.starts_with(&self.canonical_root) {
+            return Err(StoreError::PathOutsideRoot);
+        }
+        let (source_size, source_digest) = digest_file(&source_canonical)?;
+        if source_size != draft.expected_size {
+            return Err(StoreError::SizeMismatch);
+        }
+        if source_digest != draft.expected_sha256 {
+            return Err(StoreError::DigestMismatch);
+        }
+
+        let id = format!("{}-{}", draft.kind.id_prefix(), draft.expected_sha256);
+        let filename = format!("{id}.bin");
+        let directory = draft.kind.directory(&self.root);
+        let canonical_directory = fs::canonicalize(&directory).map_err(io_error)?;
+        if !canonical_directory.starts_with(&self.canonical_root) {
+            return Err(StoreError::SymlinkEscape);
+        }
+        let destination = directory.join(filename);
+        let rel_path = destination
+            .strip_prefix(self.root.root())
+            .map_err(|_| StoreError::PathOutsideRoot)?
+            .to_path_buf();
+
+        match fs::symlink_metadata(&destination) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(StoreError::SymlinkEscape);
+                }
+                let (size, digest) = digest_file(&destination)?;
+                if size != draft.expected_size {
+                    return Err(StoreError::SizeMismatch);
+                }
+                if digest != draft.expected_sha256 {
+                    return Err(StoreError::DigestMismatch);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.publish_blob(&source_canonical, &destination, &draft)?;
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+
+        let record = PersistedArtifactRecord {
+            id: id.clone(),
+            kind: draft.kind,
+            rel_path,
+            sha256: draft.expected_sha256,
+            size: draft.expected_size,
+            validation_state: ArtifactState::Verified,
+            provenance: draft.provenance,
+        };
+        let mut candidate = self.snapshot.clone();
+        if let Some(existing) = candidate.artifacts.get(&id) {
+            if existing != &record {
+                return Err(StoreError::InvalidReference("artifact id collision".into()));
+            }
+            return Ok(existing.clone());
+        }
+        candidate.artifacts.insert(id, record.clone());
+        self.commit_candidate(candidate)?;
+        Ok(record)
+    }
+
+    pub fn record_profile(&mut self, record: StagedProfileRecord) -> Result<String, StoreError> {
+        let id = record.profile_id.clone();
+        let mut candidate = self.snapshot.clone();
+        if let Some(existing) = candidate.profiles.get(&id) {
+            if existing != &record {
+                return Err(StoreError::InvalidReference("profile id collision".into()));
+            }
+            return Ok(id);
+        }
+        candidate.profiles.insert(id.clone(), record);
+        self.validate_snapshot(&candidate)?;
+        self.commit_candidate(candidate)?;
+        Ok(id)
+    }
+
+    pub fn set_release_pointers(
+        &mut self,
+        active: ReleaseIdentity,
+        previous: Option<ReleaseIdentity>,
+    ) -> Result<(), StoreError> {
+        let mut candidate = self.snapshot.clone();
+        candidate.release_pointers = ReleasePointers {
+            active: Some(active),
+            previous,
+        };
+        self.validate_snapshot(&candidate)?;
+        self.commit_candidate(candidate)
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.root.paths().operations.join(STORE_FILE_NAME)
+    }
+
+    fn commit_candidate(&mut self, candidate: ManagerStoreSnapshot) -> Result<(), StoreError> {
+        self.validate_snapshot(&candidate)?;
+        self.persist_candidate(&candidate)?;
+        self.snapshot = candidate;
+        Ok(())
+    }
+
+    fn persist_candidate(&self, candidate: &ManagerStoreSnapshot) -> Result<(), StoreError> {
+        let bytes =
+            serde_json::to_vec(candidate).map_err(|error| StoreError::Schema(error.to_string()))?;
+        atomic_write(&self.index_path(), &bytes)?;
+        Ok(())
+    }
+
+    fn publish_blob(
+        &self,
+        source: &Path,
+        destination: &Path,
+        draft: &ArtifactDraft,
+    ) -> Result<(), StoreError> {
+        let directory = destination.parent().ok_or(StoreError::PathOutsideRoot)?;
+        let temp = directory.join(format!(
+            ".{}.{}.tmp",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("artifact"),
+            uuid::Uuid::new_v4()
+        ));
+        let mut input = File::open(source).map_err(io_error)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(io_error)?;
+        let copied = std::io::copy(&mut input, &mut output).map_err(io_error)?;
+        output.sync_all().map_err(io_error)?;
+        set_private_file(&temp)?;
+        drop(output);
+        if copied != draft.expected_size {
+            let _ = fs::remove_file(&temp);
+            return Err(StoreError::SizeMismatch);
+        }
+        let (size, digest) = digest_file(&temp)?;
+        if size != draft.expected_size {
+            let _ = fs::remove_file(&temp);
+            return Err(StoreError::SizeMismatch);
+        }
+        if digest != draft.expected_sha256 {
+            let _ = fs::remove_file(&temp);
+            return Err(StoreError::DigestMismatch);
+        }
+        fs::rename(&temp, destination).map_err(io_error)?;
+        sync_directory(directory)?;
+        Ok(())
+    }
+
+    fn validate_provenance(
+        &self,
+        snapshot: &ManagerStoreSnapshot,
+        kind: &ArtifactKind,
+        provenance: &ArtifactProvenance,
+        sha256: &str,
+    ) -> Result<(), StoreError> {
+        match (kind, provenance) {
+            (
+                ArtifactKind::Build,
+                ArtifactProvenance::Build {
+                    source_receipt_id,
+                    record,
+                },
+            ) => {
+                let receipt = snapshot
+                    .source_receipts
+                    .get(source_receipt_id)
+                    .ok_or_else(|| StoreError::InvalidReference("source receipt".into()))?;
+                if receipt.full_commit != record.source
+                    || record.digest != sha256
+                    || !full_sha256(&record.help_digest)
+                    || record.role.is_empty()
+                {
+                    return Err(StoreError::InvalidRecord("build provenance".into()));
+                }
+            }
+            (ArtifactKind::Model, ArtifactProvenance::Model { catalog_id })
+                if !catalog_id.trim().is_empty() => {}
+            _ => return Err(StoreError::InvalidRecord("artifact provenance kind".into())),
+        }
+        Ok(())
+    }
+
+    fn validate_snapshot(&self, snapshot: &ManagerStoreSnapshot) -> Result<(), StoreError> {
+        if snapshot.schema_version != STORE_SCHEMA_VERSION {
+            return Err(StoreError::UnknownSchema(snapshot.schema_version));
+        }
+        if snapshot.node_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord("empty node id".into()));
+        }
+        for (id, source) in &snapshot.source_receipts {
+            if id != &format!("source-{}", source.full_commit)
+                || !full_git_sha(&source.full_commit)
+                || !full_git_sha(&source.main_proof)
+                || !source.remote.starts_with("https://")
+            {
+                return Err(StoreError::InvalidRecord("source receipt".into()));
+            }
+        }
+        for (id, artifact) in &snapshot.artifacts {
+            if id != &artifact.id
+                || !full_sha256(&artifact.sha256)
+                || artifact.validation_state != ArtifactState::Verified
+                || artifact.id != format!("{}-{}", artifact.kind.id_prefix(), artifact.sha256)
+            {
+                return Err(StoreError::InvalidRecord("artifact metadata".into()));
+            }
+            let expected = artifact
+                .kind
+                .directory(&self.root)
+                .join(format!("{id}.bin"));
+            let expected_rel = expected
+                .strip_prefix(self.root.root())
+                .map_err(|_| StoreError::PathOutsideRoot)?;
+            validate_relative_path(&artifact.rel_path)?;
+            if artifact.rel_path != expected_rel {
+                return Err(StoreError::PathOutsideRoot);
+            }
+            let path = self.resolve_artifact_path(&artifact.rel_path)?;
+            let (size, digest) = digest_file(&path)?;
+            if size != artifact.size {
+                return Err(StoreError::SizeMismatch);
+            }
+            if digest != artifact.sha256 {
+                return Err(StoreError::DigestMismatch);
+            }
+            self.validate_provenance(
+                snapshot,
+                &artifact.kind,
+                &artifact.provenance,
+                &artifact.sha256,
+            )?;
+        }
+        for (id, profile) in &snapshot.profiles {
+            if id != &profile.profile_id
+                || id.trim().is_empty()
+                || !full_sha256(&profile.config_fingerprint)
+                || profile.node_role.trim().is_empty()
+                || profile.model_catalog_id.trim().is_empty()
+                || profile.role_artifact_ids.is_empty()
+            {
+                return Err(StoreError::InvalidRecord("staged profile".into()));
+            }
+            let model = snapshot
+                .artifacts
+                .get(&profile.model_artifact_id)
+                .ok_or_else(|| StoreError::InvalidReference("model artifact".into()))?;
+            if model.kind != ArtifactKind::Model
+                || !matches!(
+                    &model.provenance,
+                    ArtifactProvenance::Model { catalog_id } if catalog_id == &profile.model_catalog_id
+                )
+            {
+                return Err(StoreError::InvalidReference("model provenance".into()));
+            }
+            for role_id in &profile.role_artifact_ids {
+                let role = snapshot
+                    .artifacts
+                    .get(role_id)
+                    .ok_or_else(|| StoreError::InvalidReference("role artifact".into()))?;
+                if role.kind != ArtifactKind::Build {
+                    return Err(StoreError::InvalidReference("role artifact kind".into()));
+                }
+            }
+        }
+        for (id, job) in &snapshot.jobs {
+            if id != &job.id || job.progress > 100 {
+                return Err(StoreError::InvalidRecord("job journal".into()));
+            }
+        }
+        for (id, journal) in &snapshot.activation_journals {
+            if id != &journal.operation_id
+                || journal.operation_id.trim().is_empty()
+                || journal.expected_generation == 0
+            {
+                return Err(StoreError::InvalidRecord("activation journal".into()));
+            }
+            for (node_id, participant) in &journal.participants {
+                if node_id != &participant.node_id
+                    || !full_sha256(&participant.candidate_digest)
+                    || participant
+                        .previous_digest
+                        .as_deref()
+                        .is_some_and(|digest| !full_sha256(digest))
+                {
+                    return Err(StoreError::InvalidRecord("activation participant".into()));
+                }
+            }
+        }
+        for pointer in [
+            snapshot.release_pointers.active.as_ref(),
+            snapshot.release_pointers.previous.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.validate_release_identity(snapshot, pointer)?;
+        }
+        if snapshot.release_pointers.active.is_some()
+            && snapshot.release_pointers.active == snapshot.release_pointers.previous
+        {
+            return Err(StoreError::InvalidReference(
+                "active equals previous".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_release_identity(
+        &self,
+        snapshot: &ManagerStoreSnapshot,
+        identity: &ReleaseIdentity,
+    ) -> Result<(), StoreError> {
+        match identity {
+            ReleaseIdentity::ManagedProfile(profile_id) => {
+                if !snapshot.profiles.contains_key(profile_id) {
+                    return Err(StoreError::InvalidReference("release profile".into()));
+                }
+            }
+            ReleaseIdentity::ExternalBaseline {
+                config_fingerprint,
+                executable_sha256,
+                model_sha256,
+            } => {
+                if !full_sha256(config_fingerprint)
+                    || !full_sha256(executable_sha256)
+                    || !full_sha256(model_sha256)
+                {
+                    return Err(StoreError::InvalidDigest);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_artifact_path(&self, rel_path: &Path) -> Result<PathBuf, StoreError> {
+        validate_relative_path(rel_path)?;
+        let mut current = self.root.root().to_path_buf();
+        for component in rel_path.components() {
+            let Component::Normal(part) = component else {
+                return Err(StoreError::PathOutsideRoot);
+            };
+            current.push(part);
+            let metadata = fs::symlink_metadata(&current).map_err(io_error)?;
+            if metadata.file_type().is_symlink() {
+                return Err(StoreError::SymlinkEscape);
+            }
+        }
+        let canonical = fs::canonicalize(&current).map_err(io_error)?;
+        if !canonical.starts_with(&self.canonical_root) {
+            return Err(StoreError::SymlinkEscape);
+        }
+        Ok(canonical)
+    }
+}
+
+fn validate_relative_path(path: &Path) -> Result<(), StoreError> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(StoreError::PathOutsideRoot);
+    }
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(StoreError::PathOutsideRoot);
+        }
+    }
+    Ok(())
+}
+
+fn full_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn full_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn digest_file(path: &Path) -> Result<(u64, String), StoreError> {
+    use sha2::Digest;
+    let mut file = File::open(path).map_err(io_error)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or(StoreError::SizeMismatch)?;
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((size, digest))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let directory = path.parent().ok_or(StoreError::PathOutsideRoot)?;
+    fs::create_dir_all(directory).map_err(io_error)?;
+    set_private_dir(directory)?;
+    let temp = directory.join(format!(".{STORE_FILE_NAME}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(io_error)?;
+        file.write_all(bytes).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        set_private_file(&temp)?;
+        drop(file);
+        fs::rename(&temp, path).map_err(io_error)?;
+        sync_directory(directory)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
+}
+
+fn set_private_dir(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn io_error(error: std::io::Error) -> StoreError {
+    StoreError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::registry::{BuildRecord, ManagerRoot, SourceRecord};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn root(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("siderostat-h06-store-{tag}-{nanos}"))
+    }
+
+    fn source_record() -> SourceRecord {
+        SourceRecord {
+            remote: "https://github.com/example/ds4-server.git".into(),
+            full_commit: "a".repeat(40),
+            main_proof: "a".repeat(40),
+            fetched_at: 1_758_795_200,
+        }
+    }
+
+    fn source_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = root.join("ds4/operations").join(name);
+        fs::create_dir_all(path.parent().expect("parent")).expect("create operations");
+        fs::write(&path, bytes).expect("write input");
+        path
+    }
+
+    fn build_record(source: &SourceRecord) -> BuildRecord {
+        BuildRecord {
+            source: source.full_commit.clone(),
+            flags: "release".into(),
+            toolchain: "rustc-test".into(),
+            arch: "arm64".into(),
+            role: "ds4-server".into(),
+            digest: HELLO_SHA256.into(),
+            help_digest: "b".repeat(64),
+        }
+    }
+
+    fn publish_test_profile(store: &mut ManagerReleaseStore, root: &Path) -> String {
+        let source = source_record();
+        let source_id = store.record_source(source.clone()).expect("source receipt");
+        let build_path = source_file(root, "build-output", b"hello");
+        let build = store
+            .publish_artifact(
+                &build_path,
+                ArtifactDraft {
+                    kind: ArtifactKind::Build,
+                    expected_sha256: HELLO_SHA256.into(),
+                    expected_size: 5,
+                    provenance: ArtifactProvenance::Build {
+                        source_receipt_id: source_id,
+                        record: build_record(&source),
+                    },
+                },
+            )
+            .expect("build artifact");
+        let model_path = source_file(root, "model-output", b"hello");
+        let model = store
+            .publish_artifact(
+                &model_path,
+                ArtifactDraft {
+                    kind: ArtifactKind::Model,
+                    expected_sha256: HELLO_SHA256.into(),
+                    expected_size: 5,
+                    provenance: ArtifactProvenance::Model {
+                        catalog_id: "model-test-1".into(),
+                    },
+                },
+            )
+            .expect("model artifact");
+        store
+            .record_profile(StagedProfileRecord {
+                profile_id: "profile-test-1".into(),
+                node_role: "coordinator".into(),
+                role_artifact_ids: vec![build.id],
+                model_artifact_id: model.id,
+                model_catalog_id: "model-test-1".into(),
+                config_fingerprint: "c".repeat(64),
+                compatibility: ProfileCompatibility::Compatible,
+                hardware_readiness: HardwareReadiness::Ready,
+            })
+            .expect("profile")
+    }
+
+    #[test]
+    fn release_store_reopens_versioned_records_and_artifacts() {
+        let root = root("reopen");
+        let manager_root = ManagerRoot::explicit(root.clone());
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "coordinator").expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root);
+        store
+            .set_release_pointers(
+                ReleaseIdentity::ManagedProfile(profile_id.clone()),
+                Some(ReleaseIdentity::ExternalBaseline {
+                    config_fingerprint: "d".repeat(64),
+                    executable_sha256: "e".repeat(64),
+                    model_sha256: "f".repeat(64),
+                }),
+            )
+            .expect("set release pointers");
+        drop(store);
+
+        let reopened =
+            ManagerReleaseStore::open(manager_root, "coordinator").expect("reopen store");
+        assert_eq!(reopened.snapshot().schema_version, STORE_SCHEMA_VERSION);
+        assert_eq!(reopened.snapshot().node_id, "coordinator");
+        assert_eq!(reopened.snapshot().source_receipts.len(), 1);
+        assert_eq!(reopened.snapshot().artifacts.len(), 2);
+        assert_eq!(
+            reopened.snapshot().profiles[&profile_id].profile_id,
+            profile_id
+        );
+        assert_eq!(
+            reopened.snapshot().release_pointers.active,
+            Some(ReleaseIdentity::ManagedProfile("profile-test-1".into()))
+        );
+        assert!(matches!(
+            reopened.snapshot().release_pointers.previous,
+            Some(ReleaseIdentity::ExternalBaseline { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_registry_is_a_projection_of_store_release_pointers() {
+        let root = root("registry-projection");
+        let manager_root = ManagerRoot::explicit(root.clone());
+        let mut store = ManagerReleaseStore::open(manager_root, "coordinator").expect("open store");
+        let profile_id = publish_test_profile(&mut store, &root);
+        let external = ReleaseIdentity::ExternalBaseline {
+            config_fingerprint: "d".repeat(64),
+            executable_sha256: "e".repeat(64),
+            model_sha256: "f".repeat(64),
+        };
+
+        store
+            .set_release_pointers(
+                ReleaseIdentity::ManagedProfile(profile_id.clone()),
+                Some(external.clone()),
+            )
+            .expect("active profile");
+        let active = crate::manager::registry::ArtifactRegistry::from_store(&store);
+        assert_eq!(active.list_by_state(ArtifactState::Active).len(), 2);
+        assert!(active.list_by_state(ArtifactState::Verified).is_empty());
+
+        store
+            .set_release_pointers(external, Some(ReleaseIdentity::ManagedProfile(profile_id)))
+            .expect("previous profile");
+        let previous = crate::manager::registry::ArtifactRegistry::from_store(&store);
+        assert_eq!(previous.list_by_state(ArtifactState::Previous).len(), 2);
+        assert!(previous.list_by_state(ArtifactState::Active).is_empty());
+    }
+
+    #[test]
+    fn release_store_rejects_active_pointer_to_missing_profile() {
+        let root = root("missing-profile");
+        let manager_root = ManagerRoot::explicit(root);
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "coordinator").expect("open store");
+        let error = store
+            .set_release_pointers(
+                ReleaseIdentity::ManagedProfile("missing-profile".into()),
+                None,
+            )
+            .expect_err("missing profile cannot become active");
+        assert!(matches!(error, StoreError::InvalidReference(_)));
+        assert!(store.snapshot().release_pointers.active.is_none());
+        drop(store);
+
+        let reopened =
+            ManagerReleaseStore::open(manager_root, "coordinator").expect("reopen unchanged store");
+        assert!(reopened.snapshot().release_pointers.active.is_none());
+    }
+
+    #[test]
+    fn release_store_rejects_unknown_schema_and_wrong_node() {
+        let schema_root = root("schema");
+        let schema_manager_root = ManagerRoot::explicit(schema_root.clone());
+        let store =
+            ManagerReleaseStore::open(schema_manager_root.clone(), "node-a").expect("open store");
+        let mut snapshot = store.snapshot().clone();
+        drop(store);
+        snapshot.schema_version = STORE_SCHEMA_VERSION + 1;
+        fs::write(
+            schema_root.join("ds4/operations").join(STORE_FILE_NAME),
+            serde_json::to_vec(&snapshot).expect("serialize"),
+        )
+        .expect("write future schema");
+        assert!(matches!(
+            ManagerReleaseStore::open(schema_manager_root, "node-a"),
+            Err(StoreError::UnknownSchema(_))
+        ));
+
+        let node_root = root("node");
+        let node_manager_root = ManagerRoot::explicit(node_root.clone());
+        let mut store = ManagerReleaseStore::open(node_manager_root.clone(), "node-a")
+            .expect("open node test store");
+        publish_test_profile(&mut store, &node_root);
+        drop(store);
+        assert!(matches!(
+            ManagerReleaseStore::open(node_manager_root, "node-b"),
+            Err(StoreError::NodeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn release_store_rejects_short_digest_and_does_not_publish_wrong_bytes() {
+        let root = root("digest");
+        let manager_root = ManagerRoot::explicit(root.clone());
+        let mut store =
+            ManagerReleaseStore::open(manager_root.clone(), "node-a").expect("open store");
+        let path = source_file(&root, "wrong-bytes", b"nope!");
+        let short = store.publish_artifact(
+            &path,
+            ArtifactDraft {
+                kind: ArtifactKind::Model,
+                expected_sha256: "abc".into(),
+                expected_size: 5,
+                provenance: ArtifactProvenance::Model {
+                    catalog_id: "model-test-1".into(),
+                },
+            },
+        );
+        assert!(matches!(short, Err(StoreError::InvalidDigest)));
+
+        let mismatch = store.publish_artifact(
+            &path,
+            ArtifactDraft {
+                kind: ArtifactKind::Model,
+                expected_sha256: HELLO_SHA256.into(),
+                expected_size: 5,
+                provenance: ArtifactProvenance::Model {
+                    catalog_id: "model-test-1".into(),
+                },
+            },
+        );
+        assert!(matches!(mismatch, Err(StoreError::DigestMismatch)));
+        assert!(store.snapshot().artifacts.is_empty());
+        drop(store);
+        let reopened = ManagerReleaseStore::open(manager_root, "node-a").expect("reopen store");
+        assert!(reopened.snapshot().artifacts.is_empty());
+    }
+
+    #[test]
+    fn release_store_rejects_parent_path_and_symlink_escape_on_reopen() {
+        let path_root = root("path");
+        let path_manager_root = ManagerRoot::explicit(path_root.clone());
+        let mut store =
+            ManagerReleaseStore::open(path_manager_root.clone(), "node-a").expect("open store");
+        publish_test_profile(&mut store, &path_root);
+        let mut snapshot = store.snapshot().clone();
+        drop(store);
+        snapshot
+            .artifacts
+            .values_mut()
+            .next()
+            .expect("artifact")
+            .rel_path = PathBuf::from("../outside");
+        fs::write(
+            path_root.join("ds4/operations").join(STORE_FILE_NAME),
+            serde_json::to_vec(&snapshot).expect("serialize"),
+        )
+        .expect("write escaped path");
+        assert!(matches!(
+            ManagerReleaseStore::open(path_manager_root, "node-a"),
+            Err(StoreError::PathOutsideRoot)
+        ));
+
+        let symlink_root = root("symlink");
+        let symlink_manager_root = ManagerRoot::explicit(symlink_root.clone());
+        let mut store = ManagerReleaseStore::open(symlink_manager_root.clone(), "node-a")
+            .expect("open symlink test store");
+        publish_test_profile(&mut store, &symlink_root);
+        let artifact = store
+            .snapshot()
+            .artifacts
+            .values()
+            .next()
+            .expect("artifact")
+            .clone();
+        drop(store);
+        let target = symlink_root.join(artifact.rel_path);
+        fs::remove_file(&target).expect("remove managed artifact");
+        let outside = symlink_root.with_extension("outside");
+        fs::write(&outside, b"outside").expect("write outside target");
+        std::os::unix::fs::symlink(&outside, &target).expect("create symlink");
+        assert!(matches!(
+            ManagerReleaseStore::open(symlink_manager_root, "node-a"),
+            Err(StoreError::SymlinkEscape)
+        ));
+    }
+
+    #[test]
+    fn unreferenced_content_file_is_not_treated_as_a_trusted_artifact() {
+        let root = root("orphan");
+        let manager_root = ManagerRoot::explicit(root.clone());
+        let store = ManagerReleaseStore::open(manager_root.clone(), "node-a").expect("open store");
+        drop(store);
+        let orphan = root
+            .join("ds4/builds")
+            .join(format!("build-{HELLO_SHA256}.bin"));
+        fs::create_dir_all(orphan.parent().expect("parent")).expect("create builds");
+        fs::write(&orphan, b"hello").expect("write orphan blob");
+
+        let reopened =
+            ManagerReleaseStore::open(manager_root, "node-a").expect("open store with orphan blob");
+        assert!(reopened.snapshot().artifacts.is_empty());
+    }
+}

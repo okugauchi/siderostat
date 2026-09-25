@@ -29,6 +29,7 @@ pub mod registry;
 pub mod rollback;
 pub mod source;
 pub mod stage;
+pub mod store;
 pub mod verify;
 
 pub use activation::{
@@ -68,6 +69,12 @@ pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
 pub use stage::{
     ActivationPlan, StageError, StageRequest, StagedProfile, StagedProfileStatus,
     build_activation_plan, stage_profile,
+};
+pub use store::{
+    ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerReleaseStore,
+    ManagerStoreSnapshot, PersistedActivationPhase, PersistedActivationRecord,
+    PersistedArtifactRecord, PersistedParticipantRecord, ProfileCompatibility, ReleaseIdentity,
+    ReleasePointers, STORE_SCHEMA_VERSION, StagedProfileRecord, StoreError,
 };
 pub use verify::{
     VerifiedArtifact, VerifyError, hex_sha256, publish_verified, recheck_verified, verify_artifact,

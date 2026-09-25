@@ -24,6 +24,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use super::store::{ArtifactKind, ManagerReleaseStore, ReleaseIdentity};
+
 /// managed root の既定相対パス（互換 root を維持）。C04。M01。
 const MANAGED_ROOT_RELATIVE: &str = "Library/Application Support/siderostat";
 
@@ -215,6 +217,66 @@ impl ArtifactRegistry {
         Self {
             root,
             records: BTreeMap::new(),
+        }
+    }
+
+    /// 検証済みの durable store から query 用 record を導出する。
+    ///
+    /// manager release store が永続正本であり、この registry は表示・既存
+    /// query API 用の一時 projection のみを保持する。M02。
+    pub fn from_store(store: &ManagerReleaseStore) -> Self {
+        let snapshot = store.snapshot();
+        let mut states = BTreeMap::new();
+        for (identity, state) in [
+            (
+                snapshot.release_pointers.previous.as_ref(),
+                ArtifactState::Previous,
+            ),
+            (
+                snapshot.release_pointers.active.as_ref(),
+                ArtifactState::Active,
+            ),
+        ] {
+            let Some(ReleaseIdentity::ManagedProfile(profile_id)) = identity else {
+                continue;
+            };
+            let Some(profile) = snapshot.profiles.get(profile_id) else {
+                continue;
+            };
+            for artifact_id in profile
+                .role_artifact_ids
+                .iter()
+                .chain(std::iter::once(&profile.model_artifact_id))
+            {
+                states.insert(artifact_id.clone(), state);
+            }
+        }
+
+        let records = snapshot
+            .artifacts
+            .values()
+            .map(|artifact| {
+                let kind = match artifact.kind {
+                    ArtifactKind::Build => "build",
+                    ArtifactKind::Model => "model",
+                };
+                ArtifactRecord {
+                    id: artifact.id.clone(),
+                    kind: kind.into(),
+                    rel_path: artifact.rel_path.clone(),
+                    sha256: artifact.sha256.clone(),
+                    state: states
+                        .get(&artifact.id)
+                        .copied()
+                        .unwrap_or(artifact.validation_state),
+                }
+            })
+            .map(|record| (record.id.clone(), record))
+            .collect();
+
+        Self {
+            root: store.root().clone(),
+            records,
         }
     }
 
