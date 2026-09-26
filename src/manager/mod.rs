@@ -22,14 +22,12 @@ pub mod build;
 pub mod catalog;
 pub mod compatibility;
 pub mod download;
-pub mod executor;
 pub mod jobs;
 pub mod process;
 pub mod registry;
 pub mod rollback;
 pub mod source;
 pub mod stage;
-pub mod store;
 pub mod verify;
 
 pub use activation::{
@@ -38,33 +36,23 @@ pub use activation::{
     mark_ready, prepare_activation,
 };
 pub use api::{
-    JobSubmitRequest, ManagerApiError, ManagerArtifactDto, ManagerArtifactReferenceDto,
-    ManagerInventoryResponse, ManagerJobDto, ManagerNodeReadinessDto, ManagerSourceReceiptDto,
-    ManagerStagedProfileDto, ManagerStatusResponse, SubmitResponse, cancel, get, inventory,
-    inventory_with_live_active_digest, parse_kind, status, submit, submit_json,
+    JobSubmitRequest, ManagerApiError, ManagerJobDto, ManagerStatusResponse, SubmitResponse,
+    cancel, get, parse_kind, status, submit, submit_json,
 };
 pub use build::{
     APPROVED_MAKE_TARGETS, APPROVED_ROLES, BuildError, BuildOutcome, BuildRequest, build_artifacts,
     is_approved_role, is_approved_target,
 };
 pub use catalog::{
-    CapabilityStatus, CatalogError, ModelCatalogEntry, bundled_catalog, compute_status,
-    load_and_validate, validate_entry,
+    CapabilityStatus, CatalogError, ModelCatalogEntry, compute_status, load_and_validate,
+    validate_entry,
 };
 pub use compatibility::{CompatibilityError, SmokeOutcome, SmokeRequest, compatibility_smoke};
 pub use download::{
     Credentials, DownloadError, DownloadProgress, DownloadSpec, HttpError, HttpResponse,
-    HttpResponseMetadata, HttpTransport, ReqwestHttpTransport, check_capacity, download_bounded,
-    load_journal, save_journal,
+    HttpTransport, check_capacity, download_bounded, load_journal, save_journal,
 };
-pub use executor::{
-    ManagerExecutionBackend, ManagerExecutionError, ManagerExecutionOutcome,
-    ManagerExecutionRequest, ManagerExecutor, ManagerExecutorError, ManagerExecutorHandle,
-    manager_stage_payload_key,
-};
-pub use jobs::{
-    JobJournal, JobKind, JobPersistence, JobPhase, ManagerJob, ManagerJobError, PersistenceError,
-};
+pub use jobs::{JobJournal, JobKind, ManagerJob, ManagerJobError};
 pub use process::{CommandSpec, GroupRunner, ProcessError, RunOutput, RunStatus};
 pub use registry::{
     ArtifactRegistry, ArtifactState, BuildRecord, CatalogEntry, ManagedPaths, ManagerRoot,
@@ -73,16 +61,9 @@ pub use registry::{
 pub use rollback::{PreviousRecovery, RollbackOutcome, RollbackRequest, rollback_to_previous};
 pub use source::{GitRunner, OfficialRemote, SourceError, stage_source};
 pub use stage::{
-    ActivationPlan, StageError, StageRequest, StageRuntimeConfig, StagedProfile,
-    StagedProfileStatus, build_activation_plan, stage_profile,
-};
-pub use store::{
-    ArtifactDraft, ArtifactKind, ArtifactProvenance, HardwareReadiness, ManagerJobStorePersistence,
-    ManagerReleaseStore, ManagerStoreSnapshot, PersistedActivationPhase, PersistedActivationRecord,
-    PersistedArtifactRecord, PersistedParticipantRecord, ProfileCompatibility, ReleaseIdentity,
-    ReleasePointers, STORE_SCHEMA_VERSION, StagedProfileRecord, StoreError,
+    ActivationPlan, StageError, StageRequest, StagedProfile, StagedProfileStatus,
+    build_activation_plan, stage_profile,
 };
 pub use verify::{
     VerifiedArtifact, VerifyError, hex_sha256, publish_verified, recheck_verified, verify_artifact,
-    verify_stored_model,
 };

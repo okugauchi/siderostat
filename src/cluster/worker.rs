@@ -17,18 +17,6 @@ pub trait DistributedWorkerLifecycle: Send + Sync + 'static {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         Box::pin(async { None })
     }
-    fn set_next_command(
-        &self,
-        _candidate: super::VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
-    }
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
-    }
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<super::CommandSlotSnapshot>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
-    }
 }
 
 pub trait WorkerLeaseStatus: Send + Sync + 'static {
@@ -61,18 +49,6 @@ pub trait TpWorkerLifecycle: Send + Sync + 'static {
     /// Optional child identity for diagnostics. Defaults to `None`。
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         Box::pin(async { None })
-    }
-    fn set_next_command(
-        &self,
-        _candidate: super::VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
-    }
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
-    }
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<super::CommandSlotSnapshot>> {
-        Box::pin(async { anyhow::bail!("manager command slot is unavailable") })
     }
 }
 

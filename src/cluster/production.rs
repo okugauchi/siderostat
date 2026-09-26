@@ -1,18 +1,17 @@
 use super::{
-    AuthError, CommandSlotSnapshot, ControlAuthenticator, ControlCommand, ControlEndpoint,
-    ControlError, ControlMessage, ControlMode, ControlResponse, ControlRole, ControlSecret,
-    CoordinatorControl, CoordinatorDistributedRuntime, CoordinatorPeerLifecycle,
-    CoordinatorRuntimeTimeouts, DistributedControlPhase, DistributedCoordinatorLifecycle,
-    DistributedCoordinatorSupervisor, DistributedManifest, DistributedWorkerLifecycle,
-    DistributedWorkerSupervisor, DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe,
-    DryRunWorkerLifecycle, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP,
-    InterfaceObservation, Ipv4Assignment, LocalStandaloneLifecycle, MacOsDynamicStoreWatcher,
-    ModeRuntime, NetworkEvidence, NetworkObservation, NetworkServiceObservation, NetworkSnapshot,
-    NodeDescriptor, OperationId, OperationKind, OperationLease, OperationLeaseGuard,
+    AuthError, ControlAuthenticator, ControlCommand, ControlEndpoint, ControlError, ControlMessage,
+    ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
+    CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
+    DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
+    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor,
+    DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle, HEADER_NODE,
+    HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
+    LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
+    NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
     PeerObservation, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
     PolicyControlResponse, PolicyControlState, PolicyControlStatus, PromotionRetryPolicy,
-    StandaloneSupervisor, StateStore, VerifiedDs4Command, WorkerControl, WorkerDistributedRuntime,
-    WorkerEventKind, spawn_network_event_monitor,
+    StandaloneSupervisor, StateStore, WorkerControl, WorkerDistributedRuntime, WorkerEventKind,
+    spawn_network_event_monitor,
 };
 #[cfg(feature = "test-support")]
 use crate::cluster::{ClusterFailure, ClusterSnapshot, PromotionFailureStatus};
@@ -49,7 +48,6 @@ use tokio::sync::Mutex;
 
 pub mod activation;
 mod effects;
-pub mod manager;
 mod pairing;
 pub(crate) mod policy;
 mod reconcile;
@@ -175,65 +173,6 @@ impl ProductionControlClient {
             );
         }
         Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    /// Send a versioned Manager participant request over the same source-pinned, signed peer
-    /// channel used by the control and policy protocols. A missing route or an unsupported
-    /// response version fails before the caller begins any local drain.
-    pub async fn manager_peer(
-        &self,
-        request: &manager::ManagerPeerRequest,
-    ) -> anyhow::Result<manager::ManagerPeerResponse> {
-        request.validate().map_err(anyhow::Error::new)?;
-        let path = request.phase.path();
-        let body = serde_json::to_vec(request)?;
-        let timestamp = now_millis();
-        let signed = self.inner.authenticator.sign(
-            self.inner.local_node_id.clone(),
-            reqwest::Method::POST.as_str(),
-            path,
-            timestamp,
-            uuid::Uuid::new_v4().simple().to_string(),
-            &body,
-        )?;
-        let response = self
-            .inner
-            .client
-            .post(self.inner.base.join(path.trim_start_matches('/'))?)
-            .header(HEADER_NODE, signed.node_id())
-            .header(HEADER_TIMESTAMP, signed.timestamp_millis())
-            .header(HEADER_NONCE, signed.nonce())
-            .header(HEADER_SIGNATURE, signed.signature())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .timeout(self.inner.lifecycle_timeout)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            // Do not include peer response bodies in errors: this boundary must not propagate
-            // credentials, paths, or child output into job logs.
-            anyhow::bail!("peer manager control {path} returned {status}");
-        }
-        let response: manager::ManagerPeerResponse = response.json().await?;
-        anyhow::ensure!(
-            response.protocol_version == manager::MANAGER_PEER_PROTOCOL_VERSION,
-            "peer manager protocol version is unsupported"
-        );
-        anyhow::ensure!(
-            response.operation_id == request.operation_id
-                && response.profile_id == request.profile_id
-                && response.candidate_digest == request.candidate_digest
-                && response.source_commit == request.source_commit
-                && response.model_digest == request.model_digest
-                && response.previous_digest == request.previous_digest
-                && response.expected_generation == request.expected_generation
-                && response.policy_epoch == request.policy_epoch
-                && response.phase == request.phase
-                && !response.ack_id.is_empty(),
-            "peer manager acknowledgement does not match the request"
-        );
-        Ok(response)
     }
 
     pub async fn node(&self) -> anyhow::Result<ControlResponse> {
@@ -382,7 +321,6 @@ struct ProductionInner {
     manifest: DistributedManifest,
     recovery: Arc<recovery::PeerLossRecovery>,
     recovery_owner_active: AtomicBool,
-    recovery_owner_lease: std::sync::Mutex<Option<OperationLeaseGuard>>,
     automatic_pairing_blocked: AtomicBool,
     /// 現在の操作方針（C03）。ForcedStandalone 保護ラッチを含む。P01 journal から
     /// 復元され、適用調整（P04/P05）で更新される。Automatic を選んでも保護ラッチは
@@ -396,19 +334,11 @@ struct ProductionInner {
     policy_pending: AtomicBool,
     policy_control: Arc<PolicyControlState>,
     policy_store: std::sync::Mutex<Option<Arc<StateStore>>>,
-    manager_store:
-        std::sync::Mutex<Option<Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>>>,
-    manager_peer_guard: tokio::sync::Mutex<Option<manager::ManagerPeerActive>>,
     /// Serializes policy-journal writes with the app-level runtime-state snapshot. Without this
     /// lock a background snapshot could read IntentSaved, then overwrite a concurrently
     /// committed Applied journal entry (P0 false-success/persistence race).
     policy_persistence: std::sync::Mutex<()>,
     planned_restart: PlannedRestartGate,
-    /// Shared runtime gate used by explicit lifecycle mutations and Manager activation. It keeps
-    /// established concurrency between ordinary operation kinds, while Activation excludes all
-    /// of them in both directions.
-    lifecycle_lease: OperationLease,
-    planned_restart_lease: std::sync::Mutex<Option<OperationLeaseGuard>>,
     /// Shared, latest verified network snapshot. The control handler derives `route_scoped`
     /// from this instead of a hard-coded `true` (N-02), so peer-present gating comes from
     /// actual production input. Fail-closed until a fresh observation is applied.
@@ -845,7 +775,6 @@ impl ProductionClusterRuntime {
             manifest,
             recovery: Arc::new(recovery::PeerLossRecovery::default()),
             recovery_owner_active: AtomicBool::new(false),
-            recovery_owner_lease: std::sync::Mutex::new(None),
             automatic_pairing_blocked: AtomicBool::new(false),
             operator_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
             applied_policy: std::sync::Mutex::new(OperationPolicy::Automatic),
@@ -853,12 +782,8 @@ impl ProductionClusterRuntime {
             policy_pending: AtomicBool::new(false),
             policy_control: Arc::new(PolicyControlState::new()),
             policy_store: std::sync::Mutex::new(None),
-            manager_store: std::sync::Mutex::new(None),
-            manager_peer_guard: tokio::sync::Mutex::new(None),
             policy_persistence: std::sync::Mutex::new(()),
             planned_restart: PlannedRestartGate::default(),
-            lifecycle_lease: OperationLease::new(),
-            planned_restart_lease: std::sync::Mutex::new(None),
             network: Arc::new(NetworkEvidence::new()),
             #[cfg(feature = "test-support")]
             pair_timings: std::sync::Mutex::new(Vec::new()),
@@ -1013,7 +938,6 @@ impl ProductionClusterRuntime {
         operator_policy: OperationPolicy,
         peer_protocol_version: Option<u16>,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Promotion)?;
         use crate::cluster::TpSessionId;
         use crate::target::ClusterState;
         let verdict = self.tp_start_verdict(operator_policy, peer_protocol_version);
@@ -1088,7 +1012,6 @@ impl ProductionClusterRuntime {
     /// coordinator promotion tracker, so the local manual state is cleared through the mode
     /// runtime instead.
     pub async fn operator_reconcile(&self) -> anyhow::Result<OperatorReconcileOutcome> {
-        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Recovery)?;
         self.inner
             .automatic_pairing_blocked
             .store(false, Ordering::Release);
@@ -1121,159 +1044,16 @@ impl ProductionClusterRuntime {
         self.inner.role
     }
 
-    fn claim_lifecycle_operation(
-        &self,
-        kind: OperationKind,
-    ) -> anyhow::Result<OperationLeaseGuard> {
-        self.inner
-            .lifecycle_lease
-            .claim(kind, OperationId(uuid::Uuid::new_v4()))
-            .map_err(anyhow::Error::new)
-    }
-
-    /// Claim the runtime-owned exclusive window used by the Manager activation actor. This is
-    /// deliberately unavailable through the HTTP request DTO; the actor supplies its persisted
-    /// operation ID only after validating the staged profile and current runtime state.
-    pub(super) fn claim_manager_activation(
-        &self,
-        operation_id: uuid::Uuid,
-    ) -> anyhow::Result<OperationLeaseGuard> {
-        self.inner
-            .lifecycle_lease
-            .claim(OperationKind::Activation, OperationId(operation_id))
-            .map_err(anyhow::Error::new)
-    }
-
-    pub(super) async fn set_manager_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> anyhow::Result<()> {
-        match candidate.role() {
-            super::process::Ds4CommandRole::Standalone => {
-                self.inner.standalone.set_next_command(candidate).await
-            }
-            super::process::Ds4CommandRole::Coordinator => {
-                self.inner
-                    .distributed_coordinator
-                    .get()
-                    .context("coordinator supervisor unavailable")?
-                    .set_next_command(candidate)
-                    .await
-            }
-            super::process::Ds4CommandRole::Worker => {
-                self.inner
-                    .distributed_worker
-                    .as_ref()
-                    .context("worker supervisor unavailable")?
-                    .set_next_command(candidate)
-                    .await
-            }
-        }
-    }
-
-    pub(super) async fn restore_manager_command(
-        &self,
-        role: super::process::Ds4CommandRole,
-    ) -> anyhow::Result<()> {
-        match role {
-            super::process::Ds4CommandRole::Standalone => {
-                self.inner.standalone.restore_previous_command().await
-            }
-            super::process::Ds4CommandRole::Coordinator => {
-                self.inner
-                    .distributed_coordinator
-                    .get()
-                    .context("coordinator supervisor unavailable")?
-                    .restore_previous_command()
-                    .await
-            }
-            super::process::Ds4CommandRole::Worker => {
-                self.inner
-                    .distributed_worker
-                    .as_ref()
-                    .context("worker supervisor unavailable")?
-                    .restore_previous_command()
-                    .await
-            }
-        }
-    }
-
-    pub(super) async fn manager_command_snapshot(
-        &self,
-        role: super::process::Ds4CommandRole,
-    ) -> anyhow::Result<CommandSlotSnapshot> {
-        match role {
-            super::process::Ds4CommandRole::Standalone => {
-                self.inner.standalone.command_snapshot().await
-            }
-            super::process::Ds4CommandRole::Coordinator => {
-                self.inner
-                    .distributed_coordinator
-                    .get()
-                    .context("coordinator supervisor unavailable")?
-                    .command_snapshot()
-                    .await
-            }
-            super::process::Ds4CommandRole::Worker => {
-                self.inner
-                    .distributed_worker
-                    .as_ref()
-                    .context("worker supervisor unavailable")?
-                    .command_snapshot()
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn current_manager_command_snapshot(
-        &self,
-    ) -> anyhow::Result<CommandSlotSnapshot> {
-        use super::process::Ds4CommandRole;
-
-        let snapshot = self.inner.mode.snapshot();
-        let command_role = match snapshot.stable_mode {
-            crate::target::StableMode::DistributedLayerParallel
-            | crate::target::StableMode::DistributedTensorParallel => match self.inner.role {
-                LocalRole::Coordinator => Ds4CommandRole::Coordinator,
-                LocalRole::Worker => Ds4CommandRole::Worker,
-                LocalRole::Unknown => anyhow::bail!("runtime role is unavailable"),
-            },
-            crate::target::StableMode::SoloStandalone
-            | crate::target::StableMode::PairedStandalone => Ds4CommandRole::Standalone,
-        };
-        self.manager_command_snapshot(command_role).await
-    }
-
-    fn manager_activation_active(&self) -> bool {
-        self.inner
-            .lifecycle_lease
-            .owner(OperationKind::Activation)
-            .is_some()
-    }
-
     pub fn planned_restart_active(&self) -> bool {
         self.inner.planned_restart.active()
     }
 
-    pub fn begin_planned_restart(&self) -> bool {
-        let mut lease = self
-            .inner
-            .planned_restart_lease
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lease.is_some() {
-            return true;
-        }
-        let Ok(guard) = self.claim_lifecycle_operation(OperationKind::Restart) else {
-            return false;
-        };
+    pub fn begin_planned_restart(&self) {
         self.inner.planned_restart.begin();
-        *lease = Some(guard);
-        true
     }
 
     pub async fn cancel_planned_restart(&self) -> anyhow::Result<()> {
-        self.clear_planned_restart();
+        self.inner.planned_restart.cancel();
         Ok(())
     }
 
@@ -1332,11 +1112,6 @@ impl ProductionClusterRuntime {
 
     pub(super) fn clear_planned_restart(&self) {
         self.inner.planned_restart.cancel();
-        self.inner
-            .planned_restart_lease
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
     }
 
     fn planned_restart_blocks_worker_prepare(&self) -> bool {
@@ -1352,38 +1127,13 @@ impl ProductionClusterRuntime {
     }
 
     pub fn try_claim_recovery_owner(&self) -> bool {
-        if self
-            .inner
+        self.inner
             .recovery_owner_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        match self.claim_lifecycle_operation(OperationKind::Recovery) {
-            Ok(guard) => {
-                *self
-                    .inner
-                    .recovery_owner_lease
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
-                true
-            }
-            Err(_) => {
-                self.inner
-                    .recovery_owner_active
-                    .store(false, Ordering::Release);
-                false
-            }
-        }
+            .is_ok()
     }
 
     pub fn release_recovery_owner(&self) {
-        self.inner
-            .recovery_owner_lease
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         self.inner
             .recovery_owner_active
             .store(false, Ordering::Release);
@@ -1462,42 +1212,6 @@ impl ProductionClusterRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
     }
 
-    /// Connect the node-local Manager release journal before the control listener starts.
-    pub fn attach_manager_store(
-        &self,
-        store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
-    ) {
-        *self
-            .inner
-            .manager_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
-    }
-
-    /// Exercise the installed Manager command actor with the same runtime-owned handler used by
-    /// the application. This is available only to integration tests, which need to observe a
-    /// complete transaction across two production-equivalent control planes.
-    #[cfg(feature = "test-support")]
-    pub async fn manager_operation_for_test(
-        &self,
-        operation: manager::ManagerRuntimeOperation,
-    ) -> Result<serde_json::Value, manager::ManagerRuntimeError> {
-        let store = self
-            .inner
-            .manager_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or(manager::ManagerRuntimeError::Unavailable)?;
-        manager::handle_cluster_operation(self, &store, operation).await
-    }
-
-    /// Simulate a participant completing a durable phase while its HTTP acknowledgement is lost.
-    #[cfg(feature = "test-support")]
-    pub fn lose_next_manager_peer_ack_for_test(&self, phase: manager::ManagerPeerPhase) {
-        manager::lose_next_manager_peer_ack_for_test(phase);
-    }
-
     /// Lock the policy journal/runtime-state persistence critical section. The guard is held only
     /// across synchronous journal load/save and in-memory policy updates; callers must not await
     /// while holding it.
@@ -1516,7 +1230,6 @@ impl ProductionClusterRuntime {
         expected_generation: u64,
         operation_id: uuid::Uuid,
     ) -> anyhow::Result<serde_json::Value> {
-        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Policy)?;
         let current_generation = self.inner.mode.snapshot().generation;
         anyhow::ensure!(
             expected_generation == 0 || expected_generation == current_generation,
@@ -1530,7 +1243,7 @@ impl ProductionClusterRuntime {
             phase: PolicyControlPhase::Prepare,
             desired,
         };
-        self.apply_policy_phase_unleased(&prepare).await?;
+        self.apply_policy_phase(&prepare).await?;
         let peer_id = self.peer_node_id().await.unwrap_or_else(|| "peer".into());
         self.inner.client.apply_policy(&prepare).await?;
 
@@ -1541,7 +1254,7 @@ impl ProductionClusterRuntime {
             ..prepare.clone()
         };
         self.inner.client.apply_policy(&commit).await?;
-        self.apply_policy_phase_unleased(&commit).await?;
+        self.apply_policy_phase(&commit).await?;
 
         let local_id = self.inner.descriptor.node_id.clone();
         Ok(serde_json::json!({
@@ -1582,7 +1295,7 @@ impl ProductionClusterRuntime {
 
     /// 認証済みpeerから受けたprepare/commit/abortをlocalへ適用する。副作用の前に
     /// intentをjournalへ保存し、commit完了後だけappliedを更新する。
-    async fn apply_policy_phase_unleased(
+    async fn apply_policy_phase(
         &self,
         request: &PolicyControlRequest,
     ) -> anyhow::Result<PolicyControlResponse> {
@@ -1698,9 +1411,6 @@ impl ProductionClusterRuntime {
         peer_present: bool,
         peer_policy_epoch: u64,
     ) -> AutomaticPromotionVerdict {
-        if self.manager_activation_active() {
-            return AutomaticPromotionVerdict::LifecycleOperationBusy;
-        }
         if self.policy_pending() && self.operator_policy() == OperationPolicy::Automatic {
             return AutomaticPromotionVerdict::EpochMismatch;
         }
@@ -1769,38 +1479,6 @@ impl ProductionClusterRuntime {
             .route("/v1/prepare-restart", post(control_prepare_restart))
             .route("/v1/cancel-restart", post(control_cancel_restart))
             .route("/v2/operation-policy", post(control_operation_policy))
-            .route(
-                manager::ManagerPeerPhase::Status.path(),
-                post(control_manager_status),
-            )
-            .route(
-                manager::ManagerPeerPhase::ForwardActivate.path(),
-                post(control_manager_forward_activate),
-            )
-            .route(
-                manager::ManagerPeerPhase::ForwardRollback.path(),
-                post(control_manager_forward_rollback),
-            )
-            .route(
-                manager::ManagerPeerPhase::Prepare.path(),
-                post(control_manager_prepare),
-            )
-            .route(
-                manager::ManagerPeerPhase::Drain.path(),
-                post(control_manager_drain),
-            )
-            .route(
-                manager::ManagerPeerPhase::Start.path(),
-                post(control_manager_start),
-            )
-            .route(
-                manager::ManagerPeerPhase::Commit.path(),
-                post(control_manager_commit),
-            )
-            .route(
-                manager::ManagerPeerPhase::Rollback.path(),
-                post(control_manager_rollback),
-            )
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self.clone())
     }
@@ -2075,7 +1753,6 @@ enum ControlHttpError {
     Auth(AuthError),
     Control(super::ControlError),
     Policy(PolicyControlError),
-    Manager(manager::ManagerPeerProtocolError),
     Effect(String),
     MissingHeader(&'static str),
     BadJson(String),
@@ -2093,12 +1770,6 @@ impl From<super::ControlError> for ControlHttpError {
     }
 }
 
-impl From<manager::ManagerPeerProtocolError> for ControlHttpError {
-    fn from(value: manager::ManagerPeerProtocolError) -> Self {
-        Self::Manager(value)
-    }
-}
-
 impl IntoResponse for ControlHttpError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -2111,24 +1782,6 @@ impl IntoResponse for ControlHttpError {
                 StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
                 format!("{error:?}"),
             ),
-            Self::Manager(error) => {
-                let status = match error {
-                    manager::ManagerPeerProtocolError::InvalidRequest => StatusCode::BAD_REQUEST,
-                    manager::ManagerPeerProtocolError::WrongRole
-                    | manager::ManagerPeerProtocolError::WrongPeer => StatusCode::FORBIDDEN,
-                    manager::ManagerPeerProtocolError::Conflict
-                    | manager::ManagerPeerProtocolError::StaleGeneration
-                    | manager::ManagerPeerProtocolError::StalePolicyEpoch => StatusCode::CONFLICT,
-                    manager::ManagerPeerProtocolError::Unavailable => {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
-                    manager::ManagerPeerProtocolError::NotReady => StatusCode::PRECONDITION_FAILED,
-                    manager::ManagerPeerProtocolError::LifecycleFailure => {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    }
-                };
-                (status, error.to_string())
-            }
             Self::Effect(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
             Self::MissingHeader(name) => (StatusCode::UNAUTHORIZED, format!("missing {name}")),
             Self::BadJson(error) => (StatusCode::BAD_REQUEST, error),
@@ -2166,9 +1819,6 @@ async fn control_operation_policy(
     }
     let request: PolicyControlRequest = serde_json::from_slice(&body)
         .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
-    let _lifecycle = runtime
-        .claim_lifecycle_operation(OperationKind::Policy)
-        .map_err(|error| ControlHttpError::Effect(error.to_string()))?;
     let verdict = runtime
         .inner
         .policy_control
@@ -2182,7 +1832,7 @@ async fn control_operation_policy(
         }));
     }
     runtime
-        .apply_policy_phase_unleased(&request)
+        .apply_policy_phase(&request)
         .await
         .map(Json)
         .map_err(|error| ControlHttpError::Effect(error.to_string()))
@@ -2275,40 +1925,6 @@ control_handler!(
     control_cancel_restart,
     ControlEndpoint::CancelRestart,
     "POST"
-);
-
-macro_rules! manager_peer_handler {
-    ($name:ident, $phase:expr) => {
-        async fn $name(
-            State(runtime): State<ProductionClusterRuntime>,
-            ConnectInfo(source): ConnectInfo<SocketAddr>,
-            headers: HeaderMap,
-            body: Bytes,
-        ) -> Result<Json<manager::ManagerPeerResponse>, ControlHttpError> {
-            runtime
-                .handle_manager_peer($phase, body, source, headers)
-                .await
-                .map(Json)
-        }
-    };
-}
-
-manager_peer_handler!(control_manager_status, manager::ManagerPeerPhase::Status);
-manager_peer_handler!(
-    control_manager_forward_activate,
-    manager::ManagerPeerPhase::ForwardActivate
-);
-manager_peer_handler!(
-    control_manager_forward_rollback,
-    manager::ManagerPeerPhase::ForwardRollback
-);
-manager_peer_handler!(control_manager_prepare, manager::ManagerPeerPhase::Prepare);
-manager_peer_handler!(control_manager_drain, manager::ManagerPeerPhase::Drain);
-manager_peer_handler!(control_manager_start, manager::ManagerPeerPhase::Start);
-manager_peer_handler!(control_manager_commit, manager::ManagerPeerPhase::Commit);
-manager_peer_handler!(
-    control_manager_rollback,
-    manager::ManagerPeerPhase::Rollback
 );
 
 fn endpoint_path(endpoint: ControlEndpoint) -> &'static str {
@@ -2661,52 +2277,6 @@ mod tests {
         Ok((StatusCode::OK, "coordinator metrics").into_response())
     }
 
-    async fn signed_manager_peer(
-        State(authenticator): State<Arc<ControlAuthenticator>>,
-        ConnectInfo(source): ConnectInfo<SocketAddr>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Result<Json<manager::ManagerPeerResponse>, ControlHttpError> {
-        let request: manager::ManagerPeerRequest = serde_json::from_slice(&body)
-            .map_err(|_| ControlHttpError::BadJson("invalid manager peer request".into()))?;
-        let signed = SignedControlHeaders::from_header_values(
-            header(&headers, HEADER_NODE)?,
-            header(&headers, HEADER_TIMESTAMP)?,
-            header(&headers, HEADER_NONCE)?,
-            header(&headers, HEADER_SIGNATURE)?,
-        )?;
-        ControlRequest {
-            method: "POST",
-            path_and_query: request.phase.path(),
-            body: &body,
-            source_ip: source.ip(),
-            headers: &signed,
-        }
-        .authenticate(&authenticator, now_millis())?;
-        Ok(Json(manager::ManagerPeerResponse {
-            protocol_version: manager::MANAGER_PEER_PROTOCOL_VERSION,
-            node_id: "worker-node".into(),
-            operation_id: request.operation_id,
-            profile_id: request.profile_id,
-            candidate_digest: request.candidate_digest,
-            source_commit: request.source_commit,
-            model_digest: request.model_digest,
-            previous_digest: request.previous_digest,
-            expected_generation: request.expected_generation,
-            policy_epoch: request.policy_epoch,
-            phase: request.phase,
-            ack_id: "ack-worker-prepare".into(),
-            profiles: Vec::new(),
-            active_release_digest: None,
-            active_model_digest: None,
-            previous_profile_id: None,
-            previous_model_digest: None,
-            previous_release_ready: false,
-            activation_phase: None,
-            activation_failure_class: None,
-        }))
-    }
-
     #[tokio::test]
     async fn real_http_client_pins_source_and_authenticates_control_body() {
         let secret = vec![0x61; 32];
@@ -2793,104 +2363,6 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn manager_peer_client_signs_the_versioned_route_and_checks_the_ack() {
-        let secret = vec![0x63; 32];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = Router::new()
-            .route(
-                manager::ManagerPeerPhase::Prepare.path(),
-                post(signed_manager_peer),
-            )
-            .with_state(Arc::new(ControlAuthenticator::new_at_source(
-                ControlSecret::new(secret.clone()).unwrap(),
-                "127.0.0.1".parse().unwrap(),
-            )));
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-        let client = ProductionControlClient::new(
-            "coordinator-node".into(),
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-            port,
-            secret,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let request = manager::ManagerPeerRequest {
-            operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
-            profile_id: "worker-profile".into(),
-            candidate_digest: "a".repeat(64),
-            source_commit: "c".repeat(40),
-            model_digest: "d".repeat(64),
-            previous_digest: Some("b".repeat(64)),
-            expected_generation: 3,
-            policy_epoch: 4,
-            phase: manager::ManagerPeerPhase::Prepare,
-            ack_id: None,
-        };
-
-        let response = client.manager_peer(&request).await.unwrap();
-        assert_eq!(response.node_id, "worker-node");
-        assert_eq!(response.ack_id, "ack-worker-prepare");
-        let unauthenticated = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/v2/manager/prepare"))
-            .json(&request)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn manager_peer_client_rejects_an_older_peer_without_the_protocol_route() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        // An older runtime has no /v2/manager/prepare endpoint; this is the same preflight
-        // failure the coordinator must observe before beginning a local drain.
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-        let client = ProductionControlClient::new(
-            "coordinator-node".into(),
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-            port,
-            vec![0x64; 32],
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let request = manager::ManagerPeerRequest {
-            operation_id: "8a5b9efb-1f7c-4c7d-a75b-2d0b26590819".into(),
-            profile_id: "worker-profile".into(),
-            candidate_digest: "a".repeat(64),
-            source_commit: "c".repeat(40),
-            model_digest: "d".repeat(64),
-            previous_digest: Some("b".repeat(64)),
-            expected_generation: 3,
-            policy_epoch: 4,
-            phase: manager::ManagerPeerPhase::Status,
-            ack_id: None,
-        };
-        assert!(client.manager_peer(&request).await.is_err());
-        server.abort();
-    }
-
     #[test]
     fn lifecycle_effects_are_acknowledged_after_completion() {
         assert!(effect_requires_ack(&ControlCommand::Pair {
@@ -2910,19 +2382,6 @@ mod tests {
         assert!(effect_requires_ack(&ControlCommand::PrepareRestart));
         assert!(effect_requires_ack(&ControlCommand::CancelRestart));
         assert!(!effect_requires_ack(&ControlCommand::BeginDrain));
-    }
-
-    #[test]
-    fn manager_activation_conflicts_are_reported_as_lifecycle_conflicts() {
-        assert_eq!(
-            super::super::ControlError::LifecycleOperationInProgress.http_status(),
-            StatusCode::CONFLICT.as_u16()
-        );
-        assert_eq!(
-            AutomaticPromotionVerdict::LifecycleOperationBusy.name(),
-            "auto-promote-lifecycle-operation-busy"
-        );
-        assert!(!AutomaticPromotionVerdict::LifecycleOperationBusy.allows_promotion());
     }
 
     #[test]

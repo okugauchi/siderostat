@@ -168,29 +168,3 @@ fn redact_secrets_hides_credentials_keeps_host() {
     assert!(redacted.contains("git.example.com"));
     assert!(redacted.contains("[REDACTED]"));
 }
-
-#[test]
-fn redact_secrets_hides_every_query_value_and_authorization_forms() {
-    let input = concat!(
-        "https://alice:password@git.example.com/repo?ref=private-ref&token=token-value&secret=secret-value&api_key=key-value&bearer=bearer-value ",
-        "Authorization: Bearer header-value\n",
-        "retry with Bearer standalone-value"
-    );
-    let redacted = redact_secrets(input);
-    assert!(redacted.contains("git.example.com"), "{redacted}");
-    for secret in [
-        "alice",
-        "password",
-        "private-ref",
-        "token-value",
-        "secret-value",
-        "key-value",
-        "bearer-value",
-        "header-value",
-        "standalone-value",
-    ] {
-        assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
-    }
-    assert!(redacted.contains("Authorization: [REDACTED]"), "{redacted}");
-    assert!(redacted.contains("Bearer [REDACTED]"), "{redacted}");
-}

@@ -94,7 +94,7 @@ fn m03_cancel_reaps_owned_group() {
     });
     let err = build_artifacts(&req, &cancel).expect_err("cancel must fail");
     handle.join().unwrap();
-    assert_eq!(err, BuildError::Canceled);
+    assert!(matches!(err, BuildError::Failed(_)));
 }
 
 /// 受入 case: secret env → child へ未継承。M03。

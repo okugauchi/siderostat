@@ -39,7 +39,6 @@ pub enum CapabilityStatus {
 /// encoder/support/prefix_file digest）と C04 CatalogEntry（URL/redirect
 /// allowlist/size/SHA/license/compatibility）を統合する。M04。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelCatalogEntry {
     /// catalog 内の一意 ID（commit 別）。M04。
     pub catalog_id: String,
@@ -72,7 +71,7 @@ pub struct ModelCatalogEntry {
     /// compatibility / restrictions 記述。M04。
     pub compatibility: Vec<String>,
     /// 計算済み status。M04。
-    #[serde(default, skip_serializing)]
+    #[serde(skip)]
     pub status: CapabilityStatus,
 }
 
@@ -89,8 +88,6 @@ pub enum CatalogError {
     Unsupported(String),
     /// 無根拠な組み合わせ（TP + 無根拠 DSpark 等）。M04。
     Unfounded(String),
-    /// unsafe identity or source URL. M04.
-    InvalidEntry(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -101,7 +98,6 @@ impl std::fmt::Display for CatalogError {
             CatalogError::MissingChecksum(id) => write!(f, "missing checksum: {id}"),
             CatalogError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             CatalogError::Unfounded(msg) => write!(f, "unfounded: {msg}"),
-            CatalogError::InvalidEntry(msg) => write!(f, "invalid catalog entry: {msg}"),
         }
     }
 }
@@ -162,35 +158,8 @@ pub fn compute_status(entry: &ModelCatalogEntry) -> CapabilityStatus {
 ///   M04。
 pub fn validate_entry(mut entry: ModelCatalogEntry) -> Result<ModelCatalogEntry, CatalogError> {
     // 欠落 checksum → activation 不可。M04。
-    if entry.sha256.trim().is_empty()
-        || entry.sha256.len() != 64
-        || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if entry.sha256.trim().is_empty() {
         return Err(CatalogError::MissingChecksum(entry.catalog_id));
-    }
-    if !valid_catalog_id(&entry.catalog_id)
-        || entry.size == 0
-        || entry.license.trim().is_empty()
-        || entry.family.trim().is_empty()
-        || entry.quantization.trim().is_empty()
-        || entry
-            .compatibility
-            .iter()
-            .any(|value| value.trim().is_empty())
-    {
-        return Err(CatalogError::InvalidEntry(entry.catalog_id));
-    }
-    validate_catalog_url(&entry.url, &entry.catalog_id)?;
-    let mut redirect_origins = HashSet::new();
-    for redirect in &entry.redirect_allowlist {
-        validate_catalog_url(redirect, &entry.catalog_id)?;
-        let origin = url::Url::parse(redirect)
-            .map_err(|_| CatalogError::InvalidEntry(entry.catalog_id.clone()))?
-            .origin()
-            .ascii_serialization();
-        if !redirect_origins.insert(origin) {
-            return Err(CatalogError::InvalidEntry(entry.catalog_id));
-        }
     }
     // Vision + 0731 support → 拒否。M04。
     if vision_0731_unsupported(&entry) {
@@ -206,70 +175,8 @@ pub fn validate_entry(mut entry: ModelCatalogEntry) -> Result<ModelCatalogEntry,
             entry.catalog_id
         )));
     }
-    for digest in [&entry.encoder, &entry.support, &entry.prefix_file]
-        .into_iter()
-        .flatten()
-    {
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(CatalogError::InvalidEntry(entry.catalog_id));
-        }
-    }
     entry.status = compute_status(&entry);
     Ok(entry)
-}
-
-fn valid_catalog_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.as_bytes()[0].is_ascii_alphanumeric()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn validate_catalog_url(value: &str, id: &str) -> Result<(), CatalogError> {
-    let parsed = url::Url::parse(value).map_err(|_| CatalogError::InvalidEntry(id.into()))?;
-    let fixture_scheme = cfg!(feature = "test-support") && parsed.scheme() == "fixture";
-    if (!fixture_scheme && parsed.scheme() != "https")
-        || parsed.host_str().is_none_or(str::is_empty)
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host.ends_with(".localhost")
-                || host.ends_with(".local")
-        })
-    {
-        return Err(CatalogError::InvalidEntry(id.into()));
-    }
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip))
-            if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() =>
-        {
-            return Err(CatalogError::InvalidEntry(id.into()));
-        }
-        Some(url::Host::Ipv6(ip))
-            if ip.is_unique_local()
-                || ip.is_loopback()
-                || ip.is_unicast_link_local()
-                || ip.is_unspecified() =>
-        {
-            return Err(CatalogError::InvalidEntry(id.into()));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Read the catalog embedded in the signed application bundle. No filesystem
-/// location or user supplied URL participates in production catalog loading.
-pub fn bundled_catalog() -> Result<Vec<ModelCatalogEntry>, CatalogError> {
-    let entries: Vec<ModelCatalogEntry> =
-        serde_json::from_str(include_str!("../../resources/ds4/catalog.json"))
-            .map_err(|error| CatalogError::Parse(error.to_string()))?;
-    validate_entries(entries)
 }
 
 /// catalog JSON を読み込み、全エントリを検証する。M04。
@@ -277,12 +184,6 @@ pub fn load_and_validate(path: &Path) -> Result<Vec<ModelCatalogEntry>, CatalogE
     let text = std::fs::read_to_string(path).map_err(|e| CatalogError::Load(e.to_string()))?;
     let entries: Vec<ModelCatalogEntry> =
         serde_json::from_str(&text).map_err(|e| CatalogError::Parse(e.to_string()))?;
-    validate_entries(entries)
-}
-
-fn validate_entries(
-    entries: Vec<ModelCatalogEntry>,
-) -> Result<Vec<ModelCatalogEntry>, CatalogError> {
     let mut out = Vec::with_capacity(entries.len());
     let mut seen = HashSet::new();
     for entry in entries {
@@ -381,53 +282,5 @@ mod tests {
         let entry = base_entry("ds4-main");
         let out = validate_entry(entry).expect("must be allowed");
         assert_eq!(out.status, CapabilityStatus::Candidate);
-    }
-
-    #[test]
-    fn bundled_catalog_contains_only_validated_sources() {
-        assert!(bundled_catalog().expect("bundled catalog").is_empty());
-    }
-
-    #[test]
-    fn catalog_rejects_short_digest_and_unsafe_urls() {
-        let mut entry = base_entry("short-digest");
-        entry.sha256 = "abcd".into();
-        assert!(matches!(
-            validate_entry(entry),
-            Err(CatalogError::MissingChecksum(_))
-        ));
-
-        let mut entry = base_entry("http-source");
-        entry.url = "http://models.example.com/model.bin".into();
-        assert!(matches!(
-            validate_entry(entry),
-            Err(CatalogError::InvalidEntry(_))
-        ));
-
-        let mut entry = base_entry("credentialed-source");
-        entry.url = "https://user:password@models.example.com/model.bin".into();
-        assert!(matches!(
-            validate_entry(entry),
-            Err(CatalogError::InvalidEntry(_))
-        ));
-    }
-
-    #[test]
-    fn catalog_rejects_unknown_fields_and_duplicate_redirect_origins() {
-        let mut value = serde_json::to_value(base_entry("strict-entry")).expect("serialize");
-        value.as_object_mut().expect("object").insert(
-            "unreviewed_source".into(),
-            serde_json::json!("https://other.invalid"),
-        );
-        assert!(serde_json::from_value::<ModelCatalogEntry>(value).is_err());
-
-        let mut entry = base_entry("duplicate-redirect");
-        entry
-            .redirect_allowlist
-            .push("https://models.example.com/another-path".into());
-        assert!(matches!(
-            validate_entry(entry),
-            Err(CatalogError::InvalidEntry(_))
-        ));
     }
 }

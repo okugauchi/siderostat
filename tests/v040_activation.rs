@@ -43,7 +43,7 @@ fn req(op: &str) -> ActivationRequest {
     ActivationRequest {
         operation_id: op.to_string(),
         expected_generation: 1,
-        profile_id: "profile-test".to_string(),
+        runtime_lease: "lease-1".to_string(),
         policy_epoch: 1,
         nodes: vec!["local".to_string(), "peer".to_string()],
     }
@@ -57,8 +57,8 @@ impl ActivationDriver for OkDriver {
     fn start_new_and_wait_ready(&mut self) -> Result<(), ActivationError> {
         Ok(())
     }
-    fn commit(&mut self) -> Result<Vec<String>, ActivationError> {
-        Ok(vec!["local".into(), "peer".into()])
+    fn commit(&mut self) -> Result<(), ActivationError> {
+        Ok(())
     }
 }
 
@@ -72,8 +72,8 @@ impl ActivationDriver for FailStartDriver {
             "start failed".to_string(),
         ))
     }
-    fn commit(&mut self) -> Result<Vec<String>, ActivationError> {
-        Ok(Vec::new())
+    fn commit(&mut self) -> Result<(), ActivationError> {
+        Ok(())
     }
 }
 
@@ -171,11 +171,15 @@ fn m08_both_present_automatic_completes() {
     assert!(matches!(verdict, ActivationVerdict::Complete(_)));
 }
 
-/// expected_generation 必須。runtime lease は runtime owner が取得する。M08。
+/// generation / lease 必須（activation/rollback に要求、C04）。M08。
 #[test]
-fn m08_generation_required() {
+fn m08_generation_or_lease_required() {
     let mut r = req("op-f");
     r.expected_generation = 0;
     let err = prepare_activation(r, &provider(true, true)).expect_err("gen required");
-    assert_eq!(err, ActivationError::MissingGeneration);
+    assert_eq!(err, ActivationError::MissingGenerationOrLease);
+    let mut r = req("op-g");
+    r.runtime_lease = String::new();
+    let err = prepare_activation(r, &provider(true, true)).expect_err("lease required");
+    assert_eq!(err, ActivationError::MissingGenerationOrLease);
 }

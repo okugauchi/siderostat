@@ -89,17 +89,38 @@ fn m04_missing_checksum_not_activatable() {
     assert!(matches!(err, CatalogError::MissingChecksum(_)));
 }
 
-/// 配布元・size・full SHA が裏付けられたモデルだけを catalog に含める。M04。
+/// fixture catalog.json を読み込み、全エントリが検証される。M04。
 #[test]
 fn m04_load_catalog_fixture() {
     let entries = load_and_validate(&catalog_path()).expect("catalog must load");
-    // 現在の resource は placeholder URL と仮 checksum だけなので空にする。M04。
-    assert!(entries.is_empty());
+    // 3 エントリ（ds4-main / dspark-tp / a-proj-q4）。M04。
+    assert_eq!(entries.len(), 3);
+    // a-proj-q4 は未 main → reference。M04。
+    let aproj = entries
+        .iter()
+        .find(|e| e.catalog_id == "a-proj-q4-20260830")
+        .expect("a-proj entry");
+    assert_eq!(aproj.status, CapabilityStatus::Reference);
+    // ds4-main は main 済 → candidate。M04。
+    let ds4 = entries
+        .iter()
+        .find(|e| e.catalog_id == "ds4-main-20260907")
+        .expect("ds4 entry");
+    assert_eq!(ds4.status, CapabilityStatus::Candidate);
 }
 
-/// placeholder 配布元は入手候補にも verified download にも公開しない。M04。
+/// RAM/size は upstream reference と明示され、性能再現を登録条件にしない。M04。
 #[test]
-fn m04_placeholder_sources_are_not_downloadable() {
+fn m04_ram_size_are_upstream_reference() {
     let entries = load_and_validate(&catalog_path()).expect("catalog must load");
-    assert!(entries.is_empty());
+    for e in &entries {
+        // RAM reference が明示されている（upstream reference と注記）。M04。
+        let ram = e.ram_reference.as_deref().expect("ram_reference present");
+        assert!(
+            ram.contains("upstream reference") || ram.contains("reference"),
+            "ram_reference must be marked as upstream reference: {ram}"
+        );
+        // size が 0 でない（download 候補として登録）。M04。
+        assert!(e.size > 0);
+    }
 }

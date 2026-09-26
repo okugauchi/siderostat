@@ -108,7 +108,7 @@ fn m07_unconfirmed_ram_is_hardware_pending() {
     assert_eq!(staged.status, StagedProfileStatus::HardwarePending);
 
     // HardwarePending の activation plan は ready=false。M07。
-    let plan = build_activation_plan(&staged, 1);
+    let plan = build_activation_plan(&staged, 1, "lease-1".to_string());
     assert!(!plan.ready);
 }
 
@@ -202,7 +202,7 @@ fn m07_validated_not_ready_until_smoke() {
     .expect("stage validated");
     assert_eq!(staged.status, StagedProfileStatus::Validated);
 
-    let plan = build_activation_plan(&staged, 1);
+    let plan = build_activation_plan(&staged, 1, "lease-1".to_string());
     assert!(plan.ready);
 
     // 軽量 smoke 成功（Validated → ok）。M07。

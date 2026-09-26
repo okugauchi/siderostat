@@ -65,6 +65,8 @@ pub struct ActivationJournal {
     pub operation_id: String,
     /// expected generation（activation/rollback に要求、C04）。M08。
     pub expected_generation: u64,
+    /// runtime lease（activation/rollback に要求、C04）。M08。
+    pub runtime_lease: String,
     /// policy epoch。M08。
     pub policy_epoch: u64,
     /// 全体フェーズ。M08。
@@ -80,12 +82,12 @@ pub trait NodeArtifactProvider {
     fn verified_artifact(&self, node: &NodeId) -> Option<String>;
 }
 
-/// runtime owner が受け取る activation 要求。lease はここへ含めず実行時に取得する。M08。
+/// activation 要求（expected_generation + runtime lease 必須、C04）。M08。
 #[derive(Debug, Clone)]
 pub struct ActivationRequest {
     pub operation_id: String,
     pub expected_generation: u64,
-    pub profile_id: String,
+    pub runtime_lease: String,
     pub policy_epoch: u64,
     /// 両 node ID（local, peer）。M08。
     pub nodes: Vec<NodeId>,
@@ -94,8 +96,8 @@ pub struct ActivationRequest {
 /// activation エラー。M08。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationError {
-    /// expected_generation が未指定（0） → 拒否。M08。
-    MissingGeneration,
+    /// expected_generation が未指定（0）または lease が空 → 拒否。M08。
+    MissingGenerationOrLease,
     /// 両 node を指定しない → 拒否。M08。
     RequiresTwoNodes,
     /// 不正な遷移（例: Prepared 前の drain）。M08。
@@ -109,7 +111,9 @@ pub enum ActivationError {
 impl std::fmt::Display for ActivationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActivationError::MissingGeneration => write!(f, "expected_generation is required"),
+            ActivationError::MissingGenerationOrLease => {
+                write!(f, "expected_generation and runtime lease are required")
+            }
             ActivationError::RequiresTwoNodes => write!(f, "activation requires two nodes"),
             ActivationError::InvalidTransition(msg) => write!(f, "invalid transition: {msg}"),
             ActivationError::UnknownNode(id) => write!(f, "unknown node: {id}"),
@@ -136,8 +140,8 @@ pub fn prepare_activation(
     req: ActivationRequest,
     provider: &dyn NodeArtifactProvider,
 ) -> Result<PrepareOutcome, ActivationError> {
-    if req.expected_generation == 0 {
-        return Err(ActivationError::MissingGeneration);
+    if req.expected_generation == 0 || req.runtime_lease.is_empty() {
+        return Err(ActivationError::MissingGenerationOrLease);
     }
     if req.nodes.len() != 2 {
         return Err(ActivationError::RequiresTwoNodes);
@@ -158,6 +162,7 @@ pub fn prepare_activation(
     let journal = ActivationJournal {
         operation_id: req.operation_id,
         expected_generation: req.expected_generation,
+        runtime_lease: req.runtime_lease,
         policy_epoch: req.policy_epoch,
         phase: ActivationPhase::Prepared,
         nodes,
@@ -302,7 +307,7 @@ mod tests {
         ActivationRequest {
             operation_id: op.to_string(),
             expected_generation: 7,
-            profile_id: "profile-test".to_string(),
+            runtime_lease: "lease-7".to_string(),
             policy_epoch: 3,
             nodes: vec!["local".to_string(), "peer".to_string()],
         }
@@ -343,13 +348,17 @@ mod tests {
         assert!(matches!(out, PrepareOutcome::Prepared(_)));
     }
 
-    /// generation 未指定は拒否。M08。
+    /// generation/lease 未指定は拒否。M08。
     #[test]
-    fn missing_generation_rejected() {
+    fn missing_generation_or_lease_rejected() {
         let mut r = req("op3");
         r.expected_generation = 0;
         let err = prepare_activation(r, &both()).expect_err("gen required");
-        assert_eq!(err, ActivationError::MissingGeneration);
+        assert_eq!(err, ActivationError::MissingGenerationOrLease);
+        let mut r = req("op3b");
+        r.runtime_lease = String::new();
+        let err = prepare_activation(r, &both()).expect_err("lease required");
+        assert_eq!(err, ActivationError::MissingGenerationOrLease);
     }
 
     /// 受入: ack 紛失 → Complete でない。両 node ack 揃うまで Committing。M08。
@@ -400,6 +409,7 @@ mod tests {
         let journal = ActivationJournal {
             operation_id: "op6".to_string(),
             expected_generation: 1,
+            runtime_lease: "l".to_string(),
             policy_epoch: 1,
             phase: ActivationPhase::Ready,
             nodes: vec![],

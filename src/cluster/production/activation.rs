@@ -26,8 +26,6 @@ use crate::manager::activation::{
 pub enum ActivationVerdict {
     /// 両 node commit ack が揃い active 公開済み。M08。
     Complete(ActivationJournal),
-    /// One or more explicit commit acknowledgements are still outstanding.
-    AwaitingPeerAck(ActivationJournal),
     /// 片側 artifact 無し → 停止 0。旧 runtime を保持。M08。
     StoppedZero(ActivationJournal),
     /// 新 profile 起動失敗 → previous へ rollback。M08。
@@ -44,9 +42,8 @@ pub trait ActivationDriver {
     fn drain_and_stop_old(&mut self) -> Result<(), ActivationError>;
     /// 新 profile を起動して ready を待つ。失敗は Err（→ rollback）。M08。
     fn start_new_and_wait_ready(&mut self) -> Result<(), ActivationError>;
-    /// Return only participant IDs whose commit acknowledgement was actually received.
-    /// A local commit is never treated as an implicit peer acknowledgement.
-    fn commit(&mut self) -> Result<Vec<NodeId>, ActivationError>;
+    /// 新 profile の commit ack を送る（両 node 揃うと active 公開）。M08。
+    fn commit(&mut self) -> Result<(), ActivationError>;
 }
 
 /// cluster-wide activation transaction を実行する。M08。
@@ -86,16 +83,17 @@ pub fn execute_activation(
     }
     let journal = mark_ready(journal)?;
 
-    // Acknowledgements are explicit; the driver cannot turn one local commit into two acks.
-    let acknowledgements = driver.commit()?;
+    // 両 node commit ack（片 ack 紛失では Complete にならない）。M08。
+    driver.commit()?;
+    // local ack（driver が両 node の commit を完了したと仮定）。M08。
     let mut journal = journal;
-    for node_id in acknowledgements {
-        journal = commit_ack(journal, &node_id)?;
+    for node in journal.nodes.clone() {
+        journal = commit_ack(journal, &node.node)?;
     }
     if journal.phase == ActivationPhase::Complete {
         Ok(ActivationVerdict::Complete(journal))
     } else {
-        Ok(ActivationVerdict::AwaitingPeerAck(journal))
+        Ok(ActivationVerdict::RolledBack(journal))
     }
 }
 
@@ -154,7 +152,7 @@ mod tests {
         ActivationRequest {
             operation_id: "op".to_string(),
             expected_generation: 1,
-            profile_id: "profile-local".to_string(),
+            runtime_lease: "lease-1".to_string(),
             policy_epoch: 1,
             nodes: vec!["local".to_string(), "peer".to_string()],
         }
@@ -168,8 +166,8 @@ mod tests {
         fn start_new_and_wait_ready(&mut self) -> Result<(), ActivationError> {
             Ok(())
         }
-        fn commit(&mut self) -> Result<Vec<NodeId>, ActivationError> {
-            Ok(vec!["local".into(), "peer".into()])
+        fn commit(&mut self) -> Result<(), ActivationError> {
+            Ok(())
         }
     }
 
@@ -183,8 +181,8 @@ mod tests {
                 "start failed".to_string(),
             ))
         }
-        fn commit(&mut self) -> Result<Vec<NodeId>, ActivationError> {
-            Ok(Vec::new())
+        fn commit(&mut self) -> Result<(), ActivationError> {
+            Ok(())
         }
     }
 
@@ -214,37 +212,6 @@ mod tests {
         )
         .expect("complete");
         assert!(matches!(out, ActivationVerdict::Complete(_)));
-    }
-
-    #[test]
-    fn one_commit_ack_remains_waiting_for_peer_ack() {
-        struct LocalAckDriver;
-        impl ActivationDriver for LocalAckDriver {
-            fn drain_and_stop_old(&mut self) -> Result<(), ActivationError> {
-                Ok(())
-            }
-            fn start_new_and_wait_ready(&mut self) -> Result<(), ActivationError> {
-                Ok(())
-            }
-            fn commit(&mut self) -> Result<Vec<NodeId>, ActivationError> {
-                Ok(vec!["local".into()])
-            }
-        }
-
-        let out = execute_activation(
-            req(),
-            &provider(true, true),
-            &mut LocalAckDriver,
-            OperationPolicy::Automatic,
-            Some(1),
-        )
-        .expect("partial commit remains pending");
-        let ActivationVerdict::AwaitingPeerAck(journal) = out else {
-            panic!("a single acknowledgement must not complete a two-node activation");
-        };
-        assert_eq!(journal.phase, ActivationPhase::Committing);
-        assert_eq!(journal.nodes[0].phase, NodePhase::Committed);
-        assert_eq!(journal.nodes[1].phase, NodePhase::Ready);
     }
 
     /// 受入: 起動失敗 → rollback。M08。

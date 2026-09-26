@@ -4,9 +4,7 @@
 
 use super::{RoleControl, now_millis};
 use crate::{
-    cluster::{
-        ClusterEvent, ClusterEventKind, DistributedCoordinatorLifecycle, EventOwner, OperationKind,
-    },
+    cluster::{ClusterEvent, ClusterEventKind, DistributedCoordinatorLifecycle, EventOwner},
     target::{ClusterState, LocalRole, ProxyTarget, UnavailableReason},
 };
 use anyhow::Context;
@@ -82,7 +80,6 @@ impl super::ProductionClusterRuntime {
         recovery_event: ClusterEventKind,
         recovery_name: &'static str,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        let _lifecycle = self.claim_lifecycle_operation(OperationKind::Recovery)?;
         let recovery = self.inner.recovery.clone();
         let _guard = recovery.lock().await;
         if self.planned_restart_active() {
@@ -304,7 +301,13 @@ impl super::ProductionClusterRuntime {
                             .recover_from_peer_loss(EventOwner::RouteLossMonitor)
                             .await;
                     }
-                    let demoted = self.demote().await?;
+                    let demoted = self
+                        .inner
+                        .coordinator_runtime
+                        .get()
+                        .context("coordinator runtime unavailable")?
+                        .demote()
+                        .await?;
                     return Ok(demoted);
                 }
             }

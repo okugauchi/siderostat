@@ -12,12 +12,9 @@
 use siderostat_core::manager::api::{ManagerJobDto, ManagerStatusResponse};
 use siderostat_monitor::{
     jobs::{JobPhase, JobTracker},
-    manager_window::{ManagerEvent, redact_secrets},
     operation::{OperationKind, OperationOutcome, OperationState},
     state::{VersionHandshake, version_handshake},
-    tray::MonitorTray,
 };
-use tray_icon::menu::{MenuEvent, MenuId};
 
 fn dto(id: &str, kind: &str, phase: &str, updated_at: u64) -> ManagerJobDto {
     ManagerJobDto {
@@ -168,52 +165,4 @@ fn operation_busy_does_not_hide_manager_jobs() {
         JobPhase::Running
     );
     assert_eq!(tracker.job_count(), 2);
-}
-
-/// H06 manager menu is a distinct tray dispatch path. It must not be
-/// accidentally handled as a settings/restart/quit event. H06.
-#[test]
-fn manager_menu_dispatch_id_is_distinct() {
-    let event = MenuEvent {
-        id: MenuId::new("open-manager"),
-    };
-    assert!(MonitorTray::is_open_manager_event(&event));
-    assert!(!MonitorTray::is_open_config_event(&event));
-    assert!(!MonitorTray::is_runtime_restart_event(&event));
-    assert!(!MonitorTray::is_quit_event(&event));
-}
-
-/// Worker failures are redacted before they cross into the AppKit view. A
-/// submitted job remains an observed running job; submission itself never
-/// becomes a fabricated terminal success. H06.
-#[test]
-fn manager_worker_failure_is_redacted_and_submission_is_nonterminal() {
-    let failed = siderostat_monitor::manager_window::manager_failed_event(
-        "POST https://user:secret@example.invalid/manager/jobs?token=abc failed",
-    );
-    assert_eq!(
-        failed,
-        ManagerEvent::Failed {
-            message: redact_secrets(
-                "POST https://user:secret@example.invalid/manager/jobs?token=abc failed",
-            ),
-        }
-    );
-    let ManagerEvent::Failed { message } = failed else {
-        panic!("worker failure must be surfaced as Failed")
-    };
-    assert!(!message.contains("secret"));
-    assert!(!message.contains("token=abc"));
-
-    let submitted = siderostat_monitor::manager_window::manager_submitted_event("build", "job-1");
-    assert_eq!(
-        submitted,
-        ManagerEvent::Submitted {
-            kind: "build".to_string(),
-            id: "job-1".to_string(),
-        }
-    );
-    assert!(
-        !matches!(submitted, ManagerEvent::Status(status) if status.jobs.iter().any(|job| job.phase == "succeeded"))
-    );
 }

@@ -121,9 +121,9 @@ fn send_sigterm(_pid: u32) -> Result<()> {
 use futures::future::BoxFuture;
 use siderostat::{
     cluster::{
-        ChildIdentity, CommandSlotSnapshot, DistributedCoordinatorLifecycle, DistributedManifest,
+        ChildIdentity, DistributedCoordinatorLifecycle, DistributedManifest,
         DistributedWorkerLifecycle, LocalStandaloneLifecycle, ModeRuntime, NetworkSnapshot,
-        ProductionClusterRuntime, ThunderboltIpState, VerifiedDs4Command,
+        ProductionClusterRuntime, ThunderboltIpState,
     },
     config::ModeAwareConfig,
     proxy::{ModeAwareProxyOptions, ModeAwareProxyState},
@@ -199,16 +199,9 @@ impl RecordedChild {
 #[derive(Clone)]
 pub struct FakeStandalone {
     child: RecordedChild,
-    selected_profile: Arc<std::sync::Mutex<String>>,
-    previous_profile: Arc<std::sync::Mutex<Option<String>>>,
-    selected_command_digest: Arc<std::sync::Mutex<String>>,
-    previous_command_digest: Arc<std::sync::Mutex<Option<String>>>,
+    profile: &'static str,
     pid: u32,
     start_fails: Arc<AtomicBool>,
-    start_failures_remaining: Arc<AtomicUsize>,
-    start_delay_millis: Arc<AtomicU64>,
-    start_pending: Arc<AtomicBool>,
-    start_notify: Arc<tokio::sync::Notify>,
     stop_delay_millis: Arc<AtomicU64>,
 }
 
@@ -216,16 +209,9 @@ impl FakeStandalone {
     pub fn new(profile: &'static str, pid: u32) -> Self {
         Self {
             child: RecordedChild::default(),
-            selected_profile: Arc::new(std::sync::Mutex::new(profile.into())),
-            previous_profile: Arc::new(std::sync::Mutex::new(None)),
-            selected_command_digest: Arc::new(std::sync::Mutex::new(String::new())),
-            previous_command_digest: Arc::new(std::sync::Mutex::new(None)),
+            profile,
             pid,
             start_fails: Arc::new(AtomicBool::new(false)),
-            start_failures_remaining: Arc::new(AtomicUsize::new(0)),
-            start_delay_millis: Arc::new(AtomicU64::new(0)),
-            start_pending: Arc::new(AtomicBool::new(false)),
-            start_notify: Arc::new(tokio::sync::Notify::new()),
             stop_delay_millis: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -239,29 +225,6 @@ impl FakeStandalone {
         self.start_fails.store(fails, Ordering::SeqCst);
     }
 
-    /// Fail exactly the next child start, allowing the following previous-release restart to
-    /// prove the transaction's rollback path.
-    pub fn set_start_fails_once(&self) {
-        self.start_failures_remaining.store(1, Ordering::SeqCst);
-    }
-
-    pub fn set_start_delay(&self, delay: Duration) {
-        self.start_delay_millis.store(
-            delay.as_millis().min(u64::MAX as u128) as u64,
-            Ordering::SeqCst,
-        );
-    }
-
-    pub async fn wait_for_start_attempt(&self) {
-        loop {
-            let notified = self.start_notify.notified();
-            if self.start_pending.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
-    }
-
     /// Delay standalone shutdown to reproduce the window between control Pair acceptance and
     /// the worker's local PairingReady transition.
     pub fn set_stop_delay(&self, delay: Duration) {
@@ -273,36 +236,14 @@ impl FakeStandalone {
 impl LocalStandaloneLifecycle for FakeStandalone {
     fn start(&self, generation: u64) -> BoxFuture<'static, anyhow::Result<()>> {
         let child = self.child.clone();
-        let selected_profile = self.selected_profile.clone();
+        let profile = self.profile;
         let pid = self.pid;
         let start_fails = self.start_fails.clone();
-        let start_failures_remaining = self.start_failures_remaining.clone();
-        let start_delay_millis = self.start_delay_millis.clone();
-        let start_pending = self.start_pending.clone();
-        let start_notify = self.start_notify.clone();
         Box::pin(async move {
-            start_pending.store(true, Ordering::SeqCst);
-            start_notify.notify_one();
-            let start_delay = start_delay_millis.load(Ordering::SeqCst);
-            if start_delay > 0 {
-                tokio::time::sleep(Duration::from_millis(start_delay)).await;
-            }
-            let fail_once = start_failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    if remaining > 0 {
-                        Some(remaining - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok();
-            if start_fails.load(Ordering::SeqCst) || fail_once {
-                start_pending.store(false, Ordering::SeqCst);
+            if start_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("injected standalone start failure");
             }
-            let profile = selected_profile.lock().unwrap().clone();
             child.start(generation, pid, profile);
-            start_pending.store(false, Ordering::SeqCst);
             Ok(())
         })
     }
@@ -328,69 +269,6 @@ impl LocalStandaloneLifecycle for FakeStandalone {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         let child = self.child.clone();
         Box::pin(async move { child.identity() })
-    }
-
-    fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        let selected_profile = self.selected_profile.clone();
-        let previous_profile = self.previous_profile.clone();
-        let selected_command_digest = self.selected_command_digest.clone();
-        let previous_command_digest = self.previous_command_digest.clone();
-        let child = self.child.clone();
-        Box::pin(async move {
-            if child.is_running() {
-                anyhow::bail!("manager command slot cannot change while child is running");
-            }
-            *previous_profile.lock().unwrap() = Some(selected_profile.lock().unwrap().clone());
-            *previous_command_digest.lock().unwrap() =
-                Some(selected_command_digest.lock().unwrap().clone());
-            *selected_profile.lock().unwrap() = candidate.profile_id().to_owned();
-            *selected_command_digest.lock().unwrap() = candidate.digest_hex();
-            Ok(())
-        })
-    }
-
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let selected_profile = self.selected_profile.clone();
-        let previous_profile = self.previous_profile.clone();
-        let selected_command_digest = self.selected_command_digest.clone();
-        let previous_command_digest = self.previous_command_digest.clone();
-        let child = self.child.clone();
-        Box::pin(async move {
-            if child.is_running() {
-                anyhow::bail!("manager command slot cannot change while child is running");
-            }
-            let previous = previous_profile
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("no previous test command"))?;
-            let current = selected_profile.lock().unwrap().clone();
-            *previous_profile.lock().unwrap() = Some(current);
-            *selected_profile.lock().unwrap() = previous;
-            let previous_digest = previous_command_digest
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("no previous test command digest"))?;
-            let current_digest = selected_command_digest.lock().unwrap().clone();
-            *previous_command_digest.lock().unwrap() = Some(current_digest);
-            *selected_command_digest.lock().unwrap() = previous_digest;
-            Ok(())
-        })
-    }
-
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
-        let selected_profile = self.selected_profile.clone();
-        let selected_command_digest = self.selected_command_digest.clone();
-        Box::pin(async move {
-            Ok(CommandSlotSnapshot {
-                profile_id: selected_profile.lock().unwrap().clone(),
-                command_sha256: selected_command_digest.lock().unwrap().clone(),
-            })
-        })
     }
 }
 
@@ -842,7 +720,6 @@ impl Node {
     ) -> anyhow::Result<Self> {
         let ds4_distributed_port = free_loopback_port().await?;
         let peer_ingress_port = free_loopback_port().await?;
-        let state_root = state_path.clone();
         let mut config = test_config(
             node_id,
             coordinator_address,
@@ -853,19 +730,6 @@ impl Node {
             state_path,
             manifest_cache,
         );
-        // The production-equivalent harness uses fake child lifecycles, but external-baseline
-        // release verification still hashes the configured binary and model. Give each node
-        // stable, node-local fixture files so baseline rollback exercises that verification.
-        config.ds4.binary = state_root.join("fixture-ds4-server");
-        config.ds4.standalone.model = state_root.join("fixture-standalone.gguf");
-        std::fs::write(
-            &config.ds4.binary,
-            format!("fixture external DS4 binary for {node_id}"),
-        )?;
-        std::fs::write(
-            &config.ds4.standalone.model,
-            format!("fixture external model for {node_id}"),
-        )?;
         config.cluster.timeouts.control_lease = control_lease;
         let proxy = proxy_state()?;
         let standalone = Arc::new(FakeStandalone::new(

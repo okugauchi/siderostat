@@ -19,7 +19,6 @@ pub enum RestartManualReason {
     PersistedChildStopFailed,
     RequiredPortOccupied,
     RequiredAddressUnavailable,
-    ManagerActivationUnresolved,
 }
 
 #[derive(Debug, Error)]

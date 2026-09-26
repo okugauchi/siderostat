@@ -20,9 +20,3 @@
 - 新モードの統合テストは、実 control HTTP で pair → promote → demote を通し、実プロセス無し（pid=None）を検証すること
 - 同一ホストに複数ノードを同居させるテストでは、peer の制御ポートを明示分離できること
 - 出典: feature/cluster-dry-run（2026-09-05）
-- 外部配布物を catalog の取得対象にする前に、配布元・正確な size・full checksum の根拠を照合する。placeholder URL と仮置き checksum は trust の根拠として採用しない
-- 出典: H06 Manager Model Download/Verify（2026-09-25）
-- 永続 release pointer や設定 manifest は child が実際に読み込んだ状態を証明しない。inventory の active digest は verified profile と一致する live observation がある時だけ出す
-- 出典: H06 Manager Durable Stage and Inventory（2026-09-25）
-- node-local Manager UI は期待 node ID とruntime-observed roleを照合し、最新 fetched_at のreceiptから当該role用buildだけを許可する。verified artifact候補が複数なら自動選択しない
-- 出典: H06 Manager Per-node Preparation Flow（2026-09-25）

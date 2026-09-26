@@ -147,8 +147,6 @@ pub enum ControlError {
     CommandNotAllowed,
     #[error("worker planned restart is still in progress")]
     PlannedRestartInProgress,
-    #[error("a manager activation owns the lifecycle gate")]
-    LifecycleOperationInProgress,
     #[error("control command is not valid in phase {phase:?}")]
     InvalidPhase { phase: DistributedControlPhase },
 }
@@ -161,7 +159,6 @@ impl ControlError {
             | Self::IdempotencyConflict
             | Self::PeerNotPaired
             | Self::PlannedRestartInProgress
-            | Self::LifecycleOperationInProgress
             | Self::InvalidPhase { .. } => 409,
             Self::CommandNotAllowed => 403,
             Self::EndpointMismatch

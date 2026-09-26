@@ -24,8 +24,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::store::{ArtifactKind, ManagerReleaseStore, ReleaseIdentity};
-
 /// managed root の既定相対パス（互換 root を維持）。C04。M01。
 const MANAGED_ROOT_RELATIVE: &str = "Library/Application Support/siderostat";
 
@@ -220,66 +218,6 @@ impl ArtifactRegistry {
         }
     }
 
-    /// 検証済みの durable store から query 用 record を導出する。
-    ///
-    /// manager release store が永続正本であり、この registry は表示・既存
-    /// query API 用の一時 projection のみを保持する。M02。
-    pub fn from_store(store: &ManagerReleaseStore) -> Self {
-        let snapshot = store.snapshot();
-        let mut states = BTreeMap::new();
-        for (identity, state) in [
-            (
-                snapshot.release_pointers.previous.as_ref(),
-                ArtifactState::Previous,
-            ),
-            (
-                snapshot.release_pointers.active.as_ref(),
-                ArtifactState::Active,
-            ),
-        ] {
-            let Some(ReleaseIdentity::ManagedProfile(profile_id)) = identity else {
-                continue;
-            };
-            let Some(profile) = snapshot.profiles.get(profile_id) else {
-                continue;
-            };
-            for artifact_id in profile
-                .role_artifact_ids
-                .iter()
-                .chain(std::iter::once(&profile.model_artifact_id))
-            {
-                states.insert(artifact_id.clone(), state);
-            }
-        }
-
-        let records = snapshot
-            .artifacts
-            .values()
-            .map(|artifact| {
-                let kind = match artifact.kind {
-                    ArtifactKind::Build => "build",
-                    ArtifactKind::Model => "model",
-                };
-                ArtifactRecord {
-                    id: artifact.id.clone(),
-                    kind: kind.into(),
-                    rel_path: artifact.rel_path.clone(),
-                    sha256: artifact.sha256.clone(),
-                    state: states
-                        .get(&artifact.id)
-                        .copied()
-                        .unwrap_or(artifact.validation_state),
-                }
-            })
-            .map(|record| (record.id.clone(), record))
-            .collect();
-
-        Self {
-            root: store.root().clone(),
-            records,
-        }
-    }
-
     /// managed root。M01。
     pub fn root(&self) -> &ManagerRoot {
         &self.root
@@ -447,7 +385,7 @@ pub struct SourceRecord {
     pub fetched_at: u64,
 }
 
-/// BuildRecord。C04: source/flags/toolchain/arch/role/target digest/help digest。M01。
+/// BuildRecord。C04: source/flags/toolchain/arch/role digest/help digest。M01。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuildRecord {
     /// source の commit ref。M01。
@@ -460,9 +398,6 @@ pub struct BuildRecord {
     pub arch: String,
     /// role（worker/coordinator 等）。M01。
     pub role: String,
-    /// 実行した固定 make target。旧 store record との互換用に欠落時は空。
-    #[serde(default)]
-    pub target: String,
     /// binary digest（full SHA-256）。M01。
     pub digest: String,
     /// help text digest。M01。

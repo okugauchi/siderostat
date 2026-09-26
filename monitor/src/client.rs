@@ -182,32 +182,6 @@ impl MetricsClient {
             .context("parse manager/status response")
     }
 
-    /// Fetch the sanitized, node-local Manager inventory. This uses the same
-    /// admin bearer token as job polling and never requests peer inventory.
-    pub async fn fetch_manager_inventory(
-        &self,
-    ) -> Result<siderostat_core::manager::api::ManagerInventoryResponse> {
-        let url = format!("{}/manager/inventory", self.base_url);
-        let mut request = self.http.get(&url);
-        if let Some(token) = &self.admin_token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.with_context(|| format!("GET {url}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(anyhow!("manager inventory unavailable (old runtime)"));
-        }
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "manager/inventory endpoint returned {}",
-                response.status()
-            ));
-        }
-        response
-            .json()
-            .await
-            .context("parse manager/inventory response")
-    }
-
     /// 接続モードを `/cluster/operation-policy`（P06 / C03）へ適用する。
     ///
     /// 選択を直接 `StableMode` へ書換えず、API へ送る（レビュー重点）。
@@ -268,27 +242,11 @@ impl MetricsClient {
         kind: &str,
         payload_key: &str,
     ) -> Result<siderostat_core::manager::api::SubmitResponse> {
-        let body = manager_job_body(kind, payload_key, None)?;
-        self.submit_manager_job_body(body).await
-    }
-
-    /// Submit an activation/rollback job with the observed generation. The
-    /// runtime owner resolves and validates its live lease internally.
-    pub async fn submit_manager_job_with_generation(
-        &self,
-        kind: &str,
-        payload_key: &str,
-        expected_generation: u64,
-    ) -> Result<siderostat_core::manager::api::SubmitResponse> {
-        let body = manager_job_body(kind, payload_key, Some(expected_generation))?;
-        self.submit_manager_job_body(body).await
-    }
-
-    async fn submit_manager_job_body(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<siderostat_core::manager::api::SubmitResponse> {
         let url = format!("{}/manager/jobs", self.base_url);
+        let body = serde_json::json!({
+            "kind": kind,
+            "payload_key": payload_key,
+        });
         let mut request = self.http.post(&url).json(&body);
         if let Some(token) = &self.admin_token {
             request = request.bearer_auth(token);
@@ -378,29 +336,6 @@ fn parse_policy_job(value: &serde_json::Value) -> Option<PendingJob> {
     })
 }
 
-fn manager_job_body(
-    kind: &str,
-    payload_key: &str,
-    expected_generation: Option<u64>,
-) -> Result<serde_json::Value> {
-    let needs_context = matches!(kind, "activate" | "rollback");
-    if needs_context {
-        anyhow::ensure!(
-            expected_generation.is_some_and(|generation| generation > 0),
-            "expected_generation must be greater than zero for {kind}"
-        );
-    }
-
-    let mut body = serde_json::json!({
-        "kind": kind,
-        "payload_key": payload_key,
-    });
-    if let Some(generation) = expected_generation {
-        body["expected_generation"] = serde_json::json!(generation);
-    }
-    Ok(body)
-}
-
 fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
     if routing.role == "worker" && routing.target == "coordinator" {
         "/metrics/coordinator"
@@ -452,27 +387,5 @@ mod tests {
     fn ready_endpoint_distinguishes_ready_from_not_ready() {
         assert!(reqwest::StatusCode::OK.is_success());
         assert!(!reqwest::StatusCode::SERVICE_UNAVAILABLE.is_success());
-    }
-
-    #[test]
-    fn manager_job_body_includes_generation_without_exposing_a_runtime_lease() {
-        let activation =
-            manager_job_body("activate", "profile-a", Some(3)).expect("activation body");
-        assert_eq!(activation["kind"], "activate");
-        assert_eq!(activation["payload_key"], "profile-a");
-        assert_eq!(activation["expected_generation"], 3);
-        assert!(activation.get("runtime_lease").is_none());
-
-        let fetch = manager_job_body("fetch", "official", None).expect("fetch body");
-        assert_eq!(fetch["kind"], "fetch");
-        assert!(fetch.get("expected_generation").is_none());
-        assert!(fetch.get("runtime_lease").is_none());
-    }
-
-    #[test]
-    fn manager_job_body_rejects_incomplete_activation_context() {
-        let error = manager_job_body("activate", "profile-a", Some(0))
-            .expect_err("zero generation must be rejected");
-        assert!(error.to_string().contains("expected_generation"));
     }
 }

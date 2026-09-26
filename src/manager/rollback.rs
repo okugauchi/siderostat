@@ -1,7 +1,7 @@
 //! DS4 Manager — rollback・再起動復旧・fault matrix。M09。
 //!
 //! C04 に基づき、activation の起動失敗時に previous へ復旧する。旧 artifact
-//! へ runtime owner の lifecycle gate を通して復旧し、復旧失敗は ManualIntervention として
+//! へ同じ runtime lease で復旧し、復旧失敗は ManualIntervention として
 //! route を閉じる。rollback でも最新 Force intent（policy_epoch）を保持し、
 //! 旧 state 丸ごと復元で新 policy を消さない。旧 artifact の自動削除は
 //! しない。M09。
@@ -26,6 +26,8 @@ pub struct RollbackRequest {
     pub operation_id: String,
     /// expected generation（activation/rollback に要求、C04）。M09。
     pub expected_generation: u64,
+    /// runtime lease（旧 artifact へ同じ lease で復旧、C04）。M09。
+    pub runtime_lease: String,
     /// 最新 policy_epoch（rollback でも保持。新 Force intent を消さない）。M09。
     pub policy_epoch: u64,
     /// previous artifact の digest（old ready へ復旧）。M09。
@@ -75,7 +77,7 @@ pub fn rollback_to_previous(
     let prepare_req = ActivationRequest {
         operation_id: req.operation_id,
         expected_generation: req.expected_generation,
-        profile_id: String::new(),
+        runtime_lease: req.runtime_lease,
         policy_epoch: req.policy_epoch,
         nodes: req.nodes,
     };
@@ -129,6 +131,7 @@ mod tests {
         RollbackRequest {
             operation_id: "op-r".to_string(),
             expected_generation: 1,
+            runtime_lease: "lease-1".to_string(),
             policy_epoch: 5,
             previous_digest: "old-digest".to_string(),
             nodes: vec!["local".to_string(), "peer".to_string()],
@@ -201,7 +204,7 @@ mod tests {
         let prepare_req = ActivationRequest {
             operation_id: req.operation_id.clone(),
             expected_generation: req.expected_generation,
-            profile_id: String::new(),
+            runtime_lease: req.runtime_lease.clone(),
             policy_epoch: req.policy_epoch,
             nodes: req.nodes.clone(),
         };

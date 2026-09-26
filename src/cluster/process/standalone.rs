@@ -1,7 +1,4 @@
-use super::{
-    ChildIdentity, CommandSlot, CommandSlotError, CommandSlotSnapshot, Ds4CommandRole,
-    ManagedChild, ProcessControlError, SupervisedChild, SupervisedSlot, VerifiedDs4Command,
-};
+use super::{ChildIdentity, ManagedChild, ProcessControlError, SupervisedChild, SupervisedSlot};
 use crate::{
     cluster::{Ds4Command, Ds4LogEvent, LocalStandaloneLifecycle},
     metrics::Metrics,
@@ -23,7 +20,7 @@ pub struct StandaloneSupervisor {
 }
 
 struct StandaloneSupervisorInner {
-    commands: CommandSlot,
+    command: Ds4Command,
     models_url: Url,
     client: reqwest::Client,
     startup_timeout: Duration,
@@ -48,7 +45,7 @@ impl StandaloneSupervisor {
     ) -> Self {
         Self {
             inner: Arc::new(StandaloneSupervisorInner {
-                commands: CommandSlot::new(command),
+                command,
                 models_url,
                 client: reqwest::Client::new(),
                 startup_timeout,
@@ -78,7 +75,7 @@ impl StandaloneSupervisor {
     ) -> Self {
         Self {
             inner: Arc::new(StandaloneSupervisorInner {
-                commands: CommandSlot::new(command),
+                command,
                 models_url,
                 client: reqwest::Client::new(),
                 startup_timeout,
@@ -100,30 +97,6 @@ impl StandaloneSupervisor {
         self.inner.child.child_identity().await
     }
 
-    pub(crate) async fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> anyhow::Result<()> {
-        if candidate.role() != Ds4CommandRole::Standalone {
-            return Err(CommandSlotError::RoleMismatch.into());
-        }
-        self.inner
-            .child
-            .set_next_command(&self.inner.commands, candidate)
-            .await
-    }
-
-    pub(crate) async fn restore_previous_command(&self) -> anyhow::Result<()> {
-        self.inner
-            .child
-            .restore_previous_command(&self.inner.commands)
-            .await
-    }
-
-    pub(crate) async fn command_snapshot(&self) -> Result<CommandSlotSnapshot, CommandSlotError> {
-        self.inner.commands.current_snapshot().await
-    }
-
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
         if self.inner.dry_run {
@@ -138,12 +111,11 @@ impl StandaloneSupervisor {
         let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
         };
-        let command = self.inner.commands.current_command().await?;
         let startup_deadline = Instant::now() + self.inner.startup_timeout;
-        let mut child = ManagedChild::spawn(&command, generation).await?;
+        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let (mut logs, mut events, forwarders) = child.start_log_forwarding_with_events(256)?;
         let (dspark_activation, mut dspark_activation_rx) = tokio::sync::watch::channel(false);
-        let activation_profile = command.profile.profile_id.clone();
+        let activation_profile = self.inner.command.profile.profile_id.clone();
         let metrics = self.inner.metrics.clone();
         let log_task = tokio::spawn(async move {
             loop {
@@ -232,7 +204,8 @@ impl StandaloneSupervisor {
             log_task.abort();
             return Err(error.into());
         }
-        if command.profile.speculative_support == crate::config::SpeculativeSupport::Dspark
+        if self.inner.command.profile.speculative_support
+            == crate::config::SpeculativeSupport::Dspark
             && !*dspark_activation_rx.borrow()
         {
             let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -314,30 +287,6 @@ impl LocalStandaloneLifecycle for StandaloneSupervisor {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.child_identity().await })
-    }
-
-    fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(
-            async move { StandaloneSupervisor::set_next_command(&supervisor, candidate).await },
-        )
-    }
-
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { StandaloneSupervisor::restore_previous_command(&supervisor).await })
-    }
-
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
-        let supervisor = self.clone();
-        Box::pin(async move {
-            StandaloneSupervisor::command_snapshot(&supervisor)
-                .await
-                .map_err(Into::into)
-        })
     }
 }
 

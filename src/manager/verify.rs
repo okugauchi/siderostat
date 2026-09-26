@@ -14,7 +14,6 @@
 //! レビュー重点: 実行 file の TOCTOU を identity 再確認で防ぐ。model の
 //! 新規検証を sample hash だけに弱めない。M06。
 use crate::manager::registry::{ArtifactRegistry, ArtifactState, RegistryError, sha256_hex};
-use crate::manager::store::{ManagerReleaseStore, StoreError};
 use std::path::PathBuf;
 
 /// verified artifact。M06。
@@ -64,24 +63,6 @@ impl From<RegistryError> for VerifyError {
             _ => VerifyError::Io(e.to_string()),
         }
     }
-}
-
-/// Rehash a persisted catalog model and durably update its trust state.
-/// Digest/size mismatches are recorded as quarantined before returning failure.
-pub fn verify_stored_model(
-    store: &mut ManagerReleaseStore,
-    artifact_id: &str,
-    catalog_id: &str,
-    expected_sha256: &str,
-    expected_size: u64,
-) -> Result<(), VerifyError> {
-    store
-        .verify_model_artifact(artifact_id, catalog_id, expected_sha256, expected_size)
-        .map_err(|error| match error {
-            StoreError::DigestMismatch | StoreError::SizeMismatch => VerifyError::Quarantined,
-            StoreError::InvalidReference(_) => VerifyError::NotFound,
-            other => VerifyError::Io(other.to_string()),
-        })
 }
 
 /// artifact の full SHA-256 を照合し、不一致なら quarantine。M06。

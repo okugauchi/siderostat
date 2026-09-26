@@ -1,7 +1,4 @@
-use super::{
-    ChildIdentity, CommandSlot, CommandSlotError, CommandSlotSnapshot, Ds4CommandRole,
-    ManagedChild, SupervisedChild, SupervisedSlot, VerifiedDs4Command,
-};
+use super::{ChildIdentity, ManagedChild, SupervisedChild, SupervisedSlot};
 use crate::{
     cluster::{
         DistributedWorkerLifecycle, Ds4Command, Ds4LogEvent, TpConnectedObservation,
@@ -18,7 +15,7 @@ pub struct DistributedWorkerSupervisor {
 }
 
 struct DistributedWorkerSupervisorInner {
-    commands: CommandSlot,
+    command: Ds4Command,
     stop_timeout: Duration,
     allow_sigkill: bool,
     metrics: Arc<Metrics>,
@@ -34,7 +31,7 @@ impl DistributedWorkerSupervisor {
     ) -> Self {
         Self {
             inner: Arc::new(DistributedWorkerSupervisorInner {
-                commands: CommandSlot::new(command),
+                command,
                 stop_timeout,
                 allow_sigkill,
                 metrics,
@@ -47,37 +44,12 @@ impl DistributedWorkerSupervisor {
         self.inner.child.child_identity().await
     }
 
-    pub(crate) async fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> anyhow::Result<()> {
-        if candidate.role() != Ds4CommandRole::Worker {
-            return Err(CommandSlotError::RoleMismatch.into());
-        }
-        self.inner
-            .child
-            .set_next_command(&self.inner.commands, candidate)
-            .await
-    }
-
-    pub(crate) async fn restore_previous_command(&self) -> anyhow::Result<()> {
-        self.inner
-            .child
-            .restore_previous_command(&self.inner.commands)
-            .await
-    }
-
-    pub(crate) async fn command_snapshot(&self) -> Result<CommandSlotSnapshot, CommandSlotError> {
-        self.inner.commands.current_snapshot().await
-    }
-
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
         let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
         };
-        let command = self.inner.commands.current_command().await?;
-        let mut child = ManagedChild::spawn(&command, generation).await?;
+        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let (mut logs, forwarders) = child.start_log_forwarding(256)?;
         let metrics = self.inner.metrics.clone();
         let log_task = tokio::spawn(async move {
@@ -184,32 +156,6 @@ impl DistributedWorkerLifecycle for DistributedWorkerSupervisor {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.child_identity().await })
     }
-
-    fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move {
-            DistributedWorkerSupervisor::set_next_command(&supervisor, candidate).await
-        })
-    }
-
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(
-            async move { DistributedWorkerSupervisor::restore_previous_command(&supervisor).await },
-        )
-    }
-
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
-        let supervisor = self.clone();
-        Box::pin(async move {
-            DistributedWorkerSupervisor::command_snapshot(&supervisor)
-                .await
-                .map_err(Into::into)
-        })
-    }
 }
 
 /// TP worker の supervised lifecycle。Prepared（child 生成・生存のみ）と Connected
@@ -222,7 +168,7 @@ pub struct TpWorkerSupervisor {
 }
 
 struct TpWorkerSupervisorInner {
-    commands: CommandSlot,
+    command: Ds4Command,
     stop_timeout: Duration,
     allow_sigkill: bool,
     metrics: Arc<Metrics>,
@@ -240,7 +186,7 @@ impl TpWorkerSupervisor {
     ) -> Self {
         Self {
             inner: Arc::new(TpWorkerSupervisorInner {
-                commands: CommandSlot::new(command),
+                command,
                 stop_timeout,
                 allow_sigkill,
                 metrics,
@@ -252,30 +198,6 @@ impl TpWorkerSupervisor {
 
     pub async fn child_identity(&self) -> Option<ChildIdentity> {
         self.inner.child.child_identity().await
-    }
-
-    pub(crate) async fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> anyhow::Result<()> {
-        if candidate.role() != Ds4CommandRole::Worker {
-            return Err(CommandSlotError::RoleMismatch.into());
-        }
-        self.inner
-            .child
-            .set_next_command(&self.inner.commands, candidate)
-            .await
-    }
-
-    pub(crate) async fn restore_previous_command(&self) -> anyhow::Result<()> {
-        self.inner
-            .child
-            .restore_previous_command(&self.inner.commands)
-            .await
-    }
-
-    pub(crate) async fn command_snapshot(&self) -> Result<CommandSlotSnapshot, CommandSlotError> {
-        self.inner.commands.current_snapshot().await
     }
 
     pub async fn is_connected(&self) -> bool {
@@ -292,8 +214,7 @@ impl TpWorkerSupervisor {
                 identity: self.inner.child.child_identity().await,
             });
         };
-        let command = self.inner.commands.current_command().await?;
-        let mut child = ManagedChild::spawn(&command, generation).await?;
+        let mut child = ManagedChild::spawn(&self.inner.command, generation).await?;
         let identity = child.identity().clone();
         let (mut logs, forwarders) = child.start_log_forwarding(256)?;
         let metrics = self.inner.metrics.clone();
@@ -429,27 +350,5 @@ impl TpWorkerLifecycle for TpWorkerSupervisor {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.child_identity().await })
-    }
-
-    fn set_next_command(
-        &self,
-        candidate: VerifiedDs4Command,
-    ) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { TpWorkerSupervisor::set_next_command(&supervisor, candidate).await })
-    }
-
-    fn restore_previous_command(&self) -> BoxFuture<'static, anyhow::Result<()>> {
-        let supervisor = self.clone();
-        Box::pin(async move { TpWorkerSupervisor::restore_previous_command(&supervisor).await })
-    }
-
-    fn command_snapshot(&self) -> BoxFuture<'static, anyhow::Result<CommandSlotSnapshot>> {
-        let supervisor = self.clone();
-        Box::pin(async move {
-            TpWorkerSupervisor::command_snapshot(&supervisor)
-                .await
-                .map_err(Into::into)
-        })
     }
 }

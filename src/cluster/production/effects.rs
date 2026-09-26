@@ -5,7 +5,7 @@ use crate::{
         ControlRequest, ControlResponse, EventOwner, HEADER_NODE, HEADER_NONCE, HEADER_SIGNATURE,
         HEADER_TIMESTAMP, SignedControlHeaders, WorkerEventKind,
     },
-    target::{ClusterState, LocalRole},
+    target::LocalRole,
 };
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -89,15 +89,6 @@ impl super::ProductionClusterRuntime {
         let message: ControlMessage = serde_json::from_slice(&body)
             .map_err(|error| ControlHttpError::BadJson(error.to_string()))?;
         let command = message.command.clone();
-        if self.manager_activation_active() {
-            return Err(ControlError::LifecycleOperationInProgress.into());
-        }
-        let planned_restart_was_active = self.planned_restart_active();
-        if matches!(&command, ControlCommand::PrepareRestart) && !self.begin_planned_restart() {
-            return Err(ControlError::LifecycleOperationInProgress.into());
-        }
-        let began_planned_restart =
-            matches!(&command, ControlCommand::PrepareRestart) && !planned_restart_was_active;
         if self.inner.role == LocalRole::Worker
             && matches!(&command, ControlCommand::PrepareWorker)
             && self.planned_restart_blocks_worker_prepare()
@@ -119,16 +110,10 @@ impl super::ProductionClusterRuntime {
                 ) {
                     Ok(response) => response,
                     Err(ControlError::GenerationMismatch { expected, received }) => {
-                        if began_planned_restart {
-                            self.clear_planned_restart();
-                        }
                         log_pair_generation_mismatch(expected, received, cluster_generation);
                         return Err(ControlError::GenerationMismatch { expected, received }.into());
                     }
                     Err(error) => {
-                        if began_planned_restart {
-                            self.clear_planned_restart();
-                        }
                         if error == ControlError::DeploymentMismatch {
                             self.schedule_deployment_mismatch_recovery();
                         }
@@ -146,16 +131,10 @@ impl super::ProductionClusterRuntime {
                 ) {
                     Ok(response) => response,
                     Err(ControlError::GenerationMismatch { expected, received }) => {
-                        if began_planned_restart {
-                            self.clear_planned_restart();
-                        }
                         log_pair_generation_mismatch(expected, received, cluster_generation);
                         return Err(ControlError::GenerationMismatch { expected, received }.into());
                     }
                     Err(error) => {
-                        if began_planned_restart {
-                            self.clear_planned_restart();
-                        }
                         if error == ControlError::DeploymentMismatch {
                             self.schedule_deployment_mismatch_recovery();
                         }
@@ -235,37 +214,18 @@ impl super::ProductionClusterRuntime {
                 };
                 self.complete_pair_effect(planned_completion).await?;
             }
-            ControlCommand::PrepareWorker => {
-                let _lifecycle =
-                    self.claim_lifecycle_operation(crate::cluster::OperationKind::Promotion)?;
-                self.prepare_worker().await?;
-            }
-            ControlCommand::BeginDrain => {
-                let _lifecycle =
-                    self.claim_lifecycle_operation(crate::cluster::OperationKind::Recovery)?;
-                self.worker_drained().await?;
-            }
-            ControlCommand::CancelGeneration | ControlCommand::Demote => {
-                let _lifecycle =
-                    self.claim_lifecycle_operation(crate::cluster::OperationKind::Recovery)?;
-                self.stop_worker().await?;
-            }
+            ControlCommand::PrepareWorker => self.prepare_worker().await?,
+            ControlCommand::BeginDrain => self.worker_drained().await?,
+            ControlCommand::CancelGeneration | ControlCommand::Demote => self.stop_worker().await?,
             ControlCommand::WorkerEvent {
                 event: WorkerEventKind::Exited,
             } if self.inner.role == LocalRole::Coordinator => {
                 self.recover_from_peer_loss(EventOwner::Control).await?;
             }
             ControlCommand::DistributedReady => {
-                let _lifecycle =
-                    self.claim_lifecycle_operation(crate::cluster::OperationKind::Promotion)?;
                 self.inner.proxy.admission().start_serving();
             }
-            ControlCommand::PrepareRestart => {
-                anyhow::ensure!(
-                    self.begin_planned_restart(),
-                    "another lifecycle operation is in progress"
-                );
-            }
+            ControlCommand::PrepareRestart => self.begin_planned_restart(),
             ControlCommand::CancelRestart => self.cancel_planned_restart().await?,
             ControlCommand::Drained | ControlCommand::WorkerEvent { .. } => {}
         }
@@ -276,28 +236,6 @@ impl super::ProductionClusterRuntime {
         &self,
         planned_completion: bool,
     ) -> anyhow::Result<()> {
-        let lifecycle =
-            match self.claim_lifecycle_operation(crate::cluster::OperationKind::Promotion) {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(_error)
-                    if self.inner.role == LocalRole::Coordinator
-                        && matches!(
-                            self.inner.mode.snapshot().state,
-                            ClusterState::SoloStandaloneReady | ClusterState::PairedStandaloneReady
-                        )
-                        && self
-                            .inner
-                            .lifecycle_lease
-                            .owner(crate::cluster::OperationKind::Promotion)
-                            .is_some() =>
-                {
-                    // The coordinator's outbound `pair()` owns Promotion while awaiting the
-                    // worker's reciprocal Pair. That authenticated request is part of the same
-                    // transaction, so reuse the in-flight lease only in the pre-pair stable state.
-                    None
-                }
-                Err(error) => return Err(error),
-            };
         let result = async {
             if self.inner.role == LocalRole::Worker {
                 let reply = ControlMessage {
@@ -313,8 +251,7 @@ impl super::ProductionClusterRuntime {
             }
             self.clear_planned_restart();
             tokio::time::sleep(self.inner.config.cluster.policy.required_peer_stability).await;
-            drop(lifecycle);
-            self.reconcile_peer_unleased(EventOwner::Control).await?;
+            self.reconcile_peer(EventOwner::Control).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;

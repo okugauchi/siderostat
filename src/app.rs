@@ -67,16 +67,7 @@ pub struct AppState {
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
     /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
-    pub jobs: Arc<std::sync::Mutex<crate::manager::jobs::JobJournal>>,
-    /// JobJournal と他の Manager metadata が共有する永続正本。job lock の後に取得する。
-    pub manager_store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
-    manager_executor: crate::manager::executor::ManagerExecutorHandle,
-    manager_worker: tokio::task::JoinHandle<()>,
-    manager_runtime_receiver:
-        std::sync::Mutex<Option<crate::cluster::production::manager::ManagerRuntimeReceiver>>,
-    manager_runtime_actor: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    standalone_lifecycle_lease: crate::cluster::OperationLease,
-    standalone_restart_lease: std::sync::Mutex<Option<crate::cluster::OperationLeaseGuard>>,
+    pub jobs: std::sync::Mutex<crate::manager::jobs::JobJournal>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -96,97 +87,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: ModeAwareConfig) -> anyhow::Result<Arc<Self>> {
-        tokio::runtime::Handle::try_current()
-            .context("manager executor requires a Tokio runtime")?;
-        #[cfg(feature = "test-support")]
-        let manager_root = Self::temporary_manager_root();
-        #[cfg(not(feature = "test-support"))]
-        let manager_root = {
-            let home = std::env::var_os("HOME").context("HOME is required for manager storage")?;
-            crate::manager::registry::ManagerRoot::default_from_home(std::path::Path::new(&home))
-        };
-        let manager_store = Arc::new(std::sync::Mutex::new(
-            crate::manager::store::ManagerReleaseStore::open(
-                manager_root,
-                config.cluster.node_id.clone(),
-            )
-            .context("open manager release store")?,
-        ));
-        let stage_config =
-            crate::manager::stage::StageRuntimeConfig::from_validated_config(&config);
-        let backend =
-            crate::manager::executor::RuntimeManagerBackend::for_release_store_with_stage_config(
-                manager_store.clone(),
-                stage_config,
-            )
-            .context("configure manager backend")?;
-        Self::from_config_with_manager_store(config, backend, manager_store)
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn from_config_with_manager_backend<B>(
-        config: ModeAwareConfig,
-        backend: B,
-        admin: AdminController,
-    ) -> anyhow::Result<Arc<Self>>
-    where
-        B: crate::manager::executor::ManagerExecutionBackend,
-    {
-        let state =
-            Self::from_config_with_manager_root(config, backend, Self::temporary_manager_root())?;
-        state.attach_admin(admin);
-        Ok(state)
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn shutdown_manager_executor_for_test(&self) {
-        self.manager_executor.shutdown_for_test();
-    }
-
-    #[cfg(feature = "test-support")]
-    fn temporary_manager_root() -> crate::manager::registry::ManagerRoot {
-        let root = std::env::temp_dir().join(format!(
-            "siderostat-manager-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        crate::manager::registry::ManagerRoot::explicit(root)
-    }
-
-    #[cfg(feature = "test-support")]
-    fn from_config_with_manager_root<B>(
-        config: ModeAwareConfig,
-        backend: B,
-        manager_root: crate::manager::registry::ManagerRoot,
-    ) -> anyhow::Result<Arc<Self>>
-    where
-        B: crate::manager::executor::ManagerExecutionBackend,
-    {
-        tokio::runtime::Handle::try_current()
-            .context("manager executor requires a Tokio runtime")?;
-        let manager_store = Arc::new(std::sync::Mutex::new(
-            crate::manager::store::ManagerReleaseStore::open(
-                manager_root,
-                config.cluster.node_id.clone(),
-            )
-            .context("open manager release store")?,
-        ));
-        Self::from_config_with_manager_store(config, backend, manager_store)
-    }
-
-    fn from_config_with_manager_store<B>(
-        config: ModeAwareConfig,
-        backend: B,
-        manager_store: Arc<std::sync::Mutex<crate::manager::store::ManagerReleaseStore>>,
-    ) -> anyhow::Result<Arc<Self>>
-    where
-        B: crate::manager::executor::ManagerExecutionBackend,
-    {
-        let job_persistence = Arc::new(crate::manager::store::ManagerJobStorePersistence::new(
-            manager_store.clone(),
-        ));
-        let job_journal = crate::manager::jobs::JobJournal::open(job_persistence)
-            .context("open manager job journal")?;
         let recovery_config = config.recovery.clone();
         let metrics = Arc::new(Metrics::default());
         let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
@@ -224,13 +124,6 @@ impl AppState {
             proxy.admission().start_serving();
         }
 
-        let jobs = Arc::new(std::sync::Mutex::new(job_journal));
-        let (manager_runtime_handle, manager_runtime_receiver) =
-            crate::cluster::production::manager::manager_runtime_channel();
-        backend.attach_runtime_handle(manager_runtime_handle);
-        let (manager_executor, manager_worker) =
-            crate::manager::executor::ManagerExecutor::start(jobs.clone(), backend);
-
         Ok(Arc::new(Self {
             config: Arc::new(AppConfig {
                 public_listen: config.proxy.public_listen,
@@ -249,14 +142,7 @@ impl AppState {
             }),
             proxy,
             metrics,
-            jobs,
-            manager_store,
-            manager_executor,
-            manager_worker,
-            manager_runtime_receiver: std::sync::Mutex::new(Some(manager_runtime_receiver)),
-            manager_runtime_actor: std::sync::Mutex::new(None),
-            standalone_lifecycle_lease: crate::cluster::OperationLease::new(),
-            standalone_restart_lease: std::sync::Mutex::new(None),
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -280,52 +166,6 @@ impl AppState {
             .cluster
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cluster);
-    }
-
-    fn attach_manager_runtime_actor<F, Fut>(&self, handler: F) -> anyhow::Result<()>
-    where
-        F: Fn(crate::cluster::production::manager::ManagerRuntimeOperation) -> Fut
-            + Send
-            + Sync
-            + 'static,
-        Fut: std::future::Future<
-                Output = Result<
-                    serde_json::Value,
-                    crate::cluster::production::manager::ManagerRuntimeError,
-                >,
-            > + Send
-            + 'static,
-    {
-        let receiver = self
-            .manager_runtime_receiver
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .context("manager runtime receiver was already attached")?;
-        let actor = receiver.spawn(handler);
-        *self
-            .manager_runtime_actor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(actor);
-        Ok(())
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn attach_manager_runtime_for_test<F, Fut>(&self, handler: F) -> anyhow::Result<()>
-    where
-        F: Fn(crate::cluster::production::manager::ManagerRuntimeOperation) -> Fut
-            + Send
-            + Sync
-            + 'static,
-        Fut: std::future::Future<
-                Output = Result<
-                    serde_json::Value,
-                    crate::cluster::production::manager::ManagerRuntimeError,
-                >,
-            > + Send
-            + 'static,
-    {
-        self.attach_manager_runtime_actor(handler)
     }
 
     fn cluster_snapshot(&self) -> Option<crate::cluster::ClusterSnapshot> {
@@ -450,61 +290,21 @@ impl AppState {
     /// Try to claim the single in-flight graceful restart slot. Returns `true`
     /// when this caller is the first to claim it (C-04a duplicate guard).
     fn try_claim_graceful_restart(&self) -> bool {
-        if self
+        !self
             .graceful_restart_in_progress
             .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return false;
-        }
-        if self.production_runtime().is_none() {
-            let id = crate::cluster::OperationId(uuid::Uuid::new_v4());
-            let guard = match self
-                .standalone_lifecycle_lease
-                .claim(crate::cluster::OperationKind::Restart, id)
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    self.graceful_restart_in_progress
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    return false;
-                }
-            };
-            *self
-                .standalone_restart_lease
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
-        }
-        true
     }
 
     /// Release the graceful restart slot. The process usually exits right after
     /// a successful restart, but a drain-timeout or identity-mismatch failure
     /// must release it so an operator can retry (C-04b).
     fn release_graceful_restart(&self) {
-        self.standalone_restart_lease
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         self.graceful_restart_in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn request_graceful_restart(&self) {
         self.restart_requested.notify_one();
-    }
-}
-
-impl Drop for AppState {
-    fn drop(&mut self) {
-        self.manager_worker.abort();
-        if let Some(actor) = self
-            .manager_runtime_actor
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            actor.abort();
-        }
     }
 }
 
@@ -823,30 +623,6 @@ pub async fn serve_with_options(
         false,
     );
     let supervisor = build_standalone_supervisor(&config, &state, dry_run)?;
-    let manager_manual = !dry_run
-        && crate::cluster::production::manager::prepare_manager_startup(
-            &state.manager_store,
-            &config,
-            &supervisor,
-        )
-        .await;
-    let restart = if manager_manual {
-        let baseline_generation = match restart {
-            RestartDecision::StartSolo {
-                baseline_generation,
-            }
-            | RestartDecision::ManualIntervention {
-                baseline_generation,
-                ..
-            } => baseline_generation,
-        };
-        RestartDecision::ManualIntervention {
-            baseline_generation,
-            reason: crate::cluster::RestartManualReason::ManagerActivationUnresolved,
-        }
-    } else {
-        restart
-    };
     // C-04a: graceful restart の fallback owner として supervisor への参照を保持する。
     // cluster 有効時は ProductionClusterRuntime が優先され、distributed child を所有する。
     state.attach_supervisor(supervisor.clone());
@@ -879,48 +655,6 @@ pub async fn serve_with_options(
     if let (Some(production), Some(store)) = (production.as_ref(), state_store.as_ref()) {
         production.attach_policy_store(store.clone());
     }
-    if let Some(production) = production.as_ref() {
-        production.attach_manager_store(state.manager_store.clone());
-    }
-    if config.cluster.enabled {
-        if let Some(production) = production.clone() {
-            let store = state.manager_store.clone();
-            state.attach_manager_runtime_actor(move |operation| {
-                let production = production.clone();
-                let store = store.clone();
-                async move {
-                    crate::cluster::production::manager::handle_cluster_operation(
-                        &production,
-                        &store,
-                        operation,
-                    )
-                    .await
-                }
-            })?;
-        } else {
-            state.attach_manager_runtime_actor(|_| async {
-                Err(crate::cluster::production::manager::ManagerRuntimeError::Unavailable)
-            })?;
-        }
-    } else if dry_run {
-        state.attach_manager_runtime_actor(|_| async {
-            Err(crate::cluster::production::manager::ManagerRuntimeError::NotReady)
-        })?;
-    } else {
-        let owner = Arc::new(
-            crate::cluster::production::manager::StandaloneManagerRuntimeOwner::new(
-                state.manager_store.clone(),
-                Arc::new(config.clone()),
-                runtime.clone(),
-                supervisor.clone(),
-                state.standalone_lifecycle_lease.clone(),
-            ),
-        );
-        state.attach_manager_runtime_actor(move |operation| {
-            let owner = owner.clone();
-            async move { owner.handle(operation).await }
-        })?;
-    }
     let notifier = build_notifier(
         config.notifications.enabled,
         config.notifications.sound,
@@ -939,9 +673,17 @@ pub async fn serve_with_options(
         &runtime,
         &supervisor,
         production.as_ref(),
+        &config.ds4.standalone.profile_id,
     );
     if let Some(store) = &state_store {
-        persist_runtime_state(store, &runtime, &supervisor, production.as_ref()).await?;
+        persist_runtime_state(
+            store,
+            &runtime,
+            &supervisor,
+            production.as_ref(),
+            &config.ds4.standalone.profile_id,
+        )
+        .await?;
     }
     let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
     let local_monitor = spawn_local_monitor(
@@ -949,6 +691,7 @@ pub async fn serve_with_options(
         state_store.clone(),
         &runtime,
         &supervisor,
+        &config.ds4.standalone.profile_id,
         notification_service.clone(),
     );
     // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
@@ -1270,6 +1013,7 @@ fn spawn_transition_monitor(
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     production: Option<&ProductionClusterRuntime>,
+    profile: &str,
 ) -> tokio::task::JoinHandle<()> {
     let mut transition_snapshots = runtime.cluster_handle().subscribe();
     let transition_metrics = state.metrics.clone();
@@ -1277,6 +1021,7 @@ fn spawn_transition_monitor(
     let transition_runtime = runtime.clone();
     let transition_supervisor = supervisor.clone();
     let transition_production = production.cloned();
+    let transition_profile = profile.to_string();
     tokio::spawn(async move {
         let mut previous = *transition_snapshots.borrow_and_update();
         let mut transition_started = std::time::Instant::now();
@@ -1298,6 +1043,7 @@ fn spawn_transition_monitor(
                     &transition_runtime,
                     &transition_supervisor,
                     transition_production.as_ref(),
+                    &transition_profile,
                 )
                 .await
                 {
@@ -1342,11 +1088,13 @@ fn spawn_local_monitor(
     state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
+    profile: &str,
     notifier: Arc<std::sync::Mutex<DesktopNotificationService>>,
 ) -> tokio::task::JoinHandle<()> {
     let local_monitor_runtime = runtime.clone();
     let local_monitor_supervisor = supervisor.clone();
     let local_monitor_store = state_store.clone();
+    let local_monitor_profile = profile.to_string();
     let local_monitor_metrics = state.metrics.clone();
     let local_monitor_notifier = notifier;
     tokio::spawn(async move {
@@ -1369,6 +1117,7 @@ fn spawn_local_monitor(
                             &local_monitor_runtime,
                             &local_monitor_supervisor,
                             None,
+                            &local_monitor_profile,
                         )
                         .await
                         {
@@ -1608,6 +1357,7 @@ async fn persist_runtime_state(
     runtime: &ModeRuntime,
     supervisor: &StandaloneSupervisor,
     production: Option<&ProductionClusterRuntime>,
+    active_profile: &str,
 ) -> anyhow::Result<()> {
     let snapshot = runtime.snapshot();
     let distributed = if snapshot.stable_mode == StableMode::DistributedLayerParallel {
@@ -1633,15 +1383,6 @@ async fn persist_runtime_state(
         spawned_at_millis: identity.spawned_at_millis,
         process_start_micros: identity.process_start_micros,
     });
-    let active_profile = match production {
-        Some(production) => {
-            production
-                .current_manager_command_snapshot()
-                .await?
-                .profile_id
-        }
-        None => supervisor.command_snapshot().await?.profile_id,
-    };
     let control_session_generation = match production {
         Some(production) => production.control_session_generation().await,
         None => snapshot.generation,
@@ -1676,7 +1417,13 @@ async fn persist_runtime_state(
             ProxyTarget::Coordinator => PersistentProxyTarget::Coordinator,
             ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
         },
-        active_profile: Some(active_profile),
+        active_profile: Some(
+            if snapshot.stable_mode == StableMode::DistributedLayerParallel {
+                "distributed-layer-parallel".into()
+            } else {
+                active_profile.into()
+            },
+        ),
         child,
         last_failure: None,
         operator_policy,
@@ -1767,7 +1514,6 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         // DS4 Manager API (M10 / C04)。admin port 専用。public proxy の
         // wildcard には落ちず、DS4 へ転送されない。M10。
         .route("/manager/status", get(manager_status))
-        .route("/manager/inventory", get(manager_inventory))
         .route("/manager/jobs", post(manager_jobs_submit))
         .route("/manager/jobs/{id}", get(manager_job_get))
         .route("/manager/jobs/{id}/cancel", post(manager_job_cancel))
@@ -2511,10 +2257,6 @@ fn manager_api_error_response(error: &crate::manager::api::ManagerApiError) -> R
             (StatusCode::NOT_FOUND, "job not found".to_string())
         }
         crate::manager::api::ManagerApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
-        crate::manager::api::ManagerApiError::Persistence => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "manager job storage unavailable".to_string(),
-        ),
     };
     json_response(status, json!({"error": message}))
 }
@@ -2525,78 +2267,7 @@ async fn manager_status(headers: HeaderMap, State(state): State<Arc<AppState>>) 
         return *response;
     }
     let journal = state.jobs.lock().unwrap();
-    // `model_manifest` is configured intent, not proof of the model currently loaded by the
-    // owned DS4 child. Until a runtime snapshot can bind the live child/generation to a
-    // verified manifest, keep this explicitly unknown instead of reporting a configured hash.
     let response = crate::manager::api::status(&journal, None);
-    json_response(
-        StatusCode::OK,
-        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
-    )
-}
-
-/// `GET /manager/inventory`。Durable store を path-free DTO に投影する。
-async fn manager_inventory(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response<Body> {
-    if let Err(response) = authorized_admin(&headers, &state) {
-        return *response;
-    }
-    let mut response = {
-        let store = match state.manager_store.lock() {
-            Ok(store) => store,
-            Err(_) => {
-                return json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json!({"error": "manager inventory unavailable"}),
-                );
-            }
-        };
-        crate::manager::api::inventory(store.snapshot())
-    };
-    let cluster_snapshot = state.cluster_snapshot();
-    let production = state.production_runtime();
-    response.node_role = production
-        .as_ref()
-        .map(|runtime| runtime.role().name().to_string())
-        .or_else(|| (!state.config.cluster_enabled).then(|| "coordinator".to_string()));
-    let policy_name = |policy| {
-        serde_json::to_value(policy)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-    response.runtime = Some(crate::manager::api::ManagerRuntimeReadinessDto {
-        cluster_enabled: state.config.cluster_enabled,
-        generation: cluster_snapshot.map_or(0, |snapshot| snapshot.generation),
-        state: cluster_snapshot.map_or_else(
-            || {
-                if state.config.cluster_enabled {
-                    "unknown".to_string()
-                } else {
-                    "solo-standalone-ready".to_string()
-                }
-            },
-            |snapshot| snapshot.state.name().to_string(),
-        ),
-        desired_policy: production
-            .as_ref()
-            .map(|runtime| policy_name(runtime.operator_policy()))
-            .unwrap_or_else(|| "automatic".to_string()),
-        applied_policy: production
-            .as_ref()
-            .map(|runtime| policy_name(runtime.applied_policy()))
-            .unwrap_or_else(|| "automatic".to_string()),
-        policy_epoch: production
-            .as_ref()
-            .map_or(0, |runtime| runtime.policy_epoch()),
-    });
-    if let Some(runtime) = production {
-        response.active_digest = runtime.manager_active_model_digest().await;
-        response.previous_release_ready = runtime.manager_previous_release_ready().await;
-        response.peer = runtime.manager_peer_inventory().await;
-    }
     json_response(
         StatusCode::OK,
         serde_json::to_value(response).unwrap_or_else(|_| json!({})),
@@ -2612,47 +2283,15 @@ async fn manager_jobs_submit(
     if let Err(response) = authorized_admin(&headers, &state) {
         return *response;
     }
-    let request: crate::manager::api::JobSubmitRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => {
-            return manager_api_error_response(&crate::manager::api::ManagerApiError::BadRequest(
-                error.to_string(),
-            ));
-        }
-    };
-    let (response, newly_created) = {
-        let mut journal = state.jobs.lock().unwrap();
-        let count_before = journal.all().len();
-        let response = match crate::manager::api::submit(&mut journal, request.clone()) {
-            Ok(response) => response,
-            Err(error) => return manager_api_error_response(&error),
-        };
-        let newly_created = journal.all().len() != count_before;
-        (response, newly_created)
-    };
-    if newly_created {
-        let admission_error = match request.execution_request(response.id.clone()) {
-            Ok(execution) => state
-                .manager_executor
-                .submit(execution)
-                .err()
-                .map(|error| error.to_string()),
-            Err(_) => Some("manager job input rejected".to_string()),
-        };
-        if let Some(error) = admission_error {
-            // Preserve the accepted {id} response. Polling the same job reveals
-            // the failure; duplicate submissions never overwrite its state.
-            let _ = state
-                .jobs
-                .lock()
-                .unwrap()
-                .fail_if_running(&response.id, error);
-        }
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::submit_json(&mut journal, &body) {
+        Ok(response) => json_response(
+            StatusCode::ACCEPTED,
+            serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => manager_api_error_response(&error),
     }
-    json_response(
-        StatusCode::ACCEPTED,
-        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
-    )
 }
 
 /// `GET /manager/jobs/{id}`。M10。M10。
@@ -2683,19 +2322,10 @@ async fn manager_job_cancel(
     if let Err(response) = authorized_admin(&headers, &state) {
         return *response;
     }
-    let result = {
-        let mut journal = state.jobs.lock().unwrap();
-        crate::manager::api::cancel(&mut journal, &id)
-    };
-    if let Err(error) = result {
-        return manager_api_error_response(&error);
-    }
-    match state.manager_executor.cancel(&id) {
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::cancel(&mut journal, &id) {
         Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
-        Err(_) => json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "manager executor unavailable"}),
-        ),
+        Err(error) => manager_api_error_response(&error),
     }
 }
 
@@ -2790,8 +2420,6 @@ enum GracefulRestartOutcome {
     ChildStopFailed,
     /// Distributed peer could not enter the planned-restart gate.
     PeerPreparationFailed,
-    /// Another runtime lifecycle transaction owns the exclusive gate.
-    LifecycleOperationBusy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2823,9 +2451,7 @@ async fn graceful_restart_sequence(
     drain_timeout: std::time::Duration,
 ) -> GracefulRestartOutcome {
     if let Some(production) = production {
-        if !production.begin_planned_restart() {
-            return GracefulRestartOutcome::LifecycleOperationBusy;
-        }
+        production.begin_planned_restart();
     }
 
     // 1. admission block: 新規リクエストを受け付けない。
@@ -2978,13 +2604,6 @@ async fn perform_graceful_restart(
             json_response(
                 StatusCode::CONFLICT,
                 json!({"error": "peer_prepare_restart_failed"}),
-            )
-        }
-        GracefulRestartOutcome::LifecycleOperationBusy => {
-            state.release_graceful_restart();
-            json_response(
-                StatusCode::CONFLICT,
-                json!({"error": "lifecycle_operation_in_progress"}),
             )
         }
     }
@@ -3418,28 +3037,6 @@ mod tests {
             proxy.set_target(ProxyTarget::LocalStandalone, true);
             proxy.admission().start_serving();
         }
-        let store_root = std::env::temp_dir().join(format!(
-            "siderostat-app-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let manager_store = Arc::new(std::sync::Mutex::new(
-            crate::manager::store::ManagerReleaseStore::open(
-                crate::manager::registry::ManagerRoot::explicit(store_root),
-                "test-node",
-            )
-            .expect("manager store"),
-        ));
-        let job_persistence = Arc::new(crate::manager::store::ManagerJobStorePersistence::new(
-            manager_store.clone(),
-        ));
-        let jobs = Arc::new(std::sync::Mutex::new(
-            crate::manager::jobs::JobJournal::open(job_persistence).expect("job journal"),
-        ));
-        let (manager_executor, manager_worker) = crate::manager::executor::ManagerExecutor::start(
-            jobs.clone(),
-            crate::manager::executor::RuntimeManagerBackend::without_model_catalog(),
-        );
         let state = Arc::new(AppState {
             config: Arc::new(AppConfig {
                 public_listen: "127.0.0.1:18080".parse().unwrap(),
@@ -3454,14 +3051,7 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
-            jobs,
-            manager_store,
-            manager_executor,
-            manager_worker,
-            manager_runtime_receiver: std::sync::Mutex::new(None),
-            manager_runtime_actor: std::sync::Mutex::new(None),
-            standalone_lifecycle_lease: crate::cluster::OperationLease::new(),
-            standalone_restart_lease: std::sync::Mutex::new(None),
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -3475,72 +3065,6 @@ mod tests {
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());
         state
-    }
-
-    #[tokio::test]
-    async fn runtime_state_persists_the_supervisors_selected_profile() {
-        let proxy = Arc::new(
-            ModeAwareProxyState::new(
-                url::Url::parse("http://127.0.0.1:8000").unwrap(),
-                url::Url::parse("http://10.99.0.1:18082").unwrap(),
-                ModeAwareProxyOptions {
-                    max_in_flight: 1,
-                    request_body_limit_bytes: 4096,
-                    response_header_timeout: std::time::Duration::from_secs(1),
-                    first_body_byte_timeout: std::time::Duration::from_secs(1),
-                    stream_idle_timeout: std::time::Duration::from_secs(1),
-                    connect_timeout: std::time::Duration::from_secs(1),
-                },
-            )
-            .unwrap(),
-        );
-        let command = crate::cluster::Ds4Command {
-            executable: std::path::PathBuf::from("/bin/sleep"),
-            working_directory: std::path::PathBuf::from("/"),
-            argv: vec![std::ffi::OsString::from("3600")],
-            profile: crate::cluster::Ds4Profile {
-                profile_id: "runtime-selected-profile".into(),
-                quantization: Quantization::Q2Q4,
-                residency: Residency::SsdStreaming,
-                speculative_support: SpeculativeSupport::None,
-            },
-        };
-        let supervisor = Arc::new(StandaloneSupervisor::new_dry_run(
-            command,
-            url::Url::parse("http://127.0.0.1:8000/v1/models").unwrap(),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(10),
-            std::time::Duration::from_secs(1),
-            false,
-            Arc::new(Metrics::default()),
-        ));
-        let runtime = ModeRuntime::spawn_ready(
-            LocalRole::Unknown,
-            proxy,
-            supervisor.clone(),
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect("runtime starts");
-        let state_path = std::env::temp_dir().join(format!(
-            "siderostat-runtime-profile-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let state_store = StateStore::acquire(&state_path).expect("state store");
-
-        persist_runtime_state(&state_store, &runtime, &supervisor, None)
-            .await
-            .expect("persist runtime snapshot");
-
-        let persisted = state_store
-            .load()
-            .expect("load state")
-            .expect("saved state");
-        assert_eq!(
-            persisted.active_profile.as_deref(),
-            Some("runtime-selected-profile")
-        );
     }
 
     #[derive(Clone, Default)]
@@ -3560,8 +3084,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn recovery_notification_helpers_use_the_attached_service() {
+    #[test]
+    fn recovery_notification_helpers_use_the_attached_service() {
         let state = test_state(true);
         state.attach_notification_service(Arc::new(std::sync::Mutex::new(
             DesktopNotificationService::new(Arc::new(crate::notify::NoopNotifier)),
@@ -3758,17 +3282,6 @@ mod tests {
         );
         assert_eq!(metrics_status, StatusCode::OK);
         assert!(metrics_body.contains("ds4_proxy_target_ready{target=\"local-standalone\"} 1"));
-    }
-
-    #[tokio::test]
-    async fn manager_status_does_not_report_configured_model_as_active_digest() {
-        let state = test_state(true);
-        let token = test_admin_token();
-        let (status, body) = get_with_token(state, "/manager/status", &token).await;
-
-        assert_eq!(status, StatusCode::OK);
-        let body: Value = serde_json::from_str(&body).unwrap();
-        assert!(body["active_digest"].is_null());
     }
 
     #[tokio::test]

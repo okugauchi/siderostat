@@ -24,8 +24,6 @@ use std::sync::atomic::AtomicBool;
 /// build エラー。M03。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
-    /// build cancellation stopped the owned process group.
-    Canceled,
     /// role が allowlist に無い。M03。
     UnapprovedRole,
     /// make target が allowlist に無い（任意 shell injection 防止）。M03。
@@ -38,8 +36,6 @@ pub enum BuildError {
     ReadOutput(String),
     /// 出力 binary が無い（build が期待成果を出さなかった）。M03。
     MissingOutput,
-    /// output/help path is absolute, escaping, or a symlink.
-    UnsafePath,
     /// help snapshot を読めない。M03。
     ReadHelp(String),
 }
@@ -47,14 +43,12 @@ pub enum BuildError {
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildError::Canceled => write!(f, "build canceled"),
             BuildError::UnapprovedRole => write!(f, "role is not approved"),
             BuildError::UnapprovedTarget => write!(f, "make target is not approved"),
             BuildError::InsufficientDisk(msg) => write!(f, "insufficient disk: {msg}"),
             BuildError::Failed(msg) => write!(f, "build failed: {msg}"),
             BuildError::ReadOutput(msg) => write!(f, "read output failed: {msg}"),
             BuildError::MissingOutput => write!(f, "build produced no output"),
-            BuildError::UnsafePath => write!(f, "build output path is unsafe"),
             BuildError::ReadHelp(msg) => write!(f, "read help failed: {msg}"),
         }
     }
@@ -151,20 +145,12 @@ pub fn build_artifacts(
     req: &BuildRequest,
     cancel: &AtomicBool,
 ) -> Result<BuildOutcome, BuildError> {
-    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(BuildError::Canceled);
-    }
     // role / target を allowlist で検証。M03。
     if !is_approved_role(&req.role) {
         return Err(BuildError::UnapprovedRole);
     }
     if !is_approved_target(&req.target) {
         return Err(BuildError::UnapprovedTarget);
-    }
-    if !safe_workspace_relative_path(&req.output_rel)
-        || !safe_workspace_relative_path(&req.help_rel)
-    {
-        return Err(BuildError::UnsafePath);
     }
 
     // 開始前 disk 予約。M03。
@@ -178,9 +164,6 @@ pub fn build_artifacts(
     match GroupRunner::new().run_group(&spec, cancel) {
         Ok(_) => {}
         Err(ProcessError::Failed(out)) => {
-            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(BuildError::Canceled);
-            }
             // build 失敗 → active 不変（新規 record を返さず、registry を触らない）。M03。
             let msg = format!("status={:?} stderr={}", out.status, out.stderr);
             return Err(BuildError::Failed(msg));
@@ -190,56 +173,16 @@ pub fn build_artifacts(
 
     // 出力 binary の digest。M03。
     let bin_path = req.workspace.join(&req.output_rel);
-    let bin_metadata = match std::fs::symlink_metadata(&bin_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BuildError::MissingOutput);
-        }
-        Err(error) => return Err(BuildError::ReadOutput(error.to_string())),
-    };
-    if bin_metadata.file_type().is_symlink() || !bin_metadata.is_file() {
-        return Err(BuildError::UnsafePath);
+    if !bin_path.exists() {
+        return Err(BuildError::MissingOutput);
     }
     let bytes = std::fs::read(&bin_path).map_err(|e| BuildError::ReadOutput(e.to_string()))?;
     let digest = sha256_hex(&bytes);
 
     // help snapshot の digest。M03。
     let help_path = req.workspace.join(&req.help_rel);
-    let help_snapshot = match std::fs::symlink_metadata(&help_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(BuildError::UnsafePath);
-        }
-        Ok(_) => std::fs::read_to_string(&help_path)
-            .map_err(|error| BuildError::ReadHelp(error.to_string()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let output = GroupRunner::new()
-                .run_group(
-                    &CommandSpec::minimal(
-                        bin_path.to_string_lossy().to_string(),
-                        vec!["--help".to_string()],
-                        &req.workspace,
-                    ),
-                    cancel,
-                )
-                .map_err(|error| {
-                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                        BuildError::Canceled
-                    } else {
-                        BuildError::ReadHelp(error.to_string())
-                    }
-                })?;
-            let snapshot = if output.stdout.is_empty() {
-                output.stderr
-            } else {
-                output.stdout
-            };
-            if snapshot.is_empty() {
-                return Err(BuildError::ReadHelp("empty help output".into()));
-            }
-            snapshot
-        }
-        Err(error) => return Err(BuildError::ReadHelp(error.to_string())),
-    };
+    let help_snapshot =
+        std::fs::read_to_string(&help_path).map_err(|e| BuildError::ReadHelp(e.to_string()))?;
     let help_digest = sha256_hex(help_snapshot.as_bytes());
 
     Ok(BuildOutcome {
@@ -249,20 +192,11 @@ pub fn build_artifacts(
             toolchain: req.toolchain.clone(),
             arch: req.arch.clone(),
             role: req.role.clone(),
-            target: req.target.clone(),
             digest,
             help_digest,
         },
         help_snapshot,
     })
-}
-
-fn safe_workspace_relative_path(path: &std::path::Path) -> bool {
-    !path.as_os_str().is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -316,7 +250,6 @@ mod tests {
         assert_eq!(out.record.source, "abc123");
         assert_eq!(out.record.flags, "-O2");
         assert_eq!(out.record.arch, "arm64");
-        assert_eq!(out.record.target, "build");
         assert!(!out.record.digest.is_empty());
         assert!(!out.record.help_digest.is_empty());
         assert_eq!(out.help_snapshot, "fake help\n");
@@ -346,38 +279,6 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let err = build_artifacts(&req, &cancel).expect_err("must fail");
         assert_eq!(err, BuildError::MissingOutput);
-    }
-
-    #[test]
-    fn output_symlink_is_rejected_before_reading_external_bytes() {
-        let base = tmp("symlink-output");
-        let script = base.join("fake_make.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nln -s /etc/passwd out.bin\necho 'fake help' > help.txt\n",
-        )
-        .expect("write fake make");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&script).expect("meta").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
-        let mut req = BuildRequest::new("ds4", "build", "abc123", &base, "out.bin");
-        req.make_program = script.to_string_lossy().into_owned();
-        let error = build_artifacts(&req, &AtomicBool::new(false)).expect_err("reject symlink");
-        assert_eq!(error, BuildError::UnsafePath);
-    }
-
-    #[test]
-    fn canceled_build_stops_before_starting_a_command() {
-        let base = tmp("canceled");
-        let fake = make_fake_make(&base, 0, true);
-        let mut req = BuildRequest::new("ds4", "build", "abc123", &base, "out.bin");
-        req.make_program = fake.to_string_lossy().into_owned();
-        assert_eq!(
-            build_artifacts(&req, &AtomicBool::new(true)),
-            Err(BuildError::Canceled)
-        );
-        assert!(!base.join("out.bin").exists());
     }
 
     /// 不正 role → UnapprovedRole。M03。
