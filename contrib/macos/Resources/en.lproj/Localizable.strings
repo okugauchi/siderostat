@@ -1,6 +1,8 @@
 "app.name" = "siDeroStat";
 
 "menu.settings" = "Open Configuration File";
+"menu.manager_edit" = "Edit";
+"menu.manager_copy" = "Copy";
 "menu.login_items" = "Open Login Items";
 "menu.restart_runtime" = "Restart siderostat-runtime";
 "menu.background_enable" = "Start siderostat-runtime and Enable Auto-Start";

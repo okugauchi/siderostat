@@ -12,6 +12,7 @@
 //! （poll は非 GUI、view model は純粋ロジック）。sudo install を GUI
 //! 既定導線にしない（本 view model に install 導線を含めない）。G03。/
 use crate::client::MetricsClient;
+use crate::localization::text;
 use siderostat_core::manager::api::ManagerStatusResponse;
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -27,8 +28,8 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_se
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSButton, NSLayoutAttribute, NSStackView, NSStackViewDistribution, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
+    NSButton, NSLayoutAttribute, NSMenu, NSMenuItem, NSStackView, NSStackViewDistribution,
+    NSTextField, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSEdgeInsets, NSObject, NSPoint, NSRect, NSSize, NSString};
@@ -1319,12 +1320,49 @@ fn project_preparation(view_model: &ManagerViewModel) -> String {
     .join(" · ")
 }
 
+#[cfg(target_os = "macos")]
+fn manager_copy_menus(mtm: MainThreadMarker) -> (Retained<NSMenu>, Retained<NSMenu>) {
+    let main_menu = NSMenu::new(mtm);
+    let edit_menu = NSMenu::new(mtm);
+    edit_menu.setTitle(&NSString::from_str(&text("menu.manager_edit", "編集")));
+
+    let copy_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(&text("menu.manager_copy", "コピー")),
+            Some(sel!(copy:)),
+            &NSString::from_str("c"),
+        )
+    };
+    edit_menu.addItem(&copy_item);
+
+    let edit_menu_item = NSMenuItem::new(mtm);
+    edit_menu_item.setTitle(&NSString::from_str(&text("menu.manager_edit", "編集")));
+    edit_menu_item.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_menu_item);
+
+    let context_menu = NSMenu::new(mtm);
+    let context_copy_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(&text("menu.manager_copy", "コピー")),
+            Some(sel!(copy:)),
+            &NSString::from_str(""),
+        )
+    };
+    context_menu.addItem(&context_copy_item);
+
+    (main_menu, context_menu)
+}
+
 /// AppKit manager window host. The view model and command channel outlive the
 /// visible window, so close/reopen does not cancel jobs. H06。
 #[cfg(target_os = "macos")]
 pub struct ManagerWindowHost {
     mtm: Option<MainThreadMarker>,
     _client: MetricsClient,
+    _main_menu: Option<Retained<NSMenu>>,
+    _copy_context_menu: Option<Retained<NSMenu>>,
     window: Option<Retained<NSWindow>>,
     status_label: Option<Retained<NSTextField>>,
     jobs_label: Option<Retained<NSTextField>>,
@@ -1370,6 +1408,8 @@ impl ManagerWindowHost {
             Arc::clone(&cancel_job_id),
             Arc::clone(&action_selection),
         );
+        let (main_menu, copy_context_menu) = manager_copy_menus(mtm);
+        NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
         let jobs_summary = project_jobs(&view_model);
         let profiles_summary = project_profiles(&model_view);
         let inventory_summary = view_model.inventory_summary();
@@ -1436,6 +1476,9 @@ impl ManagerWindowHost {
         );
         status_label.setPreferredMaxLayoutWidth(700.0);
         status_label.setMaximumNumberOfLines(2);
+        // NSResponder stores this context menu without retaining it, so the
+        // host keeps `copy_context_menu` alive for the labels' lifetime.
+        unsafe { status_label.setMenu(Some(&copy_context_menu)) };
         root.addArrangedSubview(&status_label);
 
         let section = |title: &str| {
@@ -1502,23 +1545,27 @@ impl ManagerWindowHost {
         let preparation_label =
             NSTextField::wrappingLabelWithString(&NSString::from_str(&preparation_summary), mtm);
         preparation_label.setPreferredMaxLayoutWidth(700.0);
+        unsafe { preparation_label.setMenu(Some(&copy_context_menu)) };
         root.addArrangedSubview(&preparation_label);
         section("Profiles");
         let profiles =
             NSTextField::wrappingLabelWithString(&NSString::from_str(&profiles_summary), mtm);
         profiles.setPreferredMaxLayoutWidth(700.0);
+        unsafe { profiles.setMenu(Some(&copy_context_menu)) };
         root.addArrangedSubview(&profiles);
         section("This node inventory");
         let inventory =
             NSTextField::wrappingLabelWithString(&NSString::from_str(&inventory_summary), mtm);
         inventory.setPreferredMaxLayoutWidth(700.0);
         inventory.setMaximumNumberOfLines(12);
+        unsafe { inventory.setMenu(Some(&copy_context_menu)) };
         root.addArrangedSubview(&inventory);
         section("Activation / rollback");
         action_row(vec![activate_button, rollback_button]);
         section("Jobs");
         let jobs = NSTextField::wrappingLabelWithString(&NSString::from_str(&jobs_summary), mtm);
         jobs.setPreferredMaxLayoutWidth(700.0);
+        unsafe { jobs.setMenu(Some(&copy_context_menu)) };
         root.addArrangedSubview(&jobs);
         let cancel_button = active_button("Cancel（実行中jobなし）", sel!(managerCancel:));
         if let Some(id) = view_model.latest_cancellable_job_id() {
@@ -1537,6 +1584,8 @@ impl ManagerWindowHost {
         Ok(Self {
             mtm: Some(mtm),
             _client: client,
+            _main_menu: Some(main_menu),
+            _copy_context_menu: Some(copy_context_menu),
             window: Some(window),
             status_label: Some(status_label),
             jobs_label: Some(jobs),
@@ -1584,6 +1633,8 @@ impl ManagerWindowHost {
         Self {
             mtm: None,
             _client: client,
+            _main_menu: None,
+            _copy_context_menu: None,
             window: None,
             status_label: None,
             jobs_label: None,

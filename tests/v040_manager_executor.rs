@@ -101,7 +101,7 @@ fn activation_without_generation_is_rejected() {
 
 #[test]
 fn unavailable_real_model_is_terminal_failure_not_pending_forever() {
-    let backend = RuntimeManagerBackend::without_model_catalog();
+    let backend = RuntimeManagerBackend::new(ManagerJobInputResolver::new());
     let result = backend.execute(
         request(JobKind::Download, "mxfp4-0731"),
         Arc::new(AtomicBool::new(false)),
@@ -110,7 +110,89 @@ fn unavailable_real_model_is_terminal_failure_not_pending_forever() {
 }
 
 #[test]
-fn fixture_backend_reaches_each_domain_adapter() {
+fn production_backend_reports_unwired_manager_capabilities_as_not_configured() {
+    let backend = RuntimeManagerBackend::without_model_catalog();
+    for (kind, key) in [
+        (JobKind::Fetch, "official-main"),
+        (JobKind::Build, "official-main"),
+        (JobKind::Download, "model"),
+        (JobKind::Verify, "artifact"),
+        (JobKind::Stage, "profile"),
+    ] {
+        assert!(
+            matches!(
+                backend.execute(request(kind, key), Arc::new(AtomicBool::new(false)),),
+                Err(ManagerExecutionError::NotConfigured)
+            ),
+            "{kind:?} should report not configured while its production input is not wired"
+        );
+    }
+    let profile_id = format!("profile-{}", "a".repeat(64));
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Activate, &profile_id),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        Err(ManagerExecutionError::Unavailable)
+    ));
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Rollback, "previous"),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        Err(ManagerExecutionError::Unavailable)
+    ));
+}
+
+#[test]
+fn empty_runtime_payload_remains_an_input_rejection() {
+    let backend = RuntimeManagerBackend::without_model_catalog();
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Fetch, ""),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        Err(ManagerExecutionError::InputRejected(_))
+    ));
+}
+
+#[test]
+fn runtime_resolver_rejects_unknown_key_only_for_configured_job_kinds() {
+    let mut resolver = ManagerJobInputResolver::unconfigured_runtime();
+    let official_remote = "https://github.com/antirez/ds4.git";
+    resolver
+        .register(
+            JobKind::Fetch,
+            "official-main",
+            ManagerJobInput::Fetch {
+                cache: std::path::PathBuf::from("/managed/ds4/sources/ds4.git"),
+                official: siderostat::manager::OfficialRemote::new(official_remote),
+                remote: official_remote.into(),
+                revision: "main".into(),
+                main_ref: "refs/heads/main".into(),
+            },
+        )
+        .unwrap();
+    let backend = RuntimeManagerBackend::new(resolver);
+
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Fetch, "unknown-fetch"),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        Err(ManagerExecutionError::InputRejected(_))
+    ));
+    assert!(matches!(
+        backend.execute(
+            request(JobKind::Build, "not-wired"),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        Err(ManagerExecutionError::NotConfigured)
+    ));
+}
+
+#[test]
+fn fixture_backend_runs_only_preparation_domain_adapters() {
     let backend = FixtureManagerBackend::new();
     for (kind, key) in [
         (JobKind::Fetch, "fixture-fetch"),

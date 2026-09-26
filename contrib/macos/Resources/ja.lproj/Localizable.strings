@@ -1,6 +1,8 @@
 "app.name" = "siDeroStat";
 
 "menu.settings" = "設定ファイルを開く";
+"menu.manager_edit" = "編集";
+"menu.manager_copy" = "コピー";
 "menu.login_items" = "ログイン項目を開く";
 "menu.restart_runtime" = "siderostat-runtimeを再起動";
 "menu.background_enable" = "siderostat-runtimeを起動して自動起動を有効化";

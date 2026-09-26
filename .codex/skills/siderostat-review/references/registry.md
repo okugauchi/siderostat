@@ -20,6 +20,11 @@
 - 新モードの統合テストは、実 control HTTP で pair → promote → demote を通し、実プロセス無し（pid=None）を検証すること
 - 同一ホストに複数ノードを同居させるテストでは、peer の制御ポートを明示分離できること
 - 出典: feature/cluster-dry-run（2026-09-05）
+- 設定ファイルの manifest や registry 宣言は「実行中に読み込まれた／検証済み」の証拠ではない。production adapter から UI まで実際に接続し、configured・verified・active の状態を個別にテストする
+- 外部 path を含む設定読込エラーは、ログや画面へ出す前に固定分類へ縮約し、失敗側だけを表示して成功側の状態を保持する
+- 出典: H06 Manager Executor Bridge（2026-09-25）
+- 外部コマンドへ管理対象 path を渡す前に、論理上の許可 path と一致すること、既存の対象および書込み先の親要素に symlink escape がないことを確認する。コマンド実行後の成果物検証だけでは外部 path への副作用を取り消せない
+- 出典: H06 Manager Pinned Fetch（2026-09-25）
 - 外部配布物を catalog の取得対象にする前に、配布元・正確な size・full checksum の根拠を照合する。placeholder URL と仮置き checksum は trust の根拠として採用しない
 - 出典: H06 Manager Model Download/Verify（2026-09-25）
 - 永続 release pointer や設定 manifest は child が実際に読み込んだ状態を証明しない。inventory の active digest は verified profile と一致する live observation がある時だけ出す
