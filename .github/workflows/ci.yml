@@ -47,6 +47,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
       - run: cargo test --all-targets --all-features
+      # V02: workspace all-features gate（root だけでなく monitor/xtask も）。
+      - run: cargo test --workspace --all-targets --all-features
+      # V02: workspace gate + 実 test 数 > 0 を保証する受入 suite。
+      - run: cargo test --test v040_acceptance --features test-support
 
   macos-dev-artifacts:
     name: macOS dev artifacts

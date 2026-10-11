@@ -303,6 +303,28 @@ fn default_mxfp4() -> Quantization {
     Quantization::Mxfp4
 }
 
+/// The transport used between TP members. Only rdma is supported in v0.4;
+/// tcp is rejected for TP and tcp is the LP default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    Tcp,
+    Rdma,
+}
+
+impl Transport {
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Rdma => "rdma",
+        }
+    }
+}
+
+fn default_tcp() -> Transport {
+    Transport::Tcp
+}
+
 /// The distributed execution topology is independent of the model's
 /// quantization. Only layer-parallel is wired to ds4-server in this release;
 /// tensor-parallel remains a future topology.
@@ -376,16 +398,39 @@ pub struct Ds4DistributedConfig {
     pub topology: DistributedTopology,
     #[serde(default = "default_mxfp4")]
     pub quantization: Quantization,
+    /// LP は tcp（既定）。TP は rdma 必須で、tcp は明示拒否する。TP で
+    /// 管理引数 override（--role / --transport）を禁止する。
+    #[serde(default = "default_tcp")]
+    pub transport: Transport,
     pub model: PathBuf,
     pub model_manifest: PathBuf,
     pub checkpoint: String,
     pub context_size: u32,
-    pub coordinator_layers: String,
-    pub worker_layers: String,
+    /// layer range は LP のみ必須。TP では指定を拒否する。
+    #[serde(default)]
+    pub coordinator_layers: Option<String>,
+    #[serde(default)]
+    pub worker_layers: Option<String>,
     pub kv_disk_dir: PathBuf,
     pub kv_disk_space_mb: u64,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// TP の role artifact 参照（worker ds4 / coordinator ds4-server）。host 固有。
+    #[serde(default)]
+    pub role_artifact: Option<PathBuf>,
+    /// TP の capability manifest 参照。host 固有。
+    #[serde(default)]
+    pub capability_manifest: Option<PathBuf>,
+    /// RDMA member interface。control/discovery address とは別。
+    #[serde(default)]
+    pub rdma_member_interface: Option<String>,
+    /// RDMA member address。control/discovery address とは別。
+    #[serde(default)]
+    pub rdma_address: Option<String>,
+    #[serde(default)]
+    pub rdma_device: Option<String>,
+    #[serde(default)]
+    pub rdma_gid: Option<String>,
 }
 
 impl ModeAwareConfig {
@@ -470,18 +515,11 @@ impl ModeAwareConfig {
         validate_paths(self)?;
         validate_dspark(self)?;
         validate_ssd_streaming(&self.ds4.standalone)?;
-        anyhow::ensure!(
-            self.ds4.distributed.topology == DistributedTopology::LayerParallel,
-            "ds4.distributed.topology is not supported yet; only 'layer-parallel' is available"
-        );
+        validate_distributed_topology(self)?;
         anyhow::ensure!(
             self.ds4.standalone.kv_disk_dir != self.ds4.distributed.kv_disk_dir,
             "standalone and distributed kv_disk_dir must be different"
         );
-        validate_layer_split(
-            &self.ds4.distributed.coordinator_layers,
-            &self.ds4.distributed.worker_layers,
-        )?;
         validate_secret_files(&self.cluster.security)?;
         validate_extra_args("ds4.standalone.extra_args", &self.ds4.standalone.extra_args)?;
         validate_extra_args(
@@ -490,6 +528,64 @@ impl ModeAwareConfig {
         )?;
         Ok(())
     }
+}
+
+/// LP と TP の topology 検証。
+/// - LP: layers 必須（range 指定必須）。既定 topology は LP。
+/// - TP: transport は rdma 必須（tcp は v0.4 scope で明示拒否）。layers は指定拒否。
+///   DSpark/SSD 不適合を拒否。--role / --transport の管理引数 override を拒否。
+/// - 既定 fallback は検証済 Standalone。TP で TCP へ silent fallback しない。
+fn validate_distributed_topology(config: &ModeAwareConfig) -> anyhow::Result<()> {
+    let distributed = &config.ds4.distributed;
+    match distributed.topology {
+        DistributedTopology::LayerParallel => {
+            let coordinator = distributed.coordinator_layers.as_deref();
+            let worker = distributed.worker_layers.as_deref();
+            anyhow::ensure!(
+                coordinator.is_some() && worker.is_some(),
+                "ds4.distributed layer ranges are required for layer-parallel topology"
+            );
+            validate_layer_split(coordinator.unwrap_or_default(), worker.unwrap_or_default())?;
+        }
+        DistributedTopology::TensorParallel => {
+            anyhow::ensure!(
+                distributed.transport == Transport::Rdma,
+                "ds4.distributed.transport must be 'rdma' for tensor-parallel in v0.4; 'tcp' is explicitly rejected"
+            );
+            anyhow::ensure!(
+                distributed.coordinator_layers.is_none() && distributed.worker_layers.is_none(),
+                "ds4.distributed layer ranges are not allowed for tensor-parallel topology"
+            );
+            // DSpark（speculative）と SSD streaming は TP で不適合。既定 fallback は検証済 Standalone。
+            anyhow::ensure!(
+                !config.ds4.dspark.enabled,
+                "ds4.distributed tensor-parallel does not support DSpark in v0.4"
+            );
+            anyhow::ensure!(
+                config.ds4.standalone.ssd_full_layers.is_none(),
+                "ds4.distributed tensor-parallel does not support SSD streaming in v0.4"
+            );
+            // TP で管理引数 override を拒否（--role / --transport を argv で上書きしない）。
+            reject_distributed_override(&distributed.extra_args)?;
+        }
+    }
+    Ok(())
+}
+
+/// TP の管理引数 override（--role / --transport / --layers）を拒否する。。
+fn reject_distributed_override(extra_args: &[String]) -> anyhow::Result<()> {
+    for arg in extra_args {
+        let normalized = arg.split('=').next().unwrap_or(arg);
+        if matches!(
+            normalized,
+            "--role" | "--transport" | "--layers" | "--coordinator" | "--listen"
+        ) {
+            anyhow::bail!(
+                "ds4.distributed.extra_args must not override managed arguments in tensor-parallel: {arg}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_ports(config: &ModeAwareConfig) -> anyhow::Result<()> {
@@ -1335,7 +1431,10 @@ auto_restart = true
             .expect("repository example must remain parseable");
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.ds4.standalone.quantization, Quantization::Q2Q4);
-        assert_eq!(config.ds4.distributed.coordinator_layers, "0:19");
+        assert_eq!(
+            config.ds4.distributed.coordinator_layers.as_deref(),
+            Some("0:19")
+        );
         assert!(config.ds4.dspark.enabled);
         assert_eq!(
             config.proxy.timeouts.first_body_byte,
@@ -1536,7 +1635,7 @@ auto_restart = true
     fn rejects_layer_gap_overlap_or_missing_output() {
         let files = ConfigTestFiles::new();
         let mut gap = files.config();
-        gap.ds4.distributed.worker_layers = "21:output".into();
+        gap.ds4.distributed.worker_layers = Some("21:output".into());
         assert!(
             gap.validate()
                 .unwrap_err()
@@ -1545,7 +1644,7 @@ auto_restart = true
         );
 
         let mut missing_output = files.config();
-        missing_output.ds4.distributed.worker_layers = "20:42".into();
+        missing_output.ds4.distributed.worker_layers = Some("20:42".into());
         assert!(
             missing_output
                 .validate()
@@ -1850,5 +1949,81 @@ auto_restart = true
             PathBuf::from("/Users/tester/Library/Application Support/siderostat/config.toml")
         );
         assert_eq!(path.file_name().unwrap(), OsStr::new("config.toml"));
+    }
+
+    fn tp_config(files: &ConfigTestFiles) -> ModeAwareConfig {
+        let mut config = files.config();
+        // TP は DSpark 不適合のため、dspark 全体を無効化する（enabled=false かつ
+        // support_model/confidence/strict をクリア）。
+        config.ds4.dspark = Ds4DsparkConfig {
+            enabled: false,
+            support_model: None,
+            confidence: None,
+            strict: false,
+        };
+        config.ds4.distributed.topology = DistributedTopology::TensorParallel;
+        config.ds4.distributed.transport = Transport::Rdma;
+        config.ds4.distributed.coordinator_layers = None;
+        config.ds4.distributed.worker_layers = None;
+        config.ds4.distributed.extra_args = vec![];
+        config
+    }
+
+    /// 受入 case 1: TP + rdma + range 無し → 成功。。。
+    #[test]
+    fn accepts_tensor_parallel_rdma_without_layer_ranges() {
+        let files = ConfigTestFiles::new();
+        let config = tp_config(&files);
+        config
+            .validate()
+            .expect("TP+rdma+range-less must be accepted");
+    }
+
+    /// 受入 case 2: TP + tcp → v0.4 scope で明示拒否。。。
+    #[test]
+    fn rejects_tensor_parallel_over_tcp() {
+        let files = ConfigTestFiles::new();
+        let mut config = tp_config(&files);
+        config.ds4.distributed.transport = Transport::Tcp;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("rdma"),
+            "TP over tcp must be rejected: {error}"
+        );
+    }
+
+    /// 受入 case 3: LP + range 無し → 拒否。。。
+    #[test]
+    fn rejects_layer_parallel_without_layer_ranges() {
+        let files = ConfigTestFiles::new();
+        let mut config = files.config();
+        config.ds4.distributed.coordinator_layers = None;
+        config.ds4.distributed.worker_layers = None;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("layer ranges are required"),
+            "LP without ranges must be rejected: {error}"
+        );
+    }
+
+    /// 受入 case 4: --role / --transport override → 拒否。。。
+    #[test]
+    fn rejects_managed_argument_override_in_tensor_parallel() {
+        let files = ConfigTestFiles::new();
+        let mut config = tp_config(&files);
+        config.ds4.distributed.extra_args = vec!["--role=worker".into()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("must not override"),
+            "override must be rejected: {error}"
+        );
+
+        let mut config2 = tp_config(&files);
+        config2.ds4.distributed.extra_args = vec!["--transport".into(), "rdma".into()];
+        let error2 = config2.validate().unwrap_err().to_string();
+        assert!(
+            error2.contains("must not override"),
+            "override must be rejected: {error2}"
+        );
     }
 }

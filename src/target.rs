@@ -20,6 +20,7 @@ pub enum StableMode {
     SoloStandalone,
     PairedStandalone,
     DistributedLayerParallel,
+    DistributedTensorParallel,
 }
 
 impl StableMode {
@@ -28,6 +29,7 @@ impl StableMode {
             StableMode::SoloStandalone => "solo-standalone",
             StableMode::PairedStandalone => "paired-standalone",
             StableMode::DistributedLayerParallel => "distributed-layer-parallel",
+            StableMode::DistributedTensorParallel => "distributed-tensor-parallel",
         }
     }
 }
@@ -46,6 +48,16 @@ pub enum ClusterState {
     Demoting,
     Backoff,
     ManualInterventionRequired,
+    /// TP: BeginTP 受理、新規 admission 閉、既存 stream drain。
+    TensorParallelStarting,
+    /// TP: worker Prepared を待つ。coordinator spawn。。
+    AwaitingTensorParallelWorkerHello,
+    /// TP: 同 session の両 child 接続 + HTTP ready + warm-up 完了で公開。
+    TensorParallelReady,
+    /// TP: Force/fault で demotion。新規閉。。
+    DemotingTensorParallel,
+    /// TP: transient 失敗。Automatic + 試行残で backoff。fallback のみ。。
+    TensorParallelBackoff,
 }
 
 impl ClusterState {
@@ -63,6 +75,13 @@ impl ClusterState {
             ClusterState::Demoting => "demoting",
             ClusterState::Backoff => "backoff",
             ClusterState::ManualInterventionRequired => "manual-intervention-required",
+            ClusterState::TensorParallelStarting => "tensor-parallel-starting",
+            ClusterState::AwaitingTensorParallelWorkerHello => {
+                "awaiting-tensor-parallel-worker-hello"
+            }
+            ClusterState::TensorParallelReady => "tensor-parallel-ready",
+            ClusterState::DemotingTensorParallel => "demoting-tensor-parallel",
+            ClusterState::TensorParallelBackoff => "tensor-parallel-backoff",
         }
     }
 }
@@ -107,6 +126,7 @@ pub fn resolve_target(
         ClusterState::SoloStandaloneReady
             | ClusterState::PairedStandaloneReady
             | ClusterState::DistributedReady
+            | ClusterState::TensorParallelReady
     ) {
         return ProxyTarget::Unavailable {
             reason: UnavailableReason::Transition,
@@ -146,9 +166,20 @@ pub fn resolve_target(
             ClusterState::DistributedReady,
             LocalRole::Worker,
         ) => ProxyTarget::Coordinator,
+        (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelReady,
+            LocalRole::Coordinator,
+        ) => ProxyTarget::LocalStandalone,
+        (
+            StableMode::DistributedTensorParallel,
+            ClusterState::TensorParallelReady,
+            LocalRole::Worker,
+        ) => ProxyTarget::Coordinator,
         (_, ClusterState::SoloStandaloneReady, _)
         | (_, ClusterState::PairedStandaloneReady, _)
-        | (_, ClusterState::DistributedReady, _) => ProxyTarget::Unavailable {
+        | (_, ClusterState::DistributedReady, _)
+        | (_, ClusterState::TensorParallelReady, _) => ProxyTarget::Unavailable {
             reason: UnavailableReason::InconsistentStableState,
         },
         _ => ProxyTarget::Unavailable {

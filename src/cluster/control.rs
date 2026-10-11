@@ -25,6 +25,7 @@ pub enum ControlMode {
     PairedStandalone,
     #[serde(alias = "distributed-mxfp4")]
     DistributedLayerParallel,
+    DistributedTensorParallel,
     Transitioning,
 }
 

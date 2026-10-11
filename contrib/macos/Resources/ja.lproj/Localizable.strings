@@ -1,16 +1,16 @@
-"app.name" = "Siderostat";
+"app.name" = "siDeroStat";
 
 "menu.settings" = "設定ファイルを開く";
 "menu.login_items" = "ログイン項目を開く";
 "menu.restart_runtime" = "siderostat-runtimeを再起動";
 "menu.background_enable" = "siderostat-runtimeを起動して自動起動を有効化";
 "menu.background_disable" = "siderostat-runtimeを停止して自動起動を無効化";
-"menu.quit" = "Siderostatを終了";
+"menu.quit" = "siDeroStatを終了";
 
 "status.runtime_autostart.pending" = "siderostat-runtime自動起動: --";
-"status.menu_bar_autostart.pending" = "Siderostat自動起動: --";
+"status.menu_bar_autostart.pending" = "siDeroStat自動起動: --";
 "status.runtime_autostart" = "siderostat-runtime自動起動";
-"status.menu_bar_autostart" = "Siderostat自動起動";
+"status.menu_bar_autostart" = "siDeroStat自動起動";
 "status.enabled" = "有効";
 "status.off" = "無効";
 "status.approval_needed" = "承認が必要";
@@ -19,10 +19,10 @@
 "status.offline" = "siderostat-runtimeに接続できません";
 "status.metrics_unavailable" = "siderostat-runtimeに接続済み、metricsを取得できません";
 
-"notification.version.title" = "Siderostat のバージョン確認";
-"notification.version.details" = " (Siderostat={app_version} build={app_build}、siderostat-runtime={runtime_version} build={runtime_build})";
-"notification.version.older" = "Siderostatより古いsiderostat-runtimeが稼働しています。Siderostatの更新を適用するには、メニューからsiderostat-runtimeを再起動してください。";
-"notification.version.newer" = "Siderostatより新しいsiderostat-runtimeが稼働しています。rollback時にデータは自動変換しません。";
+"notification.version.title" = "siDeroStat のバージョン確認";
+"notification.version.details" = " (siDeroStat={app_version} build={app_build}、siderostat-runtime={runtime_version} build={runtime_build})";
+"notification.version.older" = "siDeroStatより古いsiderostat-runtimeが稼働しています。siDeroStatの更新を適用するには、メニューからsiderostat-runtimeを再起動してください。";
+"notification.version.newer" = "siDeroStatより新しいsiderostat-runtimeが稼働しています。rollback時にデータは自動変換しません。";
 "notification.version.unavailable" = "siderostat-runtimeのバージョンを確認できません。";
 "notification.startup.title" = "ds4-serverの起動";
 "notification.startup.starting" = "ds4-serverを起動中";
@@ -36,17 +36,17 @@
 "notification.startup_cleanup.declined" = "既存のds4-serverまたはsiderostat-runtimeを検出しました。起動を中止しました。";
 "notification.startup_cleanup.restart" = "5秒後にsiderostat-runtimeを再起動します";
 
-"first_launch.version" = "初回起動: Siderostatのバージョン情報を確認しました";
+"first_launch.version" = "初回起動: siDeroStatのバージョン情報を確認しました";
 "first_launch.inventory_legacy" = "初回起動: 旧インストールを検出しました";
 "first_launch.inventory_clean" = "初回起動: 旧インストールはありません";
 "first_launch.config_valid" = "初回起動: 設定・秘密情報・manifestを確認しました";
 "first_launch.config_invalid" = "初回起動: 設定の検証に失敗しました";
 "first_launch.service_statuses" = "初回起動: 自動起動の状態を確認しました";
-"first_launch.registering" = "初回起動: siderostat-runtimeとSiderostatの自動起動を登録中…";
-"first_launch.registered" = "初回起動: siderostat-runtimeとSiderostatの自動起動を登録しました";
-"first_launch.approval" = "初回起動: siderostat-runtimeまたはSiderostatのログイン項目の承認が必要です";
-"first_launch.register_failed" = "初回起動: siderostat-runtimeまたはSiderostatの自動起動の登録に失敗しました";
-"first_launch.monitor_login" = "初回起動: Siderostatの自動起動を確認しました";
+"first_launch.registering" = "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録中…";
+"first_launch.registered" = "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録しました";
+"first_launch.approval" = "初回起動: siderostat-runtimeまたはsiDeroStatのログイン項目の承認が必要です";
+"first_launch.register_failed" = "初回起動: siderostat-runtimeまたはsiDeroStatの自動起動の登録に失敗しました";
+"first_launch.monitor_login" = "初回起動: siDeroStatの自動起動を確認しました";
 "first_launch.runtime_admin" = "初回起動: siderostat-runtime APIの準備を確認しました";
 "first_launch.model_ready" = "初回起動: ds4-serverのモデル準備を確認しました";
 
@@ -70,12 +70,12 @@
 "operation.open_login_items.succeeded" = "操作: ログイン項目を開きました";
 "operation.open_login_items.failed" = "操作: ログイン項目を開けませんでした";
 
-"uninstaller.confirm.title" = "Siderostatをアンインストールしますか？";
+"uninstaller.confirm.title" = "siDeroStatをアンインストールしますか？";
 "uninstaller.confirm.message" = "Siderostat.appとバックグラウンドサービスを削除します。設定、秘密情報、manifest、cluster state、モデル、KV cacheは保持します。";
 "uninstaller.confirm.cancel" = "キャンセル";
-"uninstaller.confirm.remove" = "Siderostatを削除";
-"uninstaller.result.title" = "Siderostatを削除しました";
+"uninstaller.confirm.remove" = "siDeroStatを削除";
+"uninstaller.result.title" = "siDeroStatを削除しました";
 "uninstaller.result.message" = "アプリケーションとバックグラウンドサービスを削除しました。ユーザーデータは保持されています。";
 "uninstaller.result.ok" = "OK";
-"uninstaller.failure.title" = "Siderostatを完全には削除できませんでした";
+"uninstaller.failure.title" = "siDeroStatを完全には削除できませんでした";
 "uninstaller.failure.message" = "ユーザーデータは意図的に削除していません。表示された状態を解消して、Uninstallerを再度実行してください。";
