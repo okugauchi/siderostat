@@ -1,6 +1,6 @@
 # macOS network API spike
 
-This read-only spike validates the public APIs required by `docs/spec.md` section 13. It does not change interface, service, address, or route configuration. The optional Bonjour probe registers an ephemeral `_ds4cluster._tcp` service and removes it before exit.
+This read-only spike validates the public APIs required by section 13 of the Siderostat specification maintained in the Obsidian Vault at `Projects/siderostat/docs/spec.md`. It does not change interface, service, address, or route configuration. The optional Bonjour probe registers an ephemeral `_ds4cluster._tcp` service and removes it before exit.
 
 ## Build
 

@@ -43,6 +43,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginPromotion,
+                tp_session: None,
             })
             .await?;
         let generation = awaiting.generation;
@@ -57,6 +58,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: generation,
                 kind: ClusterEventKind::WorkerHelloAccepted,
+                tp_session: None,
             })
             .await?;
         let starting = self
@@ -66,6 +68,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: promoting.generation,
                 kind: ClusterEventKind::DistributedChildStarted,
+                tp_session: None,
             })
             .await?;
         let ready = self
@@ -75,6 +78,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::DistributedRouteReady,
+                tp_session: None,
             })
             .await?;
         self.inner.proxy.set_target(ready.target, true);
@@ -125,6 +129,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: current.generation,
                             kind: ClusterEventKind::BeginDemotion,
+                            tp_session: None,
                         })
                         .await?;
                     self.inner
@@ -133,6 +138,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: demoting.generation,
                             kind: ClusterEventKind::PairingReady,
+                            tp_session: None,
                         })
                         .await?
                 }
@@ -154,6 +160,7 @@ impl super::ProductionClusterRuntime {
                         .apply(ClusterEvent {
                             expected_generation: current.generation,
                             kind: ClusterEventKind::PromotionFailed,
+                            tp_session: None,
                         })
                         .await?
                 }
@@ -174,6 +181,12 @@ impl super::ProductionClusterRuntime {
 
     pub fn start_reconcile_task(&self) -> tokio::task::JoinHandle<()> {
         let runtime = self.clone();
+        if runtime.inner.role == LocalRole::Worker {
+            let monitor_runtime = runtime.clone();
+            tokio::spawn(async move {
+                monitor_runtime.monitor_worker_child().await;
+            });
+        }
         tokio::spawn(async move {
             let promotion_running = Arc::new(AtomicBool::new(false));
             let lease_refresh = runtime.inner.config.cluster.timeouts.control_lease / 3;
@@ -227,11 +240,83 @@ impl super::ProductionClusterRuntime {
         })
     }
 
+    async fn monitor_worker_child(&self) {
+        loop {
+            if self.planned_restart_active() || self.policy_pending() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let snapshot = self.inner.mode.snapshot();
+            if snapshot.state != ClusterState::DistributedReady {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let generation = snapshot.generation;
+            let Some(worker_runtime) = &self.inner.worker_runtime else {
+                return;
+            };
+            let lease_runtime = self.clone();
+            let lease: Arc<dyn crate::cluster::WorkerLeaseStatus> = Arc::new(move || {
+                lease_runtime.inner.lease.valid()
+                    && lease_runtime.inner.mode.snapshot().state == ClusterState::DistributedReady
+                    && lease_runtime.inner.mode.snapshot().generation == generation
+            });
+            let failure = worker_runtime.wait_for_failure(lease).await;
+            if self.planned_restart_active() {
+                continue;
+            }
+            tracing::warn!(
+                event = "distributed-child-exited",
+                reason = %failure,
+                generation,
+                "distributed worker child exited; beginning safe recovery"
+            );
+            // Keep the worker in Solo until the coordinator has observed the child-loss event
+            // and its lease has expired. Otherwise the periodic worker reconcile can immediately
+            // form a new Pairing while the coordinator is still DistributedReady.
+            self.block_automatic_pairing();
+            if let Err(error) = self.notify_worker_child_exit().await {
+                tracing::warn!(error = %error, "failed to notify coordinator of worker child exit");
+            }
+            if let Err(error) = self.recover_from_peer_loss(EventOwner::Recovery).await {
+                tracing::error!(error = %error, "worker child crash recovery failed");
+            }
+            let mut peer_released = false;
+            for _ in 0..150 {
+                if !self.peer_present().await {
+                    peer_released = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if !peer_released {
+                tracing::warn!(
+                    event = "distributed-child-exit-peer-lease-timeout",
+                    generation,
+                    "coordinator lease remained present during worker recovery grace period"
+                );
+            }
+            self.unblock_automatic_pairing();
+        }
+    }
+
+    async fn notify_worker_child_exit(&self) -> anyhow::Result<()> {
+        let message = match &self.inner.control {
+            RoleControl::Worker(control) => control
+                .lock()
+                .await
+                .child_exited_message(uuid::Uuid::new_v4().to_string())?,
+            RoleControl::Coordinator(_) => return Ok(()),
+        };
+        self.inner.client.send(&message).await?;
+        Ok(())
+    }
+
     pub async fn stop_distributed(&self) -> anyhow::Result<()> {
         if let Some(worker) = &self.inner.distributed_worker {
             DistributedWorkerLifecycle::stop(worker.as_ref()).await?;
         }
-        if let Some(coordinator) = &self.inner.distributed_coordinator {
+        if let Some(coordinator) = self.inner.distributed_coordinator.get() {
             DistributedCoordinatorLifecycle::stop(coordinator.as_ref()).await?;
         }
         Ok(())
@@ -239,7 +324,7 @@ impl super::ProductionClusterRuntime {
 
     pub async fn distributed_child_identity(&self) -> Option<ChildIdentity> {
         match self.inner.role {
-            LocalRole::Coordinator => match &self.inner.distributed_coordinator {
+            LocalRole::Coordinator => match self.inner.distributed_coordinator.get() {
                 Some(child) => child.child_identity().await,
                 None => None,
             },

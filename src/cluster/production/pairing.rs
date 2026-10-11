@@ -134,6 +134,15 @@ impl super::ProductionClusterRuntime {
             current.state == ClusterState::PairedStandaloneReady,
             "cluster is not paired standalone"
         );
+        // P05: operator promote 経路の policy gate。両端の policy epoch 一致・
+        // auto_promote・deployment mismatch latch・ForcedStandalone 保護ラッチを検査し、
+        // Allow 以外では昇格しない（部分 commit / auto_promote false / latch 中）。。
+        let verdict = self.automatic_promotion_gate(true, self.policy_epoch());
+        ensure!(
+            verdict.allows_promotion(),
+            "automatic promotion blocked by policy gate: {}",
+            verdict.name()
+        );
         tracing::info!(
             event = "promotion-started",
             owner = EventOwner::Admin.name(),
@@ -149,6 +158,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginPromotion,
+                tp_session: None,
             })
             .await?;
         let hello = match self.prepare_and_accept_hello(awaiting).await {
@@ -300,6 +310,8 @@ impl super::ProductionClusterRuntime {
             .ds4
             .distributed
             .worker_layers
+            .as_deref()
+            .context("invalid worker layer range")?
             .split_once(':')
             .context("invalid worker layer range")?
             .0
@@ -408,6 +420,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::PromotionFailed,
+                tp_session: None,
             })
             .await
         {
@@ -460,6 +473,7 @@ impl super::ProductionClusterRuntime {
             StableMode::SoloStandalone => ControlMode::SoloStandalone,
             StableMode::PairedStandalone => ControlMode::PairedStandalone,
             StableMode::DistributedLayerParallel => ControlMode::DistributedLayerParallel,
+            StableMode::DistributedTensorParallel => ControlMode::DistributedTensorParallel,
         };
         descriptor
     }

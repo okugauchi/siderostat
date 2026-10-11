@@ -31,7 +31,7 @@ mod worker;
 
 pub use coordinator::DistributedCoordinatorSupervisor;
 pub use standalone::StandaloneSupervisor;
-pub use worker::DistributedWorkerSupervisor;
+pub use worker::{DistributedWorkerSupervisor, TpWorkerSupervisor};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;

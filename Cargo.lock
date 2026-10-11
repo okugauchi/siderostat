@@ -1898,6 +1898,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -2218,7 +2219,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "siderostat"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2250,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "siderostat-monitor"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "objc2",
@@ -2269,6 +2270,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "uuid",
 ]
 
 [[package]]
@@ -2859,6 +2861,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -2881,6 +2884,7 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
@@ -3176,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",

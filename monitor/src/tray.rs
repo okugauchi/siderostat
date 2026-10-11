@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use std::cell::Cell;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu},
 };
 
 const MENU_QUIT: &str = "quit";
@@ -27,6 +27,9 @@ const MENU_RUNTIME_RESTART: &str = "runtime-restart";
 const MENU_BG_TOGGLE: &str = "bg-toggle";
 const MENU_OPEN_CONFIG: &str = "open-config";
 const MENU_OPEN_LOGIN_ITEMS: &str = "open-login-items";
+const MENU_MODE_SUBMENU: &str = "mode-submenu";
+const MENU_MODE_AUTOMATIC: &str = "mode-automatic";
+const MENU_MODE_FORCED: &str = "mode-forced";
 
 /// Icon drawing colors.
 const GREEN: [u8; 4] = [0x2e, 0xcc, 0x71, 0xff]; // operating state
@@ -36,6 +39,12 @@ const LINE: [u8; 4] = [0x3f, 0x3f, 0x3f, 0xff]; // connector line
 const ICON_SIZE: u32 = 18;
 const ICON_SUB: f32 = 4.0; // supersample factor for smooth circles
 const PROGRESS_STALL_AGE_SECS: f64 = 60.0;
+
+/// How long a proxy-external decode (generation_active=0 but the ds4 is
+/// generating) stays live after its last observed completion advance. The
+/// runtime leaves the ds4-side progress gauges populated after such a decode,
+/// so the tray uses this window to avoid showing a finished request forever.
+const DECODE_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub struct MonitorTray {
     _tray: TrayIcon,
@@ -51,6 +60,10 @@ pub struct MonitorTray {
     login_status: MenuItem,
     first_launch: MenuItem,
     operation: MenuItem,
+    mode_selected: MenuItem,
+    mode_applied: MenuItem,
+    mode_auto: MenuItem,
+    mode_forced: MenuItem,
     show_decode_tps: bool,
     live_metric: LiveMetric,
     _separator: PredefinedMenuItem,
@@ -67,7 +80,7 @@ impl MonitorTray {
     /// Build the tray icon and its static menu structure.
     pub fn new(show_decode_tps: bool, live_metric: LiveMetric) -> Result<Self> {
         let icon = icon_for(None, true)?;
-        let header = MenuItem::new(text("app.name", "Siderostat"), false, None);
+        let header = MenuItem::new(text("app.name", "siDeroStat"), false, None);
         let mode = MenuItem::new("Mode: --", false, None);
         let state = MenuItem::new("State: --", false, None);
         let generation = MenuItem::new("Gen: --", false, None);
@@ -86,7 +99,7 @@ impl MonitorTray {
         let login_status = MenuItem::new(
             text(
                 "status.menu_bar_autostart.pending",
-                "Siderostat メニューバー自動起動: --",
+                "siDeroStat メニューバー自動起動: --",
             ),
             false,
             None,
@@ -97,6 +110,14 @@ impl MonitorTray {
             None,
         );
         let operation = MenuItem::new(text("operation.idle", "操作: 待機中"), false, None);
+        // 接続モード submenu（G02 / C03）。選択項目は Automatic /
+        // ForcedStandalone の 2 つ。選択は /cluster/operation-policy へ送る
+        //（StableMode 直接書換えなし）。状態行（選択・適用状態）を先頭に
+        // 表示し、update_connection_mode で更新する。G02。
+        let mode_selected = MenuItem::new("接続モード（選択）: --", false, None);
+        let mode_applied = MenuItem::new("適用状態: --", false, None);
+        let mode_auto = MenuItem::with_id(MENU_MODE_AUTOMATIC, "Automatic", true, None);
+        let mode_forced = MenuItem::with_id(MENU_MODE_FORCED, "Forced Standalone", true, None);
         let open_config = MenuItem::with_id(
             MENU_OPEN_CONFIG,
             text("menu.settings", "設定ファイルを開く"),
@@ -124,7 +145,7 @@ impl MonitorTray {
             true,
             None,
         );
-        let quit = MenuItem::with_id(MENU_QUIT, text("menu.quit", "Siderostatを終了"), true, None);
+        let quit = MenuItem::with_id(MENU_QUIT, text("menu.quit", "siDeroStatを終了"), true, None);
 
         let menu = Menu::new();
         menu.append(&header)?;
@@ -143,6 +164,13 @@ impl MonitorTray {
         menu.append(&login_status)?;
         menu.append(&first_launch)?;
         menu.append(&operation)?;
+        let mode_submenu = Submenu::with_id(MENU_MODE_SUBMENU, "接続モード", true);
+        mode_submenu.append(&mode_selected)?;
+        mode_submenu.append(&mode_applied)?;
+        mode_submenu.append(&PredefinedMenuItem::separator())?;
+        mode_submenu.append(&mode_auto)?;
+        mode_submenu.append(&mode_forced)?;
+        menu.append(&mode_submenu)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&open_config)?;
         menu.append(&runtime_restart)?;
@@ -151,7 +179,7 @@ impl MonitorTray {
         menu.append(&quit)?;
 
         let tray = TrayIconBuilder::new()
-            .with_tooltip(text("app.name", "Siderostat"))
+            .with_tooltip(text("app.name", "siDeroStat"))
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .build()
@@ -171,6 +199,10 @@ impl MonitorTray {
             login_status,
             first_launch,
             operation,
+            mode_selected,
+            mode_applied,
+            mode_auto,
+            mode_forced,
             show_decode_tps,
             live_metric,
             _separator: separator,
@@ -291,6 +323,32 @@ impl MonitorTray {
         let _ = self._tray.set_tooltip(Some(tooltip));
     }
 
+    /// 接続モード submenu の状態行を反映する（G02 / C03）。`lines` は
+    /// `ConnectionModeUi::menu_lines()` の出力（選択・適用状態・適用中・
+    /// 保留）。適用中・保留は適用状態行に追記する。G02。
+    pub fn update_connection_mode(&self, lines: &[String]) {
+        let selected = lines
+            .iter()
+            .find(|l| l.starts_with("接続モード（選択）"))
+            .cloned()
+            .unwrap_or_else(|| "接続モード（選択）: --".to_string());
+        self.mode_selected.set_text(selected);
+        let mut applied = lines
+            .iter()
+            .find(|l| l.starts_with("適用状態"))
+            .cloned()
+            .unwrap_or_else(|| "適用状態: --".to_string());
+        let extras: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("適用中") || l.starts_with("（保留）"))
+            .map(|s| s.as_str())
+            .collect();
+        if !extras.is_empty() {
+            applied = format!("{} / {}", applied, extras.join(" / "));
+        }
+        self.mode_applied.set_text(applied);
+    }
+
     /// Check whether a menu event requests the monitor to quit.
     pub fn is_quit_event(event: &MenuEvent) -> bool {
         *event.id() == MenuId::new(MENU_QUIT)
@@ -317,6 +375,16 @@ impl MonitorTray {
         *event.id() == MenuId::new(MENU_OPEN_LOGIN_ITEMS)
     }
 
+    /// Check whether a menu event selects Automatic connection mode（G02）。
+    pub fn is_mode_automatic_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_MODE_AUTOMATIC)
+    }
+
+    /// Check whether a menu event selects ForcedStandalone connection mode（G02）。
+    pub fn is_mode_forced_event(event: &MenuEvent) -> bool {
+        *event.id() == MenuId::new(MENU_MODE_FORCED)
+    }
+
     /// Update the background-service registration status display. The runtime
     /// LaunchAgent helper and the main-app login item are independent settings
     /// (C-03): updating one must never change the other.
@@ -328,7 +396,7 @@ impl MonitorTray {
             runtime,
         ));
         self.login_status.set_text(registration_status_text(
-            &text("status.menu_bar_autostart", "Siderostat自動起動"),
+            &text("status.menu_bar_autostart", "siDeroStat自動起動"),
             login_item,
         ));
         self.runtime_service_status.set(runtime);
@@ -385,7 +453,7 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
             "{} ({})",
             text(
                 "first_launch.version",
-                "初回起動: Siderostatのバージョン情報を確認しました",
+                "初回起動: siDeroStatのバージョン情報を確認しました",
             ),
             app_metadata()
         ),
@@ -414,7 +482,7 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
             runtime_status,
             main_app_login_status,
         } => format!(
-            "{} (siderostat-runtime: {}; Siderostat: {})",
+            "{} (siderostat-runtime: {}; siDeroStat: {})",
             text(
                 "first_launch.service_statuses",
                 "初回起動: 自動起動の状態を確認しました",
@@ -424,23 +492,23 @@ fn first_launch_status_text(state: &FirstLaunchState) -> String {
         ),
         FirstLaunchState::Registering => text(
             "first_launch.registering",
-            "初回起動: siderostat-runtimeとSiderostatの自動起動を登録中…",
+            "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録中…",
         ),
         FirstLaunchState::Registered => text(
             "first_launch.registered",
-            "初回起動: siderostat-runtimeとSiderostatの自動起動を登録しました",
+            "初回起動: siderostat-runtimeとsiDeroStatの自動起動を登録しました",
         ),
         FirstLaunchState::RequiresApproval => text(
             "first_launch.approval",
-            "初回起動: siderostat-runtimeまたはSiderostatのログイン項目の承認が必要です",
+            "初回起動: siderostat-runtimeまたはsiDeroStatのログイン項目の承認が必要です",
         ),
         FirstLaunchState::RegisterFailed => text(
             "first_launch.register_failed",
-            "初回起動: siderostat-runtimeまたはSiderostatの自動起動の登録に失敗しました",
+            "初回起動: siderostat-runtimeまたはsiDeroStatの自動起動の登録に失敗しました",
         ),
         FirstLaunchState::MonitorLoginChecked => text(
             "first_launch.monitor_login",
-            "初回起動: Siderostatの自動起動を確認しました",
+            "初回起動: siDeroStatの自動起動を確認しました",
         ),
         FirstLaunchState::RuntimeAdminReady => text(
             "first_launch.runtime_admin",
@@ -592,15 +660,29 @@ fn menu_bar_title(
     String::new()
 }
 
+fn decode_live(display: &DisplayState) -> bool {
+    // An active generation (proxy-tracked, generation_active=1) is always
+    // meaningful: the user needs to see the first-token wait in progress
+    // rather than inherit a stale value from the previous request.
+    if display.decode_active {
+        return true;
+    }
+    // A proxy-external decode (generation_active=0 but the ds4 is generating)
+    // is only surfaced while its progress is fresh. The runtime leaves the
+    // ds4-side gauges populated after such a decode, so fall back to the last
+    // observed completion advance to avoid showing a finished request forever.
+    display.decode_progress_observed
+        && display
+            .decode_last_advance_at
+            .is_some_and(|at| at.elapsed() < DECODE_FRESH_WINDOW)
+}
+
 fn has_decode_values(display: &DisplayState) -> bool {
-    // An active generation with no observed token is still meaningful: the
-    // user needs to see that the first-token wait is in progress rather than
-    // inherit a stale value from the previous request.
-    display.decode_active
+    decode_live(display)
 }
 
 fn decode_throughput_title(display: &DisplayState) -> String {
-    if !display.decode_active {
+    if !decode_live(display) {
         String::new()
     } else if !display.decode_progress_observed {
         "decode waiting".to_string()
@@ -704,7 +786,7 @@ fn prefill_detail_text(display: &DisplayState) -> String {
 }
 
 fn decode_detail_text(display: &DisplayState) -> String {
-    if !display.decode_active {
+    if !decode_live(display) {
         return "Decode: --".to_string();
     }
     if !display.decode_progress_observed {
@@ -808,6 +890,7 @@ fn on_connector(x: f32, y: f32, top_cy: f32, bottom_cy: f32, cx: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn pixel(rgba: &[u8], px: u32, py: u32) -> [u8; 4] {
         let idx = ((py * ICON_SIZE + px) as usize) * 4;
@@ -992,6 +1075,55 @@ mod tests {
     }
 
     #[test]
+    fn proxy_external_decode_is_surfaced_while_fresh() {
+        // generation_active=0 (no proxy tracking) but the ds4 is generating:
+        // completion has advanced within the freshness window.
+        let display = DisplayState {
+            decode_active: false,
+            decode_progress_observed: true,
+            decode_completion: 42,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            decode_progress_age_secs: Some(0.0),
+            decode_last_advance_at: Some(Instant::now()),
+            decode_last_completion: Some(42),
+            ..DisplayState::default()
+        };
+        assert!(has_decode_values(&display));
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillChunkTps),
+            "decode 32.1t/s"
+        );
+        assert_eq!(
+            decode_detail_text(&display),
+            "Decode: completion=42 chunk=32.1t/s avg=28.5t/s age=0.0s"
+        );
+    }
+
+    #[test]
+    fn stale_proxy_external_decode_is_hidden_after_freshness_window() {
+        // A finished proxy-external decode leaves the gauges populated but no
+        // longer advances; it must not be shown indefinitely.
+        let display = DisplayState {
+            decode_active: false,
+            decode_progress_observed: true,
+            decode_completion: 42,
+            decode_chunk_tps: 32.1,
+            decode_avg_tps: 28.5,
+            decode_progress_age_secs: Some(0.0),
+            decode_last_advance_at: Some(Instant::now() - Duration::from_secs(100)),
+            decode_last_completion: Some(42),
+            ..DisplayState::default()
+        };
+        assert!(!has_decode_values(&display));
+        assert_eq!(
+            menu_bar_title(&display, true, LiveMetric::PrefillChunkTps),
+            ""
+        );
+        assert_eq!(decode_detail_text(&display), "Decode: --");
+    }
+
+    #[test]
     fn stale_progress_never_displays_old_chunk_as_current() {
         let prefill = DisplayState {
             prefill_active: true,
@@ -1115,7 +1247,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (runtime, login) in cases {
             let runtime_text = registration_status_text("siderostat-runtime自動起動", runtime);
-            let login_text = registration_status_text("Siderostat自動起動", login);
+            let login_text = registration_status_text("siDeroStat自動起動", login);
             // runtime の文言は login の文言と区別され、逆も同様。
             assert_ne!(runtime_text, login_text);
             // 各組み合わせの (runtime, login) 表示対が一意。

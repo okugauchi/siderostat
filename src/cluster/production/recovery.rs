@@ -1,5 +1,6 @@
 //! Single PeerLost recovery owner shared by the control-reconcile path and the route-loss
-//! demotion monitor. See `docs/reconnect-peer-loss-design.md`.
+//! demotion monitor. See the Obsidian record
+//! `Projects/siderostat/docs/archive/reconnect-2026-08/reconnect-peer-loss-design.md`.
 
 use super::{RoleControl, now_millis};
 use crate::{
@@ -32,6 +33,19 @@ impl PeerLossRecovery {
     }
 }
 impl super::ProductionClusterRuntime {
+    /// Operator Force policy uses the same ordered cleanup as peer-loss recovery, while keeping
+    /// the policy latch active so periodic reconciliation cannot promote again.
+    pub async fn recover_from_forced_policy(
+        &self,
+    ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        self.recover_to_solo(
+            EventOwner::Control,
+            ClusterEventKind::PeerLost,
+            "forced-standalone",
+        )
+        .await
+    }
+
     /// The single PeerLost recovery entry point. Both the control-reconcile path and the
     /// route-loss demotion monitor call this. Order is fixed by the design:
     /// admission block -> distributed stop -> standalone start -> publish SoloReady.
@@ -85,6 +99,7 @@ impl super::ProductionClusterRuntime {
                     .apply(ClusterEvent {
                         expected_generation: current.generation,
                         kind: recovery_event,
+                        tp_session: None,
                     })
                     .await?;
                 self.inner.proxy.set_target(marked.target, true);
@@ -144,6 +159,7 @@ impl super::ProductionClusterRuntime {
                 .apply(ClusterEvent {
                     expected_generation: current.generation,
                     kind: recovery_event,
+                    tp_session: None,
                 })
                 .await?
         };
@@ -177,6 +193,7 @@ impl super::ProductionClusterRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await?;
 
@@ -200,7 +217,7 @@ impl super::ProductionClusterRuntime {
     async fn stop_distributed_child(&self) -> anyhow::Result<()> {
         match self.inner.role {
             LocalRole::Coordinator => {
-                if let Some(coordinator) = &self.inner.distributed_coordinator {
+                if let Some(coordinator) = self.inner.distributed_coordinator.get() {
                     DistributedCoordinatorLifecycle::stop(coordinator.as_ref()).await?;
                 }
             }
@@ -224,7 +241,7 @@ impl super::ProductionClusterRuntime {
         let coordinator = self
             .inner
             .distributed_coordinator
-            .as_ref()
+            .get()
             .context("coordinator supervisor unavailable")?
             .clone();
         loop {

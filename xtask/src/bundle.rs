@@ -109,6 +109,15 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
     );
     std::fs::copy(&runtime_bin, contents.join("Helpers/siderostat-runtime"))?;
 
+    // Web Search Bridge binary（専用 binary、W08）。bundle に含めて配布する。
+    let bridge_bin = root.join("target/release/ds4-websearch-proxy");
+    anyhow::ensure!(
+        bridge_bin.is_file(),
+        "bridge binary missing; run `cargo build --release --bin ds4-websearch-proxy` first: {}",
+        bridge_bin.display()
+    );
+    std::fs::copy(&bridge_bin, contents.join("Helpers/ds4-websearch-proxy"))?;
+
     // Bundle-internal LaunchAgent plist. The fixed /Applications path is
     // intentional: the installer postinstall bootstraps this plist directly.
     let runtime_plist = root.join("contrib/macos/dev.siderostat-ds4-proxy.runtime.plist");
@@ -141,6 +150,7 @@ pub fn app_dev(args: &AppDevArgs) -> Result<()> {
 
     // 3. Ad-hoc sign inside-out: helper first, then the app. Never --deep for signing.
     adhoc_sign(&contents.join("Helpers/siderostat-runtime"))?;
+    adhoc_sign(&contents.join("Helpers/ds4-websearch-proxy"))?;
     adhoc_sign(&app)?;
 
     // 4. Verification.
@@ -319,6 +329,13 @@ fn verify_bundle(app: &Path) -> Result<()> {
         &[
             OsStr::new("--verify"),
             OsStr::new(&app.join("Contents/Helpers/siderostat-runtime")),
+        ],
+    )?;
+    util::run(
+        "codesign",
+        &[
+            OsStr::new("--verify"),
+            OsStr::new(&app.join("Contents/Helpers/ds4-websearch-proxy")),
         ],
     )?;
     Ok(())

@@ -4,7 +4,13 @@ use crate::{
     metrics::Metrics,
 };
 use futures::future::BoxFuture;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::Instant;
 use url::Url;
 
@@ -23,6 +29,8 @@ struct StandaloneSupervisorInner {
     allow_sigkill: bool,
     metrics: Arc<Metrics>,
     child: SupervisedSlot,
+    dry_run: bool,
+    running: AtomicBool,
 }
 
 impl StandaloneSupervisor {
@@ -46,16 +54,60 @@ impl StandaloneSupervisor {
                 allow_sigkill,
                 metrics,
                 child: SupervisedSlot::new(),
+                dry_run: false,
+                running: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Build a dry-run standalone supervisor. It never spawns or stops a real DS4 child;
+    /// start/stop only flip an in-memory running flag, so the clustering state machine can
+    /// exercise the standalone lifecycle without touching the real process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_dry_run(
+        command: Ds4Command,
+        models_url: Url,
+        startup_timeout: Duration,
+        poll_interval: Duration,
+        stop_timeout: Duration,
+        allow_sigkill: bool,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(StandaloneSupervisorInner {
+                command,
+                models_url,
+                client: reqwest::Client::new(),
+                startup_timeout,
+                poll_interval,
+                stop_timeout,
+                allow_sigkill,
+                metrics,
+                child: SupervisedSlot::new(),
+                dry_run: true,
+                running: AtomicBool::new(false),
             }),
         }
     }
 
     pub async fn child_identity(&self) -> Option<ChildIdentity> {
+        if self.inner.dry_run {
+            return None;
+        }
         self.inner.child.child_identity().await
     }
 
     #[cfg(target_os = "macos")]
     async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
+        if self.inner.dry_run {
+            self.inner.running.store(true, Ordering::Release);
+            tracing::info!(
+                event = "dry-run-standalone-start",
+                generation,
+                "simulated standalone start"
+            );
+            return Ok(());
+        }
         let Some(mut slot) = self.inner.child.begin_start().await? else {
             return Ok(());
         };
@@ -183,11 +235,25 @@ impl StandaloneSupervisor {
     }
 
     #[cfg(not(target_os = "macos"))]
-    async fn start_inner(&self, _generation: u64) -> anyhow::Result<()> {
+    async fn start_inner(&self, generation: u64) -> anyhow::Result<()> {
+        if self.inner.dry_run {
+            self.inner.running.store(true, Ordering::Release);
+            tracing::info!(
+                event = "dry-run-standalone-start",
+                generation,
+                "simulated standalone start"
+            );
+            return Ok(());
+        }
         anyhow::bail!("managed DS4 supervision requires macOS")
     }
 
     async fn stop_inner(&self) -> anyhow::Result<()> {
+        if self.inner.dry_run {
+            self.inner.running.store(false, Ordering::Release);
+            tracing::info!("simulated standalone stop");
+            return Ok(());
+        }
         self.inner
             .child
             .stop(self.inner.stop_timeout, self.inner.allow_sigkill)
@@ -195,6 +261,9 @@ impl StandaloneSupervisor {
     }
 
     async fn is_running_inner(&self) -> anyhow::Result<bool> {
+        if self.inner.dry_run {
+            return Ok(self.inner.running.load(Ordering::Acquire));
+        }
         self.inner.child.is_running().await
     }
 }
@@ -218,5 +287,52 @@ impl LocalStandaloneLifecycle for StandaloneSupervisor {
     fn child_identity(&self) -> BoxFuture<'static, Option<ChildIdentity>> {
         let supervisor = self.clone();
         Box::pin(async move { supervisor.child_identity().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::{Ds4Command, Ds4Profile};
+    use crate::config::{Quantization, Residency, SpeculativeSupport};
+
+    fn dry_run_supervisor() -> StandaloneSupervisor {
+        let command = Ds4Command {
+            executable: "/bin/true".into(),
+            working_directory: "/tmp".into(),
+            argv: Vec::new(),
+            profile: Ds4Profile {
+                profile_id: "dry-run".into(),
+                quantization: Quantization::Mxfp4,
+                residency: Residency::Resident,
+                speculative_support: SpeculativeSupport::None,
+            },
+        };
+        StandaloneSupervisor::new_dry_run(
+            command,
+            Url::parse("http://127.0.0.1:0/v1/models").unwrap(),
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            false,
+            Arc::new(Metrics::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn dry_run_standalone_toggles_running_without_a_child() {
+        let supervisor = dry_run_supervisor();
+        assert!(!supervisor.is_running().await.unwrap());
+        assert!(supervisor.child_identity().await.is_none());
+
+        LocalStandaloneLifecycle::start(&supervisor, 1)
+            .await
+            .unwrap();
+        assert!(supervisor.is_running().await.unwrap());
+        assert!(supervisor.child_identity().await.is_none());
+
+        LocalStandaloneLifecycle::stop(&supervisor).await.unwrap();
+        assert!(!supervisor.is_running().await.unwrap());
+        assert!(supervisor.child_identity().await.is_none());
     }
 }

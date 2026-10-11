@@ -1,0 +1,26 @@
+{
+  "description": "W09 replay fixture — client function → result → 回答 の二ターン SSE item 列。A03 wire-profile に基づく。実 Codex parser が各 item を受理し、tool output 後も通常 tool 継続できることを検証する。",
+  "items": [
+    {
+      "type": "function_call",
+      "id": "item_0",
+      "call_id": "call_1",
+      "name": "my_shell_tool",
+      "arguments": "{\"cmd\":\"ls\"}"
+    },
+    {
+      "type": "function_call_output",
+      "id": "item_1",
+      "call_id": "call_1",
+      "output": "[\"file.txt\"]"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "id": "item_2",
+      "content": [
+        {"type": "output_text", "text": "ls の結果は file.txt です。"}
+      ]
+    }
+  ]
+}

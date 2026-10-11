@@ -100,6 +100,21 @@ impl super::ProductionClusterRuntime {
             );
             return Ok(self.inner.mode.snapshot());
         }
+        // P05: 全自動経路（periodic tick）の policy gate。両端の policy epoch 一致・
+        // auto_promote・peer 不在・deployment mismatch latch・ForcedStandalone 保護ラッチ
+        // を検査する。gate が Allow 以外なら pair を開始せず Standalone を維持する。。
+        if self.role() == LocalRole::Coordinator {
+            let verdict = self.automatic_promotion_gate(peer_present, self.policy_epoch());
+            if !verdict.allows_promotion() {
+                tracing::debug!(
+                    owner = owner.name(),
+                    state = ?state,
+                    verdict = verdict.name(),
+                    "automatic pairing suppressed by policy gate"
+                );
+                return Ok(self.inner.mode.snapshot());
+            }
+        }
         Ok(self
             .inner
             .mode

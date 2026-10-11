@@ -7,8 +7,9 @@ use crate::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
         ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
         DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
-        ModeRuntime, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION, PeerDiagnostics,
-        PersistentChild, PersistentClusterState, PersistentMode, PersistentProxyTarget,
+        ModeRuntime, OperationPolicy, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION,
+        PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
+        PersistentOperationPhase, PersistentProxyTarget, PolicyStart, PolicyStartError,
         ProcessControlError, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
         StandaloneSupervisor, StateStore, StateStoreError, build_standalone_command,
         detect_cluster_role, fingerprint_file, platform_process_controller, reconcile_restart,
@@ -35,7 +36,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
     routing::{any, get, post},
 };
@@ -65,6 +66,8 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub proxy: Arc<ModeAwareProxyState>,
     pub metrics: Arc<Metrics>,
+    /// DS4 Manager の job journal（M10 / C04）。manager API が観測する。M10。
+    pub jobs: std::sync::Mutex<crate::manager::jobs::JobJournal>,
     cluster: RwLock<Option<ClusterHandle>>,
     admin: RwLock<Option<AdminController>>,
     production: RwLock<Option<ProductionClusterRuntime>>,
@@ -139,6 +142,7 @@ impl AppState {
             }),
             proxy,
             metrics,
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -411,6 +415,23 @@ impl AdminExecutor for RuntimeAdminExecutor {
                         .demote()
                         .await?,
                 )),
+                AdminAction::SetPolicy {
+                    desired,
+                    expected_generation,
+                    request_id,
+                } => {
+                    let Some(production) = production else {
+                        return Ok(serde_json::json!({
+                            "desired": desired,
+                            "applied": "automatic",
+                            "nodes": [],
+                            "error": "cluster runtime is disabled",
+                        }));
+                    };
+                    production
+                        .apply_policy_transaction(desired, expected_generation, request_id)
+                        .await
+                }
             }
         })
     }
@@ -516,6 +537,9 @@ fn snapshot_json(snapshot: crate::cluster::ClusterSnapshot) -> Value {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServeOptions {
     pub decline_startup_cleanup: bool,
+    /// Exercise clustering only: never start/stop/restart a real ds4-server process, never
+    /// touch startup cleanup, restart reconcile, or the persistent state store.
+    pub dry_run: bool,
 }
 
 pub async fn serve(config: ModeAwareConfig) -> anyhow::Result<()> {
@@ -526,41 +550,70 @@ pub async fn serve_with_options(
     config: ModeAwareConfig,
     options: ServeOptions,
 ) -> anyhow::Result<()> {
-    validate_dspark_binding(&config).await?;
+    let dry_run = options.dry_run;
+    // dry-run は standalone child を起動しないため、DSpark バインド検証（実 model の
+    // fingerprint を読む）はスキップする。control plane の HMAC に必要な secret /
+    // manifest の読み込みは BootInputs 側で引き続き行う。
+    if !dry_run {
+        validate_dspark_binding(&config).await?;
+    }
     let boot = BootInputs::load(&config).await?;
-    match crate::startup_cleanup::cleanup_startup_processes(
-        std::process::id(),
-        &config.ds4.binary,
-        &platform_process_controller(),
-        config.cluster.timeouts.stop,
-        crate::startup_cleanup::StartupCleanupOptions {
-            decline: options.decline_startup_cleanup,
-            auto_restart: config.startup_cleanup.auto_restart,
-            notifications_enabled: config.notifications.enabled,
-            notification_sound: config.notifications.sound,
-        },
-    )
-    .await?
-    {
-        crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
-        | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
-        crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
-            anyhow::bail!(
-                "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
-            );
+    // dry-run は実プロセスに一切触れない: startup cleanup と restart reconcile をスキップし、
+    // 実 StateStore の読み書きもしない。クラスタリング本体（state machine / control plane /
+    // discovery / pairing / promotion / demotion / recovery）は production と同一の経路を動かす。
+    if dry_run {
+        tracing::info!(
+            "dry-run: skipping startup cleanup, restart reconcile, and state persistence"
+        );
+    } else {
+        match crate::startup_cleanup::cleanup_startup_processes(
+            std::process::id(),
+            &config.ds4.binary,
+            &platform_process_controller(),
+            config.cluster.timeouts.stop,
+            crate::startup_cleanup::StartupCleanupOptions {
+                decline: options.decline_startup_cleanup,
+                auto_restart: config.startup_cleanup.auto_restart,
+                notifications_enabled: config.notifications.enabled,
+                notification_sound: config.notifications.sound,
+            },
+        )
+        .await?
+        {
+            crate::startup_cleanup::StartupCleanupOutcome::NoCandidates
+            | crate::startup_cleanup::StartupCleanupOutcome::Approved { .. } => {}
+            crate::startup_cleanup::StartupCleanupOutcome::Declined { count } => {
+                anyhow::bail!(
+                    "startup cleanup was declined for {count} existing siderostat/ds4 process(es); refusing to start"
+                );
+            }
         }
     }
-    let state_store = Arc::new(StateStore::acquire(&config.cluster.state_path)?);
-    let persisted = load_persisted_state(&state_store)?;
+    let state_store = if dry_run {
+        None
+    } else {
+        Some(Arc::new(StateStore::acquire(&config.cluster.state_path)?))
+    };
+    let persisted = match &state_store {
+        Some(store) => load_persisted_state(store)?,
+        None => None,
+    };
     let local_address = SocketAddr::new(config.ds4.http_host, config.ds4.http_port);
-    let restart = reconcile_restart(
-        persisted.as_ref(),
-        &platform_process_controller(),
-        config.cluster.timeouts.stop,
-        config.ds4.allow_sigkill,
-        || required_port_available(local_address),
-    )
-    .await?;
+    let restart = if dry_run {
+        // dry-run は過去の永続状態を無視し、常に solo から開始する。
+        RestartDecision::StartSolo {
+            baseline_generation: 0,
+        }
+    } else {
+        reconcile_restart(
+            persisted.as_ref(),
+            &platform_process_controller(),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            || required_port_available(local_address),
+        )
+        .await?
+    };
     let state = AppState::from_config(config.clone())?;
     state.proxy.admission().block();
     state.proxy.set_target(
@@ -569,7 +622,7 @@ pub async fn serve_with_options(
         },
         false,
     );
-    let supervisor = build_standalone_supervisor(&config, &state)?;
+    let supervisor = build_standalone_supervisor(&config, &state, dry_run)?;
     // C-04a: graceful restart の fallback owner として supervisor への参照を保持する。
     // cluster 有効時は ProductionClusterRuntime が優先され、distributed child を所有する。
     state.attach_supervisor(supervisor.clone());
@@ -585,7 +638,23 @@ pub async fn serve_with_options(
         &runtime,
         &supervisor,
         control_session_generation,
+        dry_run,
     )?;
+    if let (Some(production), Some(persisted)) = (production.as_ref(), persisted.as_ref()) {
+        let pending = persisted
+            .pending_operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase != PersistentOperationPhase::Applied);
+        production.restore_policy(
+            persisted.operator_policy,
+            persisted.applied_policy,
+            persisted.policy_epoch,
+            pending,
+        );
+    }
+    if let (Some(production), Some(store)) = (production.as_ref(), state_store.as_ref()) {
+        production.attach_policy_store(store.clone());
+    }
     let notifier = build_notifier(
         config.notifications.enabled,
         config.notifications.sound,
@@ -600,24 +669,26 @@ pub async fn serve_with_options(
     state.attach_notification_service(notification_service.clone());
     let transition_monitor = spawn_transition_monitor(
         &state,
-        &state_store,
+        state_store.clone(),
         &runtime,
         &supervisor,
         production.as_ref(),
         &config.ds4.standalone.profile_id,
     );
-    persist_runtime_state(
-        &state_store,
-        &runtime,
-        &supervisor,
-        production.as_ref(),
-        &config.ds4.standalone.profile_id,
-    )
-    .await?;
+    if let Some(store) = &state_store {
+        persist_runtime_state(
+            store,
+            &runtime,
+            &supervisor,
+            production.as_ref(),
+            &config.ds4.standalone.profile_id,
+        )
+        .await?;
+    }
     let desktop_notifier = spawn_desktop_notifier(&runtime, notification_service.clone());
     let local_monitor = spawn_local_monitor(
         &state,
-        &state_store,
+        state_store.clone(),
         &runtime,
         &supervisor,
         &config.ds4.standalone.profile_id,
@@ -625,7 +696,12 @@ pub async fn serve_with_options(
     );
     // ネットワーク変更（Thunderbolt bridge0 の IPv4 付与・除去）を監視し、
     // role が起動時の初期値から変化したらプロセス全体を再起動する。
-    let (_role_change_task, _role_change_watcher) = spawn_role_change_monitor(&config, role);
+    // dry-run は実プロセス再起動を伴うためこの監視は起動しない。
+    let (_role_change_task, _role_change_watcher) = if dry_run {
+        (None, None)
+    } else {
+        spawn_role_change_monitor(&config, role)
+    };
     run_servers(
         &config,
         state,
@@ -717,21 +793,34 @@ fn load_persisted_state(
 fn build_standalone_supervisor(
     config: &ModeAwareConfig,
     state: &Arc<AppState>,
+    dry_run: bool,
 ) -> anyhow::Result<Arc<StandaloneSupervisor>> {
     let command = build_standalone_command(&config.ds4)?;
     let models_url = url::Url::parse(&format!(
         "http://{}:{}/v1/models",
         config.ds4.http_host, config.ds4.http_port
     ))?;
-    Ok(Arc::new(StandaloneSupervisor::new(
-        command,
-        models_url,
-        config.cluster.timeouts.standalone_startup,
-        std::time::Duration::from_millis(250),
-        config.cluster.timeouts.stop,
-        config.ds4.allow_sigkill,
-        state.metrics.clone(),
-    )))
+    Ok(Arc::new(if dry_run {
+        StandaloneSupervisor::new_dry_run(
+            command,
+            models_url,
+            config.cluster.timeouts.standalone_startup,
+            std::time::Duration::from_millis(250),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            state.metrics.clone(),
+        )
+    } else {
+        StandaloneSupervisor::new(
+            command,
+            models_url,
+            config.cluster.timeouts.standalone_startup,
+            std::time::Duration::from_millis(250),
+            config.cluster.timeouts.stop,
+            config.ds4.allow_sigkill,
+            state.metrics.clone(),
+        )
+    }))
 }
 
 async fn spawn_runtime(
@@ -778,24 +867,42 @@ fn attach_control_plane(
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     control_session_generation: Option<u64>,
+    dry_run: bool,
 ) -> anyhow::Result<Option<ProductionClusterRuntime>> {
     // detect_cluster_role は対象 interface に IPv4 が無い場合などに
     // LocalRole::Unknown を返す。Unknown は standalone 運用として想定済み
     // なので、production を生成せず起動を継続する。
     let production = if config.cluster.enabled && boot.role != LocalRole::Unknown {
-        Some(ProductionClusterRuntime::new(
-            config.clone(),
-            boot.role,
-            runtime.clone(),
-            state.proxy.clone(),
-            supervisor.clone(),
-            state.metrics.clone(),
-            boot.distributed_manifest
-                .context("distributed manifest is unavailable")?,
-            boot.control_secret
-                .context("control secret is unavailable")?,
-            control_session_generation,
-        )?)
+        if dry_run {
+            Some(ProductionClusterRuntime::new_dry_run(
+                config.clone(),
+                boot.role,
+                runtime.clone(),
+                state.proxy.clone(),
+                supervisor.clone(),
+                state.metrics.clone(),
+                boot.distributed_manifest
+                    .context("distributed manifest is unavailable")?,
+                boot.control_secret
+                    .context("control secret is unavailable")?,
+                config.cluster.control_port,
+                control_session_generation,
+            )?)
+        } else {
+            Some(ProductionClusterRuntime::new(
+                config.clone(),
+                boot.role,
+                runtime.clone(),
+                state.proxy.clone(),
+                supervisor.clone(),
+                state.metrics.clone(),
+                boot.distributed_manifest
+                    .context("distributed manifest is unavailable")?,
+                boot.control_secret
+                    .context("control secret is unavailable")?,
+                control_session_generation,
+            )?)
+        }
     } else {
         None
     };
@@ -841,7 +948,7 @@ pub async fn admin_http_reconcile(
         vec![0x42; 32],
     )?;
     let state = AppState::from_config(config.clone())?;
-    let supervisor = build_standalone_supervisor(config, &state)?;
+    let supervisor = build_standalone_supervisor(config, &state, false)?;
     state.attach_cluster(runtime.cluster_handle());
     if let Some(production) = &production {
         state.attach_production((**production).clone());
@@ -902,7 +1009,7 @@ pub async fn admin_http_reconcile(
 
 fn spawn_transition_monitor(
     state: &Arc<AppState>,
-    state_store: &Arc<StateStore>,
+    state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     production: Option<&ProductionClusterRuntime>,
@@ -929,16 +1036,19 @@ fn spawn_transition_monitor(
             );
             previous = current;
             transition_started = std::time::Instant::now();
-            if let Err(error) = persist_runtime_state(
-                &transition_store,
-                &transition_runtime,
-                &transition_supervisor,
-                transition_production.as_ref(),
-                &transition_profile,
-            )
-            .await
-            {
-                tracing::error!(error = %error, "persistent cluster transition write failed");
+            // dry-run では永続化先が無いためスキップする（実 state を汚染しない）。
+            if let Some(store) = &transition_store {
+                if let Err(error) = persist_runtime_state(
+                    store,
+                    &transition_runtime,
+                    &transition_supervisor,
+                    transition_production.as_ref(),
+                    &transition_profile,
+                )
+                .await
+                {
+                    tracing::error!(error = %error, "persistent cluster transition write failed");
+                }
             }
         }
     })
@@ -975,7 +1085,7 @@ fn spawn_desktop_notifier(
 
 fn spawn_local_monitor(
     state: &Arc<AppState>,
-    state_store: &Arc<StateStore>,
+    state_store: Option<Arc<StateStore>>,
     runtime: &Arc<ModeRuntime>,
     supervisor: &Arc<StandaloneSupervisor>,
     profile: &str,
@@ -1000,16 +1110,19 @@ fn spawn_local_monitor(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .observe_child_restart();
-                    if let Err(error) = persist_runtime_state(
-                        &local_monitor_store,
-                        &local_monitor_runtime,
-                        &local_monitor_supervisor,
-                        None,
-                        &local_monitor_profile,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %error, "persistent cluster state write failed");
+                    // dry-run では永続化先が無いためスキップする。
+                    if let Some(store) = &local_monitor_store {
+                        if let Err(error) = persist_runtime_state(
+                            store,
+                            &local_monitor_runtime,
+                            &local_monitor_supervisor,
+                            None,
+                            &local_monitor_profile,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %error, "persistent cluster state write failed");
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -1274,6 +1387,24 @@ async fn persist_runtime_state(
         Some(production) => production.control_session_generation().await,
         None => snapshot.generation,
     };
+    // P01 / C03: policy journal（operator_policy / applied_policy / policy_epoch /
+    // pending_operation）は runtime の再保存で自動に戻さない。既存 state から引き継ぐ。
+    // Policy transitions hold the same critical section while updating the journal. This prevents
+    // a background mode snapshot from reading IntentSaved and overwriting a concurrently
+    // committed Applied record.
+    let _policy_persistence_guard =
+        production.map(|production| production.policy_persistence_guard());
+    let prior = store.load()?;
+    let operator_policy = prior
+        .as_ref()
+        .map(|state| state.operator_policy)
+        .unwrap_or_default();
+    let applied_policy = prior
+        .as_ref()
+        .map(|state| state.applied_policy)
+        .unwrap_or_default();
+    let policy_epoch = prior.as_ref().map(|state| state.policy_epoch).unwrap_or(0);
+    let pending_operation = prior.and_then(|state| state.pending_operation);
     store.save(&PersistentClusterState {
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
@@ -1295,6 +1426,10 @@ async fn persist_runtime_state(
         ),
         child,
         last_failure: None,
+        operator_policy,
+        applied_policy,
+        policy_epoch,
+        pending_operation,
     })?;
     Ok(())
 }
@@ -1304,6 +1439,7 @@ fn persistent_mode(mode: StableMode) -> PersistentMode {
         StableMode::SoloStandalone => PersistentMode::SoloStandalone,
         StableMode::PairedStandalone => PersistentMode::PairedStandalone,
         StableMode::DistributedLayerParallel => PersistentMode::DistributedLayerParallel,
+        StableMode::DistributedTensorParallel => PersistentMode::DistributedTensorParallel,
     }
 }
 
@@ -1367,12 +1503,20 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/cluster/demote", post(demote))
         .route("/cluster/restart", post(restart))
         .route("/cluster/fingerprint", post(fingerprint))
+        .route("/cluster/operation-policy", post(operation_policy))
+        .route("/cluster/jobs/{id}", get(operation_policy_job))
         .route("/cluster/recover-degraded", post(recover_degraded))
         .route(
             "/cluster/recover-degraded/{recovery_id}",
             get(recover_degraded_status),
         )
         .route("/admin/restart", post(graceful_restart))
+        // DS4 Manager API (M10 / C04)。admin port 専用。public proxy の
+        // wildcard には落ちず、DS4 へ転送されない。M10。
+        .route("/manager/status", get(manager_status))
+        .route("/manager/jobs", post(manager_jobs_submit))
+        .route("/manager/jobs/{id}", get(manager_job_get))
+        .route("/manager/jobs/{id}/cancel", post(manager_job_cancel))
         .with_state(state)
 }
 
@@ -1977,12 +2121,212 @@ async fn fingerprint(
     start_job(admin, AdminAction::Fingerprint { profile })
 }
 
+/// `POST /cluster/operation-policy` — 操作方針の適用（P06 / C03）。
+///
+/// 認証（401）、payload 検証（400）、冪等性（同 ID 同 body → 既存 job、別 body → 409）、
+/// policy lease 進行中（409）、未知 request_id の GET（404）を契約通りに返す。
+/// 適用自体は非同期 job として実行し、202 + job を返す。。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationPolicyRequest {
+    #[serde(rename = "policy")]
+    policy: String,
+    #[serde(rename = "expected_generation")]
+    expected_generation: u64,
+    #[serde(rename = "request_id")]
+    request_id: uuid::Uuid,
+}
+
+async fn operation_policy(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    let body = match serde_json::from_slice::<OperationPolicyRequest>(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid operation-policy request: {error}")}),
+            );
+        }
+    };
+    let desired = match body.policy.as_str() {
+        "automatic" => OperationPolicy::Automatic,
+        "forced-standalone" => OperationPolicy::ForcedStandalone,
+        other => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("policy must be automatic or forced-standalone, got {other}")}),
+            );
+        }
+    };
+    let body_hash = crate::cluster::policy_body_hash(desired, body.expected_generation);
+    let local_node_id = "local".to_string();
+    match admin.start_policy(
+        body.request_id,
+        body_hash,
+        desired,
+        body.expected_generation,
+        local_node_id,
+    ) {
+        Ok(PolicyStart::Created(job)) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        Ok(PolicyStart::Existing(job)) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::ACCEPTED, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        Err(PolicyStartError::IdempotencyConflict) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "request_id already used with a different body"}),
+        ),
+        Err(PolicyStartError::LeaseBusy(error)) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": format!("another lifecycle operation is in progress: {error}")}),
+        ),
+    }
+}
+
+/// `GET /cluster/jobs/{id}` — policy 適用 job の状態照会（P06 / C03）。
+/// kind / state / desired / applied / node 別結果 / error を返す。未知・期限切れは 404。。
+async fn operation_policy_job(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(request_id): axum::extract::Path<uuid::Uuid>,
+) -> Response<Body> {
+    let admin = match authorized_admin(&headers, &state) {
+        Ok(admin) => admin,
+        Err(response) => return *response,
+    };
+    match admin.policy_job(&request_id) {
+        Some(job) => match serde_json::to_value(job) {
+            Ok(value) => json_response(StatusCode::OK, value),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize policy job");
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "failed to serialize policy job"}),
+                )
+            }
+        },
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": "unknown or expired policy job"}),
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GracefulRestartRequest {
     /// Optional in-flight drain timeout in milliseconds (C-04a). When omitted,
     /// the cluster stop timeout is used as the default.
     drain_timeout_ms: Option<u64>,
+}
+
+// ---- DS4 Manager API (M10 / C04) -----------------------------------------
+// `GET /manager/status`, `POST /manager/jobs`,
+// `GET /manager/jobs/{id}`, `POST /manager/jobs/{id}/cancel`。
+// 認証は admin bearer（C03 同等）。secret / raw build log は公開しない。M10。
+
+/// ManagerApiError を HTTP レスポンスへ写像する。M10。
+fn manager_api_error_response(error: &crate::manager::api::ManagerApiError) -> Response<Body> {
+    let (status, message) = match error {
+        crate::manager::api::ManagerApiError::BadRequest(msg) => {
+            (StatusCode::BAD_REQUEST, msg.clone())
+        }
+        crate::manager::api::ManagerApiError::NotFound => {
+            (StatusCode::NOT_FOUND, "job not found".to_string())
+        }
+        crate::manager::api::ManagerApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+    };
+    json_response(status, json!({"error": message}))
+}
+
+/// `GET /manager/status`。M10。job 進捗と旧 active 維持を観測できる。
+async fn manager_status(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let journal = state.jobs.lock().unwrap();
+    let response = crate::manager::api::status(&journal, None);
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+    )
+}
+
+/// `POST /manager/jobs`。M10。kind の厳密 payload を受けて job を登録する。
+async fn manager_jobs_submit(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::submit_json(&mut journal, &body) {
+        Ok(response) => json_response(
+            StatusCode::ACCEPTED,
+            serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => manager_api_error_response(&error),
+    }
+}
+
+/// `GET /manager/jobs/{id}`。M10。M10。
+async fn manager_job_get(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let journal = state.jobs.lock().unwrap();
+    match crate::manager::api::get(&journal, &id) {
+        Ok(job) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(job).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => manager_api_error_response(&error),
+    }
+}
+
+/// `POST /manager/jobs/{id}/cancel`。M10。job を Cancelling にし terminal 保持。
+async fn manager_job_cancel(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response<Body> {
+    if let Err(response) = authorized_admin(&headers, &state) {
+        return *response;
+    }
+    let mut journal = state.jobs.lock().unwrap();
+    match crate::manager::api::cancel(&mut journal, &id) {
+        Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
+        Err(error) => manager_api_error_response(&error),
+    }
 }
 
 /// `/admin/restart` — authenticated graceful runtime restart (A-01 contract).
@@ -2307,9 +2651,13 @@ fn start_job(admin: AdminController, action: AdminAction) -> Response<Body> {
                 )
             }
         },
-        Err(profile) => json_response(
+        Err(crate::cluster::AdminStartError::FingerprintBusy(profile)) => json_response(
             StatusCode::CONFLICT,
             json!({"error": format!("fingerprint job already running for {}", profile.as_str())}),
+        ),
+        Err(crate::cluster::AdminStartError::LeaseBusy(error)) => json_response(
+            StatusCode::CONFLICT,
+            json!({"error": format!("another lifecycle operation is in progress: {error}")}),
         ),
     }
 }
@@ -2364,6 +2712,29 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snapshot = state.cluster_snapshot();
     let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
     let diagnostics = state.production_diagnostics().await;
+    // v0.4.0 操作方針（P06 / C03）: desired / applied / epoch を GET /cluster に公開する。。
+    let (desired_policy, applied_policy, policy_epoch) =
+        match state.production_runtime() {
+            Some(production) => {
+                let policy = production.operator_policy();
+                let name = serde_json::to_value(policy)
+                    .and_then(|value| {
+                        value.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::other("not a string"))
+                        })
+                    })
+                    .unwrap_or_else(|_| "automatic".to_string());
+                let applied = serde_json::to_value(production.applied_policy())
+                    .and_then(|value| {
+                        value.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::other("not a string"))
+                        })
+                    })
+                    .unwrap_or_else(|_| "automatic".to_string());
+                (name, applied, production.policy_epoch())
+            }
+            None => ("automatic".to_string(), "automatic".to_string(), 0),
+        };
     let (control_session, children) = match &diagnostics {
         Some(diagnostics) => (
             control_session_json(&diagnostics.control_session),
@@ -2378,6 +2749,11 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
         "state": snapshot.map_or(if solo { "solo-standalone-ready" } else { "booting" }, |snapshot| snapshot.state.name()),
         "generation": generation,
         "cluster_generation": generation,
+        "operation_policy": {
+            "desired": desired_policy,
+            "applied": applied_policy,
+            "epoch": policy_epoch,
+        },
         "target": target_name(target.target),
         "target_ready": target.ready,
         "admission": admission_json(admission),
@@ -2675,6 +3051,7 @@ mod tests {
             }),
             proxy,
             metrics: Arc::new(Metrics::default()),
+            jobs: std::sync::Mutex::new(crate::manager::jobs::JobJournal::new()),
             cluster: RwLock::new(None),
             admin: RwLock::new(None),
             production: RwLock::new(None),
@@ -2943,6 +3320,7 @@ mod tests {
             .apply(crate::cluster::ClusterEvent {
                 expected_generation: 12,
                 kind: crate::cluster::ClusterEventKind::RequireManualIntervention,
+                tp_session: None,
             })
             .await
             .unwrap();
@@ -3057,7 +3435,10 @@ mod tests {
             assert_eq!(status, StatusCode::ACCEPTED, "{path}: {body}");
             let body: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["state"], "running");
-            assert!(body["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+            let job_id = body["job_id"].as_str().unwrap().to_string();
+            // P02 / C03: lifecycle 操作は単一オーナー lease で排他される。次の操作を
+            // 投げる前に現在の job が terminal になるのを待つ（各 job の認証+非同期形状を検証）。。
+            wait_for_job(&state, &job_id).await;
         }
         assert_eq!(missing, StatusCode::UNAUTHORIZED);
         assert_eq!(wrong, StatusCode::UNAUTHORIZED);
@@ -3065,6 +3446,33 @@ mod tests {
         let (malformed_unauthorized, _) =
             post(state, "/cluster/fingerprint", None, "not-json").await;
         assert_eq!(malformed_unauthorized, StatusCode::UNAUTHORIZED);
+    }
+
+    /// job が terminal（complete/failed）になるのを待つ。P02 の lease 解放を確認するために
+    /// 用いる。。。
+    async fn wait_for_job(state: &Arc<AppState>, job_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = state
+                .admin_controller()
+                .and_then(|admin| admin.job(job_id))
+                .map(|job| {
+                    matches!(
+                        job.state,
+                        crate::cluster::AdminJobState::Complete
+                            | crate::cluster::AdminJobState::Failed
+                    )
+                })
+                .unwrap_or(false);
+            if done {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job_id} did not reach terminal state in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

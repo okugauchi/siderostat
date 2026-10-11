@@ -2,7 +2,7 @@
 
 ## Git運用方針
 
-本書はrepository全体で継続して適用するGit運用の正本である。完了済みv0.1.0の作業順序と進捗は `docs/archive/implementation-plan-v0.1.0.md`、製品behaviorは `docs/spec.md` で管理する。
+本書はrepository全体で継続して適用するGit運用の正本である。完了済みv0.1.0の作業順序と進捗はObsidian Vaultの `Projects/siderostat/docs/archive/implementation-plan-v0.1.0.md`、製品behaviorは `Projects/siderostat/docs/spec.md` で管理する。
 
 ### README の言語と正本
 

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod v040;
+
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsString,
@@ -460,7 +462,8 @@ impl DistributedCoordinatorLifecycle for FakeCoordinatorChild {
 
 /// Synthetic DS4D HELLO frame bytes used to satisfy the coordinator rendezvous listener during
 /// promotion. Matches the WorkerHelloExpectation in `test_config` (layer_start 20, output
-/// layer, context 262144, model deepseek-v4-flash) per docs/spec.md section 17.2.
+/// layer, context 262144, model deepseek-v4-flash) per section 17.2 of the Siderostat specification
+/// maintained in the Obsidian Vault.
 pub fn fake_worker_hello_bytes() -> Vec<u8> {
     include_str!("../fixtures/ds4/hello40-schema-v1.hex")
         .lines()
@@ -499,7 +502,7 @@ pub fn inject_fake_worker_hello(ds4_distributed_port: u16) -> JoinHandle<()> {
     })
 }
 
-fn proxy_state() -> anyhow::Result<Arc<ModeAwareProxyState>> {
+pub fn proxy_state() -> anyhow::Result<Arc<ModeAwareProxyState>> {
     Ok(Arc::new(ModeAwareProxyState::new(
         url::Url::parse("http://127.0.0.1:8000")?,
         url::Url::parse("http://127.0.0.1:18082")?,
@@ -514,7 +517,7 @@ fn proxy_state() -> anyhow::Result<Arc<ModeAwareProxyState>> {
     )?))
 }
 
-fn manifest() -> DistributedManifest {
+pub fn manifest() -> DistributedManifest {
     DistributedManifest {
         schema_version: 2,
         profile: "distributed-layer-parallel".into(),
@@ -536,7 +539,7 @@ fn manifest() -> DistributedManifest {
     }
 }
 
-fn test_config(
+pub fn test_config(
     node_id: &str,
     coordinator_address: &str,
     worker_address: &str,

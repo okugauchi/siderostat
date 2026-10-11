@@ -89,6 +89,7 @@ impl ModeRuntime {
                 .apply(ClusterEvent {
                     expected_generation: baseline_generation,
                     kind: ClusterEventKind::BeginSoloStandalone,
+                    tp_session: None,
                 })
                 .await?;
             local
@@ -99,6 +100,7 @@ impl ModeRuntime {
                 .apply(ClusterEvent {
                     expected_generation: starting.generation,
                     kind: ClusterEventKind::LocalStandaloneReady,
+                    tp_session: None,
                 })
                 .await
                 .map_err(RuntimeError::Transition)
@@ -137,6 +139,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: baseline_generation,
                 kind: ClusterEventKind::RequireManualIntervention,
+                tp_session: None,
             })
             .await
         {
@@ -225,6 +228,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::LocalStandaloneLost,
+                tp_session: None,
             })
             .await?;
         self.local
@@ -236,6 +240,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await?;
         apply_proxy_snapshot(&self.proxy, ready);
@@ -261,6 +266,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::BeginPairing,
+                tp_session: None,
             })
             .await?;
         if self.role == LocalRole::Worker {
@@ -280,6 +286,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: pairing.generation,
                 kind: ClusterEventKind::PairingReady,
+                tp_session: None,
             })
             .await?;
         tracing::info!(
@@ -329,6 +336,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: current.generation,
                 kind: ClusterEventKind::PeerLost,
+                tp_session: None,
             })
             .await
         {
@@ -365,6 +373,7 @@ impl ModeRuntime {
             .apply(ClusterEvent {
                 expected_generation: starting.generation,
                 kind: ClusterEventKind::LocalStandaloneReady,
+                tp_session: None,
             })
             .await
         {

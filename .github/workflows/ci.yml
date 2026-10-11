@@ -45,8 +45,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check out the accepted Codex parser source outside public artifacts
+        run: |
+          git init "$RUNNER_TEMP/codex-parser-source"
+          git -C "$RUNNER_TEMP/codex-parser-source" remote add origin https://github.com/openai/codex.git
+          git -C "$RUNNER_TEMP/codex-parser-source" fetch --depth 1 origin 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          git -C "$RUNNER_TEMP/codex-parser-source" checkout --detach FETCH_HEAD
+      - name: Build the real Codex parser replay harness
+        run: |
+          python3 scripts/codex-replay/rebuild.py "$RUNNER_TEMP/codex-parser-source" "$RUNNER_TEMP/codex-replay" 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          printf 'CODEX_REPLAY_BIN=%s\n' "$RUNNER_TEMP/codex-replay/target/debug/codex-replay" >> "$GITHUB_ENV"
       - run: cargo test --all-targets
       - run: cargo test --all-targets --all-features
+      # V02: workspace all-features gate（root だけでなく monitor/xtask も）。
+      - run: cargo test --workspace --all-targets --all-features
+      # V02: workspace gate + 実 test 数 > 0 を保証する受入 suite。
+      - run: cargo test --test v040_acceptance --features test-support
 
   macos-dev-artifacts:
     name: macOS dev artifacts
