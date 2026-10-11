@@ -71,17 +71,8 @@ Thunderbolt 接続後、siDeroStat は接続、認証、モデル互換性、サ
 
 ## DS4 マネージャー
 
-マネージャー画面は、稼働中の artifact を変更せずに DS4 の source とモデルのライフサイクルを管理します。
-
-- 確認済みの DS4 source commit を取得し、runtime を build して binary identity を記録する
-- モデルを resume 対応で download する。checksum を検証できないモデルは activation できない
-- download したモデルを activation する。activation は単一の確認操作で、成功するまで現在の
-  active artifact を変更しません。起動失敗時は直前の active artifact へ rollback でき、その
-  artifact は保持されます
-- build 対象と失敗理由を表示します。認証情報と生の build ログはマネージャー画面に表示しません
-
-fetch/build/download は稼働中の推論サービスを中断しません。両方の Mac に検証済みの artifact が
-揃ってから、マネージャー画面で新しいモデルを staging し、active artifact を確定してください。
+DS4 の source・model・activation を管理する画面は v0.4.0 に含まれません。
+v0.5.0 以降に再検討します。
 
 ## Web Search Bridge
 

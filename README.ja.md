@@ -22,9 +22,6 @@ DS4 推論サービス（DwarfStar）を基盤とし、推論サービス・モ�
   `ForcedStandalone`（強制単独）は相手が見えていてもこの Mac を単独に保つ
 - Thunderbolt 接続上で Mac 間 tensor parallelism（TP）を実行する（両方の Mac とモデルが対応する場合）。
   TP は接続モード・peer プロトコル交渉・upstream capability で gate され、非対応 peer では起動しない
-- マネージャー画面から DS4 の source 取得、build、model download、activation ライフサイクルを管理する。
-  fetch/build/download は現在の active artifact を変更せず、起動失敗時は直前の active artifact へ
-  rollback できる
 - 任意の Web Search Bridge（SearXNG 基盤）を提供する。検索は既定でオフ、外部アクセスは
   opt-in、推論サービスの通常の要求待ち行列を迂回しない
 - メニューバーから管理対象の推論サービスを起動、停止、再起動する
@@ -53,7 +50,7 @@ DS4 推論サービス（DwarfStar）を基盤とし、推論サービス・モ�
 
 ## インストール
 
-両方の Mac に同じ `Siderostat-0.3.4.pkg` を macOS の Installer で開いて導入し、管理者認証を完了します。
+両方の Mac に同じ `Siderostat-0.4.0-no-timestamp.pkg` を macOS の Installer で開いて導入し、管理者認証を完了します。
 この package は正式な `Siderostat.app` bundle を導入します。対象 Mac では `cargo xtask install` を実行しないでください。
 
 旧来の source 導入が残っている場合は、package を開く前にその source checkout から `cargo xtask uninstall` を一度実行します。
@@ -67,6 +64,9 @@ package は確認済み source リビジョンから、[開発者向け手順](d
 両方の Mac が通常の単独稼働状態になってから Thunderbolt ケーブルを接続してください。
 
 詳細な手順は[導入ガイド](docs/installation.ja.md)を参照してください。
+
+公開パッケージは Developer ID 署名付きですが、公証・secure timestamp はありません。
+`distribution_ready=false` の手動導入用成果物です。
 
 ## siDeroStat の利用
 
@@ -93,14 +93,8 @@ http://127.0.0.1:18080/v1
 
 ### DS4 マネージャー
 
-マネージャー画面から DS4 の source とモデルのライフサイクルを管理できます。
-
-- 確認済みの DS4 source commit を取得し、runtime を build して binary identity を記録する
-- モデルを resume 対応で download する。checksum を検証できないモデルは activation できない
-- download したモデルを activation する。activation は単一の確認操作で、成功するまで現在の
-  active artifact を変更しない。起動失敗時は直前の active artifact へ rollback できる。
-  rollback 後も直前の artifact は保持される
-- build 対象と失敗理由を表示する。認証情報と生の build ログはマネージャー画面に表示しない
+DS4 の source・model・activation を管理する画面は v0.4.0 に含まれません。
+v0.5.0 以降に再検討します。
 
 ### Web Search Bridge
 
@@ -116,7 +110,7 @@ Responses API 用の任意の Web Search Bridge（SearXNG 基盤）を提供し�
 - 動作状態の切り替え中や推論サービスの起動中は、短い中断が発生することがあります。
 - 自動的な縮退復旧は既定で無効です。有効にした場合も、復旧回数に上限があり、推論サービスの通常の要求待ち行列を迂回しません。
 - Mac 間 tensor parallelism は実装済みで、接続モード・peer 交渉・upstream capability で
-  gate されます。TP の実機検証はハードウェア/OS 承認ステップまで Pending として記録され、
+  gate されます。確認済みの2-node構成で実RDMA/TP受入は完了しています。
   非対応 peer では起動しません。
 - RDMA transport と distributed DSpark の最適化は再実装しません。TP は upstream の
   DS4 main 契約に従います。

@@ -28,10 +28,6 @@ the inference service, its model, and your credentials local.
   both Macs and the model support it. TP is gated by the selected connection
   mode, peer protocol negotiation, and upstream capability; it is never
   started against an unsupported peer.
-- Manage the DS4 source, build, download, model, and activation lifecycle from
-  the manager view. Fetching, building, and downloading never change the
-  currently active artifact, and a failed startup can be rolled back to the
-  previous active artifact.
 - Provide an optional Web Search Bridge backed by SearXNG. Search is off by
   default, external access is opt-in, and the bridge never runs the
   inference service's normal request queue.
@@ -62,7 +58,7 @@ They are model details, not operating-state or topology names.
 
 ## Installation
 
-Install the same `Siderostat-0.3.4.pkg` artifact on both Macs by opening it in the macOS
+Install the same `Siderostat-0.4.0-no-timestamp.pkg` artifact on both Macs by opening it in the macOS
 Installer application and completing the administrator prompt. The package installs the official
 `Siderostat.app` bundle; do not run `cargo xtask install` on these Macs.
 
@@ -78,6 +74,9 @@ the [development guide](docs/development.md). It is then copied unchanged to the
 Connect the Thunderbolt cable after both Macs reach a normal standalone state.
 
 For the complete procedure, see the [installation guide](docs/installation.md).
+
+The package is Developer ID signed, without notarization or a secure timestamp.
+It is a manual-install artifact with `distribution_ready=false`.
 
 ## Using siDeroStat
 
@@ -107,15 +106,8 @@ setting. While a policy change is in progress, the menu shows the pending job an
 
 ### DS4 Manager
 
-The manager view lets you manage the DS4 source and model lifecycle:
-
-- Fetch a reviewed DS4 source commit, build the runtime, and record its binary identity.
-- Download a model with resume support. A model without a verified checksum cannot be activated.
-- Activate a downloaded model. Activation is a single confirmed operation and does not change the
-  currently active artifact until it succeeds; a failed startup can be rolled back to the previous
-  active artifact. Rollback keeps the previous artifact available.
-- Show build targets and failure reasons. Credentials and raw build logs are not shown in the
-  manager view.
+The DS4 source, model, and activation manager is deferred to v0.5.0 or later
+and is not included in v0.4.0.
 
 ### Web Search Bridge
 
@@ -146,8 +138,8 @@ explicitly. It does **not** serve real inference requests, so it must not be use
 - Automatic degraded recovery is disabled by default. When enabled, recovery is bounded and does not
   bypass the inference service's normal request queue.
 - Mac-to-Mac tensor parallelism is implemented and gated by the connection mode, peer negotiation,
-  and upstream capability. Real-device verification of TP is pending the hardware/OS approval step; it
-  is recorded as Pending until then and is never started against an unsupported peer.
+  and upstream capability. Real-device RDMA/TP acceptance passed for the verified
+  two-node setup. TP is never started against an unsupported peer.
 - RDMA transport and distributed DSpark optimization are not reimplemented; TP follows the upstream
   DS4 main contract.
 - `serve --dry-run` is a development-only clustering check and does not process real inference.

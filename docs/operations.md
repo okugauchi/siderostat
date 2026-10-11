@@ -77,18 +77,8 @@ Choosing `ForcedStandalone` before a long-running job keeps the Mac isolated fro
 
 ## DS4 Manager
 
-The manager view manages the DS4 source and model lifecycle without changing the running artifact:
-
-- Fetch a reviewed DS4 source commit, build the runtime, and record its binary identity.
-- Download a model with resume support. A model without a verified checksum cannot be activated.
-- Activate a downloaded model. Activation is a single confirmed operation; the currently active artifact
-  is not changed until activation succeeds. A failed startup can be rolled back to the previous active
-  artifact, which is kept available.
-- Build targets and failure reasons are shown. Credentials and raw build logs are not shown in the
-  manager view.
-
-Fetching, building, and downloading never interrupt the active inference service. Use the manager view
-to stage a new model and confirm the active artifact after both Macs have the verified artifact.
+The DS4 source, model, and activation manager is deferred to v0.5.0 or later
+and is not included in v0.4.0.
 
 ## Web Search Bridge
 
