@@ -27,10 +27,13 @@ pub(crate) fn sigkill_reap_window(stop_timeout: Duration) -> Duration {
 
 mod coordinator;
 mod standalone;
+mod tp;
 mod worker;
 
 pub use coordinator::DistributedCoordinatorSupervisor;
 pub use standalone::StandaloneSupervisor;
+pub(crate) use tp::SimulatedTp;
+pub use tp::{TpLocalLifecycle, TpLocalStatus, TpLogReadiness, TpProcessSupervisor};
 pub use worker::{DistributedWorkerSupervisor, TpWorkerSupervisor};
 
 #[cfg(unix)]
@@ -482,9 +485,16 @@ impl SupervisedSlot {
             return Ok(());
         };
         let result = current.child.stop(stop_timeout, allow_sigkill).await;
-        current.log_task.abort();
-        result?;
-        Ok(())
+        match result {
+            Ok(_) => {
+                current.log_task.abort();
+                Ok(())
+            }
+            Err(error) => {
+                *slot = Some(current);
+                Err(error.into())
+            }
+        }
     }
 
     /// Locks the slot and clears any stale child so a replacement can be placed. Returns `None`
@@ -773,6 +783,43 @@ fn system_time_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn supervised_stop_failure_retains_owned_child() {
+        use super::*;
+        let command = Ds4Command {
+            executable: "/bin/sh".into(),
+            working_directory: "/tmp".into(),
+            argv: vec!["-c".into(), "trap '' TERM; echo prepared; sleep 30".into()],
+            profile: crate::cluster::ds4_command::Ds4Profile {
+                profile_id: "stop-retain".into(),
+                quantization: crate::config::Quantization::Q2,
+                residency: crate::config::Residency::Resident,
+                speculative_support: crate::config::SpeculativeSupport::None,
+            },
+        };
+        let slot = SupervisedSlot::new();
+        let mut child = ManagedChild::spawn(&command, 1).await.unwrap();
+        let (mut logs, forwarders) = child.start_log_forwarding(16).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), logs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let log_task = tokio::spawn(async move { while logs.recv().await.is_some() {} });
+        *slot.child.lock().await = Some(SupervisedChild {
+            child,
+            _log_forwarders: forwarders,
+            log_task,
+        });
+        assert!(slot.stop(Duration::from_millis(20), false).await.is_err());
+        let retained = slot.child_identity().await.is_some();
+        let _ = slot.stop(Duration::from_millis(100), true).await;
+        assert!(
+            retained,
+            "stop failure must preserve the child ownership handle"
+        );
+    }
+
     use super::*;
     use crate::cluster::DistributedWorkerLifecycle;
     use std::sync::Mutex;

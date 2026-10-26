@@ -36,6 +36,9 @@ impl From<anyhow::Error> for PromotionHelloError {
 
 impl super::ProductionClusterRuntime {
     pub async fn pair(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_pair().await;
+        }
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "pairing must be initiated by the coordinator"
@@ -110,6 +113,9 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn promote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_promote().await;
+        }
         ensure!(
             !self.recovery_owner_active(),
             "degraded recovery owner is active"
@@ -260,6 +266,9 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn demote(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_demote().await;
+        }
         ensure!(
             self.inner.role == LocalRole::Coordinator,
             "only the coordinator may demote"
@@ -330,7 +339,7 @@ impl super::ProductionClusterRuntime {
                 layer_end: u32::MAX,
                 has_output: true,
                 context_size: self.inner.config.ds4.distributed.context_size,
-                model_name: self.inner.manifest.model_family.clone(),
+                model_name: self.inner.manifest.model_family().to_owned(),
             },
         )
         .await?;

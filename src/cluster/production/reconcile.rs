@@ -7,6 +7,9 @@ use anyhow::Context;
 
 impl super::ProductionClusterRuntime {
     pub async fn reconcile(&self) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_reconcile().await;
+        }
         if self.planned_restart_active() {
             return Ok(self.inner.mode.snapshot());
         }

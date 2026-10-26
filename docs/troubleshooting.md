@@ -71,3 +71,26 @@ not use a generic cleanup command or manually delete those files.
 Provide the source revision, Mac model, Thunderbolt connection state, the state shown on each menu bar monitor,
 and the approximate time of the problem. Remove prompts, responses, credentials, API keys, personal paths,
 and other private data before sharing screenshots or logs.
+
+## TP does not become ready
+
+Check the configured topology and transport first: TP requires `tensor-parallel` and `rdma` on both Macs.
+The control Bridge connection and the RDMA member interface/address are separate. Confirm that the
+selected device is active and that the configured numeric GID index maps to the member IPv4 address.
+siDeroStat does not enable RDMA, assign addresses, or probe the TP data socket.
+
+A schema-2 LP manifest, candidate/unknown TP capability, wrong source or role binary, changed model,
+context mismatch, or distributed-help digest mismatch prevents TP startup. Prepare matching verified
+schema-3 deployment/capability/role metadata; do not bypass the checks with extra arguments.
+The worker needs `ds4` and the coordinator needs `ds4-server`. LP layers and DSpark/SSD settings must
+be absent from TP arguments.
+
+HTTP listening alone is insufficient: both children must stay alive, report the same-session RDMA
+handshake, and complete the internal generation warm-up. A prepared worker whose coordinator abandons
+startup is recovered after its bounded startup deadline. Failed drain/stop/fallback keeps admission
+closed and requires manual intervention. Child diagnostics show the actual local TP lifecycle slot.
+
+The failed-attempt budget survives fallback and automatic restarts. After three failures, resolve the
+cause and use a manual runtime restart, apply ForcedStandalone then Automatic, or install a validated
+new deployment/RDMA identity. Reconcile verifies standalone recovery without clearing the budget.
+See [TP operation](operations.md#tensor-parallel-operation) for the acceptance boundary.

@@ -137,9 +137,11 @@ explicitly. It does **not** serve real inference requests, so it must not be use
 - A short interruption can occur while the operating state changes or the inference service starts.
 - Automatic degraded recovery is disabled by default. When enabled, recovery is bounded and does not
   bypass the inference service's normal request queue.
-- Mac-to-Mac tensor parallelism is implemented and gated by the connection mode, peer negotiation,
-  and upstream capability. Real-device RDMA/TP acceptance passed for the verified
-  two-node setup. TP is never started against an unsupported peer.
+- Mac-to-Mac tensor parallelism uses the normal startup and recovery path with verified role
+  artifacts, RDMA capability, child handshakes, HTTP readiness, and a generation warm-up.
+  The software tests use two-node control HTTP with injected lifecycles. Earlier direct upstream
+  RDMA/TP tests do not establish acceptance of this siDeroStat startup path on physical Macs;
+  that acceptance remains a separate step. See [TP operation](docs/operations.md#tensor-parallel-operation).
 - RDMA transport and distributed DSpark optimization are not reimplemented; TP follows the upstream
   DS4 main contract.
 - `serve --dry-run` is a development-only clustering check and does not process real inference.

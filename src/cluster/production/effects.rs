@@ -12,7 +12,7 @@ use axum::http::HeaderMap;
 use std::net::SocketAddr;
 
 impl super::ProductionClusterRuntime {
-    async fn authenticate(
+    pub(super) async fn authenticate(
         &self,
         method: &str,
         path: &str,

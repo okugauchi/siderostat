@@ -326,8 +326,8 @@ fn default_tcp() -> Transport {
 }
 
 /// The distributed execution topology is independent of the model's
-/// quantization. Only layer-parallel is wired to ds4-server in this release;
-/// tensor-parallel remains a future topology.
+/// quantization. Layer-parallel remains the default; tensor-parallel uses
+/// the dedicated RDMA startup path and verified role artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DistributedTopology {
@@ -488,6 +488,15 @@ impl ModeAwareConfig {
         self.ds4.distributed.model_manifest =
             expand_config_path(&self.ds4.distributed.model_manifest)?;
         self.ds4.distributed.kv_disk_dir = expand_config_path(&self.ds4.distributed.kv_disk_dir)?;
+        for path in [
+            &mut self.ds4.distributed.role_artifact,
+            &mut self.ds4.distributed.capability_manifest,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *path = expand_config_path(path)?;
+        }
         Ok(())
     }
 

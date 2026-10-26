@@ -214,6 +214,8 @@ impl super::ProductionClusterRuntime {
                 if snapshot.state == ClusterState::SoloStandaloneReady
                     && runtime.inner.role == LocalRole::Coordinator
                     && runtime.inner.config.cluster.policy.auto_pair
+                    && runtime.operator_policy() == crate::cluster::OperationPolicy::Automatic
+                    && !runtime.policy_pending()
                     && !runtime.automatic_pairing_blocked()
                 {
                     if let Err(error) = runtime.pair().await {
@@ -313,6 +315,10 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn stop_distributed(&self) -> anyhow::Result<()> {
+        if self.inner.tp.is_some() {
+            self.tp_shutdown().await?;
+            return Ok(());
+        }
         if let Some(worker) = &self.inner.distributed_worker {
             DistributedWorkerLifecycle::stop(worker.as_ref()).await?;
         }
@@ -323,6 +329,9 @@ impl super::ProductionClusterRuntime {
     }
 
     pub async fn distributed_child_identity(&self) -> Option<ChildIdentity> {
+        if let Some(tp) = &self.inner.tp {
+            return tp.child.child_identity().await;
+        }
         match self.inner.role {
             LocalRole::Coordinator => match self.inner.distributed_coordinator.get() {
                 Some(child) => child.child_identity().await,

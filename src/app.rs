@@ -6,8 +6,8 @@ use crate::{
     cluster::{
         AdminAction, AdminController, AdminExecutor, AdminFuture, ChildDiagnostics,
         ChildrenDiagnostics, ClusterHandle, ControlMode, ControlRole, ControlSessionDiagnostics,
-        DistributedControlPhase, DistributedManifest, FingerprintProfile, LeaseDiagnostics,
-        ModeRuntime, OperationPolicy, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION,
+        DistributedControlPhase, FingerprintProfile, LeaseDiagnostics, ModeRuntime,
+        OperationPolicy, OperatorReconcileOutcome, PERSISTENT_STATE_SCHEMA_VERSION,
         PeerDiagnostics, PersistentChild, PersistentClusterState, PersistentMode,
         PersistentOperationPhase, PersistentProxyTarget, PolicyStart, PolicyStartError,
         ProcessControlError, ProductionClusterRuntime, RestartDecision, StandaloneManifest,
@@ -557,7 +557,7 @@ pub async fn serve_with_options(
     if !dry_run {
         validate_dspark_binding(&config).await?;
     }
-    let boot = BootInputs::load(&config).await?;
+    let boot = BootInputs::load(&config, dry_run).await?;
     // dry-run は実プロセスに一切触れない: startup cleanup と restart reconcile をスキップし、
     // 実 StateStore の読み書きもしない。クラスタリング本体（state machine / control plane /
     // discovery / pairing / promotion / demotion / recovery）は production と同一の経路を動かす。
@@ -741,21 +741,24 @@ async fn validate_dspark_binding(config: &ModeAwareConfig) -> anyhow::Result<()>
 struct BootInputs {
     admin_token: Vec<u8>,
     control_secret: Option<Vec<u8>>,
-    distributed_manifest: Option<DistributedManifest>,
+    distributed_manifest: Option<crate::cluster::RuntimeDeployment>,
     role: LocalRole,
 }
 
 impl BootInputs {
-    async fn load(config: &ModeAwareConfig) -> anyhow::Result<Self> {
+    async fn load(config: &ModeAwareConfig, dry_run: bool) -> anyhow::Result<Self> {
         let admin_token = std::fs::read(&config.cluster.security.admin_token_file)?;
         let control_secret = if config.cluster.enabled {
             Some(std::fs::read(&config.cluster.security.control_secret_file)?)
         } else {
             None
         };
-        let distributed_manifest = if config.cluster.enabled {
+        let mut distributed_manifest = if config.cluster.enabled {
             let bytes = std::fs::read(&config.ds4.distributed.model_manifest)?;
-            Some(serde_json::from_slice::<DistributedManifest>(&bytes)?)
+            Some(crate::cluster::RuntimeDeployment::parse(
+                &bytes,
+                config.ds4.distributed.topology,
+            )?)
         } else {
             None
         };
@@ -768,6 +771,12 @@ impl BootInputs {
         } else {
             LocalRole::Unknown
         };
+        if let Some(manifest) = &mut distributed_manifest {
+            if !dry_run {
+                manifest.resolve_local_artifact(config, role).await?;
+                manifest.verify_tp(config, role).await?;
+            }
+        }
         Ok(Self {
             admin_token,
             control_secret,
@@ -1360,7 +1369,10 @@ async fn persist_runtime_state(
     active_profile: &str,
 ) -> anyhow::Result<()> {
     let snapshot = runtime.snapshot();
-    let distributed = if snapshot.stable_mode == StableMode::DistributedLayerParallel {
+    let distributed = if matches!(
+        snapshot.stable_mode,
+        StableMode::DistributedLayerParallel | StableMode::DistributedTensorParallel
+    ) {
         match production {
             Some(production) => production.distributed_child_identity().await,
             None => None,
@@ -1404,8 +1416,10 @@ async fn persist_runtime_state(
         .map(|state| state.applied_policy)
         .unwrap_or_default();
     let policy_epoch = prior.as_ref().map(|state| state.policy_epoch).unwrap_or(0);
+    let tp = prior.as_ref().and_then(|state| state.tp.clone());
     let pending_operation = prior.and_then(|state| state.pending_operation);
     store.save(&PersistentClusterState {
+        tp,
         schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
         generation: snapshot.generation,
         control_session_generation,
@@ -1418,8 +1432,11 @@ async fn persist_runtime_state(
             ProxyTarget::Unavailable { .. } => PersistentProxyTarget::Unavailable,
         },
         active_profile: Some(
-            if snapshot.stable_mode == StableMode::DistributedLayerParallel {
-                "distributed-layer-parallel".into()
+            if matches!(
+                snapshot.stable_mode,
+                StableMode::DistributedLayerParallel | StableMode::DistributedTensorParallel
+            ) {
+                snapshot.stable_mode.name().into()
             } else {
                 active_profile.into()
             },

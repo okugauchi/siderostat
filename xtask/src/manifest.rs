@@ -129,6 +129,34 @@ pub fn generate(
         &mut digest_cache,
     )?;
     let distributed_size = util::file_size(&config.ds4.distributed.model)?;
+    if config.ds4.distributed.topology == siderostat::config::DistributedTopology::TensorParallel {
+        let path = config
+            .ds4
+            .distributed
+            .capability_manifest
+            .as_ref()
+            .context("TP capability_manifest is required")?;
+        let cap: siderostat::cluster::Ds4CapabilityManifest =
+            serde_json::from_slice(&std::fs::read(path)?)?;
+        if let Some(source) = ds4_source_commit {
+            anyhow::ensure!(
+                source == cap.source_commit,
+                "TP source differs from capability"
+            );
+        }
+        let deployment = siderostat::cluster::RuntimeDeployment::from_tp_capability(
+            config,
+            &cap,
+            distributed_digest,
+            distributed_size,
+        )?;
+        util::write(
+            &config.ds4.distributed.model_manifest,
+            &serde_json::to_vec_pretty(deployment.tp().context("TP deployment missing")?)?,
+        )?;
+        util::save_digest_cache(&cache_path, &digest_cache)?;
+        return Ok(());
+    }
     let worker_command = build_distributed_worker_command(
         &config.ds4,
         config.cluster.coordinator_address,

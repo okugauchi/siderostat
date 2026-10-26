@@ -192,6 +192,109 @@ pub fn is_stale_epoch(observed: u64, current: u64) -> bool {
     observed < current
 }
 
+/// Production preflight: read-only and deadline-bounded. Never connect to the TP port.
+pub(crate) async fn probe_system(
+    config: &crate::config::ModeAwareConfig,
+    peer: Option<IpAddr>,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let c = &config.ds4.distributed;
+    let interface = c
+        .rdma_member_interface
+        .as_deref()
+        .context("TP requires rdma_member_interface")?;
+    ensure!(
+        !interface.starts_with("bridge") && !interface.is_empty(),
+        "RDMA requires a member interface"
+    );
+    let address: std::net::Ipv4Addr = c
+        .rdma_address
+        .as_deref()
+        .context("TP requires rdma_address")?
+        .parse()?;
+    let device = c
+        .rdma_device
+        .as_deref()
+        .context("TP requires an explicit rdma_device")?;
+    let gid: u32 = c
+        .rdma_gid
+        .as_deref()
+        .context("TP requires rdma_gid")?
+        .parse()?;
+    let member = read_command("/sbin/ifconfig", &[interface]).await?;
+    ensure!(
+        member.lines().any(|line| line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|p| p == ["inet", address.to_string().as_str()])),
+        "RDMA address is not assigned to the member interface"
+    );
+    let enabled = read_command("rdma_ctl", &["status"]).await?;
+    let enabled = enabled.to_ascii_lowercase();
+    ensure!(
+        enabled.contains("enabled")
+            && !enabled.contains("disabled")
+            && !enabled.contains("not enabled"),
+        "RDMA is not enabled"
+    );
+    let info = read_command("ibv_devinfo", &["-v", "-d", device]).await?;
+    ensure!(info.contains("PORT_ACTIVE"), "RDMA port is not active");
+    ensure!(
+        info.lines().any(|line| matching_gid(line, gid, address)),
+        "RDMA GID does not match member address"
+    );
+    if let Some(peer) = peer {
+        let route = read_command("/sbin/route", &["-n", "get", &peer.to_string()]).await?;
+        ensure!(
+            route
+                .lines()
+                .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["interface:", interface]),
+            "RDMA peer route is not scoped to the member interface"
+        );
+    }
+    Ok(())
+}
+
+fn matching_gid(line: &str, index: u32, address: std::net::Ipv4Addr) -> bool {
+    let Some((prefix, value)) = line.trim().split_once(']') else {
+        return false;
+    };
+    if prefix
+        .strip_prefix("GID[")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        != Some(index)
+    {
+        return false;
+    }
+    let value = value.trim();
+    let value = value
+        .strip_prefix('=')
+        .or_else(|| value.strip_prefix(':'))
+        .unwrap_or(value)
+        .trim();
+    match value.parse::<std::net::Ipv6Addr>() {
+        Ok(gid) => gid.to_ipv4_mapped() == Some(address),
+        Err(_) => false,
+    }
+}
+
+async fn read_command(program: &str, args: &[&str]) -> anyhow::Result<String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new(program)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.len() <= 1048576,
+        "RDMA probe command failed"
+    );
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +389,15 @@ mod tests {
         assert_eq!(observation.member_ipv4, Some(MEMBER));
         assert_eq!(observation.device.as_deref(), Some("mlx5_0"));
         assert!(observation.gid.unwrap().starts_with("::ffff:"));
+    }
+
+    #[test]
+    fn system_gid_matching_requires_exact_index_and_address() {
+        let address = "10.99.0.2".parse().unwrap();
+        assert!(matching_gid(" GID[ 2] = ::ffff:10.99.0.2", 2, address));
+        assert!(matching_gid("GID[2]: ::ffff:a63:2", 2, address));
+        assert!(!matching_gid("GID[2] = ::ffff:10.99.0.20", 2, address));
+        assert!(!matching_gid("GID[3] = ::ffff:10.99.0.2", 2, address));
     }
 
     struct TestRunner;

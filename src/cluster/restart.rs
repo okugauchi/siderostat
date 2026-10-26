@@ -164,6 +164,7 @@ mod tests {
             start_time_micros: 200,
         };
         let state = PersistentClusterState {
+            tp: None,
             schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
             generation: 9,
             control_session_generation: 9,

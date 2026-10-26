@@ -64,3 +64,26 @@ package の更新と legacy source のアンインストールでは、設定、
 
 ソースリビジョン、Mac のモデル、Thunderbolt ケーブルの接続状態、両方のメニューバーに表示された状態、問題のおおよその時刻を伝えてください。
 スクリーンショットやログを共有する場合は、プロンプト、応答、認証情報、API キー、個人パス、その他の私的なデータを削除してください。
+
+## TP が Ready にならない
+
+両 Mac の topology が `tensor-parallel`、transport が `rdma` であることを確認してください。
+制御用 Bridge 接続と RDMA member の interface/address は別です。選択した device が active で、
+数値の GID index が member の IPv4 に対応する必要があります。siDeroStat は RDMA の有効化、
+アドレス割当、TP データソケットへの probe を行いません。
+
+schema 2 の LP manifest、candidate/unknown の TP capability、不一致の source/role binary、
+変更されたモデル、context や distributed help digest の不一致では TP を起動しません。
+検証済みで一致する schema 3 deployment/capability/role メタデータを準備してください。
+extra_args による検査の迂回はできません。worker は `ds4`、coordinator は `ds4-server` を使い、
+TP 引数から LP layer range と DSpark/SSD 設定を外す必要があります。
+
+HTTP 待受だけでは Ready になりません。両 child の生存、同じ session の RDMA 接続、内部生成
+warm-up の成功が必要です。準備済み worker の起動を coordinator が中断した場合も、起動期限後に
+回収・復帰します。drain、停止、縮退に失敗した場合は受付を閉じたまま手動対応を要求します。
+child 診断には実際のローカル TP lifecycle が表示されます。
+
+失敗回数は Standalone 復帰や自動再起動を越えて保持します。3回失敗した場合は原因を解消してから、
+明示的な runtime 再起動、ForcedStandalone→Automatic の適用、または検証済みの新しい
+ deployment/RDMA identity への変更で解除してください。reconcile は Standalone 復帰を検証しますが
+回数を解除しません。受入範囲は [TP の運用](operations.ja.md#tensor-parallel-の運用)を参照してください。

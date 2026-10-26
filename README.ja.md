@@ -109,9 +109,11 @@ Responses API 用の任意の Web Search Bridge（SearXNG 基盤）を提供し�
 - Mac とモデルの構成は、ソースリビジョンで定められた互換性条件を満たす必要があります。
 - 動作状態の切り替え中や推論サービスの起動中は、短い中断が発生することがあります。
 - 自動的な縮退復旧は既定で無効です。有効にした場合も、復旧回数に上限があり、推論サービスの通常の要求待ち行列を迂回しません。
-- Mac 間 tensor parallelism は実装済みで、接続モード・peer 交渉・upstream capability で
-  gate されます。確認済みの2-node構成で実RDMA/TP受入は完了しています。
-  非対応 peer では起動しません。
+- Mac 間 tensor parallelism は通常の起動・復帰経路を使い、role artifact、RDMA capability、
+  child の接続、HTTP 準備、生成 warm-up を確認します。ソフトウェア試験は2-node制御HTTPと
+  注入した lifecycle で行っています。過去の上流直接起動による RDMA/TP 試験は、この
+  siDeroStat 起動経路の実機受入を証明しません。実機受入は別途必要です。
+  [TP の運用](docs/operations.ja.md#tensor-parallel-の運用)を参照してください。
 - RDMA transport と distributed DSpark の最適化は再実装しません。TP は upstream の
   DS4 main 契約に従います。
 - `serve --dry-run` は開発専用のクラスタリング確認であり、実推論を処理しません。

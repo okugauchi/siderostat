@@ -19,6 +19,7 @@ The operating state describes how the Macs are working together:
 | `Solo Standalone` | This Mac is serving by itself. |
 | `Paired Standalone` | The Macs are connected and authenticated, but distributed operation is not ready. |
 | `Distributed (layer-parallel)` | Both Macs are cooperating on an inference. |
+| `Distributed (tensor-parallel)` | Both TP children completed the RDMA handshake and generation warm-up. |
 
 Model details are separate from the operating state. `MXFP4` describes model quantization; `DSpark`
 describes speculative-execution support. Neither is a topology or operating-state name.
@@ -107,3 +108,45 @@ state on both Macs. If a recovery notification is still present, do not start th
 - Do not delete files under siDeroStat's application-support data while the service is running.
 - Use `cargo xtask uninstall` instead of manually deleting files or stopping unrelated processes.
 - Inference content, credentials, and API keys are not intended to appear in siDeroStat notifications.
+
+## Tensor-parallel operation
+
+TP is selected explicitly through `ds4.distributed.topology = "tensor-parallel"` and
+`transport = "rdma"`; LP remains the default. Both nodes must run this startup implementation.
+The existing control/discovery addresses identify the authenticated control connection.
+`rdma_member_interface`, `rdma_address`, `rdma_device`, and `rdma_gid` identify the separate
+RDMA member connection; `rdma_gid` is the numeric GID index. A bridge address alone is insufficient.
+siDeroStat checks the existing configuration and does not enable RDMA or change network settings.
+
+`model_manifest` must identify a schema-3 TP deployment. `capability_manifest` must approve stable,
+explicit tensor-parallel support for the same source revision, model family, transport, and role
+artifacts. The worker runs the approved `ds4`; the coordinator runs `ds4-server`.
+An optional `role_artifact` may replace the local executable path only when its approved identity
+matches the shared deployment. Model hash/size, context, binary hash, and distributed help digest
+are checked before startup cleanup. These metadata files must be prepared and verified externally;
+this change does not configure or certify a particular model.
+
+Do not specify LP layer ranges, DSpark/SSD arguments, TCP transport, or overrides of managed TP
+arguments. The configured context, device, and GID index are passed to the actual TP child.
+The standalone executable/configuration must remain independently usable for fallback.
+
+Startup closes admission and drains existing requests, prepares the worker, starts the coordinator,
+checks both owned children and RDMA handshakes, then checks HTTP and runs a bounded internal
+one-token generation. Public inference is enabled only after all checks succeed.
+A failed startup closes admission and rolls back to verified standalone service after stopping the
+owned TP child. During operation, a lost child/control connection closes admission and follows
+`auto_demote`: when enabled, it stops the TP child and verifies standalone before reopening admission;
+otherwise it requires manual intervention.
+A failed drain, child stop, or standalone start requires manual intervention and keeps admission closed.
+`auto_promote` controls automatic TP starts; automatic degraded-throughput recovery remains a separate
+opt-in feature.
+
+TP allows the initial failed attempt plus two retries. Failure counts and session numbers survive
+standalone fallback and automatic process restarts. Repeated successful connections followed by faults
+also consume this budget. A manual runtime restart, an applied ForcedStandalone-to-Automatic change,
+or a validated deployment/RDMA identity change resets the budget. The reconcile action verifies a safe
+standalone fallback without resetting it. Stopping the runtime keeps admission closed.
+
+Software acceptance uses two-node control HTTP and injected child lifecycles. A physical two-Mac
+RDMA test of this normal siDeroStat startup, disconnect/reconnect, Force, and restart path is still
+required before deployment. Model selection and hardware acceptance are separate work.
