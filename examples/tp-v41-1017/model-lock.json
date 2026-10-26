@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-10-27",
+  "repository": "antirez/deepseek-v4.1-flash-gguf",
+  "revision": "9dcee51692e6540f697141fc98b097e3c96492a3",
+  "filename": "DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf",
+  "size_bytes": 365713686528,
+  "sha256": "5296e85ff64b42ecb62c8d0c0c54e1caa07e3df8e93112f2365ebbaed62ce93a",
+  "ds4_source_commit": "ee7e8405232c8971000cc7ba2b945b00bf6d20d3",
+  "model_family": "DeepSeek V4.1 Flash",
+  "checkpoint": "flash-v4.1-1017",
+  "quantization": "q2",
+  "context_size": 8192,
+  "verification": {
+    "downloaded": false,
+    "standalone_smoke": false,
+    "two_mac_rdma_acceptance": false
+  },
+  "metadata_source": "https://huggingface.co/api/models/antirez/deepseek-v4.1-flash-gguf/revision/9dcee51692e6540f697141fc98b097e3c96492a3?blobs=true"
+}

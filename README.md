@@ -150,4 +150,5 @@ explicitly. It does **not** serve real inference requests, so it must not be use
 
 - [Installation guide](docs/installation.md) · [日本語](docs/installation.ja.md)
 - [Operations guide](docs/operations.md) · [日本語](docs/operations.ja.md)
+- [V4.1 Flash 1017 Q2 setup and download guide (Japanese)](docs/tp-v41-1017-setup.ja.md)
 - [Troubleshooting guide](docs/troubleshooting.md) · [日本語](docs/troubleshooting.ja.md)

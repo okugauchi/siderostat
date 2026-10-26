@@ -122,4 +122,5 @@ Responses API 用の任意の Web Search Bridge（SearXNG 基盤）を提供し�
 
 - [導入ガイド](docs/installation.ja.md) · [English](docs/installation.md)
 - [運用ガイド](docs/operations.ja.md) · [English](docs/operations.md)
+- [V4.1 Flash 1017 Q2の設定とダウンロード](docs/tp-v41-1017-setup.ja.md)
 - [トラブルシューティング](docs/troubleshooting.ja.md) · [English](docs/troubleshooting.md)
