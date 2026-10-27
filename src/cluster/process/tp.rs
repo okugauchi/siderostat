@@ -9,6 +9,15 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+pub(super) const TP_QUEUE_KEEPALIVE_MS: &str = "100";
+// Keep large resident model queues active without extending native gate deadlines.
+#[cfg(target_os = "macos")]
+pub(super) const TP_ENV_OVERRIDES: &[(&str, &str)] =
+    &[("DS4_METAL_QUEUE_KEEPALIVE_MS", TP_QUEUE_KEEPALIVE_MS)];
+#[cfg(target_os = "macos")]
+pub(super) const TP_ENV_REMOVALS: &[&str] = &["DS4_METAL_DISABLE_QUEUE_KEEPALIVE"];
+
 #[derive(Debug, Default, Clone)]
 pub struct TpLogReadiness {
     peer: bool,
@@ -116,7 +125,20 @@ impl TpProcessSupervisor {
         {
             command.argv[index + 1] = coordinator.to_string().into();
         }
-        let mut child = ManagedChild::spawn(&command, session).await?;
+        tracing::info!(
+            coordinator = self.inner.coordinator,
+            session,
+            metal_queue_keepalive_ms = TP_QUEUE_KEEPALIVE_MS,
+            disable_queue_keepalive_removed = true,
+            "starting managed TP child"
+        );
+        let mut child = ManagedChild::spawn_with_environment(
+            &command,
+            session,
+            TP_ENV_OVERRIDES,
+            TP_ENV_REMOVALS,
+        )
+        .await?;
         let (mut logs, forwarders) = child.start_log_forwarding(256)?;
         let observed = self.inner.observed.clone();
         let log_task = tokio::spawn(async move {

@@ -38,6 +38,65 @@ Standaloneは両ノードで公開APIの非stream生成とSSE生成に成功。�
 この比較はバックグラウンド制限が障害要因であることを支持する。キャッシュや初回初期化時間を完全に統制した速度比較ではなく、
 実LaunchAgentの修復確認とも区別する。
 
+## build34の通常導入後
+
+source `dd2d8fd`、build34の署名済みpkgを両ノードへ導入。
+署名、Siderostat.appだけのpayload、生成物検証、1,061件の回帰試験に成功した。
+両ノードの実LaunchAgentが `spawn type = interactive (4)` で動作することを確認。
+最初のAutomatic適用は制御接続エラーとなったが、制御listenerとTCP到達性を確認後の再試行に成功した。
+
+通常TP session 7は内部warm-upを通過し、両ノードの公開APIで非stream/SSEの短い生成に成功。
+短い非stream応答はMBP 0.335秒、Studio 0.326秒、同一TP sessionを維持した。
+しかし、その後の「1から20まで数える」要求（max_tokens 128）でHTTP 500が再発した。
+**Interactive化だけでは安定運用の受入は完了していない。** 自動再試行を止め、ForcedStandaloneへ戻した。
+
+## 通常750msと診断用5000msの追加比較
+
+通常750msの上流直接TPで、warm-up、短い生成、39トークン生成、待機後の39トークン生成には成功。
+続くSSE要求がHTTP 500となり、両rankにRDMA gate timeoutとprefill同期失敗を確認した。
+workerは `seq 9681 (recv_done 9680)`、coordinatorは `seq 9682 (recv_done 9681)`。
+この差だけでpacket lossとは断定できず、先に片側が期限切れとなる処理遅延でも説明可能。
+
+既存の診断用 `DS4_TP_GATE_TIMEOUT_MS=5000` を直接起動の子プロセスだけへ指定し、
+warm-up、短い生成、39トークン生成、30秒待機後の生成、10秒待機を挟むSSE/39トークン生成6組、
+合計16要求がすべてHTTP 200となった。両rankの実ログで `gate-timeout=5000ms` を確認。
+この値は要求全体の制限ではなく、big-prefillの一部は値+2000msとなる。
+
+上流の `QA_BEFORE_RELEASES.md` はこの変数を診断overrideと位置づけ、正常推論に必要な設定とは扱っていない。
+したがってAppや恒久設定へ反映せず、診断childを停止した。通常manifestの一致は、この環境変数の一致を保証しない。
+ユーザーは暫定延長の採用より、上流側の原因調査と通常750msでの安定化を優先する方針を選択した。
+上流mainの最新も `ee7e840` であることを確認済み。
+
+## 2026-10-28: main queue keepaliveの比較とmanaged TP対応
+
+詳細traceでは、通常gateの両ノード差の中央値9.285msに対し、idle後の該当gateは738.553msだった。
+差を補正すると約729msの到着差であり、CPU交換は750ms以内に進む一方、GPU pollが先に枯渇したケースを確認した。
+pollを共有event待ちへ切り替えただけでも、別試行でStudioのGPU開始に約1.4秒の遅れがあり、CPU期限を超えた。
+したがってpollの待機方法だけを変更する対処は採用していない。
+
+元ソースと別の診断cloneで、keepalive投入・完了と遅いCBのdriver時間だけを追加記録した。
+main queueの投入間隔は既定1000msに対して約1.0〜1.2秒で、TP専用keepaliveも約15msで正常完了していた。
+それでもmain queueの小さいCB自体に、driver内で1秒以上かかる場面があった。
+
+Studioでstartupを除き、推論の開始〜終了の前後1秒にも重ならないidle sampleを比較した。
+
+| `DS4_METAL_QUEUE_KEEPALIVE_MS` | idle sample数 | 100ms超 | 最大 | 中央値 |
+|---|---:|---:|---:|---:|
+| 既定1000 | 193 | 112 | 1465.9ms | 180.8ms |
+| 100 | 878 | 0 | 0.3ms | 0.1ms |
+
+診断版は配布せず、元の上流binaryに戻し、keepalive100msだけを指定して再検証した。
+両roleのSHA-256が既存の承認済みrole manifestと一致することを再確認した。
+750ms・通常pollを維持し、warm-up、非stream、30秒idle、10秒idleを挟むSSE/39トークン生成12組の
+28要求がすべてHTTP 200となった。さらに39トークンのSSEも、41eventsと`[DONE]`、数列の正しさを確認した。
+そのSSEは最初のcontentまで0.537秒、全体1.831秒だった。
+
+build35候補では、TP両roleのchild起動だけに100msを指定し、存在だけで無効化する
+`DS4_METAL_DISABLE_QUEUE_KEEPALIVE`をchild環境から除去する。親・Standalone・LPの環境は変更しない。
+nativeのsource/binary/help/modelとmanifest schema、gate timeoutは変更しない。
+電力影響ゼロや全モデルでの安定性、GPU pollの全ての安全性問題を解消したとは主張しない。
+診断用5000msを採用したものでもない。通常runtimeのbuild35受入結果は導入後に追記する。
+
 ## 修正候補と次の受入
 
 配布Appのruntime LaunchAgentは `ProcessType=Background` だった。

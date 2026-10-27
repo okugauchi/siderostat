@@ -515,13 +515,37 @@ impl SupervisedSlot {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn apply_child_environment(
+    process: &mut tokio::process::Command,
+    overrides: &[(&str, &str)],
+    removals: &[&str],
+) {
+    for name in removals {
+        process.env_remove(name);
+    }
+    process.envs(overrides.iter().copied());
+}
+
 impl ManagedChild {
     #[cfg(target_os = "macos")]
     pub async fn spawn(command: &Ds4Command, generation: u64) -> Result<Self, ProcessControlError> {
+        Self::spawn_with_environment(command, generation, &[], &[]).await
+    }
+
+    /// Overlay only this child's environment; retain the ordinary ownership and cleanup path.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn spawn_with_environment(
+        command: &Ds4Command,
+        generation: u64,
+        overrides: &[(&str, &str)],
+        removals: &[&str],
+    ) -> Result<Self, ProcessControlError> {
         use std::process::Stdio;
 
         let executable = tokio::fs::canonicalize(&command.executable).await?;
         let mut process = command.tokio_command();
+        apply_child_environment(&mut process, overrides, removals);
         process.stdout(Stdio::piped());
         process.stderr(Stdio::piped());
         process.kill_on_drop(true);
@@ -783,6 +807,98 @@ fn system_time_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    fn environment_probe() -> tokio::process::Command {
+        let mut process = tokio::process::Command::new("/bin/sh");
+        process.args([
+            "-c",
+            "printf '%s|%s|%s' \"$DS4_METAL_QUEUE_KEEPALIVE_MS\" \"${DS4_METAL_DISABLE_QUEUE_KEEPALIVE+disabled}\" \"$SIDEROSTAT_TEST_MARKER\"",
+        ]);
+        process.env("DS4_METAL_QUEUE_KEEPALIVE_MS", "999");
+        process.env("DS4_METAL_DISABLE_QUEUE_KEEPALIVE", "0");
+        process.env("SIDEROSTAT_TEST_MARKER", "retained");
+        process
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn tp_child_environment_enforces_keepalive_without_mutating_parent() {
+        let before = (
+            std::env::var_os("DS4_METAL_QUEUE_KEEPALIVE_MS"),
+            std::env::var_os("DS4_METAL_DISABLE_QUEUE_KEEPALIVE"),
+        );
+        let mut process = environment_probe();
+        super::apply_child_environment(
+            &mut process,
+            super::tp::TP_ENV_OVERRIDES,
+            super::tp::TP_ENV_REMOVALS,
+        );
+        let output = process.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "100||retained");
+        assert_eq!(
+            (
+                std::env::var_os("DS4_METAL_QUEUE_KEEPALIVE_MS"),
+                std::env::var_os("DS4_METAL_DISABLE_QUEUE_KEEPALIVE"),
+            ),
+            before,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ordinary_child_environment_keeps_existing_values() {
+        let mut process = environment_probe();
+        super::apply_child_environment(&mut process, &[], &[]);
+        let output = process.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "999|disabled|retained",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn managed_environment_reaches_owned_child_and_stop_reaps() {
+        use super::*;
+        use tokio::io::AsyncBufReadExt;
+
+        let command = Ds4Command {
+            // /bin/sh can re-exec /bin/bash after the initial identity check on macOS.
+            executable: "/bin/bash".into(),
+            working_directory: "/tmp".into(),
+            argv: vec![
+                "-c".into(),
+                // Keep the shell as the owned executable; it must not exec the final sleep.
+                "printf '%s|%s\\n' \"$DS4_METAL_QUEUE_KEEPALIVE_MS\" \"${DS4_METAL_DISABLE_QUEUE_KEEPALIVE+disabled}\"; sleep 30; :".into(),
+            ],
+            profile: crate::cluster::ds4_command::Ds4Profile {
+                profile_id: "environment-smoke".into(),
+                quantization: crate::config::Quantization::Q2,
+                residency: crate::config::Residency::Resident,
+                speculative_support: crate::config::SpeculativeSupport::None,
+            },
+        };
+        let mut child = ManagedChild::spawn_with_environment(
+            &command,
+            3,
+            super::tp::TP_ENV_OVERRIDES,
+            super::tp::TP_ENV_REMOVALS,
+        )
+        .await
+        .unwrap();
+        let mut output = tokio::io::BufReader::new(child.take_stdout().unwrap());
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), output.read_line(&mut line)).await;
+        let stopped = child.stop(Duration::from_secs(2), false).await;
+        // Always reap the owned process before asserting the probe result.
+        assert!(stopped.is_ok(), "owned child stop failed: {stopped:?}");
+        assert!(read.unwrap().unwrap() > 0);
+        assert_eq!(line, "100|\n");
+        assert_eq!(child.identity().generation, 3);
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn supervised_stop_failure_retains_owned_child() {
