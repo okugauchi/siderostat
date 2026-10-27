@@ -192,3 +192,19 @@ async fn force_intent_is_not_rejected_while_promotion_owns_the_lease() {
         "Force intent must reach the runtime while promotion is active"
     );
 }
+
+#[test]
+fn tp_log_readiness_accepts_upstream_concatenated_bound_message() {
+    use siderostat::cluster::TpLogReadiness;
+    for rank in [0, 1] {
+        let mut status = TpLogReadiness::default();
+        status.observe("ds4-tp: leader connected, transport=rdma gate-timeout=750ms");
+        status.observe(&format!("tensor parallelism bound: rank {rank}, 50/50 expert ownership, rdma transporttp worker ready for mirrored sessionsds4: V4.1 static context buffers 3403.23 MiB (ctx=8192), Engram disk-only"));
+        assert!(
+            status.connected(),
+            "upstream ds4_log does not append a newline"
+        );
+        status.observe("TP gate exchange failed");
+        assert!(!status.connected());
+    }
+}

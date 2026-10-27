@@ -55,3 +55,12 @@
 Force、再起動の受入は未実施であり、導入前の別作業とする。特定モデルの設定・互換性保証も含まない。
 
 今回得た一般化できる観点はレビュー registry の「非同期 lifecycle と失敗回数の保持」へ追記した。
+
+## 実機導入時の追加修正
+
+1017 Q2 / M5 Max + M4 Max の上流直接RDMA試験で、`ds4_log` がboundメッセージに改行を
+付けず次のstderrメッセージへ連結することを確認した。build32の行末一致では接続完了を認識できない。
+実ログの連結形でREDを確認し、rank 0/1・50/50 ownership・RDMAの完全markerに一致する検出へ修正した。
+peer接続観測、sessionとchildの照合、truncated除外、障害判定の保持、HTTP/warm-up gateは維持。
+関連26テストとworkspace clippyに成功し、独立再レビューでも重大指摘なし。
+上流直接RDMAでは両ノードの接続と短い生成に成功。通常siDeroStat経路の実機受入は別途継続する。

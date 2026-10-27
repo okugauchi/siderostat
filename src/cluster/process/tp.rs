@@ -29,7 +29,13 @@ impl TpLogReadiness {
         {
             self.peer = true;
         }
-        if line.contains("tensor parallelism bound: rank ") && line.ends_with(", rdma transport") {
+        // Upstream ds4_log writes this marker without a newline. The next
+        // stderr message can therefore share the same forwarded record.
+        if [0, 1].into_iter().any(|rank| {
+            line.contains(&format!(
+                "tensor parallelism bound: rank {rank}, 50/50 expert ownership, rdma transport"
+            ))
+        }) {
             self.bound = true;
         }
     }
