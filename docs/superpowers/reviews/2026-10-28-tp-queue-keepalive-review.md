@@ -18,4 +18,4 @@ owned fixtureはmacOSの`/bin/sh`→`/bin/bash`再execによるIdentityMismatch�
 
 対象環境試験、fmt、workspace全target/all-feature clippy、workspace全target/all-feature試験
 （1,064件、68 suites、exit 0）、diff checkに成功。独立再レビューでも追加指摘なし。
-署名済みbuild35の通常runtime受入は実行後に追記する。
+署名済みbuild35を両ノードへ導入し、実childの限定環境確認、通常750msの生成/SSE・idle30秒、Standalone往復、生成中worker runtime終了後の単独生成とTP自動復帰を確認した。最終TP session 11で両公開APIの非stream/SSEに成功。故意に中断した要求はerrorとして終了し、Studioの失敗回数1を保持した。物理ケーブル/OS再起動/長期運転は未実施であり、受入範囲を実機記録へ明示した。

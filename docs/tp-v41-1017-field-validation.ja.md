@@ -91,11 +91,11 @@ Studioでstartupを除き、推論の開始〜終了の前後1秒にも重なら
 28要求がすべてHTTP 200となった。さらに39トークンのSSEも、41eventsと`[DONE]`、数列の正しさを確認した。
 そのSSEは最初のcontentまで0.537秒、全体1.831秒だった。
 
-build35候補では、TP両roleのchild起動だけに100msを指定し、存在だけで無効化する
+build35では、TP両roleのchild起動だけに100msを指定し、存在だけで無効化する
 `DS4_METAL_DISABLE_QUEUE_KEEPALIVE`をchild環境から除去する。親・Standalone・LPの環境は変更しない。
 nativeのsource/binary/help/modelとmanifest schema、gate timeoutは変更しない。
 電力影響ゼロや全モデルでの安定性、GPU pollの全ての安全性問題を解消したとは主張しない。
-診断用5000msを採用したものでもない。通常runtimeのbuild35受入結果は導入後に追記する。
+診断用5000msを採用したものでもない。通常runtimeのbuild35受入結果は後述する。
 
 ## 修正候補と次の受入
 
@@ -118,3 +118,47 @@ shellの出力リダイレクトを使用し、再起動前に `launchctl print`
 
 runtimeは上流TPの生ログを保存しないため、runtime出力だけではnativeのgate失敗の詳細を取得できない。
 今回の詳細は隔離した直接起動試験から得た。promptやsecretを含む生出力の恒久保存を有効にする変更はしていない。
+
+## 2026-10-28: build35の通常runtime受入
+
+両ノードへsource `7b922c5`、version 0.4.0/build35を導入した。
+pkg SHA-256は `a1db3b3471692f671af81a9cd4f4636bbb79fa5d8d9125ebfa94a530e4e8b058`。
+Developer ID署名済み・timestamp/公証なしの手動検証用pkgであり、正式公証済み配布物ではない。
+両LaunchAgentはInteractive、native binaryは既存role manifestと一致したまま。
+実プロセスから限定した環境変数だけを検査し、TP両roleの100ms適用、disable変数とgate overrideの不在、
+親runtimeとStandaloneへの非適用を確認した。従って通常750msを維持している。
+
+### 生成、待機、モード変更
+
+- 導入直後のStandalone: 両公開APIで非streamとSSEに成功。
+- Automatic epoch 11 / TP session 9: 両公開APIで非streamとSSEに成功。
+- session 9の39トークン生成: 非stream、両公開APIのSSE、30秒idle後の非streamに成功。
+  SSEはそれぞれ41eventsと`[DONE]`、数列1〜20の一致を確認し、最初のcontentは0.524/0.542秒。
+  30秒idle後の非streamは1.881秒だった。
+- ForcedStandalone epoch 12: 両TP childが停止し、両公開APIで非streamとSSEに成功。
+- Automatic epoch 13 / TP session 10: 手動pairや再試行なしで再形成し、両公開APIで非streamとSSEに成功。
+
+### 生成中のworker runtime再起動
+
+Studio側で1〜200の数列をSSE生成し、最初のcontentを受信した後、MBPの専用runtime LaunchAgentへSIGTERMを送った。
+この要求は280events、途中448文字、`finish_reason=error`で終了し、完全な数列の成功として扱われなかった。
+`[DONE]`も届いたため、SSEの`[DONE]`だけでは生成成功と判定できない。
+終了対象のruntimeとTP worker childの残留はなく、launchdは新しいruntimeを自動起動した。
+StudioはAutomatic epoch 13のままSolo Standaloneへ移行し、非streamとSSEに成功した。
+Studioの永続化されたTP失敗回数は1、失敗sessionは10であり、試験のためのjournal書換えや試行枠の初期化は行っていない。
+再起動したMBPは365 GBのモデル全体のSHA-256検証を行うため、その間APIの待受開始も待機する。
+モデル検証後、policy epochを変えずにTP session 11へ自動復帰した。復帰後も両公開APIの非stream/SSEに成功し、
+Studioの39トークンSSEは41events・数列一致・`[DONE]`、最初のcontent 0.521秒、全体1.849秒だった。
+再生成された両TP childにも100msだけが適用され、gate overrideとdisable変数は不在だった。
+最終状態は両ノードともTP Ready・serving、in-flight 0。Studioの失敗回数1/session 10は保持された。
+通常750msでの今回の生成・待機・モード往復・worker runtime再起動の受入は成功した。
+
+
+### 条件と未実施項目
+
+今回の構成はM5 Max / M4 Max各128 GiB、1017 Q2、context 8192、resident TP、同時要求1。
+RDMA memberはMBP en2/rdma_en2・10.99.10.2、Studio en5/rdma_en5・10.99.10.1、両GID2。
+`iogpu.wired_limit_mb=98304` とen2/en5の10.99.10.x/30 aliasは再起動で失われる設定なので、OS再起動後に再設定・再確認する。
+物理ケーブルの抜去・再接続、OS全体の再起動、長時間連続運転はこの試験では未実施。
+100msによる電力影響と他モデル・他contextでの安定性は未評価。GPU poll自体の一般的な安全性を保証する結果ではない。
+詳細証跡はローカルのignore対象 `dist/tp-build35/evidence/` に保存する。

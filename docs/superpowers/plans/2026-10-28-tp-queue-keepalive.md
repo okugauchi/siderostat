@@ -36,9 +36,11 @@ Files: `src/cluster/process.rs`、`src/cluster/process/tp.rs`。
 ### Task 2: build35と実機受入
 
 - [x] 元binary・100ms・750msの28要求試験を確認し、条件と結果を保存する。
-- [ ] build35を署名・payload検証して両ノードへ配置する。
-- [ ] 通常TPの生成・SSE・session維持・Standalone復帰・再TP・peer喪失後の復帰を確認する。
-- [ ] 合否と未実施項目、揮発するOS設定を記録する。
+- [x] build35を署名・payload検証して両ノードへ配置する。
+- [x] 通常TPの生成・SSE・session維持・Standalone復帰・再TP・peer喪失後の復帰を確認する。
+- [x] 合否と未実施項目、揮発するOS設定を記録する。
 
 Ruling: 実装は既存source branch上で行い、配布は既存detached worktreeを検証済みcommitへ更新して作成する。既存の実機設定とmodelを複製しない。
 Ruling: `/bin/sh`が`/bin/bash`へ再execするfixtureでは所有確認を緩めず、試験だけ直接`/bin/bash`を使う。
+
+実機結果: 通常750ms・TP child100msでsession 9/10/11の生成・SSE、idle30秒、Standalone往復、生成中worker runtime SIGTERM後の自動TP再形成に成功。物理ケーブル/OS再起動/長期運転は未実施。詳細は実機記録を参照。
