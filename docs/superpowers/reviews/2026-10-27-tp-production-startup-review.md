@@ -64,3 +64,19 @@ Force、再起動の受入は未実施であり、導入前の別作業とする
 peer接続観測、sessionとchildの照合、truncated除外、障害判定の保持、HTTP/warm-up gateは維持。
 関連26テストとworkspace clippyに成功し、独立再レビューでも重大指摘なし。
 上流直接RDMAでは両ノードの接続と短い生成に成功。通常siDeroStat経路の実機受入は別途継続する。
+
+## 実機導入時の実行クラス修正
+
+build33はRDMA/HTTP準備後のwarm-upで失敗。隔離した上流直接試験でも `taskpolicy -b` 付きでは
+gate交換失敗とHTTP 500を再現し、指定なしでは同じ要求がHTTP 200となった。
+配布用runtime LaunchAgentの `ProcessType=Background` を `Interactive`へ変更する候補を作成した。
+[実機検証記録](../../tp-v41-1017-field-validation.ja.md)に条件・数値・交絡と残る受入を記載。
+
+独立レビューと再レビューでソース/文書に重大指摘なし。クラスの選択、TP以外への影響、
+raw prompt/secret非保存、引数・認証・timeout・model・復帰ロジックの非変更を確認した。
+固定値を写すだけの新規テストは追加せず、既存gate、生成物のplist、実LaunchAgentと実機動作を検証する。
+build34の通常導入後の内部warm-up・公開API・Standalone復帰・再TPの確認は未完了であり、
+このレビューをもって実機受入完了とは扱わない。
+
+修正候補の検証: `plutil -lint`、`cargo fmt --check`、workspace全target/all-featureのclippy、
+`cargo test --workspace --all-targets --all-features`（1,061件、68 suites、exit 0）、`git diff --check`に成功。

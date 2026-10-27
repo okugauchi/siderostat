@@ -3,6 +3,9 @@
 確認日: 2026-10-27。対象は Mac Studio M4 Max / 128GB と MacBook Pro M5 Max / 128GB の2台。
 初回はテキスト推論だけを確認し、Vision・DSparkは使わない。
 
+以下は初回準備用の候補設定と取得手順。導入後の状態と通常TPの未完了項目は
+[実機検証記録](tp-v41-1017-field-validation.ja.md)を参照する。
+
 ## 今回用意した設定
 
 | 項目 | 初回検証値 |
