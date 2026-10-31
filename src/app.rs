@@ -80,6 +80,11 @@ pub struct AppState {
     /// The server loop then performs the same cleanup as SIGTERM instead of calling
     /// `std::process::exit` from an HTTP task.
     restart_requested: Arc<tokio::sync::Notify>,
+    cleanup_retry_requested: tokio::sync::Notify,
+    shutdown_phase: std::sync::atomic::AtomicU8,
+    server_shutting_down: std::sync::atomic::AtomicBool,
+    shutdown_phase_lock: std::sync::Mutex<()>,
+    shutdown_gate: tokio::sync::RwLock<()>,
     /// Default in-flight drain timeout for `/admin/restart` when the request
     /// omits `drain_timeout_ms` (C-04a). Taken from the cluster stop timeout.
     default_drain_timeout: std::time::Duration,
@@ -157,6 +162,11 @@ impl AppState {
             recovery_config,
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
             restart_requested: Arc::new(tokio::sync::Notify::new()),
+            cleanup_retry_requested: tokio::sync::Notify::new(),
+            shutdown_phase: std::sync::atomic::AtomicU8::new(0),
+            server_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutdown_phase_lock: std::sync::Mutex::new(()),
+            shutdown_gate: tokio::sync::RwLock::new(()),
             default_drain_timeout: config.cluster.timeouts.stop,
         }))
     }
@@ -303,7 +313,62 @@ impl AppState {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn set_manual_shutdown_phase(&self, phase: u8) {
+        let _lock = self
+            .shutdown_phase_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self
+            .server_shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.shutdown_phase
+                .store(phase, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn begin_server_shutdown(&self) {
+        let _lock = self
+            .shutdown_phase_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_shutdown_draining();
+    }
+
+    fn mark_shutdown_draining(&self) {
+        let _ = self.shutdown_phase.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |phase| Some(if phase == 0 || phase == 3 { 1 } else { phase }),
+        );
+    }
+
     fn request_graceful_restart(&self) {
+        let _lock = self
+            .shutdown_phase_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self
+            .server_shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if self
+                .shutdown_phase
+                .compare_exchange(
+                    3,
+                    1,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                self.cleanup_retry_requested.notify_one();
+            }
+            return;
+        }
+        self.mark_shutdown_draining();
         self.restart_requested.notify_one();
     }
 }
@@ -317,6 +382,7 @@ struct RuntimeAdminExecutor {
     interface: String,
     coordinator_address: IpAddr,
     worker_address: IpAddr,
+    restart_requested: Arc<tokio::sync::Notify>,
 }
 
 impl AdminExecutor for RuntimeAdminExecutor {
@@ -329,6 +395,7 @@ impl AdminExecutor for RuntimeAdminExecutor {
         let interface = self.interface.clone();
         let coordinator_address = self.coordinator_address;
         let worker_address = self.worker_address;
+        let restart_requested = self.restart_requested.clone();
         Box::pin(async move {
             match action {
                 AdminAction::Reconcile => {
@@ -374,7 +441,7 @@ impl AdminExecutor for RuntimeAdminExecutor {
                         .unwrap_or(LocalRole::Unknown);
                     if new_role != current_role {
                         tracing::warn!(from = ?current_role, to = ?new_role, "cluster role changed on restart; restarting process to apply new role");
-                        spawn_process_restart();
+                        spawn_process_restart(restart_requested);
                         return Ok(json!({
                             "restart": "process",
                             "role": new_role.name(),
@@ -437,14 +504,11 @@ impl AdminExecutor for RuntimeAdminExecutor {
     }
 }
 
-fn spawn_process_restart() {
-    // LaunchAgent の KeepAlive に依存して siderostat プロセス全体を再起動する。
-    // role は起動時に一度だけ判定されるため、role 変更を適用するにはプロセスごと
-    // 再起動して起動時判定をやり直す必要がある。
-    // HTTP 応答を返す猶予を確保してから exit する。
-    tokio::task::spawn(async {
+fn spawn_process_restart(restart_requested: Arc<tokio::sync::Notify>) {
+    // Allow the admin response to be sent before the server loop drains and stops children.
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        std::process::exit(0);
+        restart_requested.notify_one();
     });
 }
 
@@ -465,6 +529,7 @@ fn spawn_graceful_server_restart(state: Arc<AppState>) {
 fn spawn_role_change_monitor(
     config: &ModeAwareConfig,
     initial_role: LocalRole,
+    restart_requested: Arc<tokio::sync::Notify>,
 ) -> (
     Option<tokio::task::JoinHandle<()>>,
     Option<MacOsDynamicStoreWatcher>,
@@ -503,7 +568,7 @@ fn spawn_role_change_monitor(
                         reason = ?request.reason,
                         "cluster role changed; restarting process to apply new role"
                     );
-                    spawn_process_restart();
+                    spawn_process_restart(restart_requested);
                     return;
                 }
                 Ok(_) => {}
@@ -520,6 +585,7 @@ fn spawn_role_change_monitor(
 fn spawn_role_change_monitor(
     _config: &ModeAwareConfig,
     _initial_role: LocalRole,
+    _restart_requested: Arc<tokio::sync::Notify>,
 ) -> (Option<tokio::task::JoinHandle<()>>, Option<()>) {
     (None, None)
 }
@@ -700,7 +766,7 @@ pub async fn serve_with_options(
     let (_role_change_task, _role_change_watcher) = if dry_run {
         (None, None)
     } else {
-        spawn_role_change_monitor(&config, role)
+        spawn_role_change_monitor(&config, role, state.restart_requested.clone())
     };
     run_servers(
         &config,
@@ -930,6 +996,7 @@ fn attach_control_plane(
             interface: config.cluster.interface.clone(),
             coordinator_address: config.cluster.coordinator_address,
             worker_address: config.cluster.worker_address,
+            restart_requested: state.restart_requested.clone(),
         }),
     )?);
     Ok(production)
@@ -973,6 +1040,7 @@ pub async fn admin_http_reconcile(
             interface: config.cluster.interface.clone(),
             coordinator_address: config.cluster.coordinator_address,
             worker_address: config.cluster.worker_address,
+            restart_requested: state.restart_requested.clone(),
         }),
     )?);
 
@@ -1284,55 +1352,179 @@ async fn run_servers(
             .await
         })
     });
-    let public_server = axum::serve(
-        public_listener,
-        public.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_requested(shutdown_receiver.clone()));
-    let admin_server = axum::serve(admin_listener, admin)
-        .with_graceful_shutdown(shutdown_requested(shutdown_receiver));
-    let servers = async { tokio::try_join!(public_server, admin_server).map(|_| ()) };
-    tokio::pin!(servers);
-    let serve_result = tokio::select! {
-        result = &mut servers => result,
-        signal = termination_signal() => {
-            signal?;
-            info!("termination signal received; draining listeners and stopping owned child");
-            state.proxy.admission().block();
-            shutdown_sender.send_replace(true);
-            (&mut servers).await
-        }
-        _ = state.restart_requested.notified() => {
-            info!("graceful restart requested; draining listeners and stopping owned child");
-            state.proxy.admission().block();
-            shutdown_sender.send_replace(true);
-            (&mut servers).await
-        }
+    let public_server = async move {
+        axum::serve(
+            public_listener,
+            public.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_requested(shutdown_receiver))
+        .await
     };
+    tokio::pin!(public_server);
+    // Keep the local read-only admin endpoints alive while request and child cleanup runs.
+    let (admin_shutdown_sender, admin_shutdown_receiver) = tokio::sync::watch::channel(false);
+    let mut admin_server = tokio::spawn(async move {
+        axum::serve(admin_listener, admin)
+            .with_graceful_shutdown(shutdown_requested(admin_shutdown_receiver))
+            .await
+    });
+    let mut admin_completed = false;
+    let mut late_admin_result: anyhow::Result<()> = Ok(());
+    let mut public_completed = false;
+    let serve_result: anyhow::Result<()> = tokio::select! {
+        result = &mut public_server => {
+            public_completed = true;
+            result.map_err(Into::into)
+        },
+        result = &mut admin_server => {
+            admin_completed = true;
+            match result {
+                Ok(result) => result.map_err(Into::into),
+                Err(error) => Err(error.into()),
+            }
+        },
+        signal = termination_signal() => {
+            signal.map_err(Into::into)
+        }
+        _ = state.restart_requested.notified() => Ok(()),
+    };
+    state.begin_server_shutdown();
+    state.proxy.admission().block();
     shutdown_sender.send_replace(true);
+    // A failing admin listener or signal source must not bypass the public drain.
+    let public_result: anyhow::Result<()> = if public_completed {
+        Ok(())
+    } else {
+        (&mut public_server).await.map_err(Into::into)
+    };
     local_monitor.abort();
     transition_monitor.abort();
     desktop_notifier.abort();
+    let _ = local_monitor.await;
+    let _ = transition_monitor.await;
+    let _ = desktop_notifier.await;
     if let Some(task) = reconcile_task {
         task.abort();
+        let _ = task.await;
     }
     if let Some(task) = recovery_detector_task {
         task.abort();
+        let _ = task.await;
     }
-    if let Some(task) = control_task {
-        task.await??;
-    }
-    if let Some(task) = peer_task {
-        task.await??;
-    }
-    if let Some(production) = &production {
-        production.stop_distributed().await?;
-    }
-    let stop_result = crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await;
+    // Always attempt owned-child cleanup, even if an auxiliary listener failed.
+    let control_result: anyhow::Result<()> = match control_task {
+        Some(task) => task
+            .await
+            .context("control listener task failed")
+            .and_then(|r| r.map_err(Into::into)),
+        None => Ok(()),
+    };
+    let peer_result: anyhow::Result<()> = match peer_task {
+        Some(task) => task
+            .await
+            .context("peer listener task failed")
+            .and_then(|r| r.map_err(Into::into)),
+        None => Ok(()),
+    };
+    let child_result = loop {
+        let result = finish_child_cleanup(
+            &state,
+            async {
+                let distributed_result = match &production {
+                    Some(production) => production.stop_distributed().await,
+                    None => Ok(()),
+                };
+                let standalone_result =
+                    crate::cluster::LocalStandaloneLifecycle::stop(supervisor.as_ref()).await;
+                distributed_result.and(standalone_result)
+            },
+            &admin_shutdown_sender,
+        )
+        .await;
+        if result.is_ok() {
+            break result;
+        }
+        if admin_completed {
+            // Preserve the supervisor even if the admin listener has failed. Retry
+            // through the same identity-checked owner rather than orphaning its child.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            state.mark_shutdown_draining();
+            continue;
+        }
+        tracing::error!(error = ?result.as_ref().err(), "child cleanup failed; preserving supervisor and waiting for explicit retry");
+        tokio::select! {
+            _ = state.cleanup_retry_requested.notified() => state.mark_shutdown_draining(),
+            result_admin = &mut admin_server => {
+                admin_completed = true;
+                late_admin_result = match result_admin {
+                    Ok(result) => result.map_err(Into::into),
+                    Err(error) => Err(error.into()),
+                };
+                if let Err(error) = &late_admin_result { tracing::error!(%error, "admin task failed during cleanup recovery"); }
+                state.mark_shutdown_draining();
+            }
+        }
+    };
     drop(runtime);
+    let admin_result: anyhow::Result<()> = if admin_completed {
+        late_admin_result
+    } else {
+        match admin_server.await {
+            Ok(result) => result.map_err(Into::into),
+            Err(error) => Err(error.into()),
+        }
+    };
     serve_result?;
-    stop_result?;
+    public_result?;
+    control_result?;
+    peer_result?;
+    child_result?;
+    admin_result?;
     Ok(())
+}
+
+async fn finish_child_cleanup<F>(
+    state: &AppState,
+    cleanup: F,
+    admin_shutdown: &tokio::sync::watch::Sender<bool>,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    // Wait until earlier POSTs have registered their jobs and lifecycle jobs have finished.
+    // On timeout retain the supervisors and the admin API; do not signal a child while a job
+    // may still mutate it. A later explicit retry can resume cleanup.
+    let ready = tokio::time::timeout(state.default_drain_timeout, async {
+        {
+            let _gate = state.shutdown_gate.write().await;
+        }
+        while state
+            .admin_controller()
+            .is_some_and(|admin| admin.has_running_mutation())
+            || state.recovery.has_active_job()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("timed out waiting for previously accepted management operations");
+    }
+    state
+        .shutdown_phase
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let result = cleanup.await;
+    if result.is_err() {
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        admin_shutdown.send_replace(true);
+    }
+    result
 }
 
 async fn shutdown_requested(mut receiver: tokio::sync::watch::Receiver<bool>) {
@@ -1534,7 +1726,38 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/manager/jobs", post(manager_jobs_submit))
         .route("/manager/jobs/{id}", get(manager_job_get))
         .route("/manager/jobs/{id}/cancel", post(manager_job_cancel))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_shutdown_mutations,
+        ))
         .with_state(state)
+}
+
+async fn reject_shutdown_mutations(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    if request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD {
+        return next.run(request).await;
+    }
+    let _gate = state.shutdown_gate.read().await;
+    let phase = state
+        .shutdown_phase
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let cleanup_retry = phase == 3 && request.uri().path() == "/admin/restart";
+    if !cleanup_retry
+        && (state
+            .server_shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || matches!(phase, 1 | 2))
+    {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "runtime_shutting_down"}),
+        );
+    }
+    next.run(request).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2372,6 +2595,31 @@ async fn graceful_restart(
         }
     };
 
+    // A failed shutdown is retried by its existing owner. A concurrent retry must
+    // never fall through to the ordinary restart sequence.
+    if state
+        .server_shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        if state
+            .shutdown_phase
+            .compare_exchange(
+                3,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            state.cleanup_retry_requested.notify_one();
+            return json_response(StatusCode::ACCEPTED, json!({"restart": "cleanup-retry"}));
+        }
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "restart_in_progress"}),
+        );
+    }
+
     // 進行中の graceful restart と重複しない。drain timeout / identity
     // mismatch で失敗した場合は C-04b がフラグを解放する。
     if !state.try_claim_graceful_restart() {
@@ -2507,6 +2755,7 @@ async fn graceful_restart_sequence(
         }
     }
 
+    state.set_manual_shutdown_phase(2);
     let stop_result: anyhow::Result<()> = match graceful_restart_owner(production.is_some()) {
         GracefulRestartOwner::Distributed => match production {
             Some(production) => production.stop_for_planned_restart(drain_timeout).await,
@@ -2576,7 +2825,12 @@ async fn perform_graceful_restart(
     production: Option<&ProductionClusterRuntime>,
     drain_timeout: std::time::Duration,
 ) -> Response<Body> {
-    match graceful_restart_sequence(state, supervisor, production, drain_timeout).await {
+    state.set_manual_shutdown_phase(1);
+    let outcome = graceful_restart_sequence(state, supervisor, production, drain_timeout).await;
+    if !matches!(outcome, GracefulRestartOutcome::Ready { .. }) {
+        state.set_manual_shutdown_phase(3);
+    }
+    match outcome {
         GracefulRestartOutcome::Ready { drain_timeout_ms } => {
             let response = json_response(
                 StatusCode::ACCEPTED,
@@ -2789,7 +3043,7 @@ async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let body = state.metrics.render_mode_aware(MetricSnapshot {
+    let mut body = state.metrics.render_mode_aware(MetricSnapshot {
         node_id: &state.config.node_id,
         interface: &state.config.interface,
         target: state.proxy.target_snapshot(),
@@ -2802,6 +3056,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         speculative_support: state.config.standalone_speculative_support,
         residency: state.config.standalone_residency,
     });
+    let phase = match state
+        .shutdown_phase
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        1 => Some("draining"),
+        2 => Some("stopping-child"),
+        3 => Some("failed"),
+        _ => None,
+    };
+    if let Some(phase) = phase {
+        body.push_str(&format!("# TYPE ds4_proxy_shutdown_phase gauge\nds4_proxy_shutdown_phase{{phase=\"{phase}\"}} 1\n"));
+    }
     response_with_body(
         StatusCode::OK,
         "text/plain; version=0.0.4",
@@ -3022,6 +3288,536 @@ mod tests {
         );
     }
 
+    #[test]
+    fn role_change_restart_does_not_exit_before_cleanup() {
+        const CHILD: &str = "SIDEROSTAT_ROLE_RESTART_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let notification = Arc::new(tokio::sync::Notify::new());
+                let notified = notification.notified();
+                spawn_process_restart(notification.clone());
+                tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+                    .await
+                    .unwrap();
+                println!("role-restart-cleanup-can-run");
+            });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::role_change_restart_does_not_exit_before_cleanup",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("role-restart-cleanup-can-run"),
+            "role change exited before cleanup: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn new_shutdown_clears_previous_failure_phase() {
+        let state = test_state(true);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        state.request_graceful_restart();
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_phase_does_not_reopen_mutations_during_server_shutdown() {
+        let state = test_state(true);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let request = Request::post("/cluster/reconcile")
+            .header("authorization", format!("Bearer {}", "03".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            admin_router(state).oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_manual_restart_exposes_failure_without_disabling_retry() {
+        let state = test_state(true);
+        let response =
+            perform_graceful_restart(&state, None, None, std::time::Duration::from_millis(50))
+                .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let router = admin_router(state.clone());
+        let response = router
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("ds4_proxy_shutdown_phase{phase=\"failed\"} 1")
+        );
+        let request = Request::post("/cluster/reconcile")
+            .header("authorization", format!("Bearer {}", "03".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn child_cleanup_waits_for_previously_accepted_admin_handler() {
+        let state = test_state(true);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route(
+                "/held",
+                axum::routing::post({
+                    let entered = entered.clone();
+                    let finish = finish.clone();
+                    move || async move {
+                        entered.notify_one();
+                        finish.notified().await;
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                reject_shutdown_mutations,
+            ));
+        let entered_future = entered.notified();
+        let request = tokio::spawn(async move {
+            router
+                .oneshot(Request::post("/held").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        entered_future.await;
+        state.request_graceful_restart();
+        let (admin_shutdown, _) = tokio::sync::watch::channel(false);
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::oneshot::channel();
+        let state2 = state.clone();
+        let cleanup = tokio::spawn(async move {
+            finish_child_cleanup(
+                &state2,
+                async move {
+                    let _ = cleanup_tx.send(());
+                    Ok(())
+                },
+                &admin_shutdown,
+            )
+            .await
+            .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup_rx)
+                .await
+                .is_err()
+        );
+        finish.notify_one();
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        cleanup.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_admin_job_reports_shutdown_failure_without_stopping_child() {
+        struct NeverFinishes;
+        impl AdminExecutor for NeverFinishes {
+            fn execute(&self, _: AdminAction) -> AdminFuture {
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(json!({}))
+                })
+            }
+        }
+        let mut state = test_state(true);
+        Arc::get_mut(&mut state).unwrap().default_drain_timeout =
+            std::time::Duration::from_millis(50);
+        let admin = AdminController::new(vec![3; 32], Arc::new(NeverFinishes)).unwrap();
+        state.attach_admin(admin.clone());
+        admin.start(AdminAction::Promote).unwrap();
+        state.request_graceful_restart();
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called2 = called.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            finish_child_cleanup(
+                &state,
+                async move {
+                    called2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                &shutdown,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "cleanup wait must be bounded");
+        assert!(result.unwrap().is_err());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!*receiver.borrow());
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn child_cleanup_waits_for_previously_accepted_admin_job() {
+        struct BlockingExecutor {
+            started: Arc<tokio::sync::Notify>,
+            finish: Arc<tokio::sync::Notify>,
+        }
+        impl AdminExecutor for BlockingExecutor {
+            fn execute(&self, _: AdminAction) -> AdminFuture {
+                let started = self.started.clone();
+                let finish = self.finish.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Ok(json!({}))
+                })
+            }
+        }
+        let state = test_state(true);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let admin = AdminController::new(
+            vec![3; 32],
+            Arc::new(BlockingExecutor {
+                started: started.clone(),
+                finish: finish.clone(),
+            }),
+        )
+        .unwrap();
+        state.attach_admin(admin.clone());
+        let started_future = started.notified();
+        admin.start(AdminAction::Promote).unwrap();
+        started_future.await;
+        state.request_graceful_restart();
+        let (admin_shutdown, _) = tokio::sync::watch::channel(false);
+        let (cleanup_started_tx, mut cleanup_started_rx) = tokio::sync::oneshot::channel();
+        let state2 = state.clone();
+        let cleanup = tokio::spawn(async move {
+            finish_child_cleanup(
+                &state2,
+                async move {
+                    let _ = cleanup_started_tx.send(());
+                    Ok(())
+                },
+                &admin_shutdown,
+            )
+            .await
+            .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut cleanup_started_rx
+            )
+            .await
+            .is_err()
+        );
+        finish.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        cleanup.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cleanup_retries_have_one_owner() {
+        let state = test_state(true);
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        let router = admin_router(state.clone());
+        let request = || {
+            Request::post("/admin/restart")
+                .header("authorization", format!("Bearer {}", "03".repeat(32)))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (a, b) = tokio::join!(router.clone().oneshot(request()), router.oneshot(request()));
+        let statuses = [a.unwrap().status(), b.unwrap().status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|&&status| status == StatusCode::ACCEPTED)
+                .count(),
+            1
+        );
+        assert!(
+            statuses.iter().any(|&status| status == StatusCode::CONFLICT
+                || status == StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn restart_notification_and_server_shutdown_are_serialized() {
+        let state = test_state(true);
+        let gate = state.shutdown_phase_lock.lock().unwrap();
+        let worker_state = state.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_state.request_graceful_restart();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        drop(gate);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        worker.join().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.cleanup_retry_requested.notified(),
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn late_manual_restart_preserves_failed_owner_phase() {
+        let state = test_state(true);
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        let outcome =
+            graceful_restart_sequence(&state, None, None, std::time::Duration::from_millis(100))
+                .await;
+        assert!(matches!(outcome, GracefulRestartOutcome::ChildStopFailed));
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn late_manual_restart_success_wakes_failed_shutdown_owner() {
+        let state = test_state(true);
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        let retry = state.cleanup_retry_requested.notified();
+        state.request_graceful_restart();
+        tokio::time::timeout(std::time::Duration::from_millis(100), retry)
+            .await
+            .expect("cleanup owner must wake");
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn old_restart_notification_does_not_trigger_cleanup_retry() {
+        let state = test_state(true);
+        state.restart_requested.notify_one();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                state.cleanup_retry_requested.notified()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_retry_only_signals_the_shutdown_owner() {
+        let state = test_state(true);
+        state
+            .server_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .shutdown_phase
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        let notified = state.cleanup_retry_requested.notified();
+        let request = Request::post("/admin/restart")
+            .header("authorization", format!("Bearer {}", "03".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        let response = admin_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .shutdown_phase
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_keeps_admin_available_for_recovery() {
+        let state = test_state(true);
+        let (admin_shutdown, admin_rx) = tokio::sync::watch::channel(false);
+        let error = finish_child_cleanup(
+            &state,
+            async { anyhow::bail!("child stop failed") },
+            &admin_shutdown,
+        )
+        .await;
+        assert!(error.is_err());
+        assert!(!*admin_rx.borrow());
+        let response = admin_router(state.clone())
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("ds4_proxy_shutdown_phase{phase=\"failed\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_metrics_remain_available_until_child_cleanup_finishes() {
+        let state = test_state(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (admin_shutdown, admin_rx) = tokio::sync::watch::channel(false);
+        let router = admin_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_requested(admin_rx))
+                .await
+                .unwrap();
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let cleanup_state = state.clone();
+        let cleanup = tokio::spawn(async move {
+            finish_child_cleanup(
+                &cleanup_state,
+                async move {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    Ok(())
+                },
+                &admin_shutdown,
+            )
+            .await
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        let client = reqwest::Client::new();
+        let body = client
+            .get(format!("http://{address}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("ds4_proxy_shutdown_phase{phase=\"stopping-child\"} 1"));
+        assert!(!server.is_finished());
+        finish_tx.send(()).unwrap();
+        cleanup.await.unwrap();
+        server.await.unwrap();
+        assert!(
+            client
+                .get(format!("http://{address}/metrics"))
+                .send()
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_admin_mutations_but_preserves_metrics() {
+        let state = test_state(true);
+        state.request_graceful_restart();
+        let router = admin_router(state);
+        let request = Request::post("/cluster/reconcile")
+            .header("authorization", format!("Bearer {}", "03".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = router
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn restart_request_exposes_shutdown_progress_in_local_metrics() {
+        let state = test_state(true);
+        state.request_graceful_restart();
+        let response = metrics(State(state)).await;
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("ds4_proxy_shutdown_phase{phase=\"draining\"} 1"));
+    }
+
     #[tokio::test]
     async fn graceful_restart_can_signal_server_shutdown_without_process_exit() {
         let state = test_state(true);
@@ -3078,6 +3874,11 @@ mod tests {
             recovery_config: RecoveryConfig::default(),
             graceful_restart_in_progress: std::sync::atomic::AtomicBool::new(false),
             restart_requested: Arc::new(tokio::sync::Notify::new()),
+            cleanup_retry_requested: tokio::sync::Notify::new(),
+            shutdown_phase: std::sync::atomic::AtomicU8::new(0),
+            server_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutdown_phase_lock: std::sync::Mutex::new(()),
+            shutdown_gate: tokio::sync::RwLock::new(()),
             default_drain_timeout: std::time::Duration::from_millis(5000),
         });
         state.attach_admin(AdminController::new(vec![3; 32], Arc::new(TestAdminExecutor)).unwrap());

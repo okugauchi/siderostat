@@ -553,6 +553,18 @@ fn mode_display_name(mode: Option<&str>) -> String {
 /// the current execution topology explicit.
 fn state_display_name(state: Option<&str>) -> String {
     match state {
+        Some("shutdown-draining") => text(
+            "status.shutdown.draining",
+            "停止中: 要求・操作の完了を待っています",
+        ),
+        Some("shutdown-stopping-child") => text(
+            "status.shutdown.child",
+            "停止中: 子プロセスを回収しています",
+        ),
+        Some("shutdown-failed") => text(
+            "status.shutdown.failed",
+            "停止に失敗しました: 子プロセス状態を確認してください",
+        ),
         Some("booting") => "Booting".to_string(),
         Some("solo-standalone-starting") => "Solo Standalone starting".to_string(),
         Some("solo-standalone-ready") => "Solo Standalone ready".to_string(),
@@ -646,6 +658,18 @@ fn menu_bar_title(
     show_decode_tps: bool,
     live_metric: LiveMetric,
 ) -> String {
+    if display.status == MonitorStatus::Online {
+        match display.cluster_state.as_deref() {
+            Some("shutdown-draining") => {
+                return text("status.shutdown.short.draining", "停止中: 完了待ち");
+            }
+            Some("shutdown-stopping-child") => {
+                return text("status.shutdown.short.child", "停止中: 子プロセス");
+            }
+            Some("shutdown-failed") => return text("status.shutdown.short.failed", "停止失敗"),
+            _ => {}
+        }
+    }
     let selected = selected_metric_title(display, show_decode_tps, live_metric);
     if !selected.is_empty() {
         return selected;
@@ -889,6 +913,23 @@ fn on_connector(x: f32, y: f32, top_cy: f32, bottom_cy: f32, cx: f32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_progress_is_visible_in_the_menu_bar() {
+        let display = super::DisplayState {
+            status: super::MonitorStatus::Online,
+            cluster_state: Some("shutdown-stopping-child".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::menu_bar_title(&display, true, super::LiveMetric::None),
+            "停止中: 子プロセス"
+        );
+        assert_eq!(
+            super::state_display_name(display.cluster_state.as_deref()),
+            "停止中: 子プロセスを回収しています"
+        );
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 

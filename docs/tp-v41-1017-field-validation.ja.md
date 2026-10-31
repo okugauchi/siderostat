@@ -162,3 +162,21 @@ RDMA memberはMBP en2/rdma_en2・10.99.10.2、Studio en5/rdma_en5・10.99.10.1�
 物理ケーブルの抜去・再接続、OS全体の再起動、長時間連続運転はこの試験では未実施。
 100msによる電力影響と他モデル・他contextでの安定性は未評価。GPU poll自体の一般的な安全性を保証する結果ではない。
 詳細証跡はローカルのignore対象 `dist/tp-build35/evidence/` に保存する。
+
+## 2026-11-01: アイドル中の物理ケーブル切断
+
+build35、TP session 12、in-flight 0でThunderboltケーブルを抜いた。両ノードでruntimeが終了し、
+管理APIに接続できず、切断中のStandalone動作は確認できなかった。再接続後も孤立したTP childが残り、
+両runtimeは起動を繰り返した。記録済みPID・実行ファイル・起動時刻と一致し、親がinitとなっていた
+TP childにSIGTERMを送り、終了確認後に両runtimeが立ち上がってTP session 13を形成した。
+両APIの1〜20の非stream/SSE生成に成功したが、これは手動回収後の復帰である。
+
+macOSログでは01:00:52.559にMBP側bridge0のIPが除去され、01:00:53.167にruntimeがexit(0)した。
+role change monitorは役割変化時に`std::process::exit(0)`を呼び、所有childの通常停止を通さない。
+時刻と孤立childはこの経路と整合するが、runtime自体の終了ログは取得できなかった。
+両ノードの`startup_cleanup.auto_restart=false`を確認した。再起動失敗の直接原因は未確定。
+
+修正候補はrole変更とrole変更を伴うadmin restartを、既存server loopの終了通知へ接続する。
+受付停止・listener終了・所有child停止を既存経路に任せ、環境設定や無関係なprocessを変更しない。
+回帰試験は旧版で即時exitにより失敗し、修正版で通知が届きprocessが生存することを確認する。
+接続断中や生成中の排出・停止および実機受入は別途必要であり、この試験だけで保証しない。

@@ -67,9 +67,22 @@ impl MetricsClient {
     /// that hop over the existing control plane, so the coordinator's admin listener remains
     /// loopback-only.
     pub async fn fetch_metrics(&self) -> Result<MetricsSnapshot> {
+        // Shutdown is local to this runtime, even when normal metrics come from the coordinator.
+        let local = self.fetch_metrics_at("/metrics").await?;
+        if local
+            .cluster_state
+            .as_deref()
+            .is_some_and(|state| state.starts_with("shutdown-"))
+        {
+            return Ok(local);
+        }
         let routing = self.fetch_cluster_routing().await?;
         let path = metrics_path(&routing);
-        self.fetch_metrics_at(path).await
+        if path == "/metrics" {
+            Ok(local)
+        } else {
+            self.fetch_metrics_at(path).await
+        }
     }
 
     async fn fetch_cluster_routing(&self) -> Result<ClusterRoutingState> {
@@ -348,6 +361,55 @@ fn metrics_path(routing: &ClusterRoutingState) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::MonitorConfig;
+    #[tokio::test]
+    async fn worker_shutdown_uses_local_progress_not_coordinator_metrics() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 4096];
+                let n = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let body = match path {
+                    "/cluster" => r#"{"role":"worker","target":"coordinator"}"#,
+                    "/metrics" => "ds4_proxy_shutdown_phase{phase=\"stopping-child\"} 1\n",
+                    "/metrics/coordinator" => {
+                        "ds4_proxy_cluster_state{state=\"tensor-parallel-ready\"} 1\n"
+                    }
+                    _ => panic!("unexpected path: {path}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = MetricsClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            admin_token: None,
+            poll_interval: Duration::from_secs(2),
+            offline_backoff: Duration::from_secs(5),
+        };
+        let snapshot = client.fetch_metrics().await.unwrap();
+        server.abort();
+        assert_eq!(
+            snapshot.cluster_state.as_deref(),
+            Some("shutdown-stopping-child")
+        );
+    }
+
     #[test]
     fn builds_client_from_config() {
         let config = MonitorConfig::default();

@@ -258,6 +258,26 @@ impl AdminController {
         Ok(job)
     }
 
+    /// Whether an already-accepted lifecycle job can still mutate child state.
+    pub fn has_running_mutation(&self) -> bool {
+        let jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if jobs
+            .values()
+            .any(|job| job.state == AdminJobState::Running && job.operation != "fingerprint")
+        {
+            return true;
+        }
+        drop(jobs);
+        self.policy_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|job| job.state == PolicyJobState::Running)
+    }
+
     pub fn job(&self, job_id: &str) -> Option<AdminJob> {
         self.jobs
             .lock()
