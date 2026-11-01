@@ -5,6 +5,7 @@ mod bonjour;
 mod capability;
 mod control;
 mod coordinator;
+mod deployment;
 mod discovery;
 mod dry_run;
 mod ds4_command;
@@ -27,6 +28,7 @@ mod runtime;
 mod state;
 mod state_store;
 mod tp;
+pub use process::{TpLocalLifecycle, TpLocalStatus, TpLogReadiness, TpProcessSupervisor};
 mod worker;
 
 pub use admin::{
@@ -56,6 +58,7 @@ pub use coordinator::{
     CoordinatorLifecycleError, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
     DistributedCoordinatorLifecycle, PromotionRetryPolicy,
 };
+pub use deployment::RuntimeDeployment;
 pub use discovery::{
     CandidateError, CandidateSource, DiscoveryCandidate, DiscoveryInput, DiscoveryTracker,
     ResolvedBonjourService,

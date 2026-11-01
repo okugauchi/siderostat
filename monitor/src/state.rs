@@ -126,11 +126,23 @@ impl DisplayState {
     /// Mark the monitor as connected but unable to read the selected metrics.
     pub fn mark_degraded(&mut self) {
         self.status = MonitorStatus::Degraded;
+        self.clear_shutdown_progress();
     }
 
     /// Mark the monitor as offline after both metrics and health polling fail.
     pub fn mark_offline(&mut self) {
         self.status = MonitorStatus::Offline;
+        self.clear_shutdown_progress();
+    }
+
+    fn clear_shutdown_progress(&mut self) {
+        if self
+            .cluster_state
+            .as_deref()
+            .is_some_and(|value| value.starts_with("shutdown-"))
+        {
+            self.cluster_state = None;
+        }
     }
 }
 
@@ -430,6 +442,16 @@ mod tests {
         assert_eq!(state.decode_completion, 42);
         assert_eq!(state.decode_elapsed_secs, 1.5);
         assert_eq!(state.decode_progress_age_secs, Some(3.5));
+    }
+
+    #[test]
+    fn losing_metrics_does_not_preserve_stale_shutdown_progress() {
+        let mut state = DisplayState::default();
+        let mut values = snapshot();
+        values.cluster_state = Some("shutdown-stopping-child".into());
+        state.apply_metrics(&values);
+        state.mark_degraded();
+        assert_eq!(state.cluster_state, None);
     }
 
     #[test]

@@ -90,6 +90,21 @@ The menu bar monitor shows the current state and progress. During startup or a s
 may temporarily fail with HTTP 503 or HTTP 504. siDeroStat does not replay a failed request, so the
 client application must decide whether a retry is safe.
 
+For uncompressed streaming responses from `/v1/chat/completions` and `/v1/completions`, an
+interruption can produce an SSE `error` event without `[DONE]`. Clients should treat an error or a
+missing completion marker as failure. Individual SSE events are limited to 1 MiB. If the client
+connection itself is lost, the error event cannot be guaranteed; compressed streams retain
+transport-error behavior.
+
+While the runtime is shutting down, the menu bar can show when it is waiting for requests or operations,
+stopping child processes, or reporting a stop failure. Short phases may finish between polls. If the
+runtime is unreachable, the monitor shows `offline`; this does not confirm that child processes stopped.
+When the service stops, active proxy requests are interrupted before owned child cleanup. The bundled
+service requests a 600-second shutdown timeout, but macOS reported 60 seconds on both tested Macs.
+Stalled operations or custom timeouts can exceed the effective deadline.
+Before upgrading from an older build, finish active requests because the installed build's own stop
+deadline remains in effect. Even when idle, a slow child stop can exceed that older deadline.
+
 ### Connection mode
 
 From the menu bar you can choose the connection mode:
@@ -137,9 +152,11 @@ explicitly. It does **not** serve real inference requests, so it must not be use
 - A short interruption can occur while the operating state changes or the inference service starts.
 - Automatic degraded recovery is disabled by default. When enabled, recovery is bounded and does not
   bypass the inference service's normal request queue.
-- Mac-to-Mac tensor parallelism is implemented and gated by the connection mode, peer negotiation,
-  and upstream capability. Real-device RDMA/TP acceptance passed for the verified
-  two-node setup. TP is never started against an unsupported peer.
+- Mac-to-Mac tensor parallelism uses the normal startup and recovery path with verified role
+  artifacts, RDMA capability, child handshakes, HTTP readiness, and a generation warm-up.
+  The software tests use two-node control HTTP with injected lifecycles. Earlier direct upstream
+  RDMA/TP tests do not establish acceptance of this siDeroStat startup path on physical Macs;
+  that acceptance remains a separate step. See [TP operation](docs/operations.md#tensor-parallel-operation).
 - RDMA transport and distributed DSpark optimization are not reimplemented; TP follows the upstream
   DS4 main contract.
 - `serve --dry-run` is a development-only clustering check and does not process real inference.
@@ -148,4 +165,5 @@ explicitly. It does **not** serve real inference requests, so it must not be use
 
 - [Installation guide](docs/installation.md) · [日本語](docs/installation.ja.md)
 - [Operations guide](docs/operations.md) · [日本語](docs/operations.ja.md)
+- [V4.1 Flash 1017 Q2 setup and download guide (Japanese)](docs/tp-v41-1017-setup.ja.md)
 - [Troubleshooting guide](docs/troubleshooting.md) · [日本語](docs/troubleshooting.ja.md)

@@ -86,7 +86,21 @@ pub fn parse_metrics(text: &str) -> MetricsSnapshot {
     }
 
     let cluster_mode = label_from_sample(text, "ds4_proxy_cluster_mode", "mode");
-    let cluster_state = label_from_sample(text, "ds4_proxy_cluster_state", "state");
+    let shutdown = if samples
+        .get("ds4_proxy_shutdown_phase")
+        .is_some_and(|v| *v == 1.0)
+    {
+        match label_from_sample(text, "ds4_proxy_shutdown_phase", "phase").as_deref() {
+            Some("draining") => Some("shutdown-draining".to_string()),
+            Some("stopping-child") => Some("shutdown-stopping-child".to_string()),
+            Some("failed") => Some("shutdown-failed".to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cluster_state =
+        shutdown.or_else(|| label_from_sample(text, "ds4_proxy_cluster_state", "state"));
     let node_id = label_from_sample(text, "ds4_proxy_cluster_mode", "node_id");
 
     MetricsSnapshot {
@@ -242,6 +256,19 @@ ds4_proxy_cluster_generation{node_id="macstudio"} 42
 # TYPE ds4_proxy_target_ready gauge
 ds4_proxy_target_ready{target="local-standalone"} 1
 "#
+    }
+
+    #[test]
+    fn shutdown_phase_overrides_stale_cluster_state() {
+        let text = format!(
+            "{}\nds4_proxy_shutdown_phase{{phase=\"stopping-child\"}} 1\n",
+            sample_metrics()
+        );
+        let snapshot = parse_metrics(&text);
+        assert_eq!(
+            snapshot.cluster_state.as_deref(),
+            Some("shutdown-stopping-child")
+        );
     }
 
     #[test]

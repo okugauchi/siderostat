@@ -79,3 +79,10 @@
 "uninstaller.result.ok" = "OK";
 "uninstaller.failure.title" = "siDeroStatを完全には削除できませんでした";
 "uninstaller.failure.message" = "ユーザーデータは意図的に削除していません。表示された状態を解消して、Uninstallerを再度実行してください。";
+
+"status.shutdown.draining" = "停止中: 要求・操作の完了を待っています";
+"status.shutdown.child" = "停止中: 子プロセスを回収しています";
+"status.shutdown.failed" = "停止に失敗しました: 子プロセス状態を確認してください";
+"status.shutdown.short.draining" = "停止中: 完了待ち";
+"status.shutdown.short.child" = "停止中: 子プロセス";
+"status.shutdown.short.failed" = "停止失敗";

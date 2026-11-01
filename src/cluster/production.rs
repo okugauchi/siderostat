@@ -3,9 +3,9 @@ use super::{
     ControlMode, ControlResponse, ControlRole, ControlSecret, CoordinatorControl,
     CoordinatorDistributedRuntime, CoordinatorPeerLifecycle, CoordinatorRuntimeTimeouts,
     DistributedControlPhase, DistributedCoordinatorLifecycle, DistributedCoordinatorSupervisor,
-    DistributedManifest, DistributedWorkerLifecycle, DistributedWorkerSupervisor,
-    DryRunCoordinatorLifecycle, DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle, HEADER_NODE,
-    HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
+    DistributedWorkerLifecycle, DistributedWorkerSupervisor, DryRunCoordinatorLifecycle,
+    DryRunHello, DryRunRouteProbe, DryRunWorkerLifecycle, HEADER_NODE, HEADER_NONCE,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, InterfaceObservation, Ipv4Assignment,
     LocalStandaloneLifecycle, MacOsDynamicStoreWatcher, ModeRuntime, NetworkEvidence,
     NetworkObservation, NetworkServiceObservation, NetworkSnapshot, NodeDescriptor,
     PeerObservation, PolicyControlError, PolicyControlPhase, PolicyControlRequest,
@@ -53,6 +53,7 @@ pub(crate) mod policy;
 mod reconcile;
 mod recovery;
 pub(crate) mod tp;
+mod tp_control;
 mod tp_runtime;
 mod worker;
 
@@ -74,6 +75,7 @@ struct ControlClientInner {
     local_node_id: String,
     authenticator: ControlAuthenticator,
     lifecycle_timeout: Duration,
+    request_timeout: Duration,
 }
 
 /// Outcome of an operator reconcile on the production runtime (B-03). Distinguishes whether a
@@ -114,6 +116,7 @@ impl ProductionControlClient {
                     peer_address,
                 ),
                 lifecycle_timeout: request_timeout,
+                request_timeout,
             }),
         })
     }
@@ -301,6 +304,7 @@ pub struct ProductionClusterRuntime {
 }
 
 struct ProductionInner {
+    tp: Option<tp_runtime::TpRuntime>,
     role: LocalRole,
     local_address: IpAddr,
     peer_address: IpAddr,
@@ -318,7 +322,7 @@ struct ProductionInner {
     distributed_coordinator: OnceLock<Arc<dyn DistributedCoordinatorLifecycle>>,
     distributed_worker: Option<Arc<dyn DistributedWorkerLifecycle>>,
     config: ModeAwareConfig,
-    manifest: DistributedManifest,
+    manifest: super::RuntimeDeployment,
     recovery: Arc<recovery::PeerLossRecovery>,
     recovery_owner_active: AtomicBool,
     automatic_pairing_blocked: AtomicBool,
@@ -333,6 +337,7 @@ struct ProductionInner {
     /// prepare後、両nodeのcommitが揃うまで自動昇格を抑止する。。
     policy_pending: AtomicBool,
     policy_control: Arc<PolicyControlState>,
+    policy_transaction: Mutex<()>,
     policy_store: std::sync::Mutex<Option<Arc<StateStore>>>,
     /// Serializes policy-journal writes with the app-level runtime-state snapshot. Without this
     /// lock a background snapshot could read IntentSaved, then overwrite a concurrently
@@ -509,10 +514,38 @@ impl ProductionClusterRuntime {
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<StandaloneSupervisor>,
         metrics: Arc<Metrics>,
-        manifest: DistributedManifest,
+        manifest: impl Into<super::RuntimeDeployment>,
         control_secret: Vec<u8>,
         control_session_generation: Option<u64>,
     ) -> anyhow::Result<Self> {
+        let manifest = manifest.into();
+        if manifest.tp().is_some() {
+            let command = manifest.tp_command(&config, role, config.cluster.coordinator_address)?;
+            let child = Arc::new(super::TpProcessSupervisor::new(
+                command,
+                config.clone(),
+                role == LocalRole::Coordinator,
+            ));
+            let port = config.cluster.control_port;
+            let runtime = Self::new_inner(
+                config,
+                role,
+                mode,
+                proxy,
+                standalone,
+                metrics,
+                manifest,
+                control_secret,
+                port,
+                control_session_generation,
+                None,
+                None,
+                false,
+                Some(child),
+            )?;
+            runtime.start_network_evidence_monitor();
+            return Ok(runtime);
+        }
         let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
         {
             Some(Arc::new(DistributedWorkerSupervisor::new(
@@ -564,6 +597,7 @@ impl ProductionClusterRuntime {
             worker_child,
             coordinator_child,
             false,
+            None,
         )?;
         // N-02: share verified network observations into the control plane so `route_scoped` is
         // measured, not hard-coded. The monitor runs only for production (`new`); tests inject
@@ -587,11 +621,31 @@ impl ProductionClusterRuntime {
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<StandaloneSupervisor>,
         metrics: Arc<Metrics>,
-        manifest: DistributedManifest,
+        manifest: impl Into<super::RuntimeDeployment>,
         control_secret: Vec<u8>,
         peer_control_port: u16,
         control_session_generation: Option<u64>,
     ) -> anyhow::Result<Self> {
+        let manifest = manifest.into();
+        if manifest.tp().is_some() {
+            return Self::new_inner(
+                config,
+                role,
+                mode,
+                proxy,
+                standalone,
+                metrics,
+                manifest,
+                control_secret,
+                peer_control_port,
+                control_session_generation,
+                None,
+                None,
+                true,
+                Some(Arc::new(super::process::SimulatedTp::default())),
+            );
+        }
+
         let coordinator_address = config.cluster.coordinator_address;
         let worker_address = config.cluster.worker_address;
         let worker_child: Option<Arc<dyn DistributedWorkerLifecycle>> = if role == LocalRole::Worker
@@ -613,7 +667,7 @@ impl ProductionClusterRuntime {
                 distributed_port: config.cluster.ds4_distributed_port,
                 layer_start: worker_start,
                 context_size: config.ds4.distributed.context_size,
-                model_name: manifest.model_family.clone(),
+                model_name: manifest.model_family().to_owned(),
                 listen_port: config.cluster.ds4_distributed_port,
             })))
         } else {
@@ -635,6 +689,7 @@ impl ProductionClusterRuntime {
             // route probe can observe the control plane through a `Weak<ProductionInner>`.
             None,
             true,
+            None,
         )?;
         // The control plane is fail-closed: without a bridge0-scoped peer it rejects
         // establish/renew. Seed a synthetic authenticated-peer snapshot so the production
@@ -662,13 +717,14 @@ impl ProductionClusterRuntime {
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<dyn LocalStandaloneLifecycle>,
         metrics: Arc<Metrics>,
-        manifest: DistributedManifest,
+        manifest: super::RuntimeDeployment,
         control_secret: Vec<u8>,
         peer_control_port: u16,
         control_session_generation: Option<u64>,
         worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
         coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
         dry_run: bool,
+        tp_child: Option<Arc<dyn super::TpLocalLifecycle>>,
     ) -> anyhow::Result<Self> {
         ensure!(role != LocalRole::Unknown, "cluster role is unknown");
         manifest.validate()?;
@@ -732,23 +788,25 @@ impl ProductionClusterRuntime {
                 .saturating_add(config.cluster.timeouts.peer_request),
         )?;
         let lease = LeaseStatus::new();
-        let (worker_runtime, distributed_worker) = if role == LocalRole::Worker {
-            let child = worker_child.context("worker child lifecycle missing")?;
-            (
-                Some(WorkerDistributedRuntime::new(
-                    proxy.admission().clone(),
-                    standalone.clone(),
-                    child.clone(),
-                    config.cluster.timeouts.drain,
-                    config.cluster.timeouts.worker_startup,
-                    Duration::from_secs(1),
-                )?),
-                Some(child),
-            )
-        } else {
-            (None, None)
-        };
+        let (worker_runtime, distributed_worker) =
+            if role == LocalRole::Worker && tp_child.is_none() {
+                let child = worker_child.context("worker child lifecycle missing")?;
+                (
+                    Some(WorkerDistributedRuntime::new(
+                        proxy.admission().clone(),
+                        standalone.clone(),
+                        child.clone(),
+                        config.cluster.timeouts.drain,
+                        config.cluster.timeouts.worker_startup,
+                        Duration::from_secs(1),
+                    )?),
+                    Some(child),
+                )
+            } else {
+                (None, None)
+            };
         let inner = ProductionInner {
+            tp: tp_child.map(tp_runtime::TpRuntime::new),
             role,
             local_address,
             peer_address,
@@ -781,6 +839,7 @@ impl ProductionClusterRuntime {
             policy_epoch: AtomicU64::new(0),
             policy_pending: AtomicBool::new(false),
             policy_control: Arc::new(PolicyControlState::new()),
+            policy_transaction: Mutex::new(()),
             policy_store: std::sync::Mutex::new(None),
             policy_persistence: std::sync::Mutex::new(()),
             planned_restart: PlannedRestartGate::default(),
@@ -792,7 +851,9 @@ impl ProductionClusterRuntime {
         let runtime = Self {
             inner: Arc::new(inner),
         };
-        runtime.finish_coordinator()?;
+        if runtime.inner.tp.is_none() {
+            runtime.finish_coordinator()?;
+        }
         Ok(runtime)
     }
 
@@ -808,13 +869,14 @@ impl ProductionClusterRuntime {
         mode: Arc<ModeRuntime>,
         proxy: Arc<ModeAwareProxyState>,
         standalone: Arc<dyn LocalStandaloneLifecycle>,
-        manifest: DistributedManifest,
+        manifest: impl Into<super::RuntimeDeployment>,
         control_secret: Vec<u8>,
         peer_control_port: u16,
         control_session_generation: Option<u64>,
         worker_child: Option<Arc<dyn DistributedWorkerLifecycle>>,
         coordinator_child: Option<Arc<dyn DistributedCoordinatorLifecycle>>,
     ) -> anyhow::Result<Self> {
+        let manifest = manifest.into();
         Self::new_inner(
             config,
             role,
@@ -829,6 +891,7 @@ impl ProductionClusterRuntime {
             worker_child,
             coordinator_child,
             false,
+            None,
         )
     }
 
@@ -938,34 +1001,47 @@ impl ProductionClusterRuntime {
         operator_policy: OperationPolicy,
         peer_protocol_version: Option<u16>,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
-        use crate::cluster::TpSessionId;
-        use crate::target::ClusterState;
-        let verdict = self.tp_start_verdict(operator_policy, peer_protocol_version);
-        if !verdict.allows_tp() {
-            anyhow::bail!(
-                "TP 開始 gate が TP を許可しない（verdict={}, policy={:?}, peer_protocol={:?}）",
-                verdict.name(),
-                operator_policy,
-                peer_protocol_version
-            );
-        }
-        // 現在の snapshot が TP 開始可能な状態（Solo/Paired ready）かを確認。
-        let current = self.inner.mode.snapshot();
-        if !matches!(
-            current.state,
-            ClusterState::PairedStandaloneReady | ClusterState::SoloStandaloneReady
-        ) {
-            anyhow::bail!(
-                "TP は Solo/Paired ready からしか開始できない: {:?}",
-                current.state
-            );
-        }
-        tp_runtime::drive_tp_ready(
-            &self.inner.mode.cluster_handle(),
-            self.inner.proxy.clone(),
-            TpSessionId(1),
+        ensure!(
+            self.tp_start_verdict(operator_policy, peer_protocol_version)
+                .allows_tp(),
+            "TP start rejected by policy/protocol"
+        );
+        self.tp_promote().await
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tp_lifecycle(
+        config: ModeAwareConfig,
+        role: LocalRole,
+        mode: Arc<ModeRuntime>,
+        proxy: Arc<ModeAwareProxyState>,
+        standalone: Arc<dyn LocalStandaloneLifecycle>,
+        manifest: super::RuntimeDeployment,
+        secret: Vec<u8>,
+        peer_port: u16,
+        child: Arc<dyn super::TpLocalLifecycle>,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            manifest.tp().is_some(),
+            "TP lifecycle requires a TP manifest"
+        );
+        Self::new_inner(
+            config,
+            role,
+            mode,
+            proxy,
+            standalone,
+            Arc::new(Metrics::default()),
+            manifest,
+            secret,
+            peer_port,
+            None,
+            None,
+            None,
+            false,
+            Some(child),
         )
-        .await
     }
 
     #[cfg(feature = "test-support")]
@@ -1017,6 +1093,21 @@ impl ProductionClusterRuntime {
             .store(false, Ordering::Release);
         let was_manual =
             self.inner.mode.snapshot().state == ClusterState::ManualInterventionRequired;
+        if let Some(tp) = &self.inner.tp {
+            let _effect = tp.effects.lock().await;
+            if was_manual {
+                self.tp_fallback_locked().await?;
+            }
+            return Ok(if self.inner.role == LocalRole::Coordinator {
+                OperatorReconcileOutcome::Coordinator {
+                    manual_cleared: was_manual,
+                }
+            } else {
+                OperatorReconcileOutcome::NotCoordinator {
+                    manual_cleared: was_manual,
+                }
+            });
+        }
         if let Some(runtime) = self.inner.coordinator_runtime.get() {
             runtime.operator_reconcile().await?;
             return Ok(OperatorReconcileOutcome::Coordinator {
@@ -1094,6 +1185,9 @@ impl ProductionClusterRuntime {
     }
 
     pub async fn stop_for_planned_restart(&self, _drain_timeout: Duration) -> anyhow::Result<()> {
+        if self.inner.tp.is_some() {
+            return self.tp_stop_for_restart().await;
+        }
         if self.inner.role == LocalRole::Coordinator
             && self.inner.mode.snapshot().state == ClusterState::DistributedReady
         {
@@ -1205,6 +1299,19 @@ impl ProductionClusterRuntime {
     /// StateStoreをpolicy control endpointへ接続する。起動時のStateStore取得後、control
     /// listener開始前に一度だけ呼び出す。
     pub fn attach_policy_store(&self, store: Arc<StateStore>) {
+        if let Some(tp) = &self.inner.tp {
+            let restored = self.restore_tp_state(&store);
+            match restored {
+                Ok(journal) => *tp.journal.lock().unwrap_or_else(|e| e.into_inner()) = journal,
+                Err(error) => {
+                    tp.journal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failed_attempts = 3;
+                    tracing::error!(error=%error,"TP journal could not be restored; promotion blocked");
+                }
+            }
+        }
         *self
             .inner
             .policy_store
@@ -1230,6 +1337,7 @@ impl ProductionClusterRuntime {
         expected_generation: u64,
         operation_id: uuid::Uuid,
     ) -> anyhow::Result<serde_json::Value> {
+        let _policy_transaction = self.inner.policy_transaction.lock().await;
         let current_generation = self.inner.mode.snapshot().generation;
         anyhow::ensure!(
             expected_generation == 0 || expected_generation == current_generation,
@@ -1299,6 +1407,9 @@ impl ProductionClusterRuntime {
         &self,
         request: &PolicyControlRequest,
     ) -> anyhow::Result<PolicyControlResponse> {
+        let reset_tp = request.phase == PolicyControlPhase::Commit
+            && request.desired == OperationPolicy::Automatic
+            && self.applied_policy() == OperationPolicy::ForcedStandalone;
         match request.phase {
             PolicyControlPhase::Prepare => {
                 let _persistence_guard = self.policy_persistence_guard();
@@ -1345,6 +1456,9 @@ impl ProductionClusterRuntime {
             PolicyControlPhase::Abort => {
                 self.set_policy_pending(false);
             }
+        }
+        if reset_tp {
+            self.reset_tp_budget()?;
         }
         Ok(PolicyControlResponse {
             status: PolicyControlStatus::Applied,
@@ -1466,6 +1580,7 @@ impl ProductionClusterRuntime {
 
     pub fn router(&self) -> Router {
         Router::new()
+            .route(tp_control::TP_PATH, post(tp_control::handle))
             .route("/v1/node", get(control_node))
             .route("/v1/metrics", get(control_metrics))
             .route("/v1/pair", post(control_pair))
@@ -1491,7 +1606,7 @@ impl ProductionClusterRuntime {
     pub async fn diagnostics(&self) -> ProductionDiagnostics {
         let inner = &self.inner;
         let now = now_millis();
-        let (generation, phase, role, lease, peer_distributed_child_generation) =
+        let (generation, mut phase, role, mut lease, peer_distributed_child_generation) =
             match &inner.control {
                 RoleControl::Coordinator(control) => {
                     let control = control.lock().await;
@@ -1515,7 +1630,7 @@ impl ProductionClusterRuntime {
                 }
             };
         let standalone_ready = inner.mode.snapshot().local_standalone_ready;
-        let children = ChildrenDiagnostics {
+        let mut children = ChildrenDiagnostics {
             standalone: Some(child_diagnostics(
                 inner.standalone.child_identity().await,
                 inner.standalone.is_running().await.ok(),
@@ -1538,6 +1653,43 @@ impl ProductionClusterRuntime {
                 None => None,
             },
         };
+        if let Some(tp) = &inner.tp {
+            let session = tp.session_id();
+            let status = if let Some(id) = session {
+                tp.child.status(id).await.ok()
+            } else {
+                None
+            };
+            let child = child_diagnostics(
+                tp.child.child_identity().await,
+                status.map(|s| s.running),
+                Some(inner.mode.snapshot().state == ClusterState::TensorParallelReady),
+            );
+            match inner.role {
+                LocalRole::Coordinator => children.distributed_coordinator = Some(child),
+                LocalRole::Worker => children.distributed_worker = Some(child),
+                LocalRole::Unknown => {}
+            }
+            let expires = inner.lease.expires_at.load(Ordering::Acquire);
+            let scoped = inner.network.route_scoped();
+            lease = LeaseDiagnostics {
+                valid: now < expires,
+                expires_at_millis: (expires > 0).then_some(expires),
+                route_scoped: scoped,
+                peer_present: now < expires && scoped,
+                peer: None,
+            };
+            phase = match inner.mode.snapshot().state {
+                ClusterState::TensorParallelReady => DistributedControlPhase::WorkerReady,
+                ClusterState::TensorParallelStarting
+                | ClusterState::AwaitingTensorParallelWorkerHello => {
+                    DistributedControlPhase::WorkerPreparing
+                }
+                ClusterState::DemotingTensorParallel => DistributedControlPhase::Draining,
+                ClusterState::PairedStandaloneReady => DistributedControlPhase::Paired,
+                _ => DistributedControlPhase::Unpaired,
+            };
+        }
         ProductionDiagnostics {
             control_session: ControlSessionDiagnostics {
                 generation,

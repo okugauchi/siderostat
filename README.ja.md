@@ -79,6 +79,20 @@ http://127.0.0.1:18080/v1
 メニューバーのモニターで現在の状態と進行状況を確認できます。起動中や状態の切り替え中は、要求が HTTP 503 または HTTP 504 で
 一時的に失敗することがあります。siDeroStat は失敗した要求を再実行しないため、安全に再試行できるかは利用するアプリケーション側で判断してください。
 
+`/v1/chat/completions` と `/v1/completions` の非圧縮ストリームが中断した場合、`[DONE]` のない
+SSE `error` イベントを返すことがあります。クライアントはエラーまたは完了マーカーの欠落を失敗として扱ってください。
+SSEイベントは1件あたり最大1 MiBです。クライアントとの接続自体が失われた場合はエラーの到達を保証できず、
+圧縮ストリームは通信エラーとして終了します。
+
+runtimeの停止中は、要求・操作の完了待ち、子プロセスの回収中、停止失敗をメニューバーに表示できます。
+短い段階は監視間隔の間に終了することがあります。runtimeに接続できない場合は `offline` と表示し、
+子プロセスの停止完了を意味しません。
+サービスの停止時は、処理中のproxy要求を中断してから所有する子プロセスを回収します。同梱サービスの
+停止期限として600秒を指定していますが、実機のmacOSでは両機とも60秒と表示されました。
+停滞した操作や変更されたtimeoutによっては実際の期限を超えることがあります。
+旧版から更新する際は、その版の停止期限が適用されるため、先に処理中の要求を終了してください。
+要求がなくても子プロセスの停止が旧期限を超える場合があります。
+
 ### 接続モード
 
 メニューバーから接続モードを選択できます。
@@ -109,9 +123,11 @@ Responses API 用の任意の Web Search Bridge（SearXNG 基盤）を提供し�
 - Mac とモデルの構成は、ソースリビジョンで定められた互換性条件を満たす必要があります。
 - 動作状態の切り替え中や推論サービスの起動中は、短い中断が発生することがあります。
 - 自動的な縮退復旧は既定で無効です。有効にした場合も、復旧回数に上限があり、推論サービスの通常の要求待ち行列を迂回しません。
-- Mac 間 tensor parallelism は実装済みで、接続モード・peer 交渉・upstream capability で
-  gate されます。確認済みの2-node構成で実RDMA/TP受入は完了しています。
-  非対応 peer では起動しません。
+- Mac 間 tensor parallelism は通常の起動・復帰経路を使い、role artifact、RDMA capability、
+  child の接続、HTTP 準備、生成 warm-up を確認します。ソフトウェア試験は2-node制御HTTPと
+  注入した lifecycle で行っています。過去の上流直接起動による RDMA/TP 試験は、この
+  siDeroStat 起動経路の実機受入を証明しません。実機受入は別途必要です。
+  [TP の運用](docs/operations.ja.md#tensor-parallel-の運用)を参照してください。
 - RDMA transport と distributed DSpark の最適化は再実装しません。TP は upstream の
   DS4 main 契約に従います。
 - `serve --dry-run` は開発専用のクラスタリング確認であり、実推論を処理しません。
@@ -120,4 +136,5 @@ Responses API 用の任意の Web Search Bridge（SearXNG 基盤）を提供し�
 
 - [導入ガイド](docs/installation.ja.md) · [English](docs/installation.md)
 - [運用ガイド](docs/operations.ja.md) · [English](docs/operations.md)
+- [V4.1 Flash 1017 Q2の設定とダウンロード](docs/tp-v41-1017-setup.ja.md)
 - [トラブルシューティング](docs/troubleshooting.ja.md) · [English](docs/troubleshooting.md)

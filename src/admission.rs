@@ -39,6 +39,7 @@ pub enum DrainError {
 #[derive(Debug)]
 struct Inner {
     state: AdmissionState,
+    closed: bool,
     in_flight: usize,
     max_in_flight: usize,
     drain_generation: Option<u64>,
@@ -67,6 +68,7 @@ impl AdmissionGate {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner {
                     state: AdmissionState::Blocked,
+                    closed: false,
                     in_flight: 0,
                     max_in_flight,
                     drain_generation: None,
@@ -88,12 +90,22 @@ impl AdmissionGate {
 
     pub fn start_serving(&self) {
         let mut inner = self.lock();
+        if inner.closed {
+            return;
+        }
         inner.state = AdmissionState::Serving;
         inner.drain_generation = None;
     }
 
     pub fn block(&self) {
         self.lock().state = AdmissionState::Blocked;
+    }
+
+    /// Permanently close this process's gate, including recovery-canary access.
+    pub(crate) fn close(&self) {
+        let mut inner = self.lock();
+        inner.closed = true;
+        inner.state = AdmissionState::Blocked;
     }
 
     /// Keeps admission blocked while retiring the generation marker from a completed drain.
@@ -131,6 +143,9 @@ impl AdmissionGate {
         inner: &mut Inner,
         upstream_ready: bool,
     ) -> Result<AdmissionPermit, AdmissionError> {
+        if inner.closed {
+            return Err(AdmissionError::NotServing);
+        }
         if !upstream_ready {
             return Err(AdmissionError::UpstreamNotReady);
         }

@@ -10,7 +10,7 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream};
 use std::{
     collections::HashSet,
@@ -24,6 +24,174 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+type ResponseStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
+
+// Keep an incomplete event private: once sent, its partial JSON cannot be retracted
+// before a later failure event. Limits apply to one event, not the transport chunk.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct SseFrameBuffer {
+    bytes: BytesMut,
+    cursor: usize,
+    line_start: usize,
+    pending_lf: bool,
+}
+
+impl SseFrameBuffer {
+    fn take_event(&mut self, eof: bool) -> Option<Bytes> {
+        if self.pending_lf {
+            if self.bytes.is_empty() && !eof {
+                return None;
+            }
+            self.pending_lf = false;
+            if self.bytes.first() == Some(&b'\n') {
+                return Some(self.bytes.split_to(1).freeze());
+            }
+        }
+        while self.cursor < self.bytes.len() {
+            let byte = self.bytes[self.cursor];
+            if byte != b'\n' && byte != b'\r' {
+                self.cursor += 1;
+                continue;
+            }
+            if byte == b'\r'
+                && self.cursor + 1 == self.bytes.len()
+                && !eof
+                && self.cursor != self.line_start
+            {
+                return None;
+            }
+            let split_crlf = byte == b'\r' && self.cursor + 1 == self.bytes.len() && !eof;
+            let end = self.cursor
+                + if byte == b'\r' && self.bytes.get(self.cursor + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+            let empty = self.cursor == self.line_start;
+            self.cursor = end;
+            self.line_start = end;
+            if empty {
+                self.pending_lf = split_crlf;
+                let event = self.bytes.split_to(end).freeze();
+                self.cursor = 0;
+                self.line_start = 0;
+                return Some(event);
+            }
+        }
+        None
+    }
+}
+
+fn is_sse_terminal_event(event: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(event);
+    let text = text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let data = text
+        .lines()
+        .filter_map(|line| {
+            if line == "data" {
+                Some("")
+            } else {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    data == "[DONE]"
+        || serde_json::from_str::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|value| value.get("error").cloned())
+            .is_some_and(|error| !error.is_null())
+}
+
+fn frame_sse_stream(source: ResponseStream, require_terminal: bool) -> ResponseStream {
+    Box::pin(stream::unfold(
+        (
+            source,
+            SseFrameBuffer::default(),
+            false,
+            false,
+            None::<io::Error>,
+        ),
+        move |(mut source, mut buffer, mut eof, done, mut pending_error)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                if let Some(event) = buffer.take_event(eof) {
+                    if event.len() > MAX_SSE_EVENT_BYTES {
+                        return Some((
+                            Err(io::Error::other("SSE event exceeds size limit")),
+                            (source, buffer, eof, true, pending_error),
+                        ));
+                    }
+                    let terminal = require_terminal && is_sse_terminal_event(&event);
+                    return Some((Ok(event), (source, buffer, eof, terminal, pending_error)));
+                }
+                if let Some(error) = pending_error.take() {
+                    return Some((Err(error), (source, buffer, eof, true, None)));
+                }
+                if buffer.bytes.len() > MAX_SSE_EVENT_BYTES || (eof && !buffer.bytes.is_empty()) {
+                    return Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "incomplete or oversized SSE event",
+                        )),
+                        (source, buffer, eof, true, None),
+                    ));
+                }
+                if eof {
+                    return if require_terminal {
+                        Some((
+                            Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "SSE completion marker missing",
+                            )),
+                            (source, buffer, eof, true, None),
+                        ))
+                    } else {
+                        None
+                    };
+                }
+                match source.next().await {
+                    Some(Ok(chunk)) => buffer.bytes.extend_from_slice(&chunk),
+                    Some(Err(error)) => {
+                        eof = true;
+                        pending_error = Some(error);
+                    }
+                    None => eof = true,
+                }
+            }
+        },
+    ))
+}
+
+fn with_idle_timeout(source: ResponseStream, timeout: Duration) -> ResponseStream {
+    Box::pin(stream::unfold(
+        (source, false),
+        move |(mut source, done)| async move {
+            if done {
+                return None;
+            }
+            match tokio::time::timeout(timeout, source.next()).await {
+                Ok(Some(result)) => Some((result, (source, false))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream stream idle timeout",
+                    )),
+                    (source, true),
+                )),
+            }
+        },
+    ))
+}
 
 struct RecoveryCanaryPermit {
     recovery_id: String,
@@ -243,6 +411,7 @@ pub struct ModeAwareProxyState {
     stream_idle_timeout: std::time::Duration,
     metrics: RwLock<Option<Arc<Metrics>>>,
     recovery_canary: Mutex<Option<RecoveryCanaryPermit>>,
+    stream_interrupt: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +450,7 @@ impl ModeAwareProxyState {
             stream_idle_timeout: options.stream_idle_timeout,
             metrics: RwLock::new(None),
             recovery_canary: Mutex::new(None),
+            stream_interrupt: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -293,6 +463,11 @@ impl ModeAwareProxyState {
 
     pub fn admission(&self) -> &AdmissionGate {
         &self.admission
+    }
+
+    pub(crate) fn interrupt_in_flight(&self) {
+        self.admission.close();
+        self.stream_interrupt.send_replace(true);
     }
 
     /// Issue a short-lived, one-use permit for the recovery owner's fixed canary. The token is
@@ -460,6 +635,7 @@ pub async fn forward_mode_aware(
     context: ProxyRequestContext,
     request: Request<Body>,
 ) -> Response<Body> {
+    let mut interrupt = state.stream_interrupt.subscribe();
     let started = std::time::Instant::now();
     let (mut parts, body) = request.into_parts();
     let recovery_canary = parts
@@ -579,7 +755,12 @@ pub async fn forward_mode_aware(
         .request(method, url)
         .headers(headers)
         .body(reqwest::Body::wrap_stream(request_stream));
-    let upstream = match tokio::time::timeout(state.response_header_timeout, builder.send()).await {
+    let upstream_result = tokio::select! {
+        biased;
+        _ = wait_for_interrupt(&mut interrupt) => return observed_error(ProxyError::NoBackendAvailable, &request_id, &mut observation),
+        result = tokio::time::timeout(state.response_header_timeout, builder.send()) => result,
+    };
+    let upstream = match upstream_result {
         Err(_) => {
             return observed_error(
                 ProxyError::ResponseHeaderTimeout,
@@ -602,16 +783,37 @@ pub async fn forward_mode_aware(
         Ok(Ok(response)) => response,
     };
 
-    match prepare_mode_aware_response(&state, upstream).await {
+    let prepared = tokio::select! {
+        biased;
+        _ = wait_for_interrupt(&mut interrupt) => return observed_error(ProxyError::NoBackendAvailable, &request_id, &mut observation),
+        result = prepare_mode_aware_response(&state, upstream) => result,
+    };
+    match prepared {
         Ok(prepared) => {
             if let Some(observation) = observation.as_mut() {
                 observation.set_status(prepared.status.as_u16());
                 observation.set_ttfb(started.elapsed().as_secs_f64());
             }
-            build_mode_aware_response(&state, &request_id, prepared, permit, observation)
+            let completion = parts.method != Method::HEAD
+                && matches!(parts.uri.path(), "/v1/chat/completions" | "/v1/completions");
+            build_mode_aware_response(
+                &state,
+                &request_id,
+                prepared,
+                permit,
+                observation,
+                completion,
+            )
         }
         Err(error) => observed_error(error, &request_id, &mut observation),
     }
+}
+
+async fn wait_for_interrupt(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow_and_update() {
+        return;
+    }
+    let _ = receiver.changed().await;
 }
 
 fn safe_path_template(path: &str) -> &'static str {
@@ -734,53 +936,119 @@ fn build_mode_aware_response(
     prepared: ModeAwarePreparedResponse,
     permit: AdmissionPermit,
     observation: Option<RequestMetricGuard>,
+    completion: bool,
 ) -> Response<Body> {
     let status = prepared.status;
     let headers = prepared.headers;
+    let is_sse = completion
+        && !matches!(
+            status,
+            StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+        )
+        && headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        && headers.get_all("content-encoding").iter().all(|value| {
+            value
+                .to_str()
+                .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+        });
     let idle_timeout = state.stream_idle_timeout;
-    let stream = stream::unfold(
-        (
-            prepared.first_chunk,
-            prepared.stream,
-            Some(permit),
-            observation,
+    let interrupt = state.stream_interrupt.subscribe();
+    let first = stream::iter(prepared.first_chunk.map(Ok::<Bytes, io::Error>));
+    let source: ResponseStream = Box::pin(
+        first.chain(
+            prepared
+                .stream
+                .map(|result| result.map_err(io::Error::other)),
         ),
-        move |(first, mut upstream, permit, mut observation)| async move {
-            if let Some(chunk) = first {
-                return Some((Ok(chunk), (None, upstream, permit, observation)));
+    );
+    let source = with_idle_timeout(source, idle_timeout);
+    let source = if is_sse {
+        frame_sse_stream(source, completion && status.is_success())
+    } else {
+        source
+    };
+    let stream = stream::unfold(
+        (source, Some(permit), observation, interrupt, false),
+        move |(mut upstream, permit, mut observation, mut interrupt, done)| async move {
+            if done {
+                return None;
             }
-            match tokio::time::timeout(idle_timeout, upstream.next()).await {
-                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (None, upstream, permit, observation))),
-                Ok(Some(Err(_))) => {
-                    if let Some(observation) = observation.as_mut() {
-                        observation.set_failure("stream-error");
-                    }
-                    upstream = Box::pin(stream::empty());
-                    Some((
-                        Err(io::Error::other("upstream stream error")),
-                        (None, upstream, None, observation),
-                    ))
+            if *interrupt.borrow() {
+                if let Some(observation) = observation.as_mut() {
+                    observation.set_failure("stream-interrupted");
                 }
-                Err(_) => {
+                upstream = Box::pin(stream::empty());
+                let result = if is_sse {
+                    Ok(Bytes::from_static(b"\n\ndata: {\"error\":{\"message\":\"Stream interrupted by runtime restart\",\"type\":\"service_unavailable\",\"code\":\"stream_interrupted\"}}\n\n"))
+                } else {
+                    Err(io::Error::other("stream interrupted by runtime restart"))
+                };
+                return Some((result, (upstream, None, observation, interrupt, true)));
+            }
+            let next = tokio::select! {
+                biased;
+                _ = interrupt.changed() => {
+                    if let Some(observation) = observation.as_mut() { observation.set_failure("stream-interrupted"); }
+                    upstream = Box::pin(stream::empty());
+                    let result = if is_sse {
+                        Ok(Bytes::from_static(b"\n\ndata: {\"error\":{\"message\":\"Stream interrupted by runtime restart\",\"type\":\"service_unavailable\",\"code\":\"stream_interrupted\"}}\n\n"))
+                    } else { Err(io::Error::other("stream interrupted by runtime restart")) };
+                    return Some((result, (upstream, None, observation, interrupt, true)));
+                }
+                next = upstream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    Some((Ok(chunk), (upstream, permit, observation, interrupt, false)))
+                }
+                Some(Err(error)) if error.kind() == io::ErrorKind::TimedOut => {
                     if let Some(observation) = observation.as_mut() {
                         observation.set_failure("stream-idle-timeout");
                     }
                     upstream = Box::pin(stream::empty());
+                    if is_sse {
+                        return Some((
+                            Ok(Bytes::from_static(b"\n\ndata: {\"error\":{\"message\":\"Upstream stream timed out\",\"type\":\"upstream_timeout\",\"code\":\"upstream_stream_timeout\"}}\n\n")),
+                            (upstream, None, observation, interrupt, true),
+                        ));
+                    }
+                    Some((Err(error), (upstream, None, observation, interrupt, true)))
+                }
+                Some(Err(error)) => {
+                    if let Some(observation) = observation.as_mut() {
+                        observation.set_failure("stream-error");
+                    }
+                    upstream = Box::pin(stream::empty());
+                    if is_sse {
+                        let payload = if error.kind() == io::ErrorKind::UnexpectedEof {
+                            b"\n\ndata: {\"error\":{\"message\":\"Upstream stream ended without completion\",\"type\":\"upstream_error\",\"code\":\"upstream_stream_incomplete\"}}\n\n".as_slice()
+                        } else {
+                            b"\n\ndata: {\"error\":{\"message\":\"Upstream stream interrupted\",\"type\":\"upstream_error\",\"code\":\"upstream_stream_interrupted\"}}\n\n".as_slice()
+                        };
+                        return Some((
+                            Ok(Bytes::from_static(payload)),
+                            (upstream, None, observation, interrupt, true),
+                        ));
+                    }
                     Some((
-                        Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "upstream stream idle timeout",
-                        )),
-                        (None, upstream, None, observation),
+                        Err(io::Error::other("upstream stream error")),
+                        (upstream, None, observation, interrupt, true),
                     ))
                 }
-                Ok(None) => None,
+                None => None,
             }
         },
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
+    if is_sse {
+        response.headers_mut().remove("content-length");
+    }
     insert_request_id(response.headers_mut(), request_id);
     response
 }
@@ -811,6 +1079,115 @@ mod tests {
         assert!(is_hop_by_hop("x-remove", &tokens));
         assert!(output.get("x-remove").is_none());
         assert_eq!(output.get("x-keep").unwrap(), "yes");
+    }
+
+    #[test]
+    fn sse_frames_survive_every_chunk_boundary_and_mixed_line_endings() {
+        let sample = b"\xef\xbb\xbf: comment\r\ndata: first\r\n\ndata: second\n\r\ndata: third\r\r";
+        for split in 0..=sample.len() {
+            let mut buffer = SseFrameBuffer::default();
+            let mut received = Vec::new();
+            for chunk in [&sample[..split], &sample[split..]] {
+                buffer.bytes.extend_from_slice(chunk);
+                while let Some(event) = buffer.take_event(false) {
+                    received.extend_from_slice(&event);
+                }
+            }
+            while let Some(event) = buffer.take_event(true) {
+                received.extend_from_slice(&event);
+            }
+            assert_eq!(received, sample, "split={split}");
+            assert!(buffer.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn completion_terminal_recognizes_done_and_multiline_error() {
+        assert!(is_sse_terminal_event(
+            b"\xef\xbb\xbf: comment\r\ndata: [DONE]\r\n\r\n"
+        ));
+        assert!(is_sse_terminal_event(
+            b"data: {\"error\":\r\ndata: {\"code\":\"failed\"}}\r\n\r\n"
+        ));
+        assert!(!is_sse_terminal_event(b"data: {\"choices\":[]}\n\n"));
+    }
+
+    #[tokio::test]
+    async fn sse_size_limit_applies_per_event_not_per_transport_chunk() {
+        let event = b"data: x\n\n";
+        let many = event.repeat(MAX_SSE_EVENT_BYTES / event.len() + 1);
+        let source: ResponseStream = Box::pin(stream::iter([Ok(Bytes::from(many.clone()))]));
+        let mut framed = frame_sse_stream(source, false);
+        let mut received = Vec::new();
+        while let Some(part) = framed.next().await {
+            received.extend_from_slice(&part.unwrap());
+        }
+        assert_eq!(received, many);
+        let source: ResponseStream = Box::pin(stream::iter([Ok(Bytes::from(vec![
+            b'x';
+            MAX_SSE_EVENT_BYTES
+                + 1
+        ]))]));
+        let mut framed = frame_sse_stream(source, false);
+        assert!(framed.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_sse_bytes_refresh_idle_timeout() {
+        let source: ResponseStream = Box::pin(stream::unfold(0, |step| async move {
+            if step >= 4 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let byte = b"d\n\n\n"[step];
+            Some((Ok(Bytes::copy_from_slice(&[byte])), step + 1))
+        }));
+        let mut framed =
+            frame_sse_stream(with_idle_timeout(source, Duration::from_millis(150)), false);
+        let first = tokio::time::timeout(Duration::from_secs(1), framed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Bytes::from_static(b"d\n\n"));
+    }
+
+    #[tokio::test]
+    async fn complete_cr_terminated_events_are_not_lost_on_transport_error() {
+        for (payload, terminal) in [
+            (b"data: [DONE]\r\r".as_slice(), true),
+            (b"data: first\r\r".as_slice(), false),
+        ] {
+            let source: ResponseStream = Box::pin(stream::iter([
+                Ok(Bytes::copy_from_slice(payload)),
+                Err(io::Error::other("upstream lost")),
+            ]));
+            let mut framed = frame_sse_stream(source, terminal);
+            assert_eq!(
+                framed.next().await.unwrap().unwrap(),
+                Bytes::copy_from_slice(payload)
+            );
+            if terminal {
+                assert!(framed.next().await.is_none());
+            } else {
+                assert!(framed.next().await.unwrap().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cr_terminated_event_does_not_wait_for_another_chunk() {
+        let source: ResponseStream = Box::pin(
+            stream::once(async { Ok(Bytes::from_static(b"data: [DONE]\r\r")) })
+                .chain(stream::pending()),
+        );
+        let mut framed = frame_sse_stream(source, true);
+        let event = tokio::time::timeout(Duration::from_millis(200), framed.next())
+            .await
+            .expect("completed event must not wait for the next transport chunk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event, Bytes::from_static(b"data: [DONE]\r\r"));
     }
 
     struct TestServer {
@@ -1171,6 +1548,305 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_upstream_disconnect_reports_failure_without_success_marker() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    match index {
+                        0 => Some((
+                            Ok::<_, io::Error>(Bytes::from_static(
+                                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                            )),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Some((Err(io::Error::other("simulated disconnect")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                let mut response = Response::new(Body::from_stream(chunks));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state.clone()).await;
+        let response = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap();
+        let body = response
+            .text()
+            .await
+            .expect("SSE failure must end as a complete HTTP response");
+        assert!(body.contains("\"content\":\"hi\""));
+        assert!(body.contains("\"error\""));
+        assert!(!body.contains("[DONE]"));
+        assert_eq!(state.admission().snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_interrupts_requests_waiting_for_headers_or_first_byte() {
+        use tokio::io::AsyncWriteExt;
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                if send_headers {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                }
+                let _ = ready.send(());
+                std::future::pending::<()>().await;
+            });
+            let state = mode_aware_state(address, 4096);
+            let proxy = start_mode_aware_proxy(state.clone()).await;
+            let request = tokio::spawn(async move {
+                reqwest::get(format!("http://{}/v1/chat/completions", proxy.address)).await
+            });
+            started.await.unwrap();
+            state.interrupt_in_flight();
+            let response = tokio::time::timeout(Duration::from_millis(500), request)
+                .await
+                .expect("restart must stop pending request")
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(state.admission().snapshot().in_flight, 0);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn interrupted_admission_cannot_be_reopened_by_stale_recovery() {
+        let state = mode_aware_state("127.0.0.1:1".parse().unwrap(), 4096);
+        state.interrupt_in_flight();
+        state.admission().start_serving();
+        assert!(state.admission().try_acquire(true).is_err());
+        assert!(state.admission().try_acquire_recovery(true).is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_mid_event_emits_only_complete_events_and_error() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    match index {
+                        0 => Some((
+                            Ok::<_, io::Error>(Bytes::from_static(b"data: {\"choices\":[]}")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Some((Err(io::Error::other("disconnect")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                let mut response = Response::new(Body::from_stream(chunks));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state).await;
+        let body = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let events: Vec<_> = body
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "partial upstream event must be withheld: {body:?}"
+        );
+        let error: serde_json::Value = serde_json::from_str(events[0]).unwrap();
+        assert_eq!(error["error"]["code"], "upstream_stream_interrupted");
+    }
+
+    #[tokio::test]
+    async fn compressed_sse_disconnect_does_not_append_uncompressed_error() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::unfold(0, |index| async move {
+                    match index {
+                        0 => Some((
+                            Ok::<_, io::Error>(Bytes::from_static(b"compressed-bytes")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Some((Err(io::Error::other("disconnect")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                let mut response = Response::new(Body::from_stream(chunks));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-encoding", HeaderValue::from_static("gzip"));
+                response
+            }),
+        ))
+        .await;
+        let proxy = start_mode_aware_proxy(mode_aware_state(backend.address, 4096)).await;
+        let response = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap();
+        assert!(
+            response.bytes().await.is_err(),
+            "encoded SSE must keep a transport error rather than mix encodings"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_eof_without_done_reports_error_but_generic_sse_can_end() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from("data: {\"choices\":[]}\n\n"))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let proxy = start_mode_aware_proxy(mode_aware_state(backend.address, 4096)).await;
+        let chat = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(chat.contains("\"code\":\"upstream_stream_incomplete\""));
+        assert!(!chat.contains("[DONE]"));
+        let other = reqwest::get(format!("http://{}/v1/events", proxy.address))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(other, "data: {\"choices\":[]}\n\n");
+    }
+
+    #[tokio::test]
+    async fn bodyless_completion_responses_do_not_require_sse_terminal() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|request: Request<Body>| async move {
+                let status = if request.uri().query() == Some("empty") {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        for request in [
+            Request::head("/v1/chat/completions"),
+            Request::get("/v1/chat/completions?empty"),
+        ] {
+            let response = forward_mode_aware(
+                state.clone(),
+                ProxyRequestContext {
+                    ingress: ProxyIngress::Public,
+                    peer: "127.0.0.1:1234".parse().unwrap(),
+                    hop: 0,
+                },
+                request.body(Body::empty()).unwrap(),
+            )
+            .await;
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(
+                body.is_empty(),
+                "bodyless response must not synthesize an SSE error: {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_error_event_is_forwarded_without_duplicate_error() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from("data: {\"error\":{\"code\":\"original\"}}\n\n"))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let proxy = start_mode_aware_proxy(mode_aware_state(backend.address, 4096)).await;
+        let body = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "data: {\"error\":{\"code\":\"original\"}}\n\n");
+    }
+
+    #[tokio::test]
+    async fn stalled_sse_reports_timeout_without_success_marker() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::once(async {
+                    Ok::<_, Infallible>(Bytes::from_static(b"data: first\n\n"))
+                })
+                .chain(stream::pending());
+                let mut response = Response::new(Body::from_stream(chunks));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let state = mode_aware_state(backend.address, 4096);
+        let proxy = start_mode_aware_proxy(state.clone()).await;
+        let response = reqwest::get(format!("http://{}/v1/chat/completions", proxy.address))
+            .await
+            .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(4), response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("\"code\":\"upstream_stream_timeout\""));
+        assert!(!body.contains("[DONE]"));
+        assert_eq!(state.admission().snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
     async fn mode_aware_proxy_releases_permit_on_client_cancellation() {
         let backend = start_server(Router::new().route(
             "/{*path}",
@@ -1463,5 +2139,71 @@ mod tests {
         }
         assert_eq!(coordinator.admission().snapshot().in_flight, 0);
         assert_eq!(worker.admission().snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn two_hop_restart_interrupts_stalled_sse_and_releases_both_permits() {
+        let backend = start_server(Router::new().route(
+            "/{*path}",
+            any(|| async {
+                let chunks = stream::once(async {
+                    Ok::<_, Infallible>(Bytes::from_static(b"data: first\n\n"))
+                })
+                .chain(stream::pending());
+                let mut response = Response::new(Body::from_stream(chunks));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let coordinator = mode_aware_state(backend.address, 4096);
+        coordinator.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        let peer = start_peer_ingress(coordinator.clone()).await;
+        let worker = mode_aware_state(peer.address, 4096);
+        worker.configure_peer_proxy(
+            PeerProxyToken::new(vec![b't'; 32]).unwrap(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        worker.set_target(ProxyTarget::Coordinator, true);
+        let public = start_mode_aware_proxy(worker.clone()).await;
+        let response = reqwest::get(format!("http://{}/v1/chat/completions", public.address))
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+        assert_eq!(coordinator.admission().snapshot().in_flight, 1);
+        worker.interrupt_in_flight();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while coordinator.admission().snapshot().in_flight != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upstream permit must be released without waiting for the client");
+        let event = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&event).contains("\"code\":\"stream_interrupted\""));
+        assert!(body.next().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while coordinator.admission().snapshot().in_flight != 0
+                || worker.admission().snapshot().in_flight != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both admission permits must be released");
     }
 }

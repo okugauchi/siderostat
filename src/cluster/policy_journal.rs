@@ -152,6 +152,7 @@ impl DefaultForSave for Option<PersistentClusterState> {
         match self {
             Some(state) => state,
             None => PersistentClusterState {
+                tp: None,
                 schema_version: super::state_store::PERSISTENT_STATE_SCHEMA_VERSION,
                 generation: 0,
                 control_session_generation: 0,

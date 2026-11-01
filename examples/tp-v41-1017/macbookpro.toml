@@ -1,0 +1,122 @@
+# V4.1 Flash 1017 Q2 acceptance candidate (not the active configuration).
+# Model and verified role/capability/deployment manifests must be prepared first.
+# RDMA member/device/GID values come from historical H03 evidence; recheck on each Mac.
+# Keep automatic pairing/promotion disabled until the acceptance prerequisites are met.
+schema_version = 2
+
+[proxy]
+public_listen = "127.0.0.1:18080"
+admin_listen = "127.0.0.1:18081"
+request_body_limit_bytes = 33554432
+max_in_flight = 1
+
+[proxy.timeouts]
+connect = "5s"
+response_headers = "3600s"
+first_body_byte = "2400s"
+stream_idle = "2400s"
+
+[cluster]
+enabled = true
+node_id = "m5max-macbookpro.local"
+interface = "bridge0"
+coordinator_address = "10.99.0.1"
+worker_address = "10.99.0.2"
+control_port = 9920
+ds4_distributed_port = 9911
+peer_ingress_port = 18082
+state_path = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/cluster-state.json"
+manifest_cache_dir = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/manifests"
+
+[cluster.discovery]
+mode = "bonjour-with-static-fallback"
+bonjour_service_type = "_ds4cluster._tcp"
+bonjour_domain = "local."
+event_debounce = "500ms"
+reconcile_interval = "2s"
+
+[cluster.security]
+control_secret_file = "$HOME/Library/Application Support/siderostat/secrets/cluster-control"
+peer_proxy_token_file = "$HOME/Library/Application Support/siderostat/secrets/peer-proxy"
+admin_token_file = "$HOME/Library/Application Support/siderostat/secrets/admin"
+max_clock_skew = "30s"
+nonce_ttl = "5m"
+
+[cluster.policy]
+auto_pair = false
+auto_promote = false
+auto_demote = true
+required_peer_stability = "5s"
+route_loss_grace = "15s"
+promotion_backoff = "300s"
+max_consecutive_promotion_failures = 3
+
+[cluster.timeouts]
+peer_connect = "1s"
+peer_request = "3s"
+control_lease = "15s"
+drain = "180s"
+stop = "180s"
+rendezvous_hello = "900s"
+worker_startup = "900s"
+coordinator_startup = "900s"
+complete_route = "900s"
+standalone_startup = "900s"
+
+[recovery]
+enabled = false
+
+[ds4]
+binary = "$HOME/LLM/ds4-tp-v41-1017/ds4-server"
+working_directory = "$HOME/LLM/ds4-tp-v41-1017"
+http_host = "127.0.0.1"
+http_port = 8000
+allow_sigkill = true
+
+[ds4.dspark]
+enabled = false
+
+# Single-Mac fallback: same Q2 GGUF, SSD-streamed routed experts.
+[ds4.standalone]
+profile_id = "v41-flash-1017-q2-ssd-8k"
+model = "$HOME/LLM/models/ds4/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
+model_manifest = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/manifests/standalone.json"
+checkpoint = "flash-v4.1-1017"
+quantization = "q2"
+residency = "ssd-streaming"
+context_size = 8192
+kv_disk_dir = "$HOME/Library/Caches/ds4-kv/acceptance/v41-1017-q2/standalone"
+kv_disk_space_mb = 16384
+ssd_cache_experts = "16GB"
+extra_args = []
+
+# Two-Mac TP: resident expert shards; Engram remains disk-backed by the upstream runtime.
+[ds4.distributed]
+topology = "tensor-parallel"
+transport = "rdma"
+quantization = "q2"
+model = "$HOME/LLM/models/ds4/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
+model_manifest = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/manifests/tp-deployment.json"
+checkpoint = "flash-v4.1-1017"
+context_size = 8192
+# Required config fields; the current TP builder does not pass these KV options to ds4.
+kv_disk_dir = "$HOME/Library/Caches/ds4-kv/acceptance/v41-1017-q2/distributed"
+kv_disk_space_mb = 16384
+role_artifact = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/manifests/worker-role.json"
+capability_manifest = "$HOME/Library/Application Support/siderostat/acceptance/v41-1017-q2/manifests/tp-capability.json"
+rdma_member_interface = "en2"
+rdma_address = "10.99.10.2"
+rdma_device = "rdma_en2"
+rdma_gid = "2"
+extra_args = []
+
+[logging]
+format = "json"
+level = "info"
+
+[notifications]
+enabled = true
+sound = true
+
+[startup_cleanup]
+auto_restart = false

@@ -147,7 +147,23 @@ fn validate_tp_extra_args(
         let normalized = argument.split('=').next().unwrap_or(argument);
         if matches!(
             normalized,
-            "--role" | "--transport" | "--layers" | "--coordinator" | "--listen" | "--debug"
+            "--role"
+                | "--transport"
+                | "--layers"
+                | "--coordinator"
+                | "--listen"
+                | "--debug"
+                | "--ctx"
+                | "--rdma-device"
+                | "--rdma-gid-index"
+                | "--tensor-parallel"
+                | "--ssd-streaming"
+                | "--dspark"
+                | "--mtp-model"
+                | "--host"
+                | "--port"
+                | "-m"
+                | "--model"
         ) {
             return Err(Ds4CommandError::TpManagedArgumentOverride(argument.clone()));
         }
@@ -158,6 +174,17 @@ fn validate_tp_extra_args(
 }
 
 fn tp_command(config: &Ds4Config, role: &str, argv: Vec<OsString>) -> Ds4Command {
+    let mut argv = argv;
+    argv.extend([
+        OsString::from("--ctx"),
+        OsString::from(config.distributed.context_size.to_string()),
+    ]);
+    if let Some(device) = &config.distributed.rdma_device {
+        argv.extend([OsString::from("--rdma-device"), OsString::from(device)]);
+    }
+    if let Some(gid) = &config.distributed.rdma_gid {
+        argv.extend([OsString::from("--rdma-gid-index"), OsString::from(gid)]);
+    }
     Ds4Command {
         executable: config.binary.clone(),
         working_directory: config.working_directory.clone(),

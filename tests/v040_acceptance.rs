@@ -122,16 +122,16 @@ fn public_artifacts_contain_no_secrets_or_models() {
     );
 }
 
-/// 受入 case 3 + version 同期: 3 package が 0.4.0 に同期されている。
+/// 受入 case 3 + version 同期: 3 package が 0.4.1 に同期されている。
 #[test]
-fn workspace_packages_are_version_0_4_0() {
+fn workspace_packages_are_version_0_4_1() {
     let root = repo_root();
     for manifest in ["Cargo.toml", "monitor/Cargo.toml", "xtask/Cargo.toml"] {
         let contents = std::fs::read_to_string(root.join(manifest))
             .unwrap_or_else(|e| panic!("read {manifest}: {e}"));
         assert!(
-            contents.contains("version = \"0.4.0\""),
-            "{manifest} must be version 0.4.0"
+            contents.contains("version = \"0.4.1\""),
+            "{manifest} must be version 0.4.1"
         );
     }
 }

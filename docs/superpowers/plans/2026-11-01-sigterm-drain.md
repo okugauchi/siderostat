@@ -1,0 +1,8 @@
+# SIGTERM時の長時間要求とchild回収
+
+目的: SIGTERM等の停止で受付と進行中のproxy要求を中断し、所有childの既存cleanupへ進める。管理job完了・child所有確認・失敗時のhandle保持を崩さない。
+
+1. 隔離されたruntimeプロセス、loopback backend、テスト専用childで、実SIGTERM時にエラー通知・child回収・終了が5秒以内に成立する試験を追加し、旧コードで失敗を確認する。要求途中およびheader待ちを検証する。
+2. run_servers の停止開始時に既存の安全なinterruptを適用し、public/peer/controlの終了・cleanup順序を維持する。管理jobとの競合・再受付防止を検証する。
+3. launchdの停止期限と設定済みstop timeoutとの整合を調べ、有限の余裕時間を設定し、無限待機や任意のchild強制停止を避ける。installerのruntime強制終了は安全側の更新中止へ変更し、更新失敗後の旧job復帰方法と旧版の期限の限界を文書化する。
+4. fmt、clippy、全test、独立reviewを実施する。実機への導入やlaunchdによる実際の強制終了試験は結果と分ける。

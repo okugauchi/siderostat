@@ -79,3 +79,10 @@
 "uninstaller.result.ok" = "OK";
 "uninstaller.failure.title" = "siDeroStat could not be fully removed";
 "uninstaller.failure.message" = "No user data was intentionally removed. Correct the reported condition and run the Uninstaller again.";
+
+"status.shutdown.draining" = "Stopping: waiting for requests and operations";
+"status.shutdown.child" = "Stopping: reclaiming child processes";
+"status.shutdown.failed" = "Stopping failed: check child process state";
+"status.shutdown.short.draining" = "Stopping: draining";
+"status.shutdown.short.child" = "Stopping: child";
+"status.shutdown.short.failed" = "Stop failed";

@@ -38,6 +38,9 @@ impl super::ProductionClusterRuntime {
     pub async fn recover_from_forced_policy(
         &self,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_demote().await;
+        }
         self.recover_to_solo(
             EventOwner::Control,
             ClusterEventKind::PeerLost,
@@ -53,6 +56,9 @@ impl super::ProductionClusterRuntime {
         &self,
         owner: EventOwner,
     ) -> anyhow::Result<crate::cluster::ClusterSnapshot> {
+        if self.inner.tp.is_some() {
+            return self.tp_demote().await;
+        }
         if self.planned_restart_active() {
             return Ok(self.inner.mode.snapshot());
         }

@@ -258,6 +258,26 @@ impl AdminController {
         Ok(job)
     }
 
+    /// Whether an already-accepted lifecycle job can still mutate child state.
+    pub fn has_running_mutation(&self) -> bool {
+        let jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if jobs
+            .values()
+            .any(|job| job.state == AdminJobState::Running && job.operation != "fingerprint")
+        {
+            return true;
+        }
+        drop(jobs);
+        self.policy_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|job| job.state == PolicyJobState::Running)
+    }
+
     pub fn job(&self, job_id: &str) -> Option<AdminJob> {
         self.jobs
             .lock()
@@ -300,9 +320,15 @@ impl AdminController {
             None => {
                 idem.insert(request_id, body_hash);
                 let operation_id = OperationId(uuid::Uuid::new_v4());
-                if let Err(error) = self.lease.try_acquire(OperationKind::Policy, operation_id) {
-                    idem.remove(&request_id);
-                    return Err(PolicyStartError::LeaseBusy(error));
+                // Force intent must reach the runtime before waiting for a child operation.
+                // The runtime serializes policy transactions and their child effects separately.
+                let policy_has_lease = desired != OperationPolicy::ForcedStandalone;
+                if policy_has_lease {
+                    if let Err(error) = self.lease.try_acquire(OperationKind::Policy, operation_id)
+                    {
+                        idem.remove(&request_id);
+                        return Err(PolicyStartError::LeaseBusy(error));
+                    }
                 }
                 let job_id = uuid::Uuid::new_v4();
                 let job = PolicyJob {
@@ -335,7 +361,9 @@ impl AdminController {
                             request_id,
                         })
                         .await;
-                    lease.release(OperationKind::Policy, operation_id);
+                    if policy_has_lease {
+                        lease.release(OperationKind::Policy, operation_id);
+                    }
                     let mut store = policy_jobs
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());

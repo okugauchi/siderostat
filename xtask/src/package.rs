@@ -76,7 +76,13 @@ running_monitor_pids() {
 }
 
 running_runtime_pids() {
-    running_pids_for_path "$RUNTIME_EXECUTABLE"
+    if ! open_files=$(/usr/sbin/lsof -nP -d txt -F pn 2>/dev/null); then
+        return 2
+    fi
+    printf '%s\n' "$open_files" | /usr/bin/awk -v expected="$RUNTIME_EXECUTABLE" '
+        /^p/ { pid = substr($0, 2) }
+        /^n/ && substr($0, 2) == expected { print pid }
+    '
 }
 
 log_message() {
@@ -93,34 +99,46 @@ runtime_job_loaded() {
 }
 
 stop_runtime_job() {
-    [ -n "$CONSOLE_UID" ] || return 0
+    runtime_is_running() {
+        if runtime_pids=$(running_runtime_pids); then
+            [ -n "$runtime_pids" ]
+        else
+            log_message 'cannot inspect runtime processes; aborting upgrade'
+            exit 1
+        fi
+    }
+
+    if [ -z "$CONSOLE_UID" ]; then
+        if runtime_is_running; then
+            log_message 'runtime is running without an active console user; aborting upgrade'
+            exit 1
+        fi
+        return 0
+    fi
+
+    # Validate inspection before changing the running job, even if it is loaded.
+    if runtime_is_running; then :; fi
 
     target=$(runtime_job_target)
     if runtime_job_loaded; then
         log_message "unloading existing runtime LaunchAgent $target before upgrade"
         if ! /bin/launchctl bootout "$target" 2>/dev/null; then
-            log_message "runtime LaunchAgent $target did not unload cleanly; requesting SIGKILL"
-            /bin/launchctl kill SIGKILL "$target" 2>/dev/null || true
-            /bin/launchctl bootout "$target" 2>/dev/null || true
+            if runtime_job_loaded || runtime_is_running; then
+                log_message "runtime LaunchAgent $target did not unload cleanly; aborting upgrade without forcing runtime termination"
+                exit 1
+            fi
         fi
     fi
 
     step=0
-    while runtime_job_loaded || [ -n "$(running_runtime_pids)" ]; do
-        if [ "$step" -eq 25 ]; then
-            /bin/launchctl kill SIGKILL "$target" 2>/dev/null || true
-            remaining=$(running_runtime_pids)
-            for pid in $remaining; do
-                /bin/kill -KILL "$pid" 2>/dev/null || true
-            done
-        fi
+    while runtime_job_loaded || runtime_is_running; do
         [ "$step" -lt "$WAIT_STEPS" ] || break
         /bin/sleep 0.2
         step=$((step + 1))
     done
 
-    if runtime_job_loaded || [ -n "$(running_runtime_pids)" ]; then
-        log_message 'could not stop the existing Siderostat runtime'
+    if runtime_job_loaded || runtime_is_running; then
+        log_message 'runtime did not finish stopping; aborting upgrade without forcing termination'
         exit 1
     fi
 }
@@ -704,7 +722,7 @@ mod tests {
         assert!(PREINSTALL_SCRIPT.contains("dev.siderostat-ds4-proxy.runtime"));
         assert!(PREINSTALL_SCRIPT.contains("CONSOLE_UID"));
         assert!(PREINSTALL_SCRIPT.contains("/bin/launchctl bootout"));
-        assert!(PREINSTALL_SCRIPT.contains("/bin/launchctl kill SIGKILL"));
+        assert!(!PREINSTALL_SCRIPT.contains("/bin/launchctl kill SIGKILL"));
         assert!(PREINSTALL_SCRIPT.contains("/bin/kill -TERM"));
         assert!(PREINSTALL_SCRIPT.contains("/bin/kill -KILL"));
         assert!(
@@ -715,6 +733,185 @@ mod tests {
         assert!(!PREINSTALL_SCRIPT.contains("pkill"));
         assert!(!PREINSTALL_SCRIPT.contains("Application Support"));
         assert!(!PREINSTALL_SCRIPT.contains("pkgutil --forget"));
+    }
+
+    #[test]
+    fn runtime_detection_uses_executable_identity_and_fails_closed() {
+        let start = PREINSTALL_SCRIPT.find("running_runtime_pids() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nlog_message() {").unwrap();
+        let function = PREINSTALL_SCRIPT[start..end].replace("/usr/sbin/lsof", "fake_lsof");
+        let harness = format!(
+            r#"
+RUNTIME_EXECUTABLE='/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime'
+fake_lsof() {{
+  [ "$SCENARIO" != error ] || return 1
+  printf '%s\n' p123 n/private/other p456 "n$RUNTIME_EXECUTABLE" p789 n/private/other
+}}
+{function}
+running_runtime_pids
+"#
+        );
+        let run = |scenario| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &harness])
+                .env("SCENARIO", scenario)
+                .output()
+                .unwrap()
+        };
+        let found = run("found");
+        assert!(found.status.success());
+        assert_eq!(String::from_utf8_lossy(&found.stdout).trim(), "456");
+        assert!(!run("error").status.success());
+    }
+
+    #[test]
+    fn preinstall_refuses_upgrade_when_runtime_inspection_fails() {
+        let start = PREINSTALL_SCRIPT.find("stop_runtime_job() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nstop_monitor() {").unwrap();
+        let function = &PREINSTALL_SCRIPT[start..end];
+        let harness = format!(
+            r#"
+CONSOLE_UID=''
+running_runtime_pids() {{ return 2; }}
+log_message() {{ :; }}
+{function}
+stop_runtime_job
+"#
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &harness])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn preinstall_checks_runtime_inspection_before_bootout() {
+        let start = PREINSTALL_SCRIPT.find("stop_runtime_job() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nstop_monitor() {").unwrap();
+        let function = PREINSTALL_SCRIPT[start..end].replace("/bin/launchctl", "fake_launchctl");
+        let harness = format!(
+            r#"
+CONSOLE_UID=501
+runtime_job_target() {{ echo fixture; }}
+runtime_job_loaded() {{ return 0; }}
+running_runtime_pids() {{ return 2; }}
+log_message() {{ :; }}
+fake_launchctl() {{ echo UNEXPECTED_BOOTOUT; }}
+{function}
+stop_runtime_job
+"#
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &harness])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("UNEXPECTED_BOOTOUT"));
+    }
+
+    #[test]
+    fn preinstall_refuses_to_kill_a_runtime_that_has_not_finished_cleanup() {
+        let start = PREINSTALL_SCRIPT.find("stop_runtime_job() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nstop_monitor() {").unwrap();
+        let function = PREINSTALL_SCRIPT[start..end]
+            .replace("/bin/launchctl", "fake_launchctl")
+            .replace("/bin/kill", "fake_kill")
+            .replace("/bin/sleep", "fake_sleep");
+        let harness = format!(
+            r#"
+CONSOLE_UID=501
+RUNTIME_LABEL=fixture
+WAIT_STEPS=26
+runtime_job_target() {{ echo fixture; }}
+runtime_job_loaded() {{ return 0; }}
+running_runtime_pids() {{ echo 123; }}
+log_message() {{ :; }}
+fake_sleep() {{ :; }}
+fake_kill() {{ echo UNEXPECTED_KILL; }}
+fake_launchctl() {{
+  case "$1" in
+    bootout) [ "$SCENARIO" = success ] ;;
+    kill) echo UNEXPECTED_KILL ;;
+  esac
+}}
+{function}
+stop_runtime_job
+"#
+        );
+        for scenario in ["success", "failure"] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &harness])
+                .env("SCENARIO", scenario)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "must refuse update while runtime is still alive: {scenario}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("UNEXPECTED_KILL"),
+                "runtime must not be forcibly killed: {scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn preinstall_proceeds_after_runtime_finishes_stopping() {
+        let start = PREINSTALL_SCRIPT.find("stop_runtime_job() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nstop_monitor() {").unwrap();
+        let function = PREINSTALL_SCRIPT[start..end]
+            .replace("/bin/launchctl", "fake_launchctl")
+            .replace("/bin/sleep", "fake_sleep");
+        let harness = format!(
+            r#"
+CONSOLE_UID=501
+RUNTIME_LABEL=fixture
+WAIT_STEPS=5
+checks=0
+runtime_job_target() {{ echo fixture; }}
+runtime_job_loaded() {{ checks=$((checks + 1)); [ "$checks" -le 2 ]; }}
+running_runtime_pids() {{ :; }}
+log_message() {{ :; }}
+fake_sleep() {{ :; }}
+fake_launchctl() {{ [ "$1" = bootout ]; }}
+{function}
+stop_runtime_job
+"#
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &harness])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "upgrade should proceed once owned runtime is stopped: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn preinstall_refuses_upgrade_if_runtime_exists_without_a_console_user() {
+        let start = PREINSTALL_SCRIPT.find("stop_runtime_job() {").unwrap();
+        let end = PREINSTALL_SCRIPT.find("\nstop_monitor() {").unwrap();
+        let function = &PREINSTALL_SCRIPT[start..end];
+        let harness = format!(
+            r#"
+CONSOLE_UID=''
+running_runtime_pids() {{ echo 123; }}
+log_message() {{ :; }}
+{function}
+stop_runtime_job
+"#
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &harness])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "upgrade must not replace an active runtime without an owner session"
+        );
     }
 
     #[test]

@@ -20,7 +20,14 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <!-- Request a longer shutdown window. macOS may enforce a shorter effective
+       timeout; verify the loaded job and do not assume this setting is honored. -->
+  <key>ExitTimeOut</key>
+  <integer>600</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <!-- User-requested inference and the inherited DS4 children need responsive
+       CPU/I/O scheduling. Background policy can exceed RDMA gate deadlines.
+       This HTTP service does not use XPC transactions for Adaptive policy. -->
+  <string>Interactive</string>
 </dict>
 </plist>

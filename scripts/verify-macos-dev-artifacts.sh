@@ -203,8 +203,16 @@ verify_expanded_package() {
         fail "preinstall script is missing runtime LaunchAgent stop"
         return 1
     }
-    grep -Fq "/bin/launchctl kill SIGKILL" "$preinstall_script" || {
-        fail "preinstall script is missing runtime force-stop fallback"
+    if grep -Fq "/bin/launchctl kill SIGKILL" "$preinstall_script"; then
+        fail "preinstall script must not force-stop the runtime"
+        return 1
+    fi
+    grep -Fq "/usr/sbin/lsof" "$preinstall_script" || {
+        fail "preinstall script is missing runtime executable inspection"
+        return 1
+    }
+    grep -Fq "aborting upgrade without forcing termination" "$preinstall_script" || {
+        fail "preinstall script must abort when the runtime remains active"
         return 1
     }
     local runtime_stop_line monitor_stop_line
@@ -313,7 +321,8 @@ run_fixture_tests() {
         'stop_runtime_job() { :; }' \
         'stop_monitor() { :; }' \
         '/bin/launchctl bootout "gui/$CONSOLE_UID/$RUNTIME_LABEL"' \
-        '/bin/launchctl kill SIGKILL "gui/$CONSOLE_UID/$RUNTIME_LABEL"' \
+        '/usr/sbin/lsof -nP -d txt -F pn' \
+        'echo "aborting upgrade without forcing termination"' \
         '/bin/kill -TERM "$pid"' \
         '/bin/kill -KILL "$pid"' \
         'stop_runtime_job' \
@@ -331,6 +340,10 @@ run_fixture_tests() {
     chmod +x "$fixture/valid-package/Scripts/preinstall" \
         "$fixture/valid-package/Scripts/postinstall"
     verify_expanded_package "$fixture/valid-package"
+    cp -R "$fixture/valid-package" "$fixture/unsafe-runtime-stop"
+    printf '%s\n' '/bin/launchctl kill SIGKILL "gui/$CONSOLE_UID/$RUNTIME_LABEL"' \
+        >> "$fixture/unsafe-runtime-stop/Scripts/preinstall"
+    expect_failure "runtime force-stop" verify_expanded_package "$fixture/unsafe-runtime-stop"
 
     mkdir -p "$fixture/unsigned-helper/Contents/Helpers" \
         "$fixture/unsigned-helper/Contents/MacOS" \

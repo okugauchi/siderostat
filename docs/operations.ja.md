@@ -19,6 +19,7 @@
 | `Solo Standalone` | この Mac だけで推論を提供しています。 |
 | `Paired Standalone` | 2台は接続・認証済みですが、分散稼働の準備中です。 |
 | `Distributed (layer-parallel)` | 2台が協力して1つの推論を処理しています。 |
+| `Distributed (tensor-parallel)` | 両 TP child の RDMA 接続と生成 warm-up が完了しています。 |
 
 モデルの詳細情報は動作状態とは別です。`MXFP4` はモデルの量子化、`DSpark` は投機実行のサポートを表します。
 どちらもトポロジー名や動作状態名ではありません。
@@ -99,3 +100,41 @@ Mac を繰り返し再起動せず、要求受付を閉じたままにします�
 - サービス稼働中に siDeroStat のアプリケーションサポートデータを削除しないでください。
 - ファイルを手動で削除したり、無関係なプロセスを停止したりせず、`cargo xtask uninstall` を使用してください。
 - 推論本文、認証情報、API キーは siDeroStat の通知に含まれません。
+
+## Tensor-parallel の運用
+
+TP は `ds4.distributed.topology = "tensor-parallel"` と `transport = "rdma"` で明示的に選びます。
+既定は LP です。両ノードにこの起動経路の実装が必要です。既存の control/discovery address は
+認証済み制御接続用です。RDMA 接続には別に `rdma_member_interface`、`rdma_address`、
+`rdma_device`、`rdma_gid`（数値の GID index）を指定します。bridge のアドレスだけでは
+起動できません。siDeroStat は設定を読み取り確認し、RDMA の有効化やネットワーク変更を行いません。
+
+`model_manifest` は schema 3 の TP deployment を指します。`capability_manifest` には
+同じ source revision、model family、transport、role artifact の明示的で stable な TP 対応が
+必要です。worker は承認済み `ds4`、coordinator は `ds4-server` を起動します。
+任意の `role_artifact` は共有 deployment と承認済み identity が一致する場合だけ、ローカルの
+実行ファイルのパスを置き換えます。モデルの hash/size、context、binary hash、distributed help の
+digest を起動時の cleanup より前に検証します。これらのメタデータは別途作成・検証が必要です。
+今回の変更は特定モデルの設定や動作保証を含みません。
+
+LP の layer range、DSpark/SSD 引数、TCP、管理対象 TP 引数の上書きは指定できません。
+context、device、GID index は実際の child の起動引数に反映されます。
+縮退先の Standalone は、その実行ファイルと設定だけで動作できる状態にしてください。
+
+起動時は新規受付を閉じて処理中の要求を待ち、worker 準備、coordinator 起動、両 child と RDMA
+接続の確認、HTTP 準備、内部の期限付き1-token生成を順に実行します。全段階の成功後に公開します。
+起動失敗時は受付を閉じ、所有 child を停止して Standalone の動作を確認してから受付を再開します。
+稼働中に child・制御接続を失った場合は受付を閉じ、`auto_demote` が有効なら同じ縮退処理を行い、
+無効なら手動対応を要求します。drain、child 停止、Standalone 起動に
+失敗した場合は受付を閉じたまま手動対応を要求します。自動 TP 起動は `auto_promote` に従います。
+生成速度低下に対する自動復旧は別設定で、既定では無効です。
+
+TP の失敗は初回に加えて2回まで再試行します。失敗回数と session 番号は Standalone 復帰や
+自動プロセス再起動を越えて保持します。接続成功後に障害が発生した場合も回数を消費します。
+明示的な runtime 再起動、ForcedStandalone から Automatic への適用済み変更、検証済み
+ deployment/RDMA identity の変更で上限を解除します。reconcile 操作は安全な Standalone 復帰を
+検証しますが、失敗回数を解除しません。runtime 停止時は受付を閉じたままにします。
+
+ソフトウェア受入は2-node制御HTTPと注入した lifecycle によるものです。通常のsiDeroStat起動、
+切断・再接続、Force、再起動の実機 RDMA 試験は導入前に別途必要です。モデル選定と実機受入は
+今回の作業に含みません。

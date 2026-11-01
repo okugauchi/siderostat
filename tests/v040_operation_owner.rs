@@ -56,7 +56,13 @@ fn restart_and_recovery_are_single_owner() {
     );
     assert_eq!(lease.owner(OperationKind::Restart), Some(restart));
 
-    // recovery は別種別なので同時に 1 オーナー。。
+    // child lifecycle全体でownerは1。restart中のrecoveryは拒否する。
+    assert!(
+        lease
+            .try_acquire(OperationKind::Recovery, recovery)
+            .is_err()
+    );
+    lease.release(OperationKind::Restart, restart);
     assert!(lease.try_acquire(OperationKind::Recovery, recovery).is_ok());
     assert_eq!(lease.owner(OperationKind::Recovery), Some(recovery));
 

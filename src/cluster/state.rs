@@ -478,7 +478,14 @@ fn transition(
         })
         .unwrap_or(false);
     let (mode, state, local_ready) = match (current.state, event.kind) {
-        (ClusterState::Booting, ClusterEventKind::BeginSoloStandalone)
+        (
+            ClusterState::ManualInterventionRequired
+            | ClusterState::DemotingTensorParallel
+            | ClusterState::PairedStandaloneReady
+            | ClusterState::SoloStandaloneReady,
+            ClusterEventKind::BeginSoloStandalone,
+        )
+        | (ClusterState::Booting, ClusterEventKind::BeginSoloStandalone)
         | (ClusterState::Backoff, ClusterEventKind::BeginSoloStandalone) => (
             StableMode::SoloStandalone,
             ClusterState::SoloStandaloneStarting,

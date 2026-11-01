@@ -78,9 +78,21 @@ pub enum PersistentOperationPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentTpState {
+    pub identity: String,
+    pub last_session: u64,
+    pub failed_attempts: u32,
+    #[serde(default)]
+    pub last_failed_session: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistentClusterState {
+    #[serde(default)]
+    pub tp: Option<PersistentTpState>,
     pub schema_version: u32,
     pub generation: u64,
     /// Control session generation (P0-B, Obsidian record
@@ -351,6 +363,7 @@ mod tests {
 
     fn state(generation: u64) -> PersistentClusterState {
         PersistentClusterState {
+            tp: None,
             schema_version: PERSISTENT_STATE_SCHEMA_VERSION,
             generation,
             control_session_generation: generation,

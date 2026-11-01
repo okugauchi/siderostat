@@ -69,7 +69,7 @@ pub struct OperationEnvelope {
     pub body_hash: u64,
 }
 
-/// 同一種別に単一オーナーのみを許す lease。C03 の「promotion/demotion/restart/
+/// 全種別を通して単一オーナーのみを許す lease。C03 の「promotion/demotion/restart/
 /// recovery/activation/policy に一つ」を満たす。。
 ///
 /// 短時間 state mutex を保持して network await しない。Force intent が立つと
@@ -137,8 +137,8 @@ impl OperationLease {
             .owners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if owners.contains_key(&kind) {
-            return Err(OperationLeaseError::Busy(kind));
+        if let Some(active_kind) = owners.keys().next().copied() {
+            return Err(OperationLeaseError::Busy(active_kind));
         }
         owners.insert(kind, id);
         Ok(())
@@ -256,13 +256,14 @@ mod tests {
     }
 
     #[test]
-    fn different_kinds_are_independent() {
+    fn different_child_operations_are_exclusive() {
         let lease = OperationLease::new();
         let a = OperationId(Uuid::new_v4());
         let b = OperationId(Uuid::new_v4());
         assert!(lease.try_acquire(OperationKind::Restart, a).is_ok());
-        assert!(lease.try_acquire(OperationKind::Recovery, b).is_ok());
+        assert!(lease.try_acquire(OperationKind::Recovery, b).is_err());
         lease.release(OperationKind::Restart, a);
+        assert!(lease.try_acquire(OperationKind::Recovery, b).is_ok());
         lease.release(OperationKind::Recovery, b);
     }
 
@@ -282,6 +283,8 @@ mod tests {
         assert!(lease.try_acquire(OperationKind::Restart, b).is_ok());
         lease.unblock_promotion();
         assert!(lease.promotion_allowed());
+        assert!(lease.try_acquire(OperationKind::Promotion, a).is_err());
+        lease.release(OperationKind::Restart, b);
         assert!(lease.try_acquire(OperationKind::Promotion, a).is_ok());
     }
 
