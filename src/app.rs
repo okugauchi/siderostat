@@ -338,11 +338,17 @@ impl AppState {
     }
 
     fn mark_shutdown_draining(&self) {
-        let _ = self.shutdown_phase.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |phase| Some(if phase == 0 || phase == 3 { 1 } else { phase }),
-        );
+        let order = std::sync::atomic::Ordering::SeqCst;
+        let mut phase = self.shutdown_phase.load(order);
+        while phase == 0 || phase == 3 {
+            match self
+                .shutdown_phase
+                .compare_exchange_weak(phase, 1, order, order)
+            {
+                Ok(_) => break,
+                Err(actual) => phase = actual,
+            }
+        }
     }
 
     fn request_graceful_restart(&self) {
