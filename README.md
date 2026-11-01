@@ -99,6 +99,11 @@ transport-error behavior.
 While the runtime is shutting down, the menu bar can show when it is waiting for requests or operations,
 stopping child processes, or reporting a stop failure. Short phases may finish between polls. If the
 runtime is unreachable, the monitor shows `offline`; this does not confirm that child processes stopped.
+When the service stops, active proxy requests are interrupted before owned child cleanup. The bundled
+service requests a 600-second shutdown timeout, but macOS reported 60 seconds on both tested Macs.
+Stalled operations or custom timeouts can exceed the effective deadline.
+Before upgrading from an older build, finish active requests because the installed build's own stop
+deadline remains in effect. Even when idle, a slow child stop can exceed that older deadline.
 
 ### Connection mode
 

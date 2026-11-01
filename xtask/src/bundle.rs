@@ -494,4 +494,30 @@ mod tests {
         assert!(plist.contains("/Applications/Siderostat.app/Contents/Helpers/siderostat-runtime"));
         assert!(!plist.contains("<key>BundleProgram</key>"));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_launch_agent_allows_default_shutdown_and_child_stop_windows() {
+        let plist = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../contrib/macos/dev.siderostat-ds4-proxy.runtime.plist");
+        let result = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :ExitTimeOut"])
+            .arg(plist)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "runtime launch agent must set a finite shutdown timeout"
+        );
+        let seconds: u64 = String::from_utf8(result.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // One default 180s management wait, up to two 180s child-stop waits, plus slack.
+        assert!(
+            (600..=900).contains(&seconds),
+            "insufficient or unbounded shutdown allowance: {seconds}s"
+        );
+    }
 }

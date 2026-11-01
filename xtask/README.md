@@ -131,9 +131,24 @@ cargo xtask app-dev --version <semver> --build-number <integer> [--verify]
 user の `gui/<uid>/dev.siderostat-ds4-proxy.runtime` だけを LaunchAgent から unload し、
 その後 `/Applications/Siderostat.app/Contents/MacOS/Siderostat` の完全一致した Monitor を終了する
 `preinstall` script を含める。runtime job または bundle 内の完全一致した runtime executable が
-残る場合、Monitor が通常終了しない場合だけ対象を限定して強制終了する。インストール完了後は
+停止しない場合、script自体はruntimeを強制終了せず更新を中止する。Monitor が通常終了しない場合は対象を限定して
+強制終了する。既にインストールされた旧版のlaunchd停止期限は旧版の設定に従うため、旧版からの更新前は
+処理中の要求がないことを確認する。ただし要求がなくてもchild停止に時間がかかる場合は旧期限でOSが
+runtimeを強制終了し得るため、これだけで安全な回収は保証されない。インストール完了後は
 アクティブなコンソールユーザーの GUI セッションで `/Applications/Siderostat.app` を起動する
 `postinstall` script を実行する。任意の process、`ds4-server`、ユーザーデータは対象にしない。
+
+更新中止時にはpostinstallが動かないため、旧Appが残っていてもruntimeのjobが未登録・停止中に
+なることがある。旧runtimeとその所有childが停止済みであることを確認してから、以前有効だった場合に限り、
+同じユーザーのGUIセッションで次を実行してjobの登録状態を確認する。未登録の場合だけ続くbootstrapを
+実行し、Monitorまたは管理APIで起動を確認する。登録済みの場合はbootstrapを繰り返さず状態を調べる。
+停止状態が不明な場合は重複起動せず調査する。
+
+```sh
+launchctl print "gui/$(id -u)/dev.siderostat-ds4-proxy.runtime"
+# 未登録の場合のみ:
+launchctl bootstrap "gui/$(id -u)" /Applications/Siderostat.app/Contents/Library/LaunchAgents/dev.siderostat-ds4-proxy.runtime.plist
+```
 
 ```sh
 cargo xtask pkg-dev --app-dir <staging> --version <semver> [--output-dir dist]

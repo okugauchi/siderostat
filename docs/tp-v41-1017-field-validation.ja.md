@@ -218,7 +218,51 @@ TP session 17でストリーミング生成を開始し、推論内容の出力�
 非圧縮の生成API SSEはイベント単位で最大1 MiBを保持し、未完了イベントを送る前に切断された
 場合はその部分を破棄してerror eventを返す。上流接続エラー・stream idle timeout・`[DONE]`
 のないEOFも失敗とし、成功を示す `[DONE]` は追加しない。圧縮SSEは平文イベントを混入させず
-従来どおり通信エラーとして終了する。通常のSIGTERMとlistener異常による停止はこの中断経路の
-対象外であり、長時間要求とOSの停止期限の組み合わせは別途検証が必要。
+従来どおり通信エラーとして終了する。この時点では通常のSIGTERMとlistener異常による停止は
+中断経路の対象外であり、後続の検証と修正を下記に記録する。
 HTTP応答開始後はステータスを変更できず、クライアントへの接続自体が失われた場合はイベントの
-到達を保証できない。この後続修正は実機で未検証。
+到達を保証できない。この修正の実機試験結果は次節に記録する。
+
+### build38の生成中切断・再接続
+
+build38、TP session 19でテスト用のストリーミング生成中にThunderboltケーブルを抜去した。
+出力575チャンクの後、SSE `error.code=stream_interrupted`を1件受信し、HTTP転送は正常に終了した。
+不正なJSONイベント、`finish_reason`、`[DONE]`はいずれもなく、途中出力を成功として扱わなかった。
+切断前の両TP childの終了を確認した。観測上、MBPは18:03:43、Studioは18:04:00に
+Solo Standalone Readyとなり、切断中に各公開APIの短い非stream生成が成功した。
+再接続後、両ノードは18:08:32にTP Readyへ復帰し、MBP公開APIの短いストリーミング生成で
+`OK`、`finish_reason=stop`、`[DONE]`を確認した。時刻は日本時間、状態はpoll時刻である。
+状態・切断時応答・再接続後応答はローカルのignore対象 `dist/tp-build38-evidence/` に保存した。
+1回の試験であり、切断時の通知到達を全ての接続断で保証するものではない。
+
+### build38の通常SIGTERM停止の隔離検証
+
+両実機のruntimeを停止せず、build38と同じcommitの隔離作業領域で、実際の`run_servers`と
+所有child supervisor、テスト用backend、独立したloopback portを使って検証した。最初のSSE
+イベントの後にbackendが停止しない要求を保持し、テストプロセス自身にSIGTERMを送った。
+5.2秒後も公開serverのdrainが完了せず、supervisorが所有するテスト用childは動作中だった。
+クライアントを切断するとdrainが完了し、runtimeは正常終了してchildも回収された。
+テスト用childはruntimeと異なるprocess groupに置かれていた。
+
+両実機のlaunchd runtimeには `exit timeout = 5` が表示され、macOSの`launchd.plist(5)`は
+停止時にSIGTERMから期限後のSIGKILLへ移る動作と、job終了後に同一process groupの残存processを
+終了する動作を記載している。したがって、長時間要求により実機runtimeが期限を超えた場合、
+通常のchild回収より先に強制終了されるリスクがある。実機でSIGKILLやchildの孤立が起きることは
+この検証では直接再現していない。隔離テストの差分とログは `dist/tp-build38-evidence/sigterm/`
+に保存した。
+
+### 通常SIGTERM停止への後続修正
+
+通常SIGTERMとlistener異常の停止開始時も受付を閉じ、処理中のproxy要求を中断してから、
+既存の管理操作待ち・所有child回収へ進む。テスト専用processに実SIGTERMを送り、停止しない
+SSE要求に失敗を返しつつ、所有childが5秒以内に回収されることを隔離試験で確認した。
+同梱LaunchAgentの`ExitTimeOut`は600秒を指定する。ただしbuild39の実機では両ノードとも
+`launchctl print`の`exit timeout`は60秒と表示され、600秒の有効性は確認できていない。
+既定180秒の管理操作待ちや子停止待ちが実効期限に収まる保証はない。
+これは有限期限であり、任意に延ばされたtimeout、滞留した制御操作、受信を停止したclient、
+手動対応待ちが期限内に終わることを保証しない。`run_servers`開始前の起動中SIGTERMも別の残件。
+installerはruntimeが残る場合に自らSIGKILLせず更新を中止する。ただし旧版から更新する際は、
+旧runtimeに登録済みのlaunchd停止期限が適用される。更新前に処理中の要求をなくしても、childの停止が
+旧期限を超えればOSによる強制終了を防げる保証はない。
+build39は両ノードでTP Readyへの復帰と短い生成を確認した。生成中の通常SIGTERMと子回収は
+build39の実機では未検証。

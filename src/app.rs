@@ -1403,7 +1403,7 @@ async fn run_servers(
         _ = state.restart_requested.notified() => Ok(()),
     };
     state.begin_server_shutdown();
-    state.proxy.admission().block();
+    state.proxy.interrupt_in_flight();
     shutdown_sender.send_replace(true);
     // A failing admin listener or signal source must not bypass the public drain.
     let public_result: anyhow::Result<()> = if public_completed {
@@ -3257,6 +3257,237 @@ mod tests {
     use super::*;
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sigterm_interrupts_stream_and_reaps_owned_child() {
+        const CHILD: &str = "SIDEROSTAT_SIGTERM_ISOLATED_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                use futures::{StreamExt, stream};
+                use std::{ffi::OsString, time::Duration};
+
+                let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend_addr = backend_listener.local_addr().unwrap();
+                let backend = tokio::spawn(async move {
+                    let router = Router::new()
+                        .route(
+                            "/v1/models",
+                            axum::routing::get(|| async { axum::Json(json!({"data":[]})) }),
+                        )
+                        .route(
+                            "/v1/chat/completions",
+                            axum::routing::any(|| async {
+                                let chunks = stream::once(async {
+                                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                        b"data: {\"choices\":[]}\n\n",
+                                    ))
+                                })
+                                .chain(stream::pending());
+                                axum::http::Response::builder()
+                                    .header("content-type", "text/event-stream")
+                                    .body(Body::from_stream(chunks))
+                                    .unwrap()
+                            }),
+                        );
+                    axum::serve(backend_listener, router).await.unwrap();
+                });
+                async fn free_port() -> std::net::SocketAddr {
+                    tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                }
+                let mut config = ModeAwareConfig::parse(include_str!(
+                    "../contrib/macos/Resources/default-config.toml"
+                ))
+                .unwrap();
+                config.cluster.enabled = false;
+                config.cluster.node_id = format!("sigterm-test-{}", uuid::Uuid::new_v4());
+                config.recovery.enabled = false;
+                config.proxy.public_listen = free_port().await;
+                loop {
+                    config.proxy.admin_listen = free_port().await;
+                    if config.proxy.admin_listen != config.proxy.public_listen
+                        && config.proxy.admin_listen != backend_addr
+                    {
+                        break;
+                    }
+                }
+                assert_ne!(config.proxy.public_listen, backend_addr);
+                config.proxy.timeouts.stream_idle = Duration::from_secs(60);
+                config.ds4.http_host = backend_addr.ip();
+                config.ds4.http_port = backend_addr.port();
+                let public_addr = config.proxy.public_listen;
+                let admin_addr = config.proxy.admin_listen;
+                let node_id = config.cluster.node_id.clone();
+                let state = AppState::from_config(config.clone()).unwrap();
+                let command = crate::cluster::Ds4Command {
+                    executable: "/bin/sleep".into(),
+                    working_directory: "/".into(),
+                    argv: vec![OsString::from("10")],
+                    profile: crate::cluster::Ds4Profile {
+                        profile_id: "isolated-test".into(),
+                        quantization: Quantization::Q2,
+                        residency: Residency::Resident,
+                        speculative_support: SpeculativeSupport::None,
+                    },
+                };
+                let supervisor = Arc::new(StandaloneSupervisor::new(
+                    command,
+                    url::Url::parse(&format!("http://{backend_addr}/v1/models")).unwrap(),
+                    Duration::from_secs(5),
+                    Duration::from_millis(20),
+                    Duration::from_secs(2),
+                    true,
+                    Arc::new(Metrics::default()),
+                ));
+                let mode = Arc::new(
+                    ModeRuntime::spawn_ready(
+                        LocalRole::Unknown,
+                        state.proxy.clone(),
+                        supervisor.clone(),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let child_pid = supervisor.child_identity().await.unwrap().pid;
+                state.attach_cluster(mode.cluster_handle());
+                state.attach_supervisor(supervisor.clone());
+                let dummy = || tokio::spawn(std::future::pending::<()>());
+                let server_state = state.clone();
+                let server_supervisor = supervisor.clone();
+                let server = tokio::spawn(async move {
+                    run_servers(
+                        &config,
+                        server_state,
+                        None,
+                        LocalRole::Unknown,
+                        server_supervisor,
+                        mode,
+                        dummy(),
+                        dummy(),
+                        dummy(),
+                    )
+                    .await
+                });
+                let client = reqwest::Client::new();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        assert!(!server.is_finished(), "isolated server failed to bind");
+                        if let Ok(response) = client
+                            .get(format!("http://{admin_addr}/cluster"))
+                            .send()
+                            .await
+                            && let Ok(snapshot) = response.json::<serde_json::Value>().await
+                            && snapshot["node_id"] == node_id
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client
+                        .post(format!("http://{public_addr}/v1/chat/completions"))
+                        .body("{}")
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut body = response.bytes_stream();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), body.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_ok()
+                );
+                assert_eq!(state.proxy.admission().snapshot().in_flight, 1);
+                assert_eq!(
+                    unsafe { libc::kill(child_pid as i32, 0) },
+                    0,
+                    "owned test child must be alive before SIGTERM"
+                );
+                // The signal targets only this isolated test process, never an installed service.
+                let stopped_at = tokio::time::Instant::now();
+                assert_eq!(
+                    unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
+                    0
+                );
+                let event = tokio::time::timeout(Duration::from_secs(3), body.next())
+                    .await
+                    .expect("SIGTERM must interrupt the stalled request")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&event).contains("\"code\":\"stream_interrupted\"")
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), body.next())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                tokio::time::timeout(Duration::from_secs(4), server)
+                    .await
+                    .expect("SIGTERM must finish cleanup")
+                    .unwrap()
+                    .unwrap();
+                assert!(supervisor.child_identity().await.is_none());
+                assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+                assert!(stopped_at.elapsed() < Duration::from_secs(5));
+                backend.abort();
+                println!("sigterm-stream-interrupted-and-owned-child-reaped");
+            });
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::sigterm_interrupts_stream_and_reaps_owned_child",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated SIGTERM test exceeded 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("sigterm-stream-interrupted-and-owned-child-reaped")
+        );
+    }
 
     struct TestAdminExecutor;
 
