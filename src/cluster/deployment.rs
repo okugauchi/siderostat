@@ -68,13 +68,13 @@ impl RuntimeDeployment {
         let Self::TensorParallel(m) = self else {
             return Ok(());
         };
+        let kind = match role {
+            LocalRole::Worker => RoleKind::Worker,
+            LocalRole::Coordinator => RoleKind::Coordinator,
+            LocalRole::Unknown => return Ok(()),
+        };
         if let Some(path) = &config.ds4.distributed.role_artifact {
             let local: super::RoleArtifact = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-            let kind = match role {
-                LocalRole::Worker => RoleKind::Worker,
-                LocalRole::Coordinator => RoleKind::Coordinator,
-                LocalRole::Unknown => return Ok(()),
-            };
             let slot = m
                 .role_artifacts
                 .iter_mut()
@@ -193,6 +193,9 @@ impl RuntimeDeployment {
     }
 
     /// Runs before startup cleanup or any managed child is changed.
+    /// An unknown role validates common identity and both role approvals, but defers
+    /// local executable validation until a subsequent boot with a known role. TP
+    /// startup must remain blocked until that role-specific validation succeeds.
     pub async fn verify_tp(&self, config: &ModeAwareConfig, role: LocalRole) -> anyhow::Result<()> {
         let Some(m) = self.tp() else { return Ok(()) };
         ensure!(
@@ -228,9 +231,9 @@ impl RuntimeDeployment {
             "TP model digest differs from deployment"
         );
         let local_role = match role {
-            LocalRole::Worker => RoleKind::Worker,
-            LocalRole::Coordinator => RoleKind::Coordinator,
-            LocalRole::Unknown => anyhow::bail!("TP role unknown"),
+            LocalRole::Worker => Some(RoleKind::Worker),
+            LocalRole::Coordinator => Some(RoleKind::Coordinator),
+            LocalRole::Unknown => None,
         };
         for artifact in &m.role_artifacts {
             let approved = cap
@@ -248,7 +251,7 @@ impl RuntimeDeployment {
                 "TP role is not approved by capability"
             );
             // Only the local role path is used; peer paths need not exist on this host.
-            if artifact.role != local_role {
+            if Some(artifact.role) != local_role {
                 continue;
             }
             let path = std::path::Path::new(&artifact.path);
