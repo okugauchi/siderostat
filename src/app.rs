@@ -368,6 +368,7 @@ impl AppState {
             }
             return;
         }
+        self.proxy.interrupt_in_flight();
         self.mark_shutdown_draining();
         self.restart_requested.notify_one();
     }
@@ -375,6 +376,7 @@ impl AppState {
 
 struct RuntimeAdminExecutor {
     runtime: Arc<ModeRuntime>,
+    proxy: Arc<ModeAwareProxyState>,
     supervisor: Arc<StandaloneSupervisor>,
     standalone_model: PathBuf,
     distributed_model: PathBuf,
@@ -388,6 +390,7 @@ struct RuntimeAdminExecutor {
 impl AdminExecutor for RuntimeAdminExecutor {
     fn execute(&self, action: AdminAction) -> AdminFuture {
         let runtime = self.runtime.clone();
+        let proxy = self.proxy.clone();
         let supervisor = self.supervisor.clone();
         let standalone_model = self.standalone_model.clone();
         let distributed_model = self.distributed_model.clone();
@@ -441,6 +444,7 @@ impl AdminExecutor for RuntimeAdminExecutor {
                         .unwrap_or(LocalRole::Unknown);
                     if new_role != current_role {
                         tracing::warn!(from = ?current_role, to = ?new_role, "cluster role changed on restart; restarting process to apply new role");
+                        proxy.interrupt_in_flight();
                         spawn_process_restart(restart_requested);
                         return Ok(json!({
                             "restart": "process",
@@ -530,6 +534,7 @@ fn spawn_role_change_monitor(
     config: &ModeAwareConfig,
     initial_role: LocalRole,
     restart_requested: Arc<tokio::sync::Notify>,
+    proxy: Arc<ModeAwareProxyState>,
 ) -> (
     Option<tokio::task::JoinHandle<()>>,
     Option<MacOsDynamicStoreWatcher>,
@@ -568,6 +573,7 @@ fn spawn_role_change_monitor(
                         reason = ?request.reason,
                         "cluster role changed; restarting process to apply new role"
                     );
+                    proxy.interrupt_in_flight();
                     spawn_process_restart(restart_requested);
                     return;
                 }
@@ -586,6 +592,7 @@ fn spawn_role_change_monitor(
     _config: &ModeAwareConfig,
     _initial_role: LocalRole,
     _restart_requested: Arc<tokio::sync::Notify>,
+    _proxy: Arc<ModeAwareProxyState>,
 ) -> (Option<tokio::task::JoinHandle<()>>, Option<()>) {
     (None, None)
 }
@@ -766,7 +773,12 @@ pub async fn serve_with_options(
     let (_role_change_task, _role_change_watcher) = if dry_run {
         (None, None)
     } else {
-        spawn_role_change_monitor(&config, role, state.restart_requested.clone())
+        spawn_role_change_monitor(
+            &config,
+            role,
+            state.restart_requested.clone(),
+            state.proxy.clone(),
+        )
     };
     run_servers(
         &config,
@@ -989,6 +1001,7 @@ fn attach_control_plane(
         boot.admin_token,
         Arc::new(RuntimeAdminExecutor {
             runtime: runtime.clone(),
+            proxy: state.proxy.clone(),
             supervisor: supervisor.clone(),
             standalone_model: config.ds4.standalone.model.clone(),
             distributed_model: config.ds4.distributed.model.clone(),
@@ -1033,6 +1046,7 @@ pub async fn admin_http_reconcile(
         admin_token.clone(),
         Arc::new(RuntimeAdminExecutor {
             runtime: runtime.clone(),
+            proxy: state.proxy.clone(),
             supervisor,
             standalone_model: config.ds4.standalone.model.clone(),
             distributed_model: config.ds4.distributed.model.clone(),
@@ -3255,6 +3269,75 @@ mod tests {
                 Ok(json!({"executed": true}))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn restart_interrupts_stalled_sse_before_waiting_for_public_drain() {
+        use futures::{StreamExt, stream};
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = backend.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let router = Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::any(|| async {
+                    let chunks = stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: first\n\n"))
+                    })
+                    .chain(stream::pending());
+                    let mut response = axum::http::Response::new(Body::from_stream(chunks));
+                    response.headers_mut().insert(
+                        "content-type",
+                        axum::http::HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                }),
+            );
+            axum::serve(backend, router).await.unwrap();
+        });
+        let mut state = test_state(false);
+        let upstream = url::Url::parse(&format!("http://{addr}")).unwrap();
+        let proxy = Arc::new(
+            ModeAwareProxyState::new(
+                upstream.clone(),
+                upstream,
+                ModeAwareProxyOptions {
+                    max_in_flight: 1,
+                    request_body_limit_bytes: 4096,
+                    response_header_timeout: std::time::Duration::from_secs(1),
+                    first_body_byte_timeout: std::time::Duration::from_secs(1),
+                    stream_idle_timeout: std::time::Duration::from_secs(30),
+                    connect_timeout: std::time::Duration::from_secs(1),
+                },
+            )
+            .unwrap(),
+        );
+        proxy.set_target(ProxyTarget::LocalStandalone, true);
+        proxy.admission().start_serving();
+        Arc::get_mut(&mut state).unwrap().proxy = proxy.clone();
+        let response = crate::proxy::forward_mode_aware(
+            proxy.clone(),
+            crate::proxy::ProxyRequestContext {
+                ingress: crate::proxy::ProxyIngress::Public,
+                peer: "127.0.0.1:1234".parse().unwrap(),
+                hop: 0,
+            },
+            Request::get("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), "data: first\n\n");
+        state.request_graceful_restart();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("restart must interrupt the stalled stream")
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&next).contains("\"error\""));
+        assert!(body.next().await.is_none());
+        assert_eq!(proxy.admission().snapshot().in_flight, 0);
+        server.abort();
     }
 
     #[tokio::test]

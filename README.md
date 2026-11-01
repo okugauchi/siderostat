@@ -90,6 +90,12 @@ The menu bar monitor shows the current state and progress. During startup or a s
 may temporarily fail with HTTP 503 or HTTP 504. siDeroStat does not replay a failed request, so the
 client application must decide whether a retry is safe.
 
+For uncompressed streaming responses from `/v1/chat/completions` and `/v1/completions`, an
+interruption can produce an SSE `error` event without `[DONE]`. Clients should treat an error or a
+missing completion marker as failure. Individual SSE events are limited to 1 MiB. If the client
+connection itself is lost, the error event cannot be guaranteed; compressed streams retain
+transport-error behavior.
+
 While the runtime is shutting down, the menu bar can show when it is waiting for requests or operations,
 stopping child processes, or reporting a stop failure. Short phases may finish between polls. If the
 runtime is unreachable, the monitor shows `offline`; this does not confirm that child processes stopped.

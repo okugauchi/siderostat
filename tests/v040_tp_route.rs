@@ -60,7 +60,9 @@ async fn streaming_handler() -> axum::response::Response<Body> {
     let chunks = stream::unfold(0_u64, |index| async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
         Some((
-            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("{index}\n"))),
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "data: {index}\n\n"
+            ))),
             index + 1,
         ))
     });

@@ -191,4 +191,34 @@ build36では停止中の表示とTP childの回収を確認したが、切断�
 役割別のファイルと実行ファイルの検証だけを後回しにする。役割不明でのTP起動は引き続き拒否する。
 再接続後は既存の役割変更による再起動で、確定した役割の実行ファイルを検証する。
 モデル全体のSHA-256検証は引き続き必要なため、Standaloneの起動にも時間がかかる。
-この修正の切断中Standalone復帰および再接続後のTP復帰は実機で未検証。
+### build37のアイドル中切断・再接続
+
+build37、TP session 16、in-flight 0でケーブルを抜去した。両TP childの終了を確認し、
+両runtimeは正常終了後に再起動した。記録上、MBPは12:33:00、Studioは12:33:35に
+Solo Standalone Readyに到達し、切断中に各公開APIの短い非stream生成で`OK`を受信した。
+12:34頃の再接続後、両ノードは12:38:33にTP Readyへ自動復帰し、session 17で
+MBP公開APIの短い非stream生成に成功した。時刻は日本時間、観測はpoll時刻である。
+状態記録はローカルのignore対象 `dist/tp-build37-evidence/cable-idle-states.jsonl` に保存した。
+反復切断および長時間安定性は今回未検証。
+
+### build37の生成中切断・再接続
+
+TP session 17でストリーミング生成を開始し、推論内容の出力中にケーブルを抜去した。
+出力を820チャンク受信した後、明示的なerror、finish_reason、`[DONE]`を受信しないまま
+接続が閉じ、クライアントはcurl error 18を報告した。途中出力は生成成功ではない。
+両TP childの終了後、Studioは12:44:35、MBPは12:45:14にSolo Standalone Readyに到達し、
+各公開APIの短い非stream生成が成功した。再接続後は両ノードが12:50:16までにTP Readyに
+復帰し、MBP公開APIで短い非stream生成に成功した。時刻は日本時間、観測はpoll時刻である。
+切断時のstreamを明示的な失敗イベントで終えることは未達であり、別途原因調査が必要。
+状態とstreamの記録は `dist/tp-build37-evidence/cable-active-states.jsonl` と
+`dist/tp-build37-evidence/cable-active-response.sse` に保存した。
+
+後続のソース修正では、役割変更による再起動時に待機中のstreamを中断し、SSE接続が
+利用できる場合は `stream_interrupted` error eventを返す。応答開始前の要求は503で終える。
+非圧縮の生成API SSEはイベント単位で最大1 MiBを保持し、未完了イベントを送る前に切断された
+場合はその部分を破棄してerror eventを返す。上流接続エラー・stream idle timeout・`[DONE]`
+のないEOFも失敗とし、成功を示す `[DONE]` は追加しない。圧縮SSEは平文イベントを混入させず
+従来どおり通信エラーとして終了する。通常のSIGTERMとlistener異常による停止はこの中断経路の
+対象外であり、長時間要求とOSの停止期限の組み合わせは別途検証が必要。
+HTTP応答開始後はステータスを変更できず、クライアントへの接続自体が失われた場合はイベントの
+到達を保証できない。この後続修正は実機で未検証。
